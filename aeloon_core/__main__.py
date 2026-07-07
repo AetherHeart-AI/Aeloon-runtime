@@ -9,14 +9,12 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from aiohttp import web
-
 from aeloon_core.config import Config, load_config, resolve_config_path, save_config
 from aeloon_core.orchestrator import AeloonCoreOrchestrator, ConsoleProgress
 from aeloon_core.terminal_cli import LOG_LEVELS, run_terminal_cli
-from server.app import create_app
 
-COMMANDS = {"run", "chat", "tui", "webui", "config"}
+COMMANDS = {"run", "chat", "tui", "config"}
+REMOVED_COMMANDS = {"webui"}
 CHAT_ONLY_OPTIONS = {"--hide-gateway-logs", "--gateway-log-detail", "--gateway-log-level"}
 CONFIG_SETTERS = {
     "workspace": ("workspace",),
@@ -44,15 +42,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     tui_parser = subparsers.add_parser("tui", help="Alias for chat.")
     _add_chat_args(tui_parser)
-
-    webui_parser = subparsers.add_parser("webui", help="Start the local Web UI server.")
-    webui_parser.add_argument(
-        "--config", type=Path, default=None, help="Optional config JSON path."
-    )
-    webui_parser.add_argument("--host", default="127.0.0.1", help="Bind host.")
-    webui_parser.add_argument("--port", type=int, default=8765, help="Bind port.")
-    webui_parser.add_argument("--workspace", type=Path, default=None, help="Override workspace.")
-    webui_parser.add_argument("--data-dir", type=Path, default=None, help="Override data dir.")
 
     config_parser = subparsers.add_parser("config", help="Manage persistent config.")
     config_subparsers = config_parser.add_subparsers(dest="config_command", required=True)
@@ -181,19 +170,6 @@ async def _run_chat(args: argparse.Namespace) -> None:
     )
 
 
-def _run_webui(args: argparse.Namespace) -> None:
-    config = _load_with_path_overrides(
-        args.config,
-        workspace=getattr(args, "workspace", None),
-        data_dir=getattr(args, "data_dir", None),
-    )
-    app = create_app(config)
-    print(f"Workspace: {config.workspace}")
-    print(f"Data dir: {config.data_dir}")
-    print(f"Web UI: http://{args.host}:{args.port}")
-    web.run_app(app, host=args.host, port=args.port)
-
-
 def _run_config(args: argparse.Namespace) -> None:
     if args.config_command == "path":
         print(resolve_config_path(args.config))
@@ -298,7 +274,7 @@ def _coerce_config_value(key: str, value: str) -> Any:
 
 def _looks_like_legacy_run(argv: list[str]) -> bool:
     first = _first_positional(argv)
-    return first is not None and first not in COMMANDS
+    return first is not None and first not in COMMANDS and first not in REMOVED_COMMANDS
 
 
 def _first_positional(argv: list[str]) -> str | None:
@@ -351,9 +327,6 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.command in {"chat", "tui"}:
         asyncio.run(_run_chat(args))
-        return
-    if args.command == "webui":
-        _run_webui(args)
         return
     if args.command == "config":
         _run_config(args)

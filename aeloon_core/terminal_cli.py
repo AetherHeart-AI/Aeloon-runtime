@@ -21,7 +21,7 @@ from rich.text import Text
 
 from aeloon_core.config import Config
 from aeloon_core.orchestrator import AeloonCoreOrchestrator, TurnResult
-from server.bridge import WebUITurnProgress
+from aeloon_core.turn_events import TurnEventProgress
 
 LOG_LEVELS = {
     "TRACE": 5,
@@ -47,7 +47,7 @@ PROMPT_STYLE = Style.from_dict({"prompt": "ansicyan bold"})
 
 
 class TerminalEventRenderer:
-    """Render Web UI progress events as a compact terminal transcript."""
+    """Render structured progress events as a compact terminal transcript."""
 
     def __init__(
         self,
@@ -370,7 +370,7 @@ class TerminalChatCli:
 
     async def _run_turn(self, prompt: str) -> TurnResult | None:
         self.renderer.print_user(prompt)
-        progress = WebUITurnProgress(session_id=self.session_id, emit=self.renderer.emit)
+        progress = TurnEventProgress(session_id=self.session_id, emit=self.renderer.emit)
         try:
             result = await self.orchestrator.run_turn(
                 prompt,

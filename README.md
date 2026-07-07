@@ -2,7 +2,7 @@
 
 A minimal, independent Aeloon agent-loop playground. It keeps the reusable LLM
 and tool iteration kernel, an OpenAI-compatible provider, a small set of local
-tools, JSONL session persistence, and a WebSocket driven debugging UI.
+tools, JSONL session persistence, and a terminal debugging CLI.
 
 ## Quick Start
 
@@ -45,24 +45,6 @@ uv run aeloon-core tui --gateway-log-level DEBUG "Read README.md"
 
 Runtime commands use the directory where you invoke `aeloon-core` as the
 workspace. To target a different folder for one command, pass `--workspace`.
-
-Run the local Web UI:
-
-```bash
-cd web
-npm install
-npm run build
-cd ..
-uv run aeloon-core webui
-```
-
-Then open `http://127.0.0.1:8765`.
-
-You can point the Web UI at another workspace without changing directories:
-
-```bash
-uv run aeloon-core webui --workspace /path/to/project --port 8766
-```
 
 ## Config
 

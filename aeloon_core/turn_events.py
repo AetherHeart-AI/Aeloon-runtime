@@ -1,4 +1,4 @@
-"""Bridge kernel progress callbacks into Web UI events."""
+"""Bridge kernel progress callbacks into terminal event streams."""
 
 from __future__ import annotations
 
@@ -15,8 +15,8 @@ Emit = Callable[[str, dict[str, Any]], Awaitable[None]]
 LOG_TEXT_PREVIEW_CHARS = 240
 
 
-class WebUITurnProgress:
-    """Accumulate a turn and emit Web UI friendly events."""
+class TurnEventProgress:
+    """Accumulate a turn and emit structured progress events."""
 
     def __init__(self, *, session_id: str, emit: Emit) -> None:
         self.session_id = session_id
@@ -462,12 +462,6 @@ class WebUITurnProgress:
             if block.get("id") == block_id:
                 return block
         return None
-
-
-def encode_event(event: str, payload: dict[str, Any]) -> str:
-    """Encode an event envelope."""
-
-    return json.dumps({"type": "event", "event": event, "payload": payload}, ensure_ascii=False)
 
 
 def _tool_call_detail(tool_call: ToolCallRequest) -> dict[str, Any]:

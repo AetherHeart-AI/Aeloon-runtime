@@ -5,11 +5,10 @@ build-backend = "hatchling.build"
 [project]
 name = "aeloon-core"
 version = "0.1.0"
-description = "Minimal Aeloon agent loop and local debugging UI."
+description = "Minimal Aeloon agent loop and terminal debugging CLI."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-  "aiohttp>=3.12",
   "html2text>=2025.4.15",
   "httpx>=0.28",
   "json-repair>=0.50",
@@ -23,10 +22,9 @@ dependencies = [
 
 [project.scripts]
 aeloon-core = "aeloon_core.__main__:main"
-aeloon-core-server = "server.__main__:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["aeloon_core", "server"]
+packages = ["aeloon_core"]
 
 [tool.ruff]
 target-version = "py311"
@@ -37,4 +35,3 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-

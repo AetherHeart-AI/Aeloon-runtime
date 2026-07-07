@@ -22,6 +22,7 @@ def test_chat_commands_are_registered() -> None:
     assert args.hide_gateway_logs is True
     assert _looks_like_legacy_run(["chat"]) is False
     assert _looks_like_legacy_run(["tui"]) is False
+    assert _looks_like_legacy_run(["webui"]) is False
 
 
 def test_implicit_chat_invocations() -> None:
