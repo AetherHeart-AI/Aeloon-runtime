@@ -14,37 +14,24 @@ from aeloon_core.tools.base import Tool
 class GlobTool(Tool):
     """Find files by glob pattern."""
 
+    name = "glob"
+    concurrency_mode = "read_only"
+    description = "Find files matching a glob pattern. Uses workspace as the default root."
+    parameters = {
+        "type": "object",
+        "properties": {
+            "pattern": {"type": "string", "description": "Glob pattern, for example **/*.py."},
+            "root": {
+                "type": "string",
+                "description": "Optional root directory. Relative paths resolve from workspace.",
+            },
+            "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
+        },
+        "required": ["pattern"],
+    }
+
     def __init__(self, *, workspace: Path) -> None:
         self.workspace = workspace
-
-    @property
-    def name(self) -> str:
-        return "glob"
-
-    @property
-    def concurrency_mode(self) -> str:
-        return "read_only"
-
-    @property
-    def description(self) -> str:
-        return "Find files matching a glob pattern. Uses workspace as the default root."
-
-    @property
-    def parameters(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "pattern": {"type": "string", "description": "Glob pattern, for example **/*.py."},
-                "root": {
-                    "type": "string",
-                    "description": (
-                        "Optional root directory. Relative paths resolve from workspace."
-                    ),
-                },
-                "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
-            },
-            "required": ["pattern"],
-        }
 
     async def execute(
         self,
@@ -79,41 +66,28 @@ class GlobTool(Tool):
 class GrepTool(Tool):
     """Search file contents."""
 
+    name = "grep"
+    concurrency_mode = "read_only"
+    description = "Search text in files. Prefers ripgrep when it is installed."
+    parameters = {
+        "type": "object",
+        "properties": {
+            "pattern": {"type": "string", "description": "Regex/text pattern to search for."},
+            "path": {
+                "type": "string",
+                "description": "Optional file or directory. Relative paths resolve from workspace.",
+            },
+            "include": {
+                "type": "string",
+                "description": "Optional glob include, for example *.py.",
+            },
+            "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
+        },
+        "required": ["pattern"],
+    }
+
     def __init__(self, *, workspace: Path) -> None:
         self.workspace = workspace
-
-    @property
-    def name(self) -> str:
-        return "grep"
-
-    @property
-    def concurrency_mode(self) -> str:
-        return "read_only"
-
-    @property
-    def description(self) -> str:
-        return "Search text in files. Prefers ripgrep when it is installed."
-
-    @property
-    def parameters(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "pattern": {"type": "string", "description": "Regex/text pattern to search for."},
-                "path": {
-                    "type": "string",
-                    "description": (
-                        "Optional file or directory. Relative paths resolve from workspace."
-                    ),
-                },
-                "include": {
-                    "type": "string",
-                    "description": "Optional glob include, for example *.py.",
-                },
-                "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
-            },
-            "required": ["pattern"],
-        }
 
     async def execute(
         self,

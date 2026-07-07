@@ -22,40 +22,29 @@ class _WorkspaceTool(Tool):
 class ReadTool(_WorkspaceTool):
     """Read file contents with line-numbered output."""
 
+    name = "read"
+    concurrency_mode = "read_only"
+    description = "Read a UTF-8 text file. Returns numbered lines and supports offset/limit."
+    parameters = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "File path to read."},
+            "offset": {
+                "type": "integer",
+                "description": "Line number to start from, 1-indexed.",
+                "minimum": 1,
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum number of lines.",
+                "minimum": 1,
+            },
+        },
+        "required": ["path"],
+    }
+
     _MAX_CHARS = 128_000
     _DEFAULT_LIMIT = 2_000
-
-    @property
-    def name(self) -> str:
-        return "read"
-
-    @property
-    def concurrency_mode(self) -> str:
-        return "read_only"
-
-    @property
-    def description(self) -> str:
-        return "Read a UTF-8 text file. Returns numbered lines and supports offset/limit."
-
-    @property
-    def parameters(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "File path to read."},
-                "offset": {
-                    "type": "integer",
-                    "description": "Line number to start from, 1-indexed.",
-                    "minimum": 1,
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Maximum number of lines.",
-                    "minimum": 1,
-                },
-            },
-            "required": ["path"],
-        }
 
     async def execute(
         self,
@@ -99,28 +88,17 @@ class ReadTool(_WorkspaceTool):
 class WriteTool(_WorkspaceTool):
     """Write text content to a file."""
 
-    @property
-    def name(self) -> str:
-        return "write"
-
-    @property
-    def concurrency_mode(self) -> str:
-        return "mutating"
-
-    @property
-    def description(self) -> str:
-        return "Write UTF-8 content to a file. Creates parent directories when needed."
-
-    @property
-    def parameters(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "File path to write."},
-                "content": {"type": "string", "description": "Content to write."},
-            },
-            "required": ["path", "content"],
-        }
+    name = "write"
+    concurrency_mode = "mutating"
+    description = "Write UTF-8 content to a file. Creates parent directories when needed."
+    parameters = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "File path to write."},
+            "content": {"type": "string", "description": "Content to write."},
+        },
+        "required": ["path", "content"],
+    }
 
     async def execute(self, path: str, content: str, **kwargs: Any) -> str:
         del kwargs
@@ -154,36 +132,25 @@ def _find_match(content: str, old_text: str) -> tuple[str | None, int]:
 class EditTool(_WorkspaceTool):
     """Edit a file by replacing text."""
 
-    @property
-    def name(self) -> str:
-        return "edit"
-
-    @property
-    def concurrency_mode(self) -> str:
-        return "mutating"
-
-    @property
-    def description(self) -> str:
-        return (
-            "Edit a UTF-8 text file by replacing old_text with new_text. "
-            "Set replace_all=true to replace every occurrence."
-        )
-
-    @property
-    def parameters(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "File path to edit."},
-                "old_text": {"type": "string", "description": "Text to replace."},
-                "new_text": {"type": "string", "description": "Replacement text."},
-                "replace_all": {
-                    "type": "boolean",
-                    "description": "Replace every occurrence instead of just one.",
-                },
+    name = "edit"
+    concurrency_mode = "mutating"
+    description = (
+        "Edit a UTF-8 text file by replacing old_text with new_text. "
+        "Set replace_all=true to replace every occurrence."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "File path to edit."},
+            "old_text": {"type": "string", "description": "Text to replace."},
+            "new_text": {"type": "string", "description": "Replacement text."},
+            "replace_all": {
+                "type": "boolean",
+                "description": "Replace every occurrence instead of just one.",
             },
-            "required": ["path", "old_text", "new_text"],
-        }
+        },
+        "required": ["path", "old_text", "new_text"],
+    }
 
     async def execute(
         self,

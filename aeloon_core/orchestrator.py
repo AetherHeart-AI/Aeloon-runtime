@@ -8,11 +8,15 @@ from typing import Any
 from aeloon_core.config import Config
 from aeloon_core.context import append_user_message
 from aeloon_core.kernel import run_agent_kernel
-from aeloon_core.providers.factory import create_provider
+from aeloon_core.providers.base import GenerationSettings
+from aeloon_core.providers.custom_provider import CustomProvider
 from aeloon_core.session import SessionStore
-from aeloon_core.tools.factory import register_core_tools
+from aeloon_core.tools.filesystem import EditTool, ReadTool, WriteTool
 from aeloon_core.tools.registry import ToolRegistry
+from aeloon_core.tools.search_grep import GlobTool, GrepTool
+from aeloon_core.tools.shell import ExecTool
 from aeloon_core.tools.todo import TodoWriteTool
+from aeloon_core.tools.web import WebFetchTool, WebSearchTool
 
 
 @dataclass
@@ -68,9 +72,36 @@ class AeloonCoreOrchestrator:
 
     def __init__(self, config: Config) -> None:
         self.config = config
-        self.provider = create_provider(config)
+        defaults = config.agents.defaults
+        provider_config = config.providers.custom
+        self.provider = CustomProvider(
+            api_key=provider_config.api_key,
+            api_base=provider_config.api_base,
+            default_model=defaults.model,
+            extra_headers=provider_config.extra_headers,
+            proxy=provider_config.proxy,
+            generation=GenerationSettings(
+                temperature=defaults.temperature,
+                max_tokens=defaults.max_tokens,
+                reasoning_effort=defaults.reasoning_effort,
+            ),
+            chat_timeout=defaults.chat_timeout,
+        )
         self.registry = ToolRegistry()
-        self.todo_tool: TodoWriteTool = register_core_tools(self.registry, config)
+        workspace = config.workspace
+        for tool in (
+            ExecTool(workspace=workspace, timeout=config.tools.exec.timeout),
+            ReadTool(workspace=workspace),
+            WriteTool(workspace=workspace),
+            EditTool(workspace=workspace),
+            GlobTool(workspace=workspace),
+            GrepTool(workspace=workspace),
+            WebFetchTool(config=config.tools.web),
+            WebSearchTool(config=config.tools.web),
+        ):
+            self.registry.register(tool)
+        self.todo_tool = TodoWriteTool(data_dir=config.data_dir)
+        self.registry.register(self.todo_tool)
         self.sessions = SessionStore(data_dir=config.data_dir, workspace=config.workspace)
 
     async def run_turn(

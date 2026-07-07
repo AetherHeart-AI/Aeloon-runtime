@@ -24,36 +24,25 @@ def _validate_http_url(url: str) -> str | None:
 class WebFetchTool(Tool):
     """Fetch a web page and return readable text."""
 
+    name = "webfetch"
+    concurrency_mode = "read_only"
+    description = "Fetch an HTTP(S) URL and return readable text content."
+    parameters = {
+        "type": "object",
+        "properties": {
+            "url": {"type": "string", "description": "HTTP(S) URL to fetch."},
+            "max_chars": {
+                "type": "integer",
+                "minimum": 500,
+                "maximum": 100000,
+                "description": "Maximum characters to return.",
+            },
+        },
+        "required": ["url"],
+    }
+
     def __init__(self, *, config: WebToolConfig) -> None:
         self.config = config
-
-    @property
-    def name(self) -> str:
-        return "webfetch"
-
-    @property
-    def concurrency_mode(self) -> str:
-        return "read_only"
-
-    @property
-    def description(self) -> str:
-        return "Fetch an HTTP(S) URL and return readable text content."
-
-    @property
-    def parameters(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "url": {"type": "string", "description": "HTTP(S) URL to fetch."},
-                "max_chars": {
-                    "type": "integer",
-                    "minimum": 500,
-                    "maximum": 100000,
-                    "description": "Maximum characters to return.",
-                },
-            },
-            "required": ["url"],
-        }
 
     async def execute(self, url: str, max_chars: int = 12000, **kwargs: Any) -> str:
         del kwargs
@@ -86,39 +75,28 @@ class WebFetchTool(Tool):
 class WebSearchTool(Tool):
     """Search the web via a configured search API or DuckDuckGo HTML fallback."""
 
+    name = "websearch"
+    concurrency_mode = "read_only"
+    description = (
+        "Search the web. If tools.web.search_api_url is set, POSTs JSON to that API; "
+        "otherwise uses a lightweight DuckDuckGo HTML fallback."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Search query."},
+            "max_results": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10,
+                "description": "Maximum result count.",
+            },
+        },
+        "required": ["query"],
+    }
+
     def __init__(self, *, config: WebToolConfig) -> None:
         self.config = config
-
-    @property
-    def name(self) -> str:
-        return "websearch"
-
-    @property
-    def concurrency_mode(self) -> str:
-        return "read_only"
-
-    @property
-    def description(self) -> str:
-        return (
-            "Search the web. If tools.web.search_api_url is set, POSTs JSON to that API; "
-            "otherwise uses a lightweight DuckDuckGo HTML fallback."
-        )
-
-    @property
-    def parameters(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Search query."},
-                "max_results": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 10,
-                    "description": "Maximum result count.",
-                },
-            },
-            "required": ["query"],
-        }
 
     async def execute(self, query: str, max_results: int | None = None, **kwargs: Any) -> str:
         del kwargs

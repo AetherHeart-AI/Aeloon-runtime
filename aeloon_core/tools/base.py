@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Literal
+from copy import deepcopy
+from typing import Any, ClassVar, Literal
 
 
 class Tool(ABC):
     """Abstract base class for agent tools."""
+
+    name: ClassVar[str]
+    description: ClassVar[str]
+    parameters: ClassVar[dict[str, Any]]
+    concurrency_mode: ClassVar[Literal["read_only", "mutating", "exclusive"]] = "exclusive"
 
     _TYPE_MAP = {
         "string": str,
@@ -18,30 +24,9 @@ class Tool(ABC):
         "object": dict,
     }
 
-    @property
-    @abstractmethod
-    def name(self) -> str:
-        """Tool name used in function calls."""
-
-    @property
-    @abstractmethod
-    def description(self) -> str:
-        """Description of what the tool does."""
-
-    @property
-    @abstractmethod
-    def parameters(self) -> dict[str, Any]:
-        """JSON Schema for tool parameters."""
-
     @abstractmethod
     async def execute(self, **kwargs: Any) -> str:
         """Execute the tool with given parameters."""
-
-    @property
-    def concurrency_mode(self) -> Literal["read_only", "mutating", "exclusive"]:
-        """Execution mode for task-graph conflict analysis."""
-
-        return "exclusive"
 
     def cast_params(self, params: dict[str, Any]) -> dict[str, Any]:
         """Apply safe schema-driven casts before validation."""
@@ -159,6 +144,6 @@ class Tool(ABC):
             "function": {
                 "name": self.name,
                 "description": self.description,
-                "parameters": self.parameters,
+                "parameters": deepcopy(self.parameters),
             },
         }

@@ -18,30 +18,10 @@ class ToolRegistry:
 
         self._tools[tool.name] = tool
 
-    def unregister(self, name: str) -> None:
-        """Unregister a tool by name."""
-
-        self._tools.pop(name, None)
-
     def get(self, name: str) -> Tool | None:
         """Get a tool by name."""
 
         return self._tools.get(name)
-
-    def all(self) -> list[Tool]:
-        """Return all registered tools."""
-
-        return list(self._tools.values())
-
-    def has(self, name: str) -> bool:
-        """Return whether a tool is registered."""
-
-        return name in self._tools
-
-    def should_suppress_final_reply(self) -> bool:
-        """Return whether any tool asks the loop to suppress final output."""
-
-        return False
 
     def get_definitions(self) -> list[dict[str, Any]]:
         """Get all tool definitions in OpenAI format."""
@@ -54,7 +34,7 @@ class ToolRegistry:
         hint = "\n\n[Analyze the error above and try a different approach.]"
         tool = self._tools.get(name)
         if not tool:
-            return f"Error: Tool '{name}' not found. Available: {', '.join(self.tool_names)}"
+            return f"Error: Tool '{name}' not found. Available: {', '.join(self._tools)}"
         try:
             params = tool.cast_params(params)
             errors = tool.validate_params(params)
@@ -66,15 +46,3 @@ class ToolRegistry:
             return result
         except Exception as exc:
             return f"Error executing {name}: {exc}" + hint
-
-    @property
-    def tool_names(self) -> list[str]:
-        """Get list of registered tool names."""
-
-        return list(self._tools)
-
-    def __len__(self) -> int:
-        return len(self._tools)
-
-    def __contains__(self, name: str) -> bool:
-        return name in self._tools

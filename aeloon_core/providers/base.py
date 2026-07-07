@@ -71,12 +71,6 @@ class LLMResponse:
     reasoning_content: str | None = None
     thinking_blocks: list[dict] | None = None
 
-    @property
-    def has_tool_calls(self) -> bool:
-        """Return whether the response contains tool calls."""
-
-        return bool(self.tool_calls)
-
 
 class ProviderAuthenticationError(RuntimeError):
     """Provider credentials are missing or expired."""
@@ -95,7 +89,6 @@ class LLMProvider(ABC):
     """Abstract base class for LLM providers."""
 
     _CHAT_RETRY_DELAYS = (1, 2, 4)
-    _CHAT_TIMEOUT_S = 3600
     _TRANSIENT_ERROR_MARKERS = (
         "429",
         "rate limit",
@@ -115,11 +108,14 @@ class LLMProvider(ABC):
         api_key: str | None = None,
         api_base: str | None = None,
         proxy: str | None = None,
+        generation: GenerationSettings | None = None,
+        chat_timeout: int = 3600,
     ) -> None:
         self.api_key = api_key
         self.api_base = api_base
         self.proxy = proxy
-        self.generation: GenerationSettings = GenerationSettings()
+        self.generation = generation or GenerationSettings()
+        self.chat_timeout = chat_timeout
 
     @staticmethod
     def _sanitize_empty_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -173,14 +169,14 @@ class LLMProvider(ABC):
 
     async def _safe_chat(self, **kwargs: Any) -> LLMResponse:
         try:
-            return await asyncio.wait_for(self.chat(**kwargs), timeout=self._CHAT_TIMEOUT_S)
+            return await asyncio.wait_for(self.chat(**kwargs), timeout=self.chat_timeout)
         except asyncio.CancelledError:
             raise
         except ProviderAuthenticationError:
             raise
         except TimeoutError:
             return LLMResponse(
-                content=f"Error calling LLM: request timed out after {self._CHAT_TIMEOUT_S}s",
+                content=f"Error calling LLM: request timed out after {self.chat_timeout}s",
                 finish_reason="error",
             )
         except Exception as exc:
@@ -213,14 +209,14 @@ class LLMProvider(ABC):
 
     async def _safe_chat_stream(self, **kwargs: Any) -> LLMResponse:
         try:
-            return await asyncio.wait_for(self.chat_stream(**kwargs), timeout=self._CHAT_TIMEOUT_S)
+            return await asyncio.wait_for(self.chat_stream(**kwargs), timeout=self.chat_timeout)
         except asyncio.CancelledError:
             raise
         except ProviderAuthenticationError:
             raise
         except TimeoutError:
             return LLMResponse(
-                content=f"Error calling LLM: request timed out after {self._CHAT_TIMEOUT_S}s",
+                content=f"Error calling LLM: request timed out after {self.chat_timeout}s",
                 finish_reason="error",
             )
         except Exception as exc:
@@ -323,7 +319,3 @@ class LLMProvider(ABC):
             )
             await asyncio.sleep(delay)
         return await self._safe_chat_stream(**kw, on_delta=None, on_reasoning_delta=None)
-
-    @abstractmethod
-    def get_default_model(self) -> str:
-        """Get the default model for this provider."""

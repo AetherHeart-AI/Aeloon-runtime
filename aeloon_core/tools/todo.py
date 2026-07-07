@@ -13,6 +13,34 @@ from aeloon_core.tools.base import Tool
 class TodoWriteTool(Tool):
     """Write the current task todo list to disk."""
 
+    name = "todowrite"
+    concurrency_mode = "mutating"
+    description = (
+        "Persist a concise todo list for the current task. Send the full list each time, "
+        "with statuses pending, in_progress, or completed."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "todos": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "content": {"type": "string"},
+                        "status": {
+                            "type": "string",
+                            "enum": ["pending", "in_progress", "completed"],
+                        },
+                        "id": {"type": "string"},
+                    },
+                    "required": ["content", "status"],
+                },
+            }
+        },
+        "required": ["todos"],
+    }
+
     def __init__(self, *, data_dir: Path) -> None:
         self.data_dir = data_dir
         self.session_id = "default"
@@ -21,45 +49,6 @@ class TodoWriteTool(Tool):
         """Set the current session id used for todo persistence."""
 
         self.session_id = session_id or "default"
-
-    @property
-    def name(self) -> str:
-        return "todowrite"
-
-    @property
-    def concurrency_mode(self) -> str:
-        return "mutating"
-
-    @property
-    def description(self) -> str:
-        return (
-            "Persist a concise todo list for the current task. Send the full list each time, "
-            "with statuses pending, in_progress, or completed."
-        )
-
-    @property
-    def parameters(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "todos": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "content": {"type": "string"},
-                            "status": {
-                                "type": "string",
-                                "enum": ["pending", "in_progress", "completed"],
-                            },
-                            "id": {"type": "string"},
-                        },
-                        "required": ["content", "status"],
-                    },
-                }
-            },
-            "required": ["todos"],
-        }
 
     async def execute(self, todos: list[dict[str, Any]], **kwargs: Any) -> str:
         del kwargs

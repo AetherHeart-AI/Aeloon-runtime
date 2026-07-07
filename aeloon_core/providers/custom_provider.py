@@ -10,7 +10,13 @@ import httpx
 import json_repair
 from openai import AsyncOpenAI
 
-from aeloon_core.providers.base import LLMProvider, LLMResponse, ResponseFormat, ToolCallRequest
+from aeloon_core.providers.base import (
+    GenerationSettings,
+    LLMProvider,
+    LLMResponse,
+    ResponseFormat,
+    ToolCallRequest,
+)
 
 _UNSUPPORTED_TOOL_MARKERS = (
     "tool choice requires",
@@ -34,8 +40,16 @@ class CustomProvider(LLMProvider):
         default_model: str = "default",
         extra_headers: dict[str, str] | None = None,
         proxy: str | None = None,
+        generation: GenerationSettings | None = None,
+        chat_timeout: int = 3600,
     ) -> None:
-        super().__init__(api_key, api_base, proxy=proxy)
+        super().__init__(
+            api_key,
+            api_base,
+            proxy=proxy,
+            generation=generation,
+            chat_timeout=chat_timeout,
+        )
         self.default_model = default_model
         default_headers = {
             "x-session-affinity": uuid.uuid4().hex,
@@ -322,6 +336,3 @@ class CustomProvider(LLMProvider):
             else {},
             reasoning_content=getattr(msg, "reasoning_content", None) or None,
         )
-
-    def get_default_model(self) -> str:
-        return self.default_model

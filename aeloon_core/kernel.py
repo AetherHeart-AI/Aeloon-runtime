@@ -475,7 +475,7 @@ async def run_agent_kernel(
         )
         await _emit_hook("on_llm_response", response)
 
-        if response.has_tool_calls:
+        if response.tool_calls:
             thought = _strip(response.content)
             if thought:
                 await _emit_progress(thought)

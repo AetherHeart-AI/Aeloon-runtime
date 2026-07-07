@@ -14,48 +14,34 @@ from aeloon_core.tools.base import Tool
 class ExecTool(Tool):
     """Execute shell commands in the configured workspace."""
 
+    name = "exec"
+    description = (
+        "Execute a shell command in the workspace and return stdout, stderr, "
+        "and exit code. Quote paths because they may contain spaces."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "command": {"type": "string", "description": "Shell command to execute."},
+            "working_dir": {
+                "type": "string",
+                "description": "Optional working directory. Relative paths resolve from workspace.",
+            },
+            "timeout": {
+                "type": "integer",
+                "description": "Timeout in seconds.",
+                "minimum": 1,
+                "maximum": 600,
+            },
+        },
+        "required": ["command"],
+    }
+
     _MAX_OUTPUT = 12_000
 
     def __init__(self, *, workspace: Path, timeout: int = 60) -> None:
         self.workspace = workspace
         self.timeout = timeout
-
-    @property
-    def name(self) -> str:
-        return "exec"
-
-    @property
-    def concurrency_mode(self) -> str:
-        return "exclusive"
-
-    @property
-    def description(self) -> str:
-        return (
-            "Execute a shell command in the workspace and return stdout, stderr, "
-            "and exit code. Quote paths because they may contain spaces."
-        )
-
-    @property
-    def parameters(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "command": {"type": "string", "description": "Shell command to execute."},
-                "working_dir": {
-                    "type": "string",
-                    "description": (
-                        "Optional working directory. Relative paths resolve from workspace."
-                    ),
-                },
-                "timeout": {
-                    "type": "integer",
-                    "description": "Timeout in seconds.",
-                    "minimum": 1,
-                    "maximum": 600,
-                },
-            },
-            "required": ["command"],
-        }
 
     async def execute(
         self,

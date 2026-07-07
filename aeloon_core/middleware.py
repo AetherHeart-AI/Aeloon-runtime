@@ -25,23 +25,3 @@ class AgentMiddleware(Protocol):
         args: dict | list | None,
         execute: Callable[[], Awaitable[str]],
     ) -> str: ...
-
-
-class BaseAgentMiddleware:
-    """No-op base class for middleware implementations."""
-
-    async def around_llm(
-        self,
-        messages: list[dict],
-        tool_defs: list[dict],
-        call_llm: Callable[[list[dict], list[dict]], Awaitable[LLMResponse]],
-    ) -> LLMResponse:
-        return await call_llm(messages, tool_defs)
-
-    async def around_tool(
-        self,
-        name: str,
-        args: dict | list | None,
-        execute: Callable[[], Awaitable[str]],
-    ) -> str:
-        return await execute()
