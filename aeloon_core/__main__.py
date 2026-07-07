@@ -1,0 +1,290 @@
+"""CLI entry point for Aeloon Core."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+from aiohttp import web
+
+from aeloon_core.config import Config, load_config, resolve_config_path, save_config
+from aeloon_core.orchestrator import AeloonCoreOrchestrator, ConsoleProgress
+from server.app import create_app
+
+COMMANDS = {"run", "webui", "config"}
+CONFIG_SETTERS = {
+    "workspace": ("workspace",),
+    "data-dir": ("data_dir",),
+    "api-key": ("providers", "custom", "api_key"),
+    "api-base": ("providers", "custom", "api_base"),
+    "model": ("agents", "defaults", "model"),
+    "reasoning-effort": ("agents", "defaults", "reasoning_effort"),
+    "max-iterations": ("agents", "defaults", "max_iterations"),
+}
+SECRET_KEYS = {"api_key"}
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser."""
+
+    parser = argparse.ArgumentParser(description="Run Aeloon Core.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    run_parser = subparsers.add_parser("run", help="Run one agent turn.")
+    _add_run_args(run_parser)
+
+    webui_parser = subparsers.add_parser("webui", help="Start the local Web UI server.")
+    webui_parser.add_argument(
+        "--config", type=Path, default=None, help="Optional config JSON path."
+    )
+    webui_parser.add_argument("--host", default="127.0.0.1", help="Bind host.")
+    webui_parser.add_argument("--port", type=int, default=8765, help="Bind port.")
+    webui_parser.add_argument("--workspace", type=Path, default=None, help="Override workspace.")
+    webui_parser.add_argument("--data-dir", type=Path, default=None, help="Override data dir.")
+
+    config_parser = subparsers.add_parser("config", help="Manage persistent config.")
+    config_subparsers = config_parser.add_subparsers(dest="config_command", required=True)
+
+    config_path_parser = config_subparsers.add_parser("path", help="Print config path.")
+    config_path_parser.add_argument(
+        "--config", type=Path, default=None, help="Optional config JSON path."
+    )
+
+    config_show_parser = config_subparsers.add_parser("show", help="Print effective config.")
+    config_show_parser.add_argument(
+        "--config", type=Path, default=None, help="Optional config JSON path."
+    )
+    config_show_parser.add_argument(
+        "--show-secrets",
+        action="store_true",
+        help="Print secrets instead of masking them.",
+    )
+
+    config_init_parser = config_subparsers.add_parser(
+        "init",
+        help="Write a persistent config file.",
+    )
+    _add_config_write_args(config_init_parser)
+    config_init_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite an existing config file.",
+    )
+
+    config_set_parser = config_subparsers.add_parser("set", help="Set one config value.")
+    config_set_parser.add_argument(
+        "--config", type=Path, default=None, help="Optional config JSON path."
+    )
+    config_set_parser.add_argument("key", choices=sorted(CONFIG_SETTERS))
+    config_set_parser.add_argument("value")
+
+    return parser
+
+
+def build_legacy_run_parser() -> argparse.ArgumentParser:
+    """Build the legacy prompt-first parser."""
+
+    parser = argparse.ArgumentParser(description="Run one Aeloon Core agent turn.")
+    _add_run_args(parser)
+    return parser
+
+
+def _add_run_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("prompt", nargs="+", help="Prompt text to send to the agent.")
+    parser.add_argument("--config", type=Path, default=None, help="Optional config JSON path.")
+    parser.add_argument("--session", default=None, help="Existing session id to continue.")
+    parser.add_argument("--workspace", type=Path, default=None, help="Override workspace.")
+    parser.add_argument("--data-dir", type=Path, default=None, help="Override data dir.")
+
+
+def _add_config_write_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--config", type=Path, default=None, help="Optional config JSON path.")
+    parser.add_argument("--workspace", type=Path, default=None, help="Workspace to operate on.")
+    parser.add_argument("--data-dir", type=Path, default=None, help="Session data directory.")
+    parser.add_argument("--api-key", default=None, help="OpenAI-compatible API key.")
+    parser.add_argument("--api-base", default=None, help="OpenAI-compatible API base URL.")
+    parser.add_argument("--model", default=None, help="Default model.")
+
+
+async def _run_prompt(args: argparse.Namespace) -> None:
+    config = _load_with_path_overrides(
+        args.config,
+        workspace=getattr(args, "workspace", None),
+        data_dir=getattr(args, "data_dir", None),
+    )
+    orchestrator = AeloonCoreOrchestrator(config)
+    prompt = " ".join(args.prompt)
+    result = await orchestrator.run_turn(
+        prompt,
+        session_id=args.session,
+        on_progress=ConsoleProgress(),
+    )
+    print(f"\n[session] {result.session_id}")
+    if result.tools_used:
+        print(f"[tools used] {', '.join(result.tools_used)}")
+
+
+def _run_webui(args: argparse.Namespace) -> None:
+    config = _load_with_path_overrides(
+        args.config,
+        workspace=getattr(args, "workspace", None),
+        data_dir=getattr(args, "data_dir", None),
+    )
+    app = create_app(config)
+    print(f"Workspace: {config.workspace}")
+    print(f"Data dir: {config.data_dir}")
+    print(f"Web UI: http://{args.host}:{args.port}")
+    web.run_app(app, host=args.host, port=args.port)
+
+
+def _run_config(args: argparse.Namespace) -> None:
+    if args.config_command == "path":
+        print(resolve_config_path(args.config))
+        return
+    if args.config_command == "show":
+        config = load_config(args.config)
+        print(json.dumps(_config_dump(config, show_secrets=args.show_secrets), indent=2))
+        return
+    if args.config_command == "init":
+        path = resolve_config_path(args.config)
+        if path.exists() and not args.force:
+            raise SystemExit(f"Config already exists: {path}. Use --force to overwrite.")
+        config = _config_with_write_args(load_config(args.config), args)
+        written = save_config(config, path)
+        print(f"Wrote config: {written}")
+        return
+    if args.config_command == "set":
+        config = load_config(args.config)
+        data = config.model_dump(mode="json")
+        _set_nested_value(
+            data, CONFIG_SETTERS[args.key], _coerce_config_value(args.key, args.value)
+        )
+        written = save_config(Config.model_validate(data), args.config)
+        print(f"Updated {args.key} in {written}")
+        return
+    raise SystemExit(f"Unknown config command: {args.config_command}")
+
+
+def _load_with_path_overrides(
+    config_path: Path | None,
+    *,
+    workspace: Path | None,
+    data_dir: Path | None,
+) -> Config:
+    config = load_config(config_path)
+    updates: dict[str, Any] = {}
+    if workspace is not None:
+        updates["workspace"] = workspace
+    if data_dir is not None:
+        updates["data_dir"] = data_dir
+    if not updates:
+        return config
+    return config.model_copy(update=updates).normalized()
+
+
+def _config_with_write_args(config: Config, args: argparse.Namespace) -> Config:
+    data = config.model_dump(mode="json")
+    if args.workspace is not None:
+        data["workspace"] = str(args.workspace)
+    if args.data_dir is not None:
+        data["data_dir"] = str(args.data_dir)
+    if args.api_key is not None:
+        data.setdefault("providers", {}).setdefault("custom", {})["api_key"] = args.api_key
+    if args.api_base is not None:
+        data.setdefault("providers", {}).setdefault("custom", {})["api_base"] = args.api_base
+    if args.model is not None:
+        data.setdefault("agents", {}).setdefault("defaults", {})["model"] = args.model
+    return Config.model_validate(data)
+
+
+def _config_dump(config: Config, *, show_secrets: bool) -> dict[str, Any]:
+    data = config.model_dump(mode="json")
+    if not show_secrets:
+        _mask_secrets(data)
+    return data
+
+
+def _mask_secrets(value: Any) -> None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key in SECRET_KEYS and isinstance(child, str) and child:
+                value[key] = _mask_secret(child)
+            else:
+                _mask_secrets(child)
+    elif isinstance(value, list):
+        for child in value:
+            _mask_secrets(child)
+
+
+def _mask_secret(value: str) -> str:
+    if value == "no-key":
+        return value
+    if len(value) <= 8:
+        return "***"
+    return f"{value[:4]}...{value[-4:]}"
+
+
+def _set_nested_value(data: dict[str, Any], path: tuple[str, ...], value: Any) -> None:
+    current = data
+    for key in path[:-1]:
+        nested = current.setdefault(key, {})
+        if not isinstance(nested, dict):
+            nested = {}
+            current[key] = nested
+        current = nested
+    current[path[-1]] = value
+
+
+def _coerce_config_value(key: str, value: str) -> Any:
+    if key == "max-iterations":
+        return int(value)
+    return value
+
+
+def _looks_like_legacy_run(argv: list[str]) -> bool:
+    first = _first_positional(argv)
+    return first is not None and first not in COMMANDS
+
+
+def _first_positional(argv: list[str]) -> str | None:
+    skip_next = False
+    for token in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if token in {"--config", "--session", "--workspace", "--data-dir"}:
+            skip_next = True
+            continue
+        if token.startswith("-"):
+            continue
+        return token
+    return None
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Run the CLI."""
+
+    raw_args = list(sys.argv[1:] if argv is None else argv)
+    if _looks_like_legacy_run(raw_args):
+        asyncio.run(_run_prompt(build_legacy_run_parser().parse_args(raw_args)))
+        return
+
+    args = build_parser().parse_args(raw_args)
+    if args.command == "run":
+        asyncio.run(_run_prompt(args))
+        return
+    if args.command == "webui":
+        _run_webui(args)
+        return
+    if args.command == "config":
+        _run_config(args)
+        return
+    raise SystemExit(f"Unknown command: {args.command}")
+
+
+if __name__ == "__main__":
+    main()
