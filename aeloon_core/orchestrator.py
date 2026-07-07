@@ -115,13 +115,16 @@ class AeloonCoreOrchestrator:
 
         actual_session_id = session_id or self.sessions.new_session()
         self.todo_tool.set_session_id(actual_session_id)
+        defaults = self.config.agents.defaults
         messages = append_user_message(self.sessions.load_messages(actual_session_id), prompt)
         final_content, tools_used, messages = await run_agent_kernel(
             provider=self.provider,
-            model=self.config.agents.defaults.model,
+            model=defaults.model,
             tools=self.registry,
             messages=messages,
-            max_iterations=self.config.agents.defaults.max_iterations,
+            max_iterations=defaults.max_iterations,
+            max_auto_continue_iterations=defaults.max_auto_continue_iterations,
+            max_finalization_iterations=defaults.max_finalization_iterations,
             on_progress=on_progress,
         )
         blocks = list(getattr(on_progress, "blocks", []) or [])
