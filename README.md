@@ -14,6 +14,38 @@ export AELOON_CORE_MODEL="gpt-4.1-mini"
 uv run python -m aeloon_core "List the current directory and read README.md"
 ```
 
+Run the opencode-style terminal CLI:
+
+```bash
+uv run aeloon-core
+# or explicitly:
+uv run aeloon-core chat
+```
+
+Inside the CLI, type prompts directly. The terminal view keeps the core turn
+information visible: workspace, model, session id, streamed assistant output,
+tool calls, tool results, token usage, and compact gateway logs. Useful commands:
+
+```text
+/help
+/sessions
+/resume <session-id>
+/new
+/logs debug
+/logs off
+/quit
+```
+
+You can also run one rich-rendered turn and exit:
+
+```bash
+uv run aeloon-core chat "List the current directory"
+uv run aeloon-core tui --gateway-log-level DEBUG "Read README.md"
+```
+
+Runtime commands use the directory where you invoke `aeloon-core` as the
+workspace. To target a different folder for one command, pass `--workspace`.
+
 Run the local Web UI:
 
 ```bash
@@ -39,7 +71,6 @@ create it from the CLI:
 
 ```bash
 uv run aeloon-core config init \
-  --workspace /path/to/project \
   --api-key sk-... \
   --api-base https://api.openai.com/v1 \
   --model gpt-4.1-mini
@@ -50,7 +81,6 @@ Inspect or update it later:
 ```bash
 uv run aeloon-core config path
 uv run aeloon-core config show
-uv run aeloon-core config set workspace /path/to/another-project
 uv run aeloon-core config set model gpt-4.1-mini
 ```
 
@@ -60,7 +90,6 @@ Environment variables override file values:
 - `AELOON_CORE_API_KEY`
 - `AELOON_CORE_API_BASE`
 - `AELOON_CORE_MODEL`
-- `AELOON_CORE_WORKSPACE`
 - `AELOON_CORE_DATA_DIR`
 
 Minimal file example:
@@ -77,8 +106,7 @@ Minimal file example:
     "defaults": {
       "model": "gpt-4.1-mini"
     }
-  },
-  "workspace": "/Users/zhangxin/Desktop/aeloon-core"
+  }
 }
 ```
 

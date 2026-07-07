@@ -13,9 +13,11 @@ from aiohttp import web
 
 from aeloon_core.config import Config, load_config, resolve_config_path, save_config
 from aeloon_core.orchestrator import AeloonCoreOrchestrator, ConsoleProgress
+from aeloon_core.terminal_cli import LOG_LEVELS, run_terminal_cli
 from server.app import create_app
 
-COMMANDS = {"run", "webui", "config"}
+COMMANDS = {"run", "chat", "tui", "webui", "config"}
+CHAT_ONLY_OPTIONS = {"--hide-gateway-logs", "--gateway-log-detail", "--gateway-log-level"}
 CONFIG_SETTERS = {
     "workspace": ("workspace",),
     "data-dir": ("data_dir",),
@@ -36,6 +38,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_parser = subparsers.add_parser("run", help="Run one agent turn.")
     _add_run_args(run_parser)
+
+    chat_parser = subparsers.add_parser("chat", help="Start the interactive terminal CLI.")
+    _add_chat_args(chat_parser)
+
+    tui_parser = subparsers.add_parser("tui", help="Alias for chat.")
+    _add_chat_args(tui_parser)
 
     webui_parser = subparsers.add_parser("webui", help="Start the local Web UI server.")
     webui_parser.add_argument(
@@ -101,6 +109,34 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--data-dir", type=Path, default=None, help="Override data dir.")
 
 
+def _add_chat_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "prompt",
+        nargs="*",
+        help="Optional prompt to run once. Omit it for interactive chat.",
+    )
+    parser.add_argument("--config", type=Path, default=None, help="Optional config JSON path.")
+    parser.add_argument("--session", default=None, help="Existing session id to continue.")
+    parser.add_argument("--workspace", type=Path, default=None, help="Override workspace.")
+    parser.add_argument("--data-dir", type=Path, default=None, help="Override data dir.")
+    parser.add_argument(
+        "--hide-gateway-logs",
+        action="store_true",
+        help="Hide compact gateway log lines.",
+    )
+    parser.add_argument(
+        "--gateway-log-level",
+        choices=sorted(LOG_LEVELS),
+        default="INFO",
+        help="Minimum gateway log level to display.",
+    )
+    parser.add_argument(
+        "--gateway-log-detail",
+        action="store_true",
+        help="Print gateway log detail JSON.",
+    )
+
+
 def _add_config_write_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", type=Path, default=None, help="Optional config JSON path.")
     parser.add_argument("--workspace", type=Path, default=None, help="Workspace to operate on.")
@@ -126,6 +162,23 @@ async def _run_prompt(args: argparse.Namespace) -> None:
     print(f"\n[session] {result.session_id}")
     if result.tools_used:
         print(f"[tools used] {', '.join(result.tools_used)}")
+
+
+async def _run_chat(args: argparse.Namespace) -> None:
+    config = _load_with_path_overrides(
+        args.config,
+        workspace=getattr(args, "workspace", None),
+        data_dir=getattr(args, "data_dir", None),
+    )
+    prompt = " ".join(args.prompt).strip() or None
+    await run_terminal_cli(
+        config,
+        prompt=prompt,
+        session_id=args.session,
+        show_gateway_logs=not args.hide_gateway_logs,
+        gateway_log_level=args.gateway_log_level,
+        gateway_log_detail=args.gateway_log_detail,
+    )
 
 
 def _run_webui(args: argparse.Namespace) -> None:
@@ -176,13 +229,11 @@ def _load_with_path_overrides(
     data_dir: Path | None,
 ) -> Config:
     config = load_config(config_path)
-    updates: dict[str, Any] = {}
-    if workspace is not None:
-        updates["workspace"] = workspace
+    updates: dict[str, Any] = {
+        "workspace": workspace if workspace is not None else Path.cwd(),
+    }
     if data_dir is not None:
         updates["data_dir"] = data_dir
-    if not updates:
-        return config
     return config.model_copy(update=updates).normalized()
 
 
@@ -256,7 +307,7 @@ def _first_positional(argv: list[str]) -> str | None:
         if skip_next:
             skip_next = False
             continue
-        if token in {"--config", "--session", "--workspace", "--data-dir"}:
+        if token in {"--config", "--session", "--workspace", "--data-dir", "--gateway-log-level"}:
             skip_next = True
             continue
         if token.startswith("-"):
@@ -265,10 +316,31 @@ def _first_positional(argv: list[str]) -> str | None:
     return None
 
 
+def _looks_like_implicit_chat(argv: list[str]) -> bool:
+    if any(token in {"-h", "--help"} for token in argv):
+        return False
+    first = _first_positional(argv)
+    if first is None:
+        return True
+    return any(_is_chat_only_option(token) for token in argv)
+
+
+def _is_chat_only_option(token: str) -> bool:
+    return token in CHAT_ONLY_OPTIONS or any(
+        token.startswith(f"{option}=") for option in CHAT_ONLY_OPTIONS
+    )
+
+
 def main(argv: list[str] | None = None) -> None:
     """Run the CLI."""
 
     raw_args = list(sys.argv[1:] if argv is None else argv)
+    if not raw_args:
+        asyncio.run(_run_chat(build_parser().parse_args(["chat"])))
+        return
+    if _looks_like_implicit_chat(raw_args):
+        asyncio.run(_run_chat(build_parser().parse_args(["chat", *raw_args])))
+        return
     if _looks_like_legacy_run(raw_args):
         asyncio.run(_run_prompt(build_legacy_run_parser().parse_args(raw_args)))
         return
@@ -276,6 +348,9 @@ def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(raw_args)
     if args.command == "run":
         asyncio.run(_run_prompt(args))
+        return
+    if args.command in {"chat", "tui"}:
+        asyncio.run(_run_chat(args))
         return
     if args.command == "webui":
         _run_webui(args)
