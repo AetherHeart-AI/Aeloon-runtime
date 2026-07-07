@@ -67,14 +67,35 @@ class ReadTool(_WorkspaceTool):
             if offset > total:
                 return f"Error: offset {offset} is beyond end of file ({total} lines)"
             start = max(offset, 1) - 1
-            end = min(start + (limit or self._DEFAULT_LIMIT), total)
-            numbered = [
-                f"{start + index + 1}| {line}" for index, line in enumerate(lines[start:end])
-            ]
+            requested_end = min(start + (limit or self._DEFAULT_LIMIT), total)
+            numbered: list[str] = []
+            output_chars = 0
+            capped = False
+            end = start
+
+            for index, line in enumerate(lines[start:requested_end], start=start + 1):
+                rendered = f"{index}| {line}"
+                separator_chars = 1 if numbered else 0
+                if numbered and output_chars + separator_chars + len(rendered) > self._MAX_CHARS:
+                    capped = True
+                    break
+                if not numbered and len(rendered) > self._MAX_CHARS:
+                    suffix = "... (line truncated)"
+                    rendered = rendered[: self._MAX_CHARS - len(suffix)] + suffix
+                    capped = True
+                numbered.append(rendered)
+                output_chars += separator_chars + len(rendered)
+                end = index
+                if capped:
+                    break
+
             result = "\n".join(numbered)
-            if len(result) > self._MAX_CHARS:
-                result = result[: self._MAX_CHARS] + "\n\n... truncated ..."
-            if end < total:
+            if capped:
+                result += (
+                    f"\n\n(Output capped at {self._MAX_CHARS} chars. "
+                    f"Showing lines {offset}-{end}. Use offset={end + 1}.)"
+                )
+            elif end < total:
                 result += f"\n\n(Showing lines {offset}-{end} of {total}. Use offset={end + 1}.)"
             else:
                 result += f"\n\n(End of file - {total} lines total)"
@@ -90,23 +111,77 @@ class WriteTool(_WorkspaceTool):
 
     name = "write"
     concurrency_mode = "mutating"
-    description = "Write UTF-8 content to a file. Creates parent directories when needed."
+    description = (
+        "Create a UTF-8 text file or intentionally overwrite one. Prefer read+edit for "
+        "existing files. Large writes must include end_marker and append that marker as "
+        "the final characters of content; the marker is stripped before writing."
+    )
     parameters = {
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "File path to write."},
-            "content": {"type": "string", "description": "Content to write."},
+            "content": {
+                "type": "string",
+                "description": "Complete content to write. For large files, end with end_marker.",
+            },
+            "overwrite": {
+                "type": "boolean",
+                "description": "Set true only when intentionally replacing an existing file.",
+            },
+            "end_marker": {
+                "type": "string",
+                "description": (
+                    "Optional completion marker. Required for large content. If set, content "
+                    "must end with this exact marker and the marker is not written to disk."
+                ),
+                "minLength": 8,
+                "maxLength": 128,
+            },
         },
         "required": ["path", "content"],
     }
 
-    async def execute(self, path: str, content: str, **kwargs: Any) -> str:
+    _LARGE_CONTENT_CHARS = 16_000
+
+    async def execute(
+        self,
+        path: str,
+        content: str,
+        overwrite: bool = False,
+        end_marker: str | None = None,
+        **kwargs: Any,
+    ) -> str:
         del kwargs
         try:
             fp = self._resolve(path)
+            if fp.exists() and fp.is_dir():
+                return f"Error: Cannot write file because path is a directory: {path}"
+            if fp.exists() and not overwrite:
+                return (
+                    f"Error: File already exists: {path}. Use the edit tool for existing "
+                    "files, or retry write with overwrite=true if full replacement is intentional."
+                )
+
+            content_to_write = content
+            if len(content) > self._LARGE_CONTENT_CHARS and not end_marker:
+                return (
+                    f"Error: Refusing large write of {len(content)} chars without end_marker. "
+                    "For large generated files, prefer a small skeleton plus edit calls. "
+                    "If a full write is intentional, pass end_marker and append it as the "
+                    "final characters of content so truncated writes are rejected."
+                )
+            if end_marker:
+                if not content.endswith(end_marker):
+                    return (
+                        "Error: content does not end with end_marker; refusing to write because "
+                        "the model output may have been truncated. Retry by continuing the file "
+                        "or use a smaller write/edit."
+                    )
+                content_to_write = content[: -len(end_marker)]
+
             fp.parent.mkdir(parents=True, exist_ok=True)
-            fp.write_text(content, encoding="utf-8")
-            return f"Successfully wrote {len(content)} bytes to {fp}"
+            fp.write_text(content_to_write, encoding="utf-8")
+            return f"Successfully wrote {len(content_to_write)} chars to {fp}"
         except Exception as exc:
             return f"Error writing file: {exc}"
 
