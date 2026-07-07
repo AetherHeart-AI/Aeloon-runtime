@@ -64,6 +64,9 @@ Inspect or update it later:
 uv run aeloon-core config path
 uv run aeloon-core config show
 uv run aeloon-core config set model gpt-4.1-mini
+uv run aeloon-core config set max-tokens auto
+uv run aeloon-core config set max-auto-continue-iterations 25
+uv run aeloon-core config set max-finalization-iterations 2
 ```
 
 You can override the path with `AELOON_CORE_CONFIG` or `--config`.
@@ -72,6 +75,7 @@ Environment variables override file values:
 - `AELOON_CORE_API_KEY`
 - `AELOON_CORE_API_BASE`
 - `AELOON_CORE_MODEL`
+- `AELOON_CORE_MAX_TOKENS` (`auto` uses model-aware defaults)
 - `AELOON_CORE_DATA_DIR`
 
 Minimal file example:
@@ -86,11 +90,17 @@ Minimal file example:
   },
   "agents": {
     "defaults": {
-      "model": "gpt-4.1-mini"
+      "model": "gpt-4.1-mini",
+      "max_tokens": null
     }
   }
 }
 ```
+
+`max_tokens: null` means auto. Aeloon resolves the output budget from public
+model metadata before each call: OpenRouter's `/api/v1/models` table for
+OpenRouter routes, LiteLLM's `model_prices_and_context_window.json` table for
+other OpenAI-compatible routes, and 4,096 only when metadata is unavailable.
 
 ## Core Tools
 
@@ -105,3 +115,12 @@ The runtime registers exactly these tools:
 - `webfetch`
 - `websearch`
 - `todowrite`
+
+File writes follow an OpenCode-style safety pattern:
+
+- Use `read` with `offset`/`limit` to inspect files in chunks.
+- Use `edit` for existing files whenever possible.
+- `write` refuses to overwrite an existing file unless `overwrite=true`.
+- Large `write` calls require an `end_marker` appended to the end of `content`;
+  the marker is stripped before the file is saved. If the marker is missing,
+  Aeloon treats the write as possibly truncated and refuses to touch the file.
