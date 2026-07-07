@@ -10,6 +10,7 @@ import httpx
 import json_repair
 from openai import AsyncOpenAI
 
+from aeloon_core.model_metadata import resolve_max_tokens_for_model
 from aeloon_core.providers.base import (
     GenerationSettings,
     LLMProvider,
@@ -92,22 +93,31 @@ class CustomProvider(LLMProvider):
             kwargs["response_format"] = response_format
         return kwargs
 
+    async def _resolve_max_tokens(self, model: str, max_tokens: int | None) -> int:
+        return await resolve_max_tokens_for_model(
+            model,
+            max_tokens,
+            api_base=self.api_base,
+            http_client=self._http_client,
+        )
+
     async def chat(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         model: str | None = None,
-        max_tokens: int = 4096,
+        max_tokens: int | None = None,
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         response_format: ResponseFormat | None = None,
     ) -> LLMResponse:
+        resolved_model = model or self.default_model
         kwargs = self._build_kwargs(
             messages=messages,
             tools=tools,
-            model=model,
-            max_tokens=max_tokens,
+            model=resolved_model,
+            max_tokens=await self._resolve_max_tokens(resolved_model, max_tokens),
             temperature=temperature,
             reasoning_effort=reasoning_effort,
             tool_choice=tool_choice,
@@ -136,18 +146,19 @@ class CustomProvider(LLMProvider):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         model: str | None = None,
-        max_tokens: int = 4096,
+        max_tokens: int | None = None,
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         on_delta: Callable[[str], Awaitable[None]] | None = None,
         on_reasoning_delta: Callable[[str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
+        resolved_model = model or self.default_model
         kwargs = self._build_kwargs(
             messages=messages,
             tools=tools,
-            model=model,
-            max_tokens=max_tokens,
+            model=resolved_model,
+            max_tokens=await self._resolve_max_tokens(resolved_model, max_tokens),
             temperature=temperature,
             reasoning_effort=reasoning_effort,
             tool_choice=tool_choice,

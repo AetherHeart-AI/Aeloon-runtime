@@ -22,8 +22,11 @@ CONFIG_SETTERS = {
     "api-key": ("providers", "custom", "api_key"),
     "api-base": ("providers", "custom", "api_base"),
     "model": ("agents", "defaults", "model"),
+    "max-tokens": ("agents", "defaults", "max_tokens"),
     "reasoning-effort": ("agents", "defaults", "reasoning_effort"),
     "max-iterations": ("agents", "defaults", "max_iterations"),
+    "max-auto-continue-iterations": ("agents", "defaults", "max_auto_continue_iterations"),
+    "max-finalization-iterations": ("agents", "defaults", "max_finalization_iterations"),
 }
 SECRET_KEYS = {"api_key"}
 
@@ -133,6 +136,11 @@ def _add_config_write_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--api-key", default=None, help="OpenAI-compatible API key.")
     parser.add_argument("--api-base", default=None, help="OpenAI-compatible API base URL.")
     parser.add_argument("--model", default=None, help="Default model.")
+    parser.add_argument(
+        "--max-tokens",
+        default=None,
+        help="Output token budget per model call. Use 'auto' for model-aware defaults.",
+    )
 
 
 async def _run_prompt(args: argparse.Namespace) -> None:
@@ -225,6 +233,10 @@ def _config_with_write_args(config: Config, args: argparse.Namespace) -> Config:
         data.setdefault("providers", {}).setdefault("custom", {})["api_base"] = args.api_base
     if args.model is not None:
         data.setdefault("agents", {}).setdefault("defaults", {})["model"] = args.model
+    if args.max_tokens is not None:
+        data.setdefault("agents", {}).setdefault("defaults", {})["max_tokens"] = (
+            _coerce_config_value("max-tokens", args.max_tokens)
+        )
     return Config.model_validate(data)
 
 
@@ -267,7 +279,14 @@ def _set_nested_value(data: dict[str, Any], path: tuple[str, ...], value: Any) -
 
 
 def _coerce_config_value(key: str, value: str) -> Any:
-    if key == "max-iterations":
+    if key in {
+        "max-tokens",
+        "max-iterations",
+        "max-auto-continue-iterations",
+        "max-finalization-iterations",
+    }:
+        if key == "max-tokens" and value.strip().lower() in {"auto", "none", "null"}:
+            return None
         return int(value)
     return value
 

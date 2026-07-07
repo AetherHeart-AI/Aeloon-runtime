@@ -30,11 +30,13 @@ class AgentDefaultsConfig(BaseModel):
 
     model: str = "default"
     temperature: float = 0.7
-    max_tokens: int = 4096
+    max_tokens: int | None = None
     reasoning_effort: str | None = None
     chat_timeout: int = 3600
     context_window_tokens: int = 128_000
     max_iterations: int = 25
+    max_auto_continue_iterations: int = 25
+    max_finalization_iterations: int = 2
 
 
 class AgentsConfig(BaseModel):
@@ -117,6 +119,10 @@ def load_config(path: Path | str | None = None) -> Config:
         updates.setdefault("providers", {}).setdefault("custom", {})["api_base"] = api_base
     if model := os.environ.get("AELOON_CORE_MODEL"):
         updates.setdefault("agents", {}).setdefault("defaults", {})["model"] = model
+    if max_tokens := os.environ.get("AELOON_CORE_MAX_TOKENS"):
+        updates.setdefault("agents", {}).setdefault("defaults", {})["max_tokens"] = (
+            _parse_optional_int(max_tokens)
+        )
     if workspace := os.environ.get("AELOON_CORE_WORKSPACE"):
         updates["workspace"] = workspace
     if data_dir := os.environ.get("AELOON_CORE_DATA_DIR"):
@@ -141,6 +147,13 @@ def save_config(config: Config, path: Path | str | None = None) -> Path:
         encoding="utf-8",
     )
     return config_path
+
+
+def _parse_optional_int(value: str) -> int | None:
+    normalized = value.strip().lower()
+    if normalized in {"", "auto", "none", "null"}:
+        return None
+    return int(value)
 
 
 def _deep_update(target: dict[str, Any], updates: dict[str, Any]) -> None:
