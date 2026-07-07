@@ -41,7 +41,8 @@ LOG_STYLES = {
     "ERROR": "red",
     "CRITICAL": "bold red",
 }
-RESULT_PREVIEW_CHARS = 1_200
+OUTPUT_PREVIEW_CHARS = 360
+OUTPUT_PREVIEW_LINES = 2
 HISTORY_PREVIEW_CHARS = 160
 PROMPT_STYLE = Style.from_dict({"prompt": "ansicyan bold"})
 
@@ -64,9 +65,13 @@ class TerminalEventRenderer:
         self.gateway_logs: list[dict[str, Any]] = []
         self.block_types: dict[str, str] = {}
         self.block_names: dict[str, str] = {}
+        self.block_arguments: dict[str, Any] = {}
         self.block_content_lengths: dict[str, int] = {}
+        self.block_contents: dict[str, str] = {}
         self.last_usage: dict[str, Any] = {}
+        self.last_turn_duration_ms: int | None = None
         self._assistant_streaming = False
+        self._thinking_streaming = False
         self._lock = asyncio.Lock()
 
     async def emit(self, event: str, payload: dict[str, Any]) -> None:
@@ -106,7 +111,7 @@ class TerminalEventRenderer:
         """Print a user turn."""
 
         self._finish_stream_line()
-        self.console.print(Panel(prompt, title="You", border_style="magenta", expand=False))
+        self.console.print(Text(f"You: {prompt}", style="bold magenta"))
 
     def print_turn_summary(self, result: TurnResult) -> None:
         """Print final session metadata for a turn."""
@@ -115,10 +120,14 @@ class TerminalEventRenderer:
         tools = ", ".join(result.tools_used) if result.tools_used else "none"
         usage = _format_usage(self.last_usage)
         summary = f"session {result.session_id} | tools {tools}"
+        duration = _format_duration(self.last_turn_duration_ms)
+        if duration:
+            summary = f"{summary} | duration {duration}"
         if usage:
             summary = f"{summary} | {usage}"
         self.console.print(Text(summary, style="dim"))
         self.last_usage = {}
+        self.last_turn_duration_ms = None
 
     def print_error(self, message: str) -> None:
         """Print an error without treating it as assistant output."""
@@ -186,12 +195,12 @@ class TerminalEventRenderer:
             return
         if event == "chat.turn.start":
             self._finish_stream_line()
+            self._finish_thinking_line()
             self.console.print(Rule(f"turn {payload.get('turn_id', '')}", style="cyan"))
             return
         if event == "chat.status":
             self._finish_stream_line()
-            label = "tools" if payload.get("kind") == "tool_hint" else "status"
-            self.console.print(f"[dim]{label}[/] {_preview(payload.get('text'), limit=240)}")
+            self._finish_thinking_line()
             return
         if event == "chat.block.add":
             self._render_block_add(payload)
@@ -203,10 +212,15 @@ class TerminalEventRenderer:
             self._render_block_update(payload)
             return
         if event == "chat.llm.response":
+            self._finish_thinking_line()
             usage = payload.get("usage")
             self.last_usage = usage if isinstance(usage, dict) else {}
             return
         if event == "chat.turn.end":
+            duration = payload.get("duration_ms")
+            self.last_turn_duration_ms = duration if isinstance(duration, int) else None
+            self._flush_text_blocks()
+            self._finish_thinking_line()
             self._finish_stream_line()
 
     def _render_block_add(self, payload: dict[str, Any]) -> None:
@@ -217,23 +231,35 @@ class TerminalEventRenderer:
             self.block_types[block_id] = block_type
             if block.get("name"):
                 self.block_names[block_id] = str(block.get("name"))
+            if "arguments" in block:
+                self.block_arguments[block_id] = block.get("arguments")
+            if "content" in block:
+                self.block_contents[block_id] = str(block.get("content") or "")
         if block_type == "tool_call":
+            self._consume_pending_text_blocks()
             self._finish_stream_line()
-            title = f"Tool {block.get('name') or 'call'}"
-            body = _format_arguments(block.get("arguments"))
-            self.console.print(Panel(body, title=title, border_style="yellow", expand=False))
+            self._finish_thinking_line()
+            name = str(block.get("name") or "tool")
+            status = _tool_running_status(name)
+            self.console.print(
+                _tool_line(
+                    name=name,
+                    status=status,
+                    detail=_tool_call_detail_text(name, block.get("arguments")),
+                )
+            )
 
     def _render_block_delta(self, payload: dict[str, Any]) -> None:
         block_id = str(payload.get("block_id") or "")
-        if self.block_types.get(block_id) != "text":
-            return
         delta = str(payload.get("delta") or "")
         if not delta:
             return
-        self._append_assistant(delta)
-        self.block_content_lengths[block_id] = self.block_content_lengths.get(block_id, 0) + len(
-            delta
-        )
+        self.block_contents[block_id] = self.block_contents.get(block_id, "") + delta
+        block_type = self.block_types.get(block_id)
+        if block_type == "text":
+            self._render_text_stream(block_id)
+        elif block_type == "reasoning":
+            self._render_reasoning_delta(block_id)
 
     def _render_block_update(self, payload: dict[str, Any]) -> None:
         block_id = str(payload.get("block_id") or "")
@@ -242,33 +268,43 @@ class TerminalEventRenderer:
         if block_type == "text" and "content" in patch:
             self._render_text_content(block_id, str(patch.get("content") or ""))
             return
+        if block_type == "reasoning":
+            if "content" in patch:
+                self._render_reasoning_content(block_id, str(patch.get("content") or ""))
+            if patch.get("status") == "done":
+                self._render_reasoning_content(block_id, self.block_contents.get(block_id, ""))
+            return
         if block_type == "tool_call":
             self._render_tool_result(block_id, patch)
 
     def _render_text_content(self, block_id: str, content: str) -> None:
-        printed = self.block_content_lengths.get(block_id, 0)
-        if 0 < printed <= len(content):
-            new_text = content[printed:]
-        else:
-            new_text = content
-        if not new_text:
-            return
-        self._append_assistant(new_text)
-        self.block_content_lengths[block_id] = len(content)
+        self.block_contents[block_id] = content
+        self._render_text_stream(block_id)
 
     def _render_tool_result(self, block_id: str, patch: dict[str, Any]) -> None:
         if "result" not in patch and "status" not in patch:
             return
         self._finish_stream_line()
+        self._finish_thinking_line()
         status = str(patch.get("status") or "done")
         name = self.block_names.get(block_id, "tool")
         style = "red" if status == "error" else "green"
-        result = _preview(patch.get("result"), limit=RESULT_PREVIEW_CHARS)
         duration = patch.get("duration_ms")
-        title = f"{name} -> {status}"
-        if duration is not None:
-            title = f"{title} ({duration} ms)"
-        self.console.print(Panel(result or "(empty)", title=title, border_style=style))
+        detail = _tool_result_detail_text(
+            name,
+            patch.get("result"),
+            arguments=self.block_arguments.get(block_id),
+            status=status,
+            duration_ms=duration,
+        )
+        self.console.print(
+            _tool_line(
+                name=name,
+                status=status,
+                detail=detail,
+                style=style,
+            )
+        )
 
     def _render_log(self, payload: dict[str, Any]) -> None:
         self.gateway_logs.append(payload)
@@ -278,6 +314,7 @@ class TerminalEventRenderer:
         if LOG_LEVELS.get(level, 20) < LOG_LEVELS.get(self.gateway_log_level, 20):
             return
         self._finish_stream_line()
+        self._finish_thinking_line()
         source = str(payload.get("source") or "gateway")
         message = _preview(payload.get("message"), limit=280)
         ts = _short_time(str(payload.get("ts") or ""))
@@ -302,15 +339,87 @@ class TerminalEventRenderer:
 
     def _append_assistant(self, text: str) -> None:
         if not self._assistant_streaming:
+            self._finish_thinking_line()
             self.console.print("[bold cyan]Assistant[/]")
             self._assistant_streaming = True
         self.console.print(Text(text), end="")
+
+    def _flush_text_blocks(self) -> None:
+        self._finish_stream_line()
+        self._finish_thinking_line()
+        for block_id, block_type in self.block_types.items():
+            if block_type == "text":
+                self._render_text_block(block_id)
+
+    def _consume_pending_text_blocks(self) -> None:
+        for block_id, block_type in self.block_types.items():
+            if block_type == "text":
+                self.block_content_lengths[block_id] = len(
+                    self.block_contents.get(block_id, "")
+                )
+
+    def _render_text_block(self, block_id: str) -> None:
+        content = self.block_contents.get(block_id, "")
+        printed = self.block_content_lengths.get(block_id, 0)
+        new_text = content[printed:] if 0 < printed <= len(content) else content
+        if not new_text.strip():
+            self.block_content_lengths[block_id] = len(content)
+            return
+        self._append_assistant(new_text)
+        self.block_content_lengths[block_id] = len(content)
+
+    def _render_text_stream(self, block_id: str) -> None:
+        content = self.block_contents.get(block_id, "")
+        printed = self.block_content_lengths.get(block_id, 0)
+        new_text = content[printed:] if 0 < printed <= len(content) else content
+        if not new_text:
+            return
+        self._append_assistant(new_text)
+        self.block_content_lengths[block_id] = len(content)
+
+    def _render_reasoning_delta(self, block_id: str) -> None:
+        content = self.block_contents.get(block_id, "")
+        printed = self.block_content_lengths.get(block_id, 0)
+        new_text = content[printed:] if 0 < printed <= len(content) else content
+        if new_text:
+            self._append_thinking(new_text)
+        self.block_content_lengths[block_id] = len(content)
+
+    def _render_reasoning_content(self, block_id: str, content: str) -> None:
+        printed = self.block_content_lengths.get(block_id, 0)
+        new_text = content[printed:] if 0 < printed <= len(content) else content
+        self.block_contents[block_id] = content
+        raw_text = _reasoning_display_text(new_text)
+        if raw_text:
+            self._append_thinking(raw_text)
+        self.block_content_lengths[block_id] = len(content)
+
+    def _append_thinking(self, text: str) -> None:
+        if not text:
+            return
+        if not self._thinking_streaming:
+            self._finish_stream_line()
+            self.console.print("[bold blue]Thinking[/]")
+            self._thinking_streaming = True
+        self.console.print(Text(text, style="blue"), end="")
+        self._flush_console()
 
     def _finish_stream_line(self) -> None:
         if not self._assistant_streaming:
             return
         self.console.print()
         self._assistant_streaming = False
+
+    def _finish_thinking_line(self) -> None:
+        if not self._thinking_streaming:
+            return
+        self.console.print()
+        self._thinking_streaming = False
+
+    def _flush_console(self) -> None:
+        flush = getattr(self.console.file, "flush", None)
+        if callable(flush):
+            flush()
 
 
 class TerminalChatCli:
@@ -541,12 +650,334 @@ def _format_usage(usage: dict[str, Any]) -> str:
     return "usage " + ", ".join(f"{key} {value}" for key, value in usage.items())
 
 
+def _format_duration(duration_ms: int | None) -> str:
+    if duration_ms is None:
+        return ""
+    return f"{duration_ms / 1000:.1f}s"
+
+
 def _preview(value: Any, *, limit: int) -> str:
     text = "" if value is None else str(value)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     if len(text) <= limit:
         return text
     return text[:limit] + f"... [{len(text) - limit} chars]"
+
+
+def _panel_text(content: str, summary: str) -> Text:
+    text = Text(content)
+    if summary:
+        text.append(f"\n{summary}", style="dim")
+    return text
+
+
+def _tool_line(
+    *,
+    name: str,
+    status: str,
+    detail: str,
+    style: str = "yellow",
+) -> Text:
+    text = Text(no_wrap=True, overflow="crop")
+    text.append("Tool ", style="dim")
+    text.append(name, style=style if status != "running" else "yellow")
+    text.append(f" -> {status}", style=style if status != "running" else "yellow")
+    if detail:
+        text.append(" | ", style="dim")
+        text.append(_one_line(detail, limit=180))
+    return text
+
+
+def _tool_running_status(name: str) -> str:
+    if name == "write":
+        return "writing ~"
+    if name == "edit":
+        return "editing ~"
+    return "running"
+
+
+def _tool_call_detail_text(name: str, arguments: Any) -> str:
+    args = arguments if isinstance(arguments, dict) else {}
+    if name == "read":
+        return _join_parts(
+            _path_detail(args),
+            _number_arg(args, "offset"),
+            _number_arg(args, "limit"),
+        )
+    if name == "write":
+        return _join_parts(_path_detail(args), f"{_string_arg_len(args, 'content')} chars")
+    if name == "edit":
+        return _join_parts(
+            _path_detail(args),
+            f"old {_string_arg_len(args, 'old_text')} chars",
+            f"new {_string_arg_len(args, 'new_text')} chars",
+            "replace_all" if args.get("replace_all") else "",
+        )
+    if name == "exec":
+        return _join_parts(
+            _preview_arg(args, "command", limit=120),
+            _preview_arg(args, "working_dir", label="cwd"),
+            _number_arg(args, "timeout"),
+        )
+    if name == "glob":
+        return _join_parts(
+            _preview_arg(args, "pattern"),
+            _preview_arg(args, "root"),
+            _number_arg(args, "limit"),
+        )
+    if name == "grep":
+        return _join_parts(
+            _preview_arg(args, "pattern"),
+            _preview_arg(args, "path"),
+            _preview_arg(args, "include"),
+            _number_arg(args, "limit"),
+        )
+    if name == "webfetch":
+        return _join_parts(_preview_arg(args, "url", limit=120), _number_arg(args, "max_chars"))
+    if name == "websearch":
+        return _join_parts(_preview_arg(args, "query", limit=120), _number_arg(args, "max_results"))
+    if name == "todowrite":
+        todos = args.get("todos")
+        if isinstance(todos, list):
+            return f"{len(todos)} todos"
+    return _generic_arg_summary(arguments)
+
+
+def _tool_result_detail_text(
+    name: str,
+    result: Any,
+    *,
+    arguments: Any,
+    status: str,
+    duration_ms: Any,
+) -> str:
+    text = "" if result is None else str(result)
+    args = arguments if isinstance(arguments, dict) else {}
+    duration = f"{duration_ms} ms" if duration_ms is not None else ""
+    if status == "error" or text.startswith("Error"):
+        return _join_parts("error", _one_line(text, limit=120), duration)
+
+    if name == "read":
+        chars, lines = _read_result_size(text)
+        return _join_parts(_path_detail(args), f"read {chars} chars/{lines} lines", duration)
+    if name == "write":
+        wrote = f"wrote {_string_arg_len(args, 'content')} chars"
+        return _join_parts(_path_detail(args), wrote, duration)
+    if name == "edit":
+        old_len = _string_arg_len(args, "old_text")
+        new_len = _string_arg_len(args, "new_text")
+        return _join_parts(
+            _path_detail(args),
+            f"edited {old_len} -> {new_len} chars",
+            duration,
+        )
+    if name == "exec":
+        return _join_parts(_exit_code_summary(text), _text_size_summary(text), duration)
+    if name == "glob":
+        return _join_parts(
+            _result_count_summary(text, noun="matches"),
+            _text_size_summary(text),
+            duration,
+        )
+    if name == "grep":
+        return _join_parts(
+            _result_count_summary(text, noun="matches"),
+            _text_size_summary(text),
+            duration,
+        )
+    if name == "webfetch":
+        return _join_parts(_web_status_summary(text), _text_size_summary(text), duration)
+    if name == "websearch":
+        return _join_parts(
+            _result_count_summary(text, noun="results"),
+            _text_size_summary(text),
+            duration,
+        )
+    if name == "todowrite":
+        return _join_parts(_text_size_summary(text), duration)
+    return _join_parts(_text_size_summary(text), duration)
+
+
+def _generic_arg_summary(arguments: Any) -> str:
+    if not isinstance(arguments, dict):
+        return _text_size_summary("" if arguments is None else str(arguments))
+    parts: list[str] = []
+    hidden_keys = {"content", "old_text", "new_text", "text", "body", "input", "prompt"}
+    for key, value in arguments.items():
+        if isinstance(value, str):
+            if key in hidden_keys:
+                parts.append(f"{key} {len(value)} chars")
+            else:
+                parts.append(f"{key}={_one_line(value, limit=60)}")
+        elif isinstance(value, list):
+            parts.append(f"{key} {len(value)} items")
+        elif isinstance(value, dict):
+            parts.append(f"{key} {len(value)} keys")
+        else:
+            parts.append(f"{key}={value}")
+    return _join_parts(*parts)
+
+
+def _path_detail(args: dict[str, Any]) -> str:
+    return _preview_arg(args, "path", limit=120)
+
+
+def _preview_arg(
+    args: dict[str, Any],
+    key: str,
+    *,
+    label: str | None = None,
+    limit: int = 80,
+) -> str:
+    value = args.get(key)
+    if value in (None, ""):
+        return ""
+    prefix = f"{label or key}="
+    return f"{prefix}{_one_line(str(value), limit=limit)}"
+
+
+def _number_arg(args: dict[str, Any], key: str) -> str:
+    value = args.get(key)
+    return f"{key}={value}" if value is not None else ""
+
+
+def _string_arg_len(args: dict[str, Any], key: str) -> int:
+    value = args.get(key)
+    return len(value) if isinstance(value, str) else 0
+
+
+def _text_size_summary(text: str) -> str:
+    return f"returned {len(text)} chars/{_line_count(text)} lines"
+
+
+def _read_result_size(text: str) -> tuple[int, int]:
+    content_lines: list[str] = []
+    for line in text.splitlines():
+        prefix, separator, rest = line.partition("| ")
+        if separator and prefix.isdigit():
+            content_lines.append(rest)
+    if not content_lines:
+        if text.startswith("(Empty file"):
+            return 0, 0
+        return len(text), _line_count(text)
+    return sum(len(line) for line in content_lines), len(content_lines)
+
+
+def _result_count_summary(text: str, *, noun: str) -> str:
+    clean = text.strip()
+    if not clean or clean == "(no matches)" or clean == "(no results)" or clean == "(no output)":
+        return f"0 {noun}"
+    return f"{_line_count(clean)} {noun}"
+
+
+def _exit_code_summary(text: str) -> str:
+    for line in reversed(text.splitlines()):
+        stripped = line.strip()
+        if stripped.startswith("Exit code:"):
+            return f"exit {stripped.removeprefix('Exit code:').strip()}"
+    return "exit unknown"
+
+
+def _web_status_summary(text: str) -> str:
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Status:"):
+            return f"status {stripped.removeprefix('Status:').strip()}"
+    return ""
+
+
+def _line_count(text: str) -> int:
+    return len(text.splitlines()) if text else 0
+
+
+def _join_parts(*parts: str) -> str:
+    return " | ".join(part for part in parts if part)
+
+
+def _one_line(value: str, *, limit: int) -> str:
+    text = " ".join(value.replace("\r\n", "\n").replace("\r", "\n").split())
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}... [{len(text) - limit} chars]"
+
+
+def _compact_output(
+    value: Any,
+    *,
+    char_limit: int,
+    line_limit: int,
+) -> tuple[str, str]:
+    text = "" if value is None else str(value)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = text.split("\n") if text else []
+    selected = _select_key_lines(lines, line_limit=line_limit)
+    preview = "\n".join(_preview_line(line, char_limit=char_limit) for line in selected)
+    return preview, _compact_summary(text, lines, preview)
+
+
+def _select_key_lines(lines: list[str], *, line_limit: int) -> list[str]:
+    if len(lines) <= line_limit:
+        return lines
+    non_empty = [(index, line) for index, line in enumerate(lines) if line.strip()]
+    if not non_empty:
+        return lines[:line_limit]
+
+    selected: list[tuple[int, str]] = [non_empty[0]]
+    keywords = ("error", "failed", "traceback", "exception", "warning")
+    lower_lines = [(index, line, line.lower()) for index, line in non_empty[1:]]
+    keyword_line = next(
+        (
+            (index, line)
+            for index, line, lower in lower_lines
+            if any(keyword in lower for keyword in keywords)
+        ),
+        None,
+    )
+    if keyword_line is not None:
+        selected.append(keyword_line)
+    elif line_limit > 1:
+        selected.append(non_empty[-1])
+
+    unique: list[tuple[int, str]] = []
+    seen_indexes: set[int] = set()
+    for item in selected:
+        if item[0] not in seen_indexes:
+            unique.append(item)
+            seen_indexes.add(item[0])
+    return [line for _, line in unique[:line_limit]]
+
+
+def _preview_line(line: str, *, char_limit: int) -> str:
+    clean = line.strip()
+    if len(clean) <= char_limit:
+        return clean
+    return f"{clean[:char_limit]}... [{len(clean) - char_limit} chars]"
+
+
+def _compact_summary(text: str, lines: list[str], preview: str) -> str:
+    line_count = len(lines)
+    char_count = len(text)
+    collapsed = char_count > len(preview) or line_count > OUTPUT_PREVIEW_LINES
+    summary = f"{line_count} lines, {char_count} chars"
+    if collapsed:
+        omitted_lines = max(0, line_count - min(line_count, OUTPUT_PREVIEW_LINES))
+        omitted_chars = max(0, char_count - len(preview))
+        summary = f"{summary}, collapsed {omitted_lines} lines/{omitted_chars} chars"
+    return summary
+
+
+def _reasoning_display_text(text: str) -> str:
+    raw_lines: list[str] = []
+    for raw_line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = raw_line.strip()
+        if not line:
+            continue
+        marker_start = line.find(" [")
+        marker_end = line.find("] ", marker_start + 2)
+        if marker_start < 0 or marker_end < 0:
+            raw_lines.append(raw_line)
+            continue
+    return "\n".join(raw_lines)
 
 
 def _short_time(value: str) -> str:

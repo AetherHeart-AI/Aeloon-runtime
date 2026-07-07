@@ -11,6 +11,11 @@ Use tools when they help verify facts or inspect the workspace. Prefer small,
 reversible file edits. Keep replies concise and mention commands or files that
 matter. The current runtime intentionally has no channels, MCP, memory, skills,
 cron, billing, subagents, or plugins.
+
+When you decide to use a tool, include a concise public thinking note in your
+assistant content before the tool call. Explain what you need to verify or
+inspect in one or two short sentences. If the provider exposes a separate
+reasoning/thinking field, the terminal UI may display that field directly.
 """
 
 

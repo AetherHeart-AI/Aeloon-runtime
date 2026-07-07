@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -25,12 +26,14 @@ class TurnEventProgress:
         self.blocks: list[dict[str, Any]] = []
         self._text_block_id: str | None = None
         self._reasoning_block_id: str | None = None
+        self._reasoning_raw_open = False
         self._started = False
         self._turn_started_at: str | None = None
 
     async def __call__(self, text: str, *, tool_hint: bool = False) -> None:
         kind = "tool_hint" if tool_hint else "status"
-        await self._append_reasoning_line(text, kind=kind)
+        if not tool_hint and not _is_internal_status(text):
+            await self._append_reasoning_line(text, kind="thought")
         detail = {
             "event": "chat.status",
             "session_id": self.session_id,
@@ -86,7 +89,13 @@ class TurnEventProgress:
 
     async def on_llm_reasoning_delta(self, delta: str) -> None:
         block = await self._ensure_reasoning_block()
-        block["content"] = str(block.get("content") or "") + delta
+        current = str(block.get("content") or "")
+        needs_separator = (
+            current and not current.endswith("\n") and not self._reasoning_raw_open
+        )
+        separator = "\n" if needs_separator else ""
+        block["content"] = f"{current}{separator}{delta}"
+        self._reasoning_raw_open = True
         payload = {
             "session_id": self.session_id,
             "turn_id": self.turn_id,
@@ -102,8 +111,10 @@ class TurnEventProgress:
         if reasoning:
             block = await self._ensure_reasoning_block()
             if reasoning not in str(block.get("content") or ""):
-                separator = "\n" if block.get("content") else ""
-                block["content"] = f"{block.get('content') or ''}{separator}{reasoning}"
+                current = str(block.get("content") or "")
+                separator = "\n" if current and not current.endswith("\n") else ""
+                block["content"] = f"{current}{separator}{reasoning}"
+                self._reasoning_raw_open = True
                 await self.emit(
                     "chat.block.update",
                     {
@@ -302,11 +313,13 @@ class TurnEventProgress:
                 },
             )
         completed_at = _now()
+        duration_ms = _duration_ms(self._turn_started_at, completed_at)
         payload = {
             "session_id": self.session_id,
             "turn_id": self.turn_id,
             "final": content,
             "blocks": self.blocks,
+            "duration_ms": duration_ms,
             "ts": completed_at,
         }
         await self.emit("chat.turn.end", payload)
@@ -320,7 +333,7 @@ class TurnEventProgress:
                 "turn_id": self.turn_id,
                 "final": _text_summary(content),
                 "blocks": [_block_log_detail(item) for item in self.blocks],
-                "duration_ms": _duration_ms(self._turn_started_at, completed_at),
+                "duration_ms": duration_ms,
                 "ts": completed_at,
             },
         )
@@ -375,7 +388,9 @@ class TurnEventProgress:
         rendered = json.dumps(entry, ensure_ascii=False) if data else clean
         line = f"{_now()} [{kind}] {rendered}"
         current = str(block.get("content") or "")
-        block["content"] = f"{current}\n{line}" if current else line
+        separator = "\n" if current else ""
+        block["content"] = f"{current}{separator}{line}"
+        self._reasoning_raw_open = False
         payload = {
             "session_id": self.session_id,
             "turn_id": self.turn_id,
@@ -530,6 +545,11 @@ def _preview_text(value: Any, *, limit: int = LOG_TEXT_PREVIEW_CHARS) -> str:
     if len(text) <= limit:
         return text
     return text[:limit]
+
+
+def _is_internal_status(text: str) -> bool:
+    clean = text.strip()
+    return bool(re.fullmatch(r"Thinking(?: \(step \d+\))?\.\.\.", clean))
 
 
 def _duration_ms(start: Any, end: Any) -> int | None:
