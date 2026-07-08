@@ -67,12 +67,22 @@ class ToolsConfig(BaseModel):
     web: WebToolConfig = Field(default_factory=WebToolConfig)
 
 
+class SkillsConfig(BaseModel):
+    """Skill discovery settings."""
+
+    enabled: bool = True
+    external: bool = True
+    claude_code: bool = True
+    paths: list[str] = Field(default_factory=list)
+
+
 class Config(BaseModel):
     """Top-level runtime config."""
 
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    skills: SkillsConfig = Field(default_factory=SkillsConfig)
     workspace: Path = Field(default_factory=Path.cwd)
     data_dir: Path = Field(default_factory=lambda: Path("~/.aeloon-core").expanduser())
 
@@ -127,6 +137,14 @@ def load_config(path: Path | str | None = None) -> Config:
         updates["workspace"] = workspace
     if data_dir := os.environ.get("AELOON_CORE_DATA_DIR"):
         updates["data_dir"] = data_dir
+    if skills_enabled := os.environ.get("AELOON_CORE_SKILLS_ENABLED"):
+        updates.setdefault("skills", {})["enabled"] = _parse_bool(skills_enabled)
+    if disable_external := os.environ.get("AELOON_CORE_DISABLE_EXTERNAL_SKILLS"):
+        updates.setdefault("skills", {})["external"] = not _parse_bool(disable_external)
+    if disable_claude := os.environ.get("AELOON_CORE_DISABLE_CLAUDE_CODE_SKILLS"):
+        updates.setdefault("skills", {})["claude_code"] = not _parse_bool(disable_claude)
+    if skill_paths := os.environ.get("AELOON_CORE_SKILL_PATHS"):
+        updates.setdefault("skills", {})["paths"] = _split_env_list(skill_paths)
 
     if updates:
         merged = config.model_dump(mode="json")
@@ -154,6 +172,20 @@ def _parse_optional_int(value: str) -> int | None:
     if normalized in {"", "auto", "none", "null"}:
         return None
     return int(value)
+
+
+def _parse_bool(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"invalid boolean value: {value!r}")
+
+
+def _split_env_list(value: str, *, separator: str | None = None) -> list[str]:
+    sep = os.pathsep if separator is None else separator
+    return [item.strip() for item in value.split(sep) if item.strip()]
 
 
 def _deep_update(target: dict[str, Any], updates: dict[str, Any]) -> None:

@@ -9,8 +9,9 @@ SYSTEM_PROMPT = """You are Aeloon Core, a compact local coding and research assi
 
 Use tools when they help verify facts or inspect the workspace. Prefer small,
 reversible file edits. Keep replies concise and mention commands or files that
-matter. The current runtime intentionally has no channels, MCP, memory, skills,
-cron, billing, subagents, or plugins.
+matter. The current runtime intentionally has no channels, MCP, memory, cron,
+billing, subagents, or plugins. Skills may be available as on-demand instructions
+through the skill tool when the system context lists them.
 
 For file changes, follow an OpenCode-style workflow: read existing files before
 changing them, prefer edit for existing files, and use write only for new files
@@ -24,6 +25,8 @@ inspect in one or two short sentences. If the provider exposes a separate
 reasoning/thinking field, the terminal UI may display that field directly.
 """
 
+SKILL_GUIDANCE_MARKER = "[aeloon-core:skill-guidance]"
+
 
 def build_initial_messages(*, workspace: Path) -> list[dict[str, Any]]:
     """Build the initial system messages for a session."""
@@ -34,6 +37,45 @@ def build_initial_messages(*, workspace: Path) -> list[dict[str, Any]]:
             "content": SYSTEM_PROMPT.strip() + f"\n\nWorkspace: {workspace}",
         }
     ]
+
+
+def refresh_initial_system_message(
+    messages: list[dict[str, Any]],
+    *,
+    workspace: Path,
+) -> list[dict[str, Any]]:
+    """Return messages with the current runtime system prompt."""
+
+    current = build_initial_messages(workspace=workspace)[0]
+    if messages and messages[0].get("role") == "system":
+        return [current, *messages[1:]]
+    return [current, *messages]
+
+
+def apply_skill_guidance(
+    messages: list[dict[str, Any]],
+    guidance: str | None,
+) -> list[dict[str, Any]]:
+    """Insert or replace the skill guidance system message."""
+
+    without_old = [
+        message
+        for message in messages
+        if not (
+            message.get("role") == "system"
+            and str(message.get("content") or "").startswith(SKILL_GUIDANCE_MARKER)
+        )
+    ]
+    if not guidance:
+        return without_old
+
+    message = {
+        "role": "system",
+        "content": f"{SKILL_GUIDANCE_MARKER}\n{guidance}",
+    }
+    if without_old and without_old[0].get("role") == "system":
+        return [without_old[0], message, *without_old[1:]]
+    return [message, *without_old]
 
 
 def append_user_message(messages: list[dict[str, Any]], prompt: str) -> list[dict[str, Any]]:

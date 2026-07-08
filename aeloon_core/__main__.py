@@ -27,6 +27,10 @@ CONFIG_SETTERS = {
     "max-iterations": ("agents", "defaults", "max_iterations"),
     "max-auto-continue-iterations": ("agents", "defaults", "max_auto_continue_iterations"),
     "max-finalization-iterations": ("agents", "defaults", "max_finalization_iterations"),
+    "skills-enabled": ("skills", "enabled"),
+    "skills-external": ("skills", "external"),
+    "skills-claude-code": ("skills", "claude_code"),
+    "skills-paths": ("skills", "paths"),
 }
 SECRET_KEYS = {"api_key"}
 
@@ -288,7 +292,20 @@ def _coerce_config_value(key: str, value: str) -> Any:
         if key == "max-tokens" and value.strip().lower() in {"auto", "none", "null"}:
             return None
         return int(value)
+    if key in {"skills-enabled", "skills-external", "skills-claude-code"}:
+        return _parse_bool(value)
+    if key == "skills-paths":
+        return [item.strip() for item in value.split(",") if item.strip()]
     return value
+
+
+def _parse_bool(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise SystemExit(f"Expected boolean value, got: {value}")
 
 
 def _looks_like_legacy_run(argv: list[str]) -> bool:

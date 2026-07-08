@@ -104,7 +104,7 @@ other OpenAI-compatible routes, and 4,096 only when metadata is unavailable.
 
 ## Core Tools
 
-The runtime registers exactly these tools:
+The runtime registers these tools:
 
 - `exec`
 - `read`
@@ -112,6 +112,7 @@ The runtime registers exactly these tools:
 - `edit`
 - `glob`
 - `grep`
+- `skill` when skills are enabled
 - `webfetch`
 - `websearch`
 - `todowrite`
@@ -124,3 +125,66 @@ File writes follow an OpenCode-style safety pattern:
 - Large `write` calls require an `end_marker` appended to the end of `content`;
   the marker is stripped before the file is saved. If the marker is missing,
   Aeloon treats the write as possibly truncated and refuses to touch the file.
+
+## Skills
+
+Aeloon Core discovers OpenCode-style `SKILL.md` files at startup. The model sees
+only names and descriptions in system context, then loads the full instructions
+on demand with the `skill` tool.
+
+Standard locations:
+
+- Project native: `.aeloon-core/skill/<name>/SKILL.md` and
+  `.aeloon-core/skills/<name>/SKILL.md`
+- Project OpenCode-compatible: `.opencode/skill/<name>/SKILL.md` and
+  `.opencode/skills/<name>/SKILL.md`
+- Project Claude-compatible: `.claude/skills/<name>/SKILL.md`
+- Project agent-compatible: `.agents/skills/<name>/SKILL.md`
+- Global native: `~/.aeloon-core/skill/<name>/SKILL.md` and
+  `~/.aeloon-core/skills/<name>/SKILL.md`
+- Global OpenCode-compatible: `~/.config/opencode/skill/<name>/SKILL.md` and
+  `~/.config/opencode/skills/<name>/SKILL.md`
+- Global Claude-compatible: `~/.claude/skills/<name>/SKILL.md`
+- Global agent-compatible: `~/.agents/skills/<name>/SKILL.md`
+
+For project-local external and config directories, Aeloon walks upward from the
+workspace to the git worktree root. Later discoveries override earlier duplicate
+skill names, so project-native skills can override global or compatibility
+skills.
+
+Minimal `SKILL.md`:
+
+```markdown
+---
+name: git-release
+description: Prepare consistent releases and changelogs.
+---
+
+## Workflow
+
+Draft release notes, check the versioning scheme, and produce the release
+command.
+```
+
+Aeloon only reads simple scalar `name` and `description` fields from the
+frontmatter; other fields are ignored.
+
+Additional settings live under `skills`:
+
+```json
+{
+  "skills": {
+    "enabled": true,
+    "external": true,
+    "claude_code": true,
+    "paths": ["./team-skills"]
+  }
+}
+```
+
+Environment overrides:
+
+- `AELOON_CORE_SKILLS_ENABLED`
+- `AELOON_CORE_DISABLE_EXTERNAL_SKILLS`
+- `AELOON_CORE_DISABLE_CLAUDE_CODE_SKILLS`
+- `AELOON_CORE_SKILL_PATHS` using the OS path separator

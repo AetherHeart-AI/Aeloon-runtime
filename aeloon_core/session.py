@@ -42,7 +42,12 @@ class SessionStore:
         safe = "".join(ch for ch in session_id if ch.isalnum() or ch in {"-", "_"})
         return self.sessions_dir / f"{safe or 'default'}.jsonl"
 
-    def load_messages(self, session_id: str) -> list[dict[str, Any]]:
+    def load_messages(
+        self,
+        session_id: str,
+        *,
+        initial_messages: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
         """Load the latest message array for a session."""
 
         records = self._read_records(session_id)
@@ -50,7 +55,7 @@ class SessionStore:
             messages = record.get("messages")
             if isinstance(messages, list):
                 return messages
-        return build_initial_messages(workspace=self.workspace)
+        return initial_messages or build_initial_messages(workspace=self.workspace)
 
     def append_turn(
         self,
