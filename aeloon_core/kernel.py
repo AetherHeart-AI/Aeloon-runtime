@@ -11,14 +11,15 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
+from aeloon_core.loop_guard import (
+    AgentLoopGuard,
+    LoopGuardAction,
+    LoopGuardDecision,
+    rejected_arguments_summary,
+)
 from aeloon_core.providers.base import LLMProvider, ToolCallRequest
 from aeloon_core.task_graph import TaskNode, TaskState, build_task_graph
 from aeloon_core.utils.helpers import build_assistant_message
-from aeloon_core.utils.tool_history import (
-    collect_tool_call_fingerprints,
-    duplicate_tool_result,
-    tool_call_fingerprint,
-)
 
 if TYPE_CHECKING:
     from aeloon_core.providers.base import LLMResponse
@@ -140,29 +141,6 @@ def _default_add_tool_result(
     return messages
 
 
-def _partition_duplicate_tool_calls(
-    messages: list[dict],
-    tool_calls: list[ToolCallRequest],
-) -> tuple[list[ToolCallRequest], list[ToolCallRequest]]:
-    history_end = len(messages)
-    while history_end > 0 and messages[history_end - 1].get("role") == "tool":
-        history_end -= 1
-    if history_end > 0 and messages[history_end - 1].get("role") == "assistant":
-        history_end -= 1
-    seen = collect_tool_call_fingerprints(messages[:history_end])
-    executable: list[ToolCallRequest] = []
-    duplicates: list[ToolCallRequest] = []
-    batch_seen: set[str] = set()
-    for tool_call in tool_calls:
-        fingerprint = tool_call_fingerprint(tool_call.name, tool_call.arguments)
-        if fingerprint in seen or fingerprint in batch_seen:
-            duplicates.append(tool_call)
-            continue
-        batch_seen.add(fingerprint)
-        executable.append(tool_call)
-    return executable, duplicates
-
-
 async def _execute_tool_batch(
     *,
     tool_calls: list[ToolCallRequest],
@@ -213,72 +191,8 @@ async def _execute_tool_batch(
     return nodes
 
 
-def _split_malformed_tool_calls(
-    tool_calls: list[ToolCallRequest],
-) -> tuple[list[ToolCallRequest], list[ToolCallRequest]]:
-    valid: list[ToolCallRequest] = []
-    invalid: list[ToolCallRequest] = []
-    for tool_call in tool_calls:
-        if isinstance(tool_call.arguments, dict):
-            valid.append(tool_call)
-        else:
-            invalid.append(tool_call)
-    return valid, invalid
-
-
-def _format_malformed_arguments_error(tool_call: ToolCallRequest) -> str:
-    try:
-        raw = json.dumps(tool_call.arguments, ensure_ascii=False, default=str)
-    except Exception:
-        raw = repr(tool_call.arguments)
-    if len(raw) > 500:
-        raw = raw[:500] + "..."
-    return (
-        f"Error: arguments for tool '{tool_call.name}' must be a JSON object, "
-        f"but received {type(tool_call.arguments).__name__}: {raw}. Retry with a "
-        "single JSON object whose keys match the tool schema."
-    )
-
-
-def _rejected_arguments_summary(tool_call: ToolCallRequest) -> str:
-    return json.dumps(
-        {
-            "_rejected_malformed_arguments": True,
-            "original_type": type(tool_call.arguments).__name__,
-        },
-        ensure_ascii=False,
-    )
-
-
 _PROVIDER_TOOL_CALL_ARGS_MAX_CHARS = 4096
 _PROVIDER_TOOL_ARG_STRING_MAX_CHARS = 1024
-_MAX_UNPRODUCTIVE_TOOL_ROUNDS = 2
-_MAX_ITERATIONS_FINALIZATION_PROMPT = """CRITICAL - MAXIMUM ITERATIONS REACHED
-
-The normal tool-call iteration budget for this task has been reached.
-Tools are disabled for this finalization pass.
-Respond with text only.
-
-STRICT REQUIREMENTS:
-1. Do NOT make any tool calls.
-2. Provide a concise text response summarizing work done so far.
-3. Clearly state any remaining work that could not be completed.
-4. Recommend the next best action.
-
-Any attempt to use tools is a critical violation. Respond with text ONLY."""
-_VISIBLE_ANSWER_FINALIZATION_PROMPT = """VISIBLE ANSWER REQUIRED
-
-The previous model response exhausted its output token budget without producing visible answer text.
-Tools are disabled for this recovery pass. Respond with concise visible text only.
-
-STRICT REQUIREMENTS:
-1. Do NOT make any tool calls.
-2. Do NOT continue hidden reasoning.
-3. Provide the best answer possible from the context already available.
-4. If the task is incomplete, clearly state what remains and what should happen next.
-
-Respond with text ONLY."""
-_OUTPUT_EXHAUSTED_FINISH_REASONS = {"length", "max_tokens", "max_output_tokens"}
 
 
 def _shrink_oversized_tool_arguments(raw: str) -> str:
@@ -340,43 +254,6 @@ def _shrink_answered_tool_args_for_provider(messages: list[dict]) -> list[dict]:
     return out if changed else messages
 
 
-def _finalization_prompt_message(max_iterations: int) -> dict[str, str]:
-    return {
-        "role": "user",
-        "content": (
-            f"{_MAX_ITERATIONS_FINALIZATION_PROMPT}\n\n"
-            f"Configured normal iteration budget: {max_iterations}."
-        ),
-    }
-
-
-def _visible_answer_prompt_message() -> dict[str, str]:
-    return {"role": "user", "content": _VISIBLE_ANSWER_FINALIZATION_PROMPT}
-
-
-def _tool_result_failed(result: str | None) -> bool:
-    text = (result or "").lstrip().lower()
-    return text.startswith("error") or text.startswith("skipped duplicate call")
-
-
-def _off_track_message(reason: str) -> str:
-    return (
-        "I stopped the agent loop because it appears to be off track: "
-        f"{reason}. I did not continue automatically to avoid spending more "
-        "iterations on a loop. Please review the last tool result or provide "
-        "narrower instructions."
-    )
-
-
-def _finalization_exhausted_message(finalization_budget: int) -> str:
-    return (
-        "I stopped because the model repeatedly exhausted its output budget "
-        "without producing a visible final answer. No final artifact was produced. "
-        f"The text-only recovery budget was {finalization_budget} attempt(s). "
-        "Increase max_tokens or ask for a smaller first step, then retry."
-    )
-
-
 async def run_agent_kernel(
     *,
     provider: LLMProvider,
@@ -399,20 +276,17 @@ async def run_agent_kernel(
     _strip = strip_think or _default_strip_think
     _tool_hint = tool_hint or _default_tool_hint
 
-    base_budget = max(0, max_iterations)
-    auto_continue_budget = max(0, max_auto_continue_iterations)
-    finalization_budget = max(0, max_finalization_iterations)
-    iteration_limit = base_budget
-    auto_continue_remaining = auto_continue_budget
+    guard = AgentLoopGuard(
+        max_iterations=max_iterations,
+        max_auto_continue_iterations=max_auto_continue_iterations,
+        max_finalization_iterations=max_finalization_iterations,
+    )
     iteration = 0
     finalization_iteration = 0
     finalizing = False
     finalization_message: dict[str, str] | None = None
     final_content = None
     tools_used: list[str] = []
-    empty_stop_retries = 0
-    max_empty_stop_retries = 1
-    unproductive_tool_rounds = 0
 
     async def _emit_progress(text: str, *, tool_hint: bool = False) -> None:
         if on_progress is not None:
@@ -430,35 +304,16 @@ async def run_agent_kernel(
 
     await _emit_hook("on_turn_start")
 
-    async def _extend_iteration_budget() -> bool:
-        nonlocal auto_continue_remaining, iteration_limit
-        if auto_continue_remaining <= 0:
-            return False
-        grant_size = base_budget if base_budget > 0 else 1
-        grant = min(grant_size, auto_continue_remaining)
-        iteration_limit += grant
-        auto_continue_remaining -= grant
-        logger.info(
-            "Iteration budget reached; automatically continuing with {} more iteration(s), "
-            "{} auto-continue iteration(s) remaining",
-            grant,
-            auto_continue_remaining,
-        )
-        await _emit_progress(
-            f"Iteration budget reached; automatically continuing with {grant} more step(s)."
-        )
-        return True
-
     async def _switch_to_finalization(
         prompt_message: dict[str, str] | None = None,
         *,
         reason: str = "iteration budgets exhausted",
     ) -> bool:
         nonlocal finalization_message, finalizing
-        if finalizing or finalization_budget <= 0:
+        if finalizing or guard.finalization_budget <= 0:
             return False
         finalizing = True
-        finalization_message = prompt_message or _finalization_prompt_message(max_iterations)
+        finalization_message = prompt_message or guard.finalization_prompt_message()
         logger.info(
             "Entering finalization because {}; base={}, auto_continue={}, finalization={}",
             reason,
@@ -469,42 +324,40 @@ async def run_agent_kernel(
         await _emit_progress(f"{reason}; asking for a text-only wrap-up with tools disabled.")
         return True
 
-    def _record_productive_tool_round() -> None:
-        nonlocal unproductive_tool_rounds
-        unproductive_tool_rounds = 0
-
-    def _record_unproductive_tool_round(reason: str, *, immediate: bool = False) -> str | None:
-        nonlocal unproductive_tool_rounds
-        unproductive_tool_rounds += 1
-        if immediate or unproductive_tool_rounds >= _MAX_UNPRODUCTIVE_TOOL_ROUNDS:
-            return reason
-        logger.info(
-            "Unproductive tool round ({}/{}): {}",
-            unproductive_tool_rounds,
-            _MAX_UNPRODUCTIVE_TOOL_ROUNDS,
-            reason,
-        )
-        return None
-
-    async def _stop_off_track(reason: str) -> None:
+    async def _finish_with_guard_decision(
+        decision: LoopGuardDecision,
+        *,
+        add_message: bool = True,
+    ) -> None:
         nonlocal final_content, messages
-        final_content = _off_track_message(reason)
-        logger.warning("Stopping off-track agent loop: {}", reason)
-        messages = add_assistant(messages, final_content)
+        final_content = decision.final_content or decision.reason
+        if decision.action == LoopGuardAction.STOP_OFF_TRACK:
+            logger.warning("Stopping off-track agent loop: {}", decision.reason)
+        if add_message:
+            messages = add_assistant(messages, final_content)
         await _emit_hook("on_final", final_content, messages=messages)
 
-    async def _grant_more_or_finalize() -> None:
-        """When the budget is spent, grant an auto-continue or enter finalization."""
-        if iteration >= iteration_limit and not await _extend_iteration_budget():
-            await _switch_to_finalization()
-
-    async def _fail_if_unproductive(reason: str, *, immediate: bool = False) -> bool:
-        """Record an unproductive round; stop off-track and return True if over budget."""
-        stop_reason = _record_unproductive_tool_round(reason, immediate=immediate)
-        if stop_reason is None:
+    async def _apply_budget_decision(decision: LoopGuardDecision) -> bool:
+        if decision.action == LoopGuardAction.EXTEND_BUDGET:
+            if decision.progress_message:
+                await _emit_progress(decision.progress_message)
             return False
-        await _stop_off_track(stop_reason)
-        return True
+        if decision.action == LoopGuardAction.FINALIZE:
+            await _switch_to_finalization(
+                decision.prompt_message,
+                reason=decision.reason or "iteration budgets exhausted",
+            )
+            return False
+        if decision.action == LoopGuardAction.FINAL_RESPONSE:
+            await _finish_with_guard_decision(decision, add_message=False)
+            return True
+        return False
+
+    async def _grant_more_or_finalize() -> bool:
+        """When the budget is spent, grant an auto-continue or enter finalization."""
+        if iteration < guard.iteration_limit:
+            return False
+        return await _apply_budget_decision(guard.handle_iteration_budget_reached())
 
     async def _do_llm_call(
         current_messages: list[dict],
@@ -561,13 +414,13 @@ async def run_agent_kernel(
 
     while True:
         if finalizing:
-            if finalization_iteration >= finalization_budget:
+            if finalization_iteration >= guard.finalization_budget:
                 break
             finalization_iteration += 1
             tool_defs: list[dict] = []
             call_messages = [
                 *messages,
-                finalization_message or _finalization_prompt_message(max_iterations),
+                finalization_message or guard.finalization_prompt_message(),
             ]
             await _emit_progress(
                 "Wrapping up..."
@@ -575,12 +428,10 @@ async def run_agent_kernel(
                 else f"Wrapping up (attempt {finalization_iteration})..."
             )
         else:
-            if iteration >= iteration_limit:
-                if await _extend_iteration_budget():
-                    continue
-                if await _switch_to_finalization():
-                    continue
-                break
+            if iteration >= guard.iteration_limit:
+                if await _apply_budget_decision(guard.handle_iteration_budget_reached()):
+                    break
+                continue
             iteration += 1
             tool_defs = tools.get_definitions()
             call_messages = messages
@@ -608,21 +459,22 @@ async def run_agent_kernel(
                     final_content = clean
                     await _emit_hook("on_final", clean, messages=messages)
                     break
-                await _stop_off_track(
-                    "the model attempted to call tools after tools were disabled for finalization"
+                await _finish_with_guard_decision(
+                    guard.handle_finalization_tool_call_violation()
                 )
                 break
 
             thought = _strip(response.content)
             if thought:
                 await _emit_progress(thought)
-            tool_calls, malformed_calls = _split_malformed_tool_calls(response.tool_calls)
-            malformed_ids = {bad_call.id for bad_call in malformed_calls}
+            malformed_result = guard.handle_malformed_tool_calls(response.tool_calls)
+            tool_calls = malformed_result.executable_calls
+            malformed_ids = {bad_call.id for bad_call in malformed_result.malformed_calls}
             tool_call_dicts = []
             for tool_call in response.tool_calls:
                 call_dict = tool_call.to_openai_tool_call()
                 if tool_call.id in malformed_ids:
-                    call_dict["function"]["arguments"] = _rejected_arguments_summary(tool_call)
+                    call_dict["function"]["arguments"] = rejected_arguments_summary(tool_call)
                 tool_call_dicts.append(call_dict)
             messages = add_assistant(
                 messages,
@@ -631,47 +483,44 @@ async def run_agent_kernel(
                 reasoning_content=response.reasoning_content,
                 thinking_blocks=response.thinking_blocks,
             )
-            if malformed_calls:
-                for bad_call in malformed_calls:
+            if malformed_result.malformed_calls:
+                for tool_result in malformed_result.tool_results:
                     messages = add_tool(
                         messages,
-                        bad_call.id,
-                        bad_call.name,
-                        _format_malformed_arguments_error(bad_call),
+                        tool_result.call_id,
+                        tool_result.tool_name,
+                        tool_result.content,
                     )
-                if not tool_calls:
-                    if await _fail_if_unproductive(
-                        "the model only supplied malformed tool arguments"
-                    ):
+                if malformed_result.decision.action == LoopGuardAction.STOP_OFF_TRACK:
+                    await _finish_with_guard_decision(malformed_result.decision)
+                    break
+                if malformed_result.decision.action == LoopGuardAction.RETURN_TO_MODEL:
+                    if await _grant_more_or_finalize():
                         break
-                    await _grant_more_or_finalize()
                     continue
 
-            executable_calls, duplicate_calls = _partition_duplicate_tool_calls(
-                messages,
-                tool_calls,
-            )
-            for duplicate in duplicate_calls:
+            duplicate_result = guard.handle_duplicate_tool_calls(messages, tool_calls)
+            for duplicate in duplicate_result.duplicate_calls:
                 logger.warning(
                     "Skipping duplicate tool_call '{}' with identical arguments",
                     duplicate.name,
                 )
+            for tool_result in duplicate_result.tool_results:
                 messages = add_tool(
                     messages,
-                    duplicate.id,
-                    duplicate.name,
-                    duplicate_tool_result(duplicate.name),
+                    tool_result.call_id,
+                    tool_result.tool_name,
+                    tool_result.content,
                 )
-            if duplicate_calls and not executable_calls:
-                if await _fail_if_unproductive(
-                    "the model repeated tool calls that already ran with identical arguments",
-                    immediate=True,
-                ):
+            if duplicate_result.decision.action == LoopGuardAction.STOP_OFF_TRACK:
+                await _finish_with_guard_decision(duplicate_result.decision)
+                break
+            if duplicate_result.decision.action == LoopGuardAction.RETURN_TO_MODEL:
+                if await _grant_more_or_finalize():
                     break
-                await _grant_more_or_finalize()
                 continue
 
-            tool_calls = executable_calls
+            tool_calls = duplicate_result.executable_calls
             hint = _strip(_tool_hint(tool_calls))
             if hint:
                 await _emit_progress(hint, tool_hint=True)
@@ -694,14 +543,12 @@ async def run_agent_kernel(
                     node.result or f"Error executing {node.tool_name}: unknown failure",
                 )
                 await _emit_hook("on_tool_result", node)
-            if executed_nodes and all(_tool_result_failed(node.result) for node in executed_nodes):
-                if await _fail_if_unproductive(
-                    "all tool calls in the latest round failed or returned errors"
-                ):
-                    break
-            else:
-                _record_productive_tool_round()
-            await _grant_more_or_finalize()
+            tool_result_decision = guard.handle_tool_results(executed_nodes)
+            if tool_result_decision.action == LoopGuardAction.STOP_OFF_TRACK:
+                await _finish_with_guard_decision(tool_result_decision)
+                break
+            if await _grant_more_or_finalize():
+                break
             continue
 
         clean = _strip(response.content)
@@ -718,45 +565,27 @@ async def run_agent_kernel(
             break
 
         if clean is None:
-            if finalizing and response.finish_reason in _OUTPUT_EXHAUSTED_FINISH_REASONS:
-                logger.warning(
-                    "Finalization output budget exhausted (attempt {}/{})",
-                    finalization_iteration,
-                    finalization_budget,
-                )
-                if finalization_iteration >= finalization_budget:
-                    break
+            empty_decision = guard.handle_empty_or_exhausted_response(
+                finish_reason=response.finish_reason,
+                finalizing=finalizing,
+                finalization_iteration=finalization_iteration,
+            )
+            if empty_decision.action == LoopGuardAction.CONTINUE:
                 continue
-
-            if (
-                response.finish_reason in _OUTPUT_EXHAUSTED_FINISH_REASONS
-                and not finalizing
-                and finalization_budget > 0
-            ):
-                logger.warning(
-                    "LLM exhausted output budget without visible answer; entering finalization"
-                )
-                await _emit_progress(
-                    "The model used its output budget without a visible answer; "
-                    "asking for a concise text-only answer."
-                )
+            if empty_decision.action == LoopGuardAction.FINALIZE:
+                if empty_decision.progress_message:
+                    await _emit_progress(empty_decision.progress_message)
                 if await _switch_to_finalization(
-                    _visible_answer_prompt_message(),
-                    reason="output budget exhausted without visible answer",
+                    empty_decision.prompt_message,
+                    reason=(
+                        empty_decision.reason
+                        or "output budget exhausted without visible answer"
+                    ),
                 ):
                     continue
-
-            logger.warning(
-                "LLM returned empty stop response (attempt {}/{})",
-                empty_stop_retries + 1,
-                max_empty_stop_retries + 1,
-            )
-            if empty_stop_retries < max_empty_stop_retries:
-                empty_stop_retries += 1
-                continue
-            final_content = "Sorry, the AI model returned an empty response. Please try again."
-            messages = add_assistant(messages, final_content)
-            await _emit_hook("on_final", final_content, messages=messages)
+            if empty_decision.action == LoopGuardAction.FINAL_RESPONSE:
+                await _finish_with_guard_decision(empty_decision)
+                break
             break
 
         messages = add_assistant(
@@ -769,35 +598,23 @@ async def run_agent_kernel(
         await _emit_hook("on_final", clean, messages=messages)
         break
 
-    if final_content is None and finalizing and finalization_iteration >= finalization_budget:
+    if final_content is None and finalizing and finalization_iteration >= guard.finalization_budget:
         logger.warning(
             "Finalization exhausted without visible output; finalization={}",
             max_finalization_iterations,
         )
-        final_content = _finalization_exhausted_message(max_finalization_iterations)
+        final_content = guard.finalization_exhausted_message()
         messages = add_assistant(messages, final_content)
         await _emit_hook("on_final", final_content, messages=messages)
 
-    if final_content is None and iteration >= iteration_limit:
+    if final_content is None and iteration >= guard.iteration_limit:
         logger.warning(
             "Iteration budget exhausted: base={}, auto_continue={}, finalization={}",
             max_iterations,
             max_auto_continue_iterations,
             max_finalization_iterations,
         )
-        if finalization_budget > 0:
-            final_content = (
-                f"I reached the maximum number of tool call iterations ({max_iterations}) "
-                f"plus the automatic continuation budget ({max_auto_continue_iterations}) "
-                f"and could not produce a final text response within the finalization budget "
-                f"({max_finalization_iterations}). Try breaking the task into smaller steps."
-            )
-        else:
-            final_content = (
-                f"I reached the maximum number of tool call iterations ({max_iterations}) "
-                f"plus the automatic continuation budget ({max_auto_continue_iterations}) "
-                "without completing the task. Try breaking the task into smaller steps."
-            )
+        final_content = guard.final_message_for_exhausted_loop()
         await _emit_hook("on_final", final_content, messages=messages)
 
     return final_content, tools_used, messages

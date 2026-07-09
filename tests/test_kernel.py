@@ -15,6 +15,10 @@ class ValueArgs(BaseModel):
     value: str
 
 
+class CommandArgs(BaseModel):
+    command: str
+
+
 class EchoTool(Tool):
     name = "echo"
     description = "Echo a value."
@@ -31,6 +35,16 @@ class FailingTool(Tool):
 
     async def execute(self, value: str) -> str:
         return f"Error: failed for {value}"
+
+
+class TimeoutExecTool(Tool):
+    name = "exec"
+    description = "Execute a command."
+    args_model = CommandArgs
+
+    async def execute(self, command: str) -> str:
+        del command
+        return "Error: Command timed out after 3 seconds"
 
 
 class ScriptedProvider(LLMProvider):
@@ -66,6 +80,12 @@ def registry_with_echo() -> ToolRegistry:
 def registry_with_echo_and_fail() -> ToolRegistry:
     registry = registry_with_echo()
     registry.register(FailingTool())
+    return registry
+
+
+def registry_with_timeout_exec() -> ToolRegistry:
+    registry = ToolRegistry()
+    registry.register(TimeoutExecTool())
     return registry
 
 
@@ -243,7 +263,7 @@ async def test_kernel_preserves_old_failure_when_finalization_budget_disabled() 
 
 
 @pytest.mark.asyncio
-async def test_kernel_stops_when_auto_continue_repeats_identical_tool_call() -> None:
+async def test_kernel_allows_model_to_recover_after_duplicate_tool_call() -> None:
     provider = ScriptedProvider(
         [
             LLMResponse(
@@ -254,6 +274,48 @@ async def test_kernel_stops_when_auto_continue_repeats_identical_tool_call() -> 
             LLMResponse(
                 content=None,
                 tool_calls=[ToolCallRequest(id="call-2", name="echo", arguments={"value": "one"})],
+                finish_reason="tool_calls",
+            ),
+            LLMResponse(content="done with existing echo result", finish_reason="stop"),
+        ]
+    )
+
+    final_content, tools_used, messages = await run_agent_kernel(
+        provider=provider,
+        model="test-model",
+        tools=registry_with_echo(),
+        messages=[{"role": "user", "content": "echo once"}],
+        max_iterations=1,
+        max_auto_continue_iterations=5,
+        max_finalization_iterations=1,
+    )
+
+    assert final_content == "done with existing echo result"
+    assert tools_used == ["echo"]
+    assert messages[-1] == {"role": "assistant", "content": "done with existing echo result"}
+    assert len(provider.calls) == 3
+    assert messages[-2]["role"] == "tool"
+    assert messages[-2]["tool_call_id"] == "call-2"
+    assert "Skipped duplicate call to echo" in messages[-2]["content"]
+
+
+@pytest.mark.asyncio
+async def test_kernel_stops_after_consecutive_duplicate_tool_rounds() -> None:
+    provider = ScriptedProvider(
+        [
+            LLMResponse(
+                content=None,
+                tool_calls=[ToolCallRequest(id="call-1", name="echo", arguments={"value": "one"})],
+                finish_reason="tool_calls",
+            ),
+            LLMResponse(
+                content=None,
+                tool_calls=[ToolCallRequest(id="call-2", name="echo", arguments={"value": "one"})],
+                finish_reason="tool_calls",
+            ),
+            LLMResponse(
+                content=None,
+                tool_calls=[ToolCallRequest(id="call-3", name="echo", arguments={"value": "one"})],
                 finish_reason="tool_calls",
             ),
         ]
@@ -273,7 +335,7 @@ async def test_kernel_stops_when_auto_continue_repeats_identical_tool_call() -> 
     assert "repeated tool calls" in (final_content or "")
     assert tools_used == ["echo"]
     assert messages[-1]["role"] == "assistant"
-    assert len(provider.calls) == 2
+    assert len(provider.calls) == 3
 
 
 @pytest.mark.asyncio
@@ -307,3 +369,52 @@ async def test_kernel_stops_after_consecutive_failed_tool_rounds() -> None:
     assert "failed or returned errors" in (final_content or "")
     assert tools_used == ["fail", "fail"]
     assert len(provider.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_kernel_allows_recovery_after_consecutive_exec_timeouts() -> None:
+    provider = ScriptedProvider(
+        [
+            LLMResponse(
+                content=None,
+                tool_calls=[
+                    ToolCallRequest(
+                        id="call-1",
+                        name="exec",
+                        arguments={"command": "python3 -m http.server 8765"},
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
+            LLMResponse(
+                content=None,
+                tool_calls=[
+                    ToolCallRequest(
+                        id="call-2",
+                        name="exec",
+                        arguments={"command": "python3 -m http.server 8765 & echo pid=$!"},
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
+            LLMResponse(content="I will use a shorter verification command.", finish_reason="stop"),
+        ]
+    )
+
+    final_content, tools_used, messages = await run_agent_kernel(
+        provider=provider,
+        model="test-model",
+        tools=registry_with_timeout_exec(),
+        messages=[{"role": "user", "content": "start a server"}],
+        max_iterations=1,
+        max_auto_continue_iterations=5,
+        max_finalization_iterations=1,
+    )
+
+    assert final_content == "I will use a shorter verification command."
+    assert tools_used == ["exec", "exec"]
+    assert messages[-1] == {
+        "role": "assistant",
+        "content": "I will use a shorter verification command.",
+    }
+    assert len(provider.calls) == 3
