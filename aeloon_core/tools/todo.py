@@ -5,9 +5,21 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field
 
 from aeloon_core.tools.base import Tool
+
+
+class TodoItem(BaseModel):
+    content: str
+    status: Literal["pending", "in_progress", "completed"]
+    id: str | None = None
+
+
+class TodoArgs(BaseModel):
+    todos: list[TodoItem] = Field(description="Full todo list to persist.")
 
 
 class TodoWriteTool(Tool):
@@ -19,27 +31,7 @@ class TodoWriteTool(Tool):
         "Persist a concise todo list for the current task. Send the full list each time, "
         "with statuses pending, in_progress, or completed."
     )
-    parameters = {
-        "type": "object",
-        "properties": {
-            "todos": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "content": {"type": "string"},
-                        "status": {
-                            "type": "string",
-                            "enum": ["pending", "in_progress", "completed"],
-                        },
-                        "id": {"type": "string"},
-                    },
-                    "required": ["content", "status"],
-                },
-            }
-        },
-        "required": ["todos"],
-    }
+    args_model = TodoArgs
 
     def __init__(self, *, data_dir: Path) -> None:
         self.data_dir = data_dir
@@ -50,8 +42,7 @@ class TodoWriteTool(Tool):
 
         self.session_id = session_id or "default"
 
-    async def execute(self, todos: list[dict[str, Any]], **kwargs: Any) -> str:
-        del kwargs
+    async def execute(self, todos: list[dict[str, Any]]) -> str:
         cleaned: list[dict[str, str]] = []
         for index, item in enumerate(todos, start=1):
             content = str(item.get("content") or "").strip()

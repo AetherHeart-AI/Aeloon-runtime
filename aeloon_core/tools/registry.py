@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from pydantic import ValidationError
+
 from aeloon_core.tools.base import Tool
 
 
@@ -29,20 +31,27 @@ class ToolRegistry:
         return [tool.to_schema() for tool in self._tools.values()]
 
     async def execute(self, name: str, params: dict[str, Any]) -> str:
-        """Execute a tool by name with given parameters."""
+        """Execute a tool by name, validating params against its Pydantic model."""
 
         hint = "\n\n[Analyze the error above and try a different approach.]"
         tool = self._tools.get(name)
         if not tool:
             return f"Error: Tool '{name}' not found. Available: {', '.join(self._tools)}"
         try:
-            params = tool.cast_params(params)
-            errors = tool.validate_params(params)
-            if errors:
-                return f"Error: Invalid parameters for tool '{name}': " + "; ".join(errors) + hint
-            result = await tool.execute(**params)
+            args = tool.args_model.model_validate(params)
+        except ValidationError as exc:
+            errors = "; ".join(_format_error(error) for error in exc.errors())
+            return f"Error: Invalid parameters for tool '{name}': {errors}{hint}"
+        try:
+            result = await tool.execute(**args.model_dump(exclude_unset=True))
             if isinstance(result, str) and result.startswith("Error"):
                 return result + hint
             return result
         except Exception as exc:
             return f"Error executing {name}: {exc}" + hint
+
+
+def _format_error(error: dict[str, Any]) -> str:
+    location = ".".join(str(part) for part in error.get("loc", ()))
+    message = error.get("msg", "invalid value")
+    return f"{location}: {message}" if location else message

@@ -98,9 +98,8 @@ Minimal file example:
 ```
 
 `max_tokens: null` means auto. Aeloon resolves the output budget from public
-model metadata before each call: OpenRouter's `/api/v1/models` table for
-OpenRouter routes, LiteLLM's `model_prices_and_context_window.json` table for
-other OpenAI-compatible routes, and 4,096 only when metadata is unavailable.
+model metadata before each call: LiteLLM's `model_prices_and_context_window.json`
+table, and 4,096 only when metadata is unavailable.
 
 ## Core Tools
 

@@ -21,8 +21,6 @@ class ToolCallRequest:
     id: str
     name: str
     arguments: dict[str, Any] | list[Any] | None
-    provider_specific_fields: dict[str, Any] | None = None
-    function_provider_specific_fields: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.arguments, dict):
@@ -43,7 +41,7 @@ class ToolCallRequest:
     def to_openai_tool_call(self) -> dict[str, Any]:
         """Serialize to an OpenAI-style tool_call payload."""
 
-        tool_call: dict[str, Any] = {
+        return {
             "id": self.id,
             "type": "function",
             "function": {
@@ -51,13 +49,6 @@ class ToolCallRequest:
                 "arguments": json.dumps(self.arguments, ensure_ascii=False),
             },
         }
-        if self.provider_specific_fields:
-            tool_call["provider_specific_fields"] = self.provider_specific_fields
-        if self.function_provider_specific_fields:
-            tool_call["function"]["provider_specific_fields"] = (
-                self.function_provider_specific_fields
-            )
-        return tool_call
 
 
 @dataclass
@@ -70,10 +61,6 @@ class LLMResponse:
     usage: dict[str, int] = field(default_factory=dict)
     reasoning_content: str | None = None
     thinking_blocks: list[dict] | None = None
-
-
-class ProviderAuthenticationError(RuntimeError):
-    """Provider credentials are missing or expired."""
 
 
 @dataclass(frozen=True)
@@ -167,12 +154,12 @@ class LLMProvider(ABC):
         err = (content or "").lower()
         return any(marker in err for marker in cls._TRANSIENT_ERROR_MARKERS)
 
-    async def _safe_chat(self, **kwargs: Any) -> LLMResponse:
+    async def _safe_call(self, coro: Awaitable[LLMResponse]) -> LLMResponse:
+        """Await an LLM coroutine with a timeout, converting failures to errors."""
+
         try:
-            return await asyncio.wait_for(self.chat(**kwargs), timeout=self.chat_timeout)
+            return await asyncio.wait_for(coro, timeout=self.chat_timeout)
         except asyncio.CancelledError:
-            raise
-        except ProviderAuthenticationError:
             raise
         except TimeoutError:
             return LLMResponse(
@@ -181,6 +168,58 @@ class LLMProvider(ABC):
             )
         except Exception as exc:
             return LLMResponse(content=f"Error calling LLM: {exc}", finish_reason="error")
+
+    def _resolved_kwargs(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        model: str | None,
+        max_tokens: object,
+        temperature: object,
+        reasoning_effort: object,
+        tool_choice: str | dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Fill unset generation params from provider defaults."""
+
+        return dict(
+            messages=messages,
+            tools=tools,
+            model=model,
+            max_tokens=self.generation.max_tokens if max_tokens is self._SENTINEL else max_tokens,
+            temperature=(
+                self.generation.temperature if temperature is self._SENTINEL else temperature
+            ),
+            reasoning_effort=(
+                self.generation.reasoning_effort
+                if reasoning_effort is self._SENTINEL
+                else reasoning_effort
+            ),
+            tool_choice=tool_choice,
+        )
+
+    async def _retry(
+        self,
+        attempt_call: Callable[[int], Awaitable[LLMResponse]],
+        *,
+        label: str,
+    ) -> LLMResponse:
+        """Invoke attempt_call with retry on transient provider failures."""
+
+        for attempt, delay in enumerate(self._CHAT_RETRY_DELAYS, start=1):
+            response = await attempt_call(attempt)
+            if response.finish_reason != "error" or not self._is_transient_error(response.content):
+                return response
+            logger.warning(
+                "{} transient error (attempt {}/{}), retrying in {}s: {}",
+                label,
+                attempt,
+                len(self._CHAT_RETRY_DELAYS),
+                delay,
+                (response.content or "")[:120].lower(),
+            )
+            await asyncio.sleep(delay)
+        return await attempt_call(len(self._CHAT_RETRY_DELAYS) + 1)
 
     async def chat_stream(
         self,
@@ -207,21 +246,6 @@ class LLMProvider(ABC):
             tool_choice=tool_choice,
         )
 
-    async def _safe_chat_stream(self, **kwargs: Any) -> LLMResponse:
-        try:
-            return await asyncio.wait_for(self.chat_stream(**kwargs), timeout=self.chat_timeout)
-        except asyncio.CancelledError:
-            raise
-        except ProviderAuthenticationError:
-            raise
-        except TimeoutError:
-            return LLMResponse(
-                content=f"Error calling LLM: request timed out after {self.chat_timeout}s",
-                finish_reason="error",
-            )
-        except Exception as exc:
-            return LLMResponse(content=f"Error calling LLM: {exc}", finish_reason="error")
-
     async def chat_with_retry(
         self,
         messages: list[dict[str, Any]],
@@ -235,14 +259,7 @@ class LLMProvider(ABC):
     ) -> LLMResponse:
         """Call chat() with retry on transient provider failures."""
 
-        if max_tokens is self._SENTINEL:
-            max_tokens = self.generation.max_tokens
-        if temperature is self._SENTINEL:
-            temperature = self.generation.temperature
-        if reasoning_effort is self._SENTINEL:
-            reasoning_effort = self.generation.reasoning_effort
-
-        kw: dict[str, Any] = dict(
+        kw = self._resolved_kwargs(
             messages=messages,
             tools=tools,
             model=model,
@@ -254,21 +271,7 @@ class LLMProvider(ABC):
         if response_format is not None:
             kw["response_format"] = response_format
 
-        for attempt, delay in enumerate(self._CHAT_RETRY_DELAYS, start=1):
-            response = await self._safe_chat(**kw)
-            if response.finish_reason != "error":
-                return response
-            if not self._is_transient_error(response.content):
-                return response
-            logger.warning(
-                "LLM transient error (attempt {}/{}), retrying in {}s: {}",
-                attempt,
-                len(self._CHAT_RETRY_DELAYS),
-                delay,
-                (response.content or "")[:120].lower(),
-            )
-            await asyncio.sleep(delay)
-        return await self._safe_chat(**kw)
+        return await self._retry(lambda _attempt: self._safe_call(self.chat(**kw)), label="LLM")
 
     async def chat_stream_with_retry(
         self,
@@ -284,14 +287,7 @@ class LLMProvider(ABC):
     ) -> LLMResponse:
         """Call chat_stream() with retry on transient provider failures."""
 
-        if max_tokens is self._SENTINEL:
-            max_tokens = self.generation.max_tokens
-        if temperature is self._SENTINEL:
-            temperature = self.generation.temperature
-        if reasoning_effort is self._SENTINEL:
-            reasoning_effort = self.generation.reasoning_effort
-
-        kw: dict[str, Any] = dict(
+        kw = self._resolved_kwargs(
             messages=messages,
             tools=tools,
             model=model,
@@ -300,22 +296,15 @@ class LLMProvider(ABC):
             reasoning_effort=reasoning_effort,
             tool_choice=tool_choice,
         )
-        for attempt, delay in enumerate(self._CHAT_RETRY_DELAYS, start=1):
-            response = await self._safe_chat_stream(
-                **kw,
-                on_delta=on_delta if attempt == 1 else None,
-                on_reasoning_delta=on_reasoning_delta if attempt == 1 else None,
+
+        def _attempt(attempt: int) -> Awaitable[LLMResponse]:
+            # Only stream deltas on the first try; retries collect silently.
+            return self._safe_call(
+                self.chat_stream(
+                    **kw,
+                    on_delta=on_delta if attempt == 1 else None,
+                    on_reasoning_delta=on_reasoning_delta if attempt == 1 else None,
+                )
             )
-            if response.finish_reason != "error":
-                return response
-            if not self._is_transient_error(response.content):
-                return response
-            logger.warning(
-                "Streaming LLM transient error (attempt {}/{}), retrying in {}s: {}",
-                attempt,
-                len(self._CHAT_RETRY_DELAYS),
-                delay,
-                (response.content or "")[:120].lower(),
-            )
-            await asyncio.sleep(delay)
-        return await self._safe_chat_stream(**kw, on_delta=None, on_reasoning_delta=None)
+
+        return await self._retry(_attempt, label="Streaming LLM")

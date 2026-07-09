@@ -41,8 +41,6 @@ LOG_STYLES = {
     "ERROR": "red",
     "CRITICAL": "bold red",
 }
-OUTPUT_PREVIEW_CHARS = 360
-OUTPUT_PREVIEW_LINES = 2
 HISTORY_PREVIEW_CHARS = 160
 PROMPT_STYLE = Style.from_dict({"prompt": "ansicyan bold"})
 
@@ -358,10 +356,13 @@ class TerminalEventRenderer:
                     self.block_contents.get(block_id, "")
                 )
 
+    def _unprinted_suffix(self, block_id: str, content: str) -> str:
+        printed = self.block_content_lengths.get(block_id, 0)
+        return content[printed:] if 0 < printed <= len(content) else content
+
     def _render_text_block(self, block_id: str) -> None:
         content = self.block_contents.get(block_id, "")
-        printed = self.block_content_lengths.get(block_id, 0)
-        new_text = content[printed:] if 0 < printed <= len(content) else content
+        new_text = self._unprinted_suffix(block_id, content)
         if not new_text.strip():
             self.block_content_lengths[block_id] = len(content)
             return
@@ -370,8 +371,7 @@ class TerminalEventRenderer:
 
     def _render_text_stream(self, block_id: str) -> None:
         content = self.block_contents.get(block_id, "")
-        printed = self.block_content_lengths.get(block_id, 0)
-        new_text = content[printed:] if 0 < printed <= len(content) else content
+        new_text = self._unprinted_suffix(block_id, content)
         if not new_text:
             return
         self._append_assistant(new_text)
@@ -379,15 +379,13 @@ class TerminalEventRenderer:
 
     def _render_reasoning_delta(self, block_id: str) -> None:
         content = self.block_contents.get(block_id, "")
-        printed = self.block_content_lengths.get(block_id, 0)
-        new_text = content[printed:] if 0 < printed <= len(content) else content
+        new_text = self._unprinted_suffix(block_id, content)
         if new_text:
             self._append_thinking(new_text)
         self.block_content_lengths[block_id] = len(content)
 
     def _render_reasoning_content(self, block_id: str, content: str) -> None:
-        printed = self.block_content_lengths.get(block_id, 0)
-        new_text = content[printed:] if 0 < printed <= len(content) else content
+        new_text = self._unprinted_suffix(block_id, content)
         self.block_contents[block_id] = content
         raw_text = _reasoning_display_text(new_text)
         if raw_text:
@@ -628,14 +626,6 @@ async def run_terminal_cli(
     await cli.run(initial_prompt=prompt)
 
 
-def _format_arguments(value: Any) -> str | Syntax:
-    if value is None:
-        return "{}"
-    if isinstance(value, dict | list):
-        return Syntax(json.dumps(value, ensure_ascii=False, indent=2), "json", word_wrap=True)
-    return str(value)
-
-
 def _format_usage(usage: dict[str, Any]) -> str:
     if not usage:
         return ""
@@ -662,13 +652,6 @@ def _preview(value: Any, *, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + f"... [{len(text) - limit} chars]"
-
-
-def _panel_text(content: str, summary: str) -> Text:
-    text = Text(content)
-    if summary:
-        text.append(f"\n{summary}", style="dim")
-    return text
 
 
 def _tool_line(
@@ -743,6 +726,10 @@ def _tool_call_detail_text(name: str, arguments: Any) -> str:
     return _generic_arg_summary(arguments)
 
 
+# Tools whose result summary is just "<n> <noun>" plus size/duration.
+_RESULT_COUNT_NOUNS = {"glob": "matches", "grep": "matches", "websearch": "results"}
+
+
 def _tool_result_detail_text(
     name: str,
     result: Any,
@@ -757,6 +744,13 @@ def _tool_result_detail_text(
     if status == "error" or text.startswith("Error"):
         return _join_parts("error", _one_line(text, limit=120), duration)
 
+    count_noun = _RESULT_COUNT_NOUNS.get(name)
+    if count_noun is not None:
+        return _join_parts(
+            _result_count_summary(text, noun=count_noun),
+            _text_size_summary(text),
+            duration,
+        )
     if name == "read":
         chars, lines = _read_result_size(text)
         return _join_parts(_path_detail(args), f"read {chars} chars/{lines} lines", duration)
@@ -773,28 +767,8 @@ def _tool_result_detail_text(
         )
     if name == "exec":
         return _join_parts(_exit_code_summary(text), _text_size_summary(text), duration)
-    if name == "glob":
-        return _join_parts(
-            _result_count_summary(text, noun="matches"),
-            _text_size_summary(text),
-            duration,
-        )
-    if name == "grep":
-        return _join_parts(
-            _result_count_summary(text, noun="matches"),
-            _text_size_summary(text),
-            duration,
-        )
     if name == "webfetch":
         return _join_parts(_web_status_summary(text), _text_size_summary(text), duration)
-    if name == "websearch":
-        return _join_parts(
-            _result_count_summary(text, noun="results"),
-            _text_size_summary(text),
-            duration,
-        )
-    if name == "todowrite":
-        return _join_parts(_text_size_summary(text), duration)
     return _join_parts(_text_size_summary(text), duration)
 
 
@@ -899,71 +873,6 @@ def _one_line(value: str, *, limit: int) -> str:
     if len(text) <= limit:
         return text
     return f"{text[:limit]}... [{len(text) - limit} chars]"
-
-
-def _compact_output(
-    value: Any,
-    *,
-    char_limit: int,
-    line_limit: int,
-) -> tuple[str, str]:
-    text = "" if value is None else str(value)
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    lines = text.split("\n") if text else []
-    selected = _select_key_lines(lines, line_limit=line_limit)
-    preview = "\n".join(_preview_line(line, char_limit=char_limit) for line in selected)
-    return preview, _compact_summary(text, lines, preview)
-
-
-def _select_key_lines(lines: list[str], *, line_limit: int) -> list[str]:
-    if len(lines) <= line_limit:
-        return lines
-    non_empty = [(index, line) for index, line in enumerate(lines) if line.strip()]
-    if not non_empty:
-        return lines[:line_limit]
-
-    selected: list[tuple[int, str]] = [non_empty[0]]
-    keywords = ("error", "failed", "traceback", "exception", "warning")
-    lower_lines = [(index, line, line.lower()) for index, line in non_empty[1:]]
-    keyword_line = next(
-        (
-            (index, line)
-            for index, line, lower in lower_lines
-            if any(keyword in lower for keyword in keywords)
-        ),
-        None,
-    )
-    if keyword_line is not None:
-        selected.append(keyword_line)
-    elif line_limit > 1:
-        selected.append(non_empty[-1])
-
-    unique: list[tuple[int, str]] = []
-    seen_indexes: set[int] = set()
-    for item in selected:
-        if item[0] not in seen_indexes:
-            unique.append(item)
-            seen_indexes.add(item[0])
-    return [line for _, line in unique[:line_limit]]
-
-
-def _preview_line(line: str, *, char_limit: int) -> str:
-    clean = line.strip()
-    if len(clean) <= char_limit:
-        return clean
-    return f"{clean[:char_limit]}... [{len(clean) - char_limit} chars]"
-
-
-def _compact_summary(text: str, lines: list[str], preview: str) -> str:
-    line_count = len(lines)
-    char_count = len(text)
-    collapsed = char_count > len(preview) or line_count > OUTPUT_PREVIEW_LINES
-    summary = f"{line_count} lines, {char_count} chars"
-    if collapsed:
-        omitted_lines = max(0, line_count - min(line_count, OUTPUT_PREVIEW_LINES))
-        omitted_chars = max(0, char_count - len(preview))
-        summary = f"{summary}, collapsed {omitted_lines} lines/{omitted_chars} chars"
-    return summary
 
 
 def _reasoning_display_text(text: str) -> str:

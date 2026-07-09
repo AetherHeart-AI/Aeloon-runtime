@@ -109,15 +109,6 @@ class SessionStore:
             )
         return sorted(summaries, key=lambda item: item.updated_at, reverse=True)
 
-    def delete_session(self, session_id: str) -> bool:
-        """Delete a session file."""
-
-        path = self.session_path(session_id)
-        if not path.exists():
-            return False
-        path.unlink()
-        return True
-
     def _read_records(self, session_id: str) -> list[dict[str, Any]]:
         path = self.session_path(session_id)
         if not path.exists():

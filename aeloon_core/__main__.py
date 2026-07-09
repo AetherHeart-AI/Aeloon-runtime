@@ -10,8 +10,9 @@ from pathlib import Path
 from typing import Any
 
 from aeloon_core.config import Config, load_config, resolve_config_path, save_config
-from aeloon_core.orchestrator import AeloonCoreOrchestrator, ConsoleProgress
+from aeloon_core.orchestrator import AeloonCoreOrchestrator
 from aeloon_core.terminal_cli import LOG_LEVELS, run_terminal_cli
+from aeloon_core.turn_events import TurnEventProgress
 
 COMMANDS = {"run", "chat", "tui", "config"}
 REMOVED_COMMANDS = {"webui"}
@@ -97,12 +98,17 @@ def build_legacy_run_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _add_run_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("prompt", nargs="+", help="Prompt text to send to the agent.")
+def _add_path_args(parser: argparse.ArgumentParser, *, session: bool = False) -> None:
     parser.add_argument("--config", type=Path, default=None, help="Optional config JSON path.")
-    parser.add_argument("--session", default=None, help="Existing session id to continue.")
+    if session:
+        parser.add_argument("--session", default=None, help="Existing session id to continue.")
     parser.add_argument("--workspace", type=Path, default=None, help="Override workspace.")
     parser.add_argument("--data-dir", type=Path, default=None, help="Override data dir.")
+
+
+def _add_run_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("prompt", nargs="+", help="Prompt text to send to the agent.")
+    _add_path_args(parser, session=True)
 
 
 def _add_chat_args(parser: argparse.ArgumentParser) -> None:
@@ -111,10 +117,7 @@ def _add_chat_args(parser: argparse.ArgumentParser) -> None:
         nargs="*",
         help="Optional prompt to run once. Omit it for interactive chat.",
     )
-    parser.add_argument("--config", type=Path, default=None, help="Optional config JSON path.")
-    parser.add_argument("--session", default=None, help="Existing session id to continue.")
-    parser.add_argument("--workspace", type=Path, default=None, help="Override workspace.")
-    parser.add_argument("--data-dir", type=Path, default=None, help="Override data dir.")
+    _add_path_args(parser, session=True)
     parser.add_argument(
         "--hide-gateway-logs",
         action="store_true",
@@ -134,9 +137,7 @@ def _add_chat_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_config_write_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--config", type=Path, default=None, help="Optional config JSON path.")
-    parser.add_argument("--workspace", type=Path, default=None, help="Workspace to operate on.")
-    parser.add_argument("--data-dir", type=Path, default=None, help="Session data directory.")
+    _add_path_args(parser)
     parser.add_argument("--api-key", default=None, help="OpenAI-compatible API key.")
     parser.add_argument("--api-base", default=None, help="OpenAI-compatible API base URL.")
     parser.add_argument("--model", default=None, help="Default model.")
@@ -147,6 +148,49 @@ def _add_config_write_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+class _PlainTextProgressSink:
+    """Render TurnEventProgress events as plain stdout lines for the `run` command."""
+
+    def __init__(self) -> None:
+        self._block_types: dict[str, str] = {}
+        self._block_names: dict[str, str] = {}
+        self._streaming = False
+
+    async def emit(self, event: str, payload: dict[str, Any]) -> None:
+        if event == "chat.status":
+            self._break_stream()
+            prefix = "tools" if payload.get("kind") == "tool_hint" else "status"
+            print(f"[{prefix}] {payload.get('text', '')}")
+        elif event == "chat.block.add":
+            block = payload.get("block", {})
+            block_id = block.get("id")
+            self._block_types[block_id] = block.get("type")
+            self._block_names[block_id] = block.get("name")
+            if block.get("type") == "tool_call":
+                self._break_stream()
+                print(f"[tool call] {block.get('name')}")
+        elif event == "chat.block.delta":
+            if self._block_types.get(payload.get("block_id")) == "text":
+                print(payload.get("delta", ""), end="", flush=True)
+                self._streaming = True
+        elif event == "chat.block.update":
+            block_id = payload.get("block_id")
+            patch = payload.get("patch", {})
+            if "result" in patch and self._block_types.get(block_id) == "tool_call":
+                self._break_stream()
+                result = str(patch.get("result") or "")
+                preview = result[:500] + ("..." if len(result) > 500 else "")
+                print(f"[tool result] {self._block_names.get(block_id)}: {preview}")
+        elif event == "chat.turn.end":
+            self._break_stream()
+            print(f"\n[final]\n{payload.get('final', '')}")
+
+    def _break_stream(self) -> None:
+        if self._streaming:
+            print()
+            self._streaming = False
+
+
 async def _run_prompt(args: argparse.Namespace) -> None:
     config = _load_with_path_overrides(
         args.config,
@@ -155,10 +199,12 @@ async def _run_prompt(args: argparse.Namespace) -> None:
     )
     orchestrator = AeloonCoreOrchestrator(config)
     prompt = " ".join(args.prompt)
+    session_id = args.session or orchestrator.sessions.new_session()
+    progress = TurnEventProgress(session_id=session_id, emit=_PlainTextProgressSink().emit)
     result = await orchestrator.run_turn(
         prompt,
-        session_id=args.session,
-        on_progress=ConsoleProgress(),
+        session_id=session_id,
+        on_progress=progress,
     )
     print(f"\n[session] {result.session_id}")
     if result.tools_used:
@@ -226,21 +272,21 @@ def _load_with_path_overrides(
 
 
 def _config_with_write_args(config: Config, args: argparse.Namespace) -> Config:
+    # Map each --init flag to the same nested config path the `set` command uses.
+    write_arg_keys = {
+        "workspace": "workspace",
+        "data_dir": "data-dir",
+        "api_key": "api-key",
+        "api_base": "api-base",
+        "model": "model",
+        "max_tokens": "max-tokens",
+    }
     data = config.model_dump(mode="json")
-    if args.workspace is not None:
-        data["workspace"] = str(args.workspace)
-    if args.data_dir is not None:
-        data["data_dir"] = str(args.data_dir)
-    if args.api_key is not None:
-        data.setdefault("providers", {}).setdefault("custom", {})["api_key"] = args.api_key
-    if args.api_base is not None:
-        data.setdefault("providers", {}).setdefault("custom", {})["api_base"] = args.api_base
-    if args.model is not None:
-        data.setdefault("agents", {}).setdefault("defaults", {})["model"] = args.model
-    if args.max_tokens is not None:
-        data.setdefault("agents", {}).setdefault("defaults", {})["max_tokens"] = (
-            _coerce_config_value("max-tokens", args.max_tokens)
-        )
+    for attr, key in write_arg_keys.items():
+        raw = getattr(args, attr, None)
+        if raw is None:
+            continue
+        _set_nested_value(data, CONFIG_SETTERS[key], _coerce_config_value(key, str(raw)))
     return Config.model_validate(data)
 
 

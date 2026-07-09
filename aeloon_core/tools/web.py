@@ -9,9 +9,24 @@ from urllib.parse import quote_plus, urlparse
 
 import html2text
 import httpx
+from pydantic import BaseModel, Field
 
 from aeloon_core.config import WebToolConfig
 from aeloon_core.tools.base import Tool
+
+
+class WebFetchArgs(BaseModel):
+    url: str = Field(description="HTTP(S) URL to fetch.")
+    max_chars: int = Field(
+        default=12000, ge=500, le=100000, description="Maximum characters to return."
+    )
+
+
+class WebSearchArgs(BaseModel):
+    query: str = Field(description="Search query.")
+    max_results: int | None = Field(
+        default=None, ge=1, le=10, description="Maximum result count."
+    )
 
 
 def _validate_http_url(url: str) -> str | None:
@@ -27,25 +42,12 @@ class WebFetchTool(Tool):
     name = "webfetch"
     concurrency_mode = "read_only"
     description = "Fetch an HTTP(S) URL and return readable text content."
-    parameters = {
-        "type": "object",
-        "properties": {
-            "url": {"type": "string", "description": "HTTP(S) URL to fetch."},
-            "max_chars": {
-                "type": "integer",
-                "minimum": 500,
-                "maximum": 100000,
-                "description": "Maximum characters to return.",
-            },
-        },
-        "required": ["url"],
-    }
+    args_model = WebFetchArgs
 
     def __init__(self, *, config: WebToolConfig) -> None:
         self.config = config
 
-    async def execute(self, url: str, max_chars: int = 12000, **kwargs: Any) -> str:
-        del kwargs
+    async def execute(self, url: str, max_chars: int = 12000) -> str:
         if error := _validate_http_url(url):
             return f"Error: {error}"
         try:
@@ -81,25 +83,12 @@ class WebSearchTool(Tool):
         "Search the web. If tools.web.search_api_url is set, POSTs JSON to that API; "
         "otherwise uses a lightweight DuckDuckGo HTML fallback."
     )
-    parameters = {
-        "type": "object",
-        "properties": {
-            "query": {"type": "string", "description": "Search query."},
-            "max_results": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": 10,
-                "description": "Maximum result count.",
-            },
-        },
-        "required": ["query"],
-    }
+    args_model = WebSearchArgs
 
     def __init__(self, *, config: WebToolConfig) -> None:
         self.config = config
 
-    async def execute(self, query: str, max_results: int | None = None, **kwargs: Any) -> str:
-        del kwargs
+    async def execute(self, query: str, max_results: int | None = None) -> str:
         limit = min(max_results or self.config.max_results, 10)
         try:
             if self.config.search_api_url:

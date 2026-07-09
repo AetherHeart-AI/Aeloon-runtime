@@ -4,43 +4,37 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import re
 import shutil
 from pathlib import Path
-from typing import Any
 
-from aeloon_core.tools.base import Tool
+from pydantic import BaseModel, Field
+
+from aeloon_core.tools.base import WorkspaceTool
 
 
-class GlobTool(Tool):
+class GlobArgs(BaseModel):
+    pattern: str = Field(description="Glob pattern, for example **/*.py.")
+    root: str | None = Field(
+        default=None, description="Optional root directory. Relative paths resolve from workspace."
+    )
+    limit: int = Field(default=200, ge=1, le=1000)
+
+
+class GlobTool(WorkspaceTool):
     """Find files by glob pattern."""
 
     name = "glob"
     concurrency_mode = "read_only"
     description = "Find files matching a glob pattern. Uses workspace as the default root."
-    parameters = {
-        "type": "object",
-        "properties": {
-            "pattern": {"type": "string", "description": "Glob pattern, for example **/*.py."},
-            "root": {
-                "type": "string",
-                "description": "Optional root directory. Relative paths resolve from workspace.",
-            },
-            "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
-        },
-        "required": ["pattern"],
-    }
-
-    def __init__(self, *, workspace: Path) -> None:
-        self.workspace = workspace
+    args_model = GlobArgs
 
     async def execute(
         self,
         pattern: str,
         root: str | None = None,
         limit: int = 200,
-        **kwargs: Any,
     ) -> str:
-        del kwargs
         base = self._resolve(root)
         matches = sorted(path for path in base.glob(pattern) if path.exists())
         limited = matches[:limit]
@@ -54,40 +48,26 @@ class GlobTool(Tool):
             lines.append(f"... {len(matches) - len(limited)} more")
         return "\n".join(lines)
 
-    def _resolve(self, root: str | None) -> Path:
-        if not root:
-            return self.workspace
-        path = Path(root).expanduser()
-        if not path.is_absolute():
-            path = self.workspace / path
-        return path.resolve(strict=False)
+
+class GrepArgs(BaseModel):
+    pattern: str = Field(description="Regex/text pattern to search for.")
+    path: str | None = Field(
+        default=None,
+        description="Optional file or directory. Relative paths resolve from workspace.",
+    )
+    include: str | None = Field(
+        default=None, description="Optional glob include, for example *.py."
+    )
+    limit: int = Field(default=200, ge=1, le=1000)
 
 
-class GrepTool(Tool):
+class GrepTool(WorkspaceTool):
     """Search file contents."""
 
     name = "grep"
     concurrency_mode = "read_only"
     description = "Search text in files. Prefers ripgrep when it is installed."
-    parameters = {
-        "type": "object",
-        "properties": {
-            "pattern": {"type": "string", "description": "Regex/text pattern to search for."},
-            "path": {
-                "type": "string",
-                "description": "Optional file or directory. Relative paths resolve from workspace.",
-            },
-            "include": {
-                "type": "string",
-                "description": "Optional glob include, for example *.py.",
-            },
-            "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
-        },
-        "required": ["pattern"],
-    }
-
-    def __init__(self, *, workspace: Path) -> None:
-        self.workspace = workspace
+    args_model = GrepArgs
 
     async def execute(
         self,
@@ -95,9 +75,7 @@ class GrepTool(Tool):
         path: str | None = None,
         include: str | None = None,
         limit: int = 200,
-        **kwargs: Any,
     ) -> str:
-        del kwargs
         target = self._resolve(path)
         if shutil.which("rg"):
             return await self._run_rg(pattern, target, include, limit)
@@ -140,8 +118,6 @@ class GrepTool(Tool):
         include: str | None,
         limit: int,
     ) -> str:
-        import re
-
         regex = re.compile(pattern)
         files = [target] if target.is_file() else [p for p in target.rglob("*") if p.is_file()]
         matches: list[str] = []
@@ -158,14 +134,6 @@ class GrepTool(Tool):
                     if len(matches) >= limit:
                         return "\n".join(matches)
         return "\n".join(matches) if matches else "(no matches)"
-
-    def _resolve(self, path: str | None) -> Path:
-        if not path:
-            return self.workspace
-        candidate = Path(path).expanduser()
-        if not candidate.is_absolute():
-            candidate = self.workspace / candidate
-        return candidate.resolve(strict=False)
 
 
 def _is_under(path: Path, directory: Path) -> bool:

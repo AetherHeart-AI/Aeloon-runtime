@@ -37,43 +37,6 @@ class TurnResult:
     blocks: list[dict[str, Any]]
 
 
-class ConsoleProgress:
-    """Console progress consumer used by the CLI."""
-
-    def __init__(self) -> None:
-        self._streaming = False
-
-    async def __call__(self, text: str, *, tool_hint: bool = False) -> None:
-        prefix = "tools" if tool_hint else "status"
-        if self._streaming:
-            print()
-            self._streaming = False
-        print(f"[{prefix}] {text}")
-
-    async def on_llm_delta(self, delta: str) -> None:
-        print(delta, end="", flush=True)
-        self._streaming = True
-
-    async def on_tool_calls(self, tool_calls: list[Any]) -> None:
-        if self._streaming:
-            print()
-            self._streaming = False
-        names = ", ".join(call.name for call in tool_calls)
-        print(f"[tool calls] {names}")
-
-    async def on_tool_result(self, node: Any) -> None:
-        result = str(node.result or "")
-        preview = result[:500] + ("..." if len(result) > 500 else "")
-        print(f"[tool result] {node.tool_name}: {preview}")
-
-    async def on_final(self, content: str, **kwargs: Any) -> None:
-        del kwargs
-        if self._streaming:
-            print()
-            self._streaming = False
-        print(f"\n[final]\n{content}")
-
-
 class AeloonCoreOrchestrator:
     """Build messages, run the kernel, and persist turns."""
 

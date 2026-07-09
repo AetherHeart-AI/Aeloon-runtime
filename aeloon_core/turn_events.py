@@ -30,27 +30,17 @@ class TurnEventProgress:
         self._started = False
         self._turn_started_at: str | None = None
 
+    def _payload(self, **extra: Any) -> dict[str, Any]:
+        """Build an event payload stamped with the session and turn ids."""
+
+        return {"session_id": self.session_id, "turn_id": self.turn_id, **extra}
+
     async def __call__(self, text: str, *, tool_hint: bool = False) -> None:
         kind = "tool_hint" if tool_hint else "status"
         if not tool_hint and not _is_internal_status(text):
             await self._append_reasoning_line(text, kind="thought")
-        detail = {
-            "event": "chat.status",
-            "session_id": self.session_id,
-            "turn_id": self.turn_id,
-            "text": _text_summary(text),
-            "kind": kind,
-        }
-        await self.emit(
-            "chat.status",
-            {
-                "session_id": self.session_id,
-                "turn_id": self.turn_id,
-                "text": text,
-                "kind": "tool_hint" if tool_hint else "status",
-                "ts": _now(),
-            },
-        )
+        detail = self._payload(event="chat.status", text=_text_summary(text), kind=kind)
+        await self.emit("chat.status", self._payload(text=text, kind=kind, ts=_now()))
         await self._emit_log(
             level="INFO",
             source="kernel.status",
@@ -61,11 +51,7 @@ class TurnEventProgress:
     async def on_turn_start(self) -> None:
         self._started = True
         self._turn_started_at = _now()
-        payload = {
-            "session_id": self.session_id,
-            "turn_id": self.turn_id,
-            "ts": self._turn_started_at,
-        }
+        payload = self._payload(ts=self._turn_started_at)
         await self.emit("chat.turn.start", payload)
         await self._emit_log(
             level="INFO",
@@ -77,14 +63,12 @@ class TurnEventProgress:
     async def on_llm_delta(self, delta: str) -> None:
         block = await self._ensure_text_block()
         block["content"] = str(block.get("content") or "") + delta
-        payload = {
-            "session_id": self.session_id,
-            "turn_id": self.turn_id,
-            "block_id": block["id"],
-            "delta": delta,
-            "content_length": len(str(block.get("content") or "")),
-            "ts": _now(),
-        }
+        payload = self._payload(
+            block_id=block["id"],
+            delta=delta,
+            content_length=len(str(block.get("content") or "")),
+            ts=_now(),
+        )
         await self.emit("chat.block.delta", payload)
 
     async def on_llm_reasoning_delta(self, delta: str) -> None:
@@ -96,14 +80,12 @@ class TurnEventProgress:
         separator = "\n" if needs_separator else ""
         block["content"] = f"{current}{separator}{delta}"
         self._reasoning_raw_open = True
-        payload = {
-            "session_id": self.session_id,
-            "turn_id": self.turn_id,
-            "block_id": block["id"],
-            "delta": delta,
-            "content_length": len(str(block.get("content") or "")),
-            "ts": _now(),
-        }
+        payload = self._payload(
+            block_id=block["id"],
+            delta=delta,
+            content_length=len(str(block.get("content") or "")),
+            ts=_now(),
+        )
         await self.emit("chat.block.delta", payload)
 
     async def on_llm_response(self, response: Any) -> None:
@@ -117,21 +99,17 @@ class TurnEventProgress:
                 self._reasoning_raw_open = True
                 await self.emit(
                     "chat.block.update",
-                    {
-                        "session_id": self.session_id,
-                        "turn_id": self.turn_id,
-                        "block_id": block["id"],
-                        "patch": {"content": block["content"]},
-                        "ts": _now(),
-                    },
+                    self._payload(
+                        block_id=block["id"],
+                        patch={"content": block["content"]},
+                        ts=_now(),
+                    ),
                 )
-        payload = {
-            "session_id": self.session_id,
-            "turn_id": self.turn_id,
-            "finish_reason": getattr(response, "finish_reason", None),
-            "usage": getattr(response, "usage", {}),
-            "ts": _now(),
-        }
+        payload = self._payload(
+            finish_reason=getattr(response, "finish_reason", None),
+            usage=getattr(response, "usage", {}),
+            ts=_now(),
+        )
         assistant_block = self._find_block(self._text_block_id) if self._text_block_id else None
         reasoning_block = (
             self._find_block(self._reasoning_block_id) if self._reasoning_block_id else None
@@ -182,12 +160,7 @@ class TurnEventProgress:
                 "created_at": _now(),
             }
             self.blocks.append(block)
-            payload = {
-                "session_id": self.session_id,
-                "turn_id": self.turn_id,
-                "block": block,
-                "ts": _now(),
-            }
+            payload = self._payload(block=block, ts=_now())
             await self.emit("chat.block.add", payload)
             await self._emit_log(
                 level="INFO",
@@ -235,13 +208,7 @@ class TurnEventProgress:
             "result": block["result"],
             "completed_at": block["completed_at"],
         }
-        payload = {
-            "session_id": self.session_id,
-            "turn_id": self.turn_id,
-            "block_id": node.call_id,
-            "patch": ui_patch,
-            "ts": _now(),
-        }
+        payload = self._payload(block_id=node.call_id, patch=ui_patch, ts=_now())
         await self.emit("chat.block.update", payload)
         log_patch = {
             "status": block["status"],
@@ -253,16 +220,14 @@ class TurnEventProgress:
             level="ERROR" if block["status"] == "error" else "INFO",
             source="tool.result",
             message=f"tool {node.tool_name} -> {block['status']}",
-            detail={
-                "event": "chat.block.update",
-                "session_id": self.session_id,
-                "turn_id": self.turn_id,
-                "block_id": node.call_id,
-                "patch": log_patch,
-                "ts": payload["ts"],
-                "task_node": _task_node_detail(node),
-                "block": _block_log_detail(block),
-            },
+            detail=self._payload(
+                event="chat.block.update",
+                block_id=node.call_id,
+                patch=log_patch,
+                ts=payload["ts"],
+                task_node=_task_node_detail(node),
+                block=_block_log_detail(block),
+            ),
         )
 
     async def on_final(self, content: str, **kwargs: Any) -> None:
@@ -274,27 +239,23 @@ class TurnEventProgress:
                 reasoning_block["completed_at"] = _now()
                 await self.emit(
                     "chat.block.update",
-                    {
-                        "session_id": self.session_id,
-                        "turn_id": self.turn_id,
-                        "block_id": reasoning_block["id"],
-                        "patch": {
+                    self._payload(
+                        block_id=reasoning_block["id"],
+                        patch={
                             "status": "done",
                             "completed_at": reasoning_block["completed_at"],
                         },
-                        "ts": _now(),
-                    },
+                        ts=_now(),
+                    ),
                 )
                 await self._emit_log(
                     level="INFO",
                     source="reasoning.done",
                     message=f"reasoning block {reasoning_block['id']} completed",
-                    detail={
-                        "event": "chat.block.update",
-                        "session_id": self.session_id,
-                        "turn_id": self.turn_id,
-                        "block": _block_log_detail(reasoning_block),
-                    },
+                    detail=self._payload(
+                        event="chat.block.update",
+                        block=_block_log_detail(reasoning_block),
+                    ),
                 )
         block = None
         if self._text_block_id:
@@ -304,73 +265,69 @@ class TurnEventProgress:
             block["content"] = content
             await self.emit(
                 "chat.block.update",
-                {
-                    "session_id": self.session_id,
-                    "turn_id": self.turn_id,
-                    "block_id": block["id"],
-                    "patch": {"content": content},
-                    "ts": _now(),
-                },
+                self._payload(block_id=block["id"], patch={"content": content}, ts=_now()),
             )
         completed_at = _now()
         duration_ms = _duration_ms(self._turn_started_at, completed_at)
-        payload = {
-            "session_id": self.session_id,
-            "turn_id": self.turn_id,
-            "final": content,
-            "blocks": self.blocks,
-            "duration_ms": duration_ms,
-            "ts": completed_at,
-        }
+        payload = self._payload(
+            final=content,
+            blocks=self.blocks,
+            duration_ms=duration_ms,
+            ts=completed_at,
+        )
         await self.emit("chat.turn.end", payload)
         await self._emit_log(
             level="INFO",
             source="chat.turn.end",
             message=f"turn {self.turn_id} ended",
-            detail={
-                "event": "chat.turn.end",
-                "session_id": self.session_id,
-                "turn_id": self.turn_id,
-                "final": _text_summary(content),
-                "blocks": [_block_log_detail(item) for item in self.blocks],
-                "duration_ms": duration_ms,
-                "ts": completed_at,
-            },
+            detail=self._payload(
+                event="chat.turn.end",
+                final=_text_summary(content),
+                blocks=[_block_log_detail(item) for item in self.blocks],
+                duration_ms=duration_ms,
+                ts=completed_at,
+            ),
         )
 
-    async def _ensure_text_block(self) -> dict[str, Any]:
-        if self._text_block_id:
-            block = self._find_block(self._text_block_id)
+    async def _ensure_block(
+        self,
+        existing_id: str | None,
+        block_type: str,
+        *,
+        extra_fields: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Return the current block of this type, creating and announcing a new one."""
+
+        if existing_id:
+            block = self._find_block(existing_id)
             if block is not None:
                 return block
         block = {
-            "id": f"text-{uuid.uuid4().hex[:10]}",
-            "type": "text",
+            "id": f"{block_type}-{uuid.uuid4().hex[:10]}",
+            "type": block_type,
             "role": "assistant",
             "content": "",
+            **(extra_fields or {}),
             "created_at": _now(),
         }
-        self._text_block_id = block["id"]
         self.blocks.append(block)
-        payload = {
-            "session_id": self.session_id,
-            "turn_id": self.turn_id,
-            "block": block,
-            "ts": _now(),
-        }
+        payload = self._payload(block=block, ts=_now())
         await self.emit("chat.block.add", payload)
         await self._emit_log(
             level="DEBUG",
             source="chat.block.add",
-            message=f"text block {block['id']} added",
-            detail={
-                "event": "chat.block.add",
-                "session_id": self.session_id,
-                "turn_id": self.turn_id,
-                "block": _block_log_detail(block),
-                "ts": payload["ts"],
-            },
+            message=f"{block_type} block {block['id']} added",
+            detail=self._payload(
+                event="chat.block.add",
+                block=_block_log_detail(block),
+                ts=payload["ts"],
+            ),
         )
+        return block
+
+    async def _ensure_text_block(self) -> dict[str, Any]:
+        block = await self._ensure_block(self._text_block_id, "text")
+        self._text_block_id = block["id"]
         return block
 
     async def _append_reasoning_line(
@@ -391,65 +348,30 @@ class TurnEventProgress:
         separator = "\n" if current else ""
         block["content"] = f"{current}{separator}{line}"
         self._reasoning_raw_open = False
-        payload = {
-            "session_id": self.session_id,
-            "turn_id": self.turn_id,
-            "block_id": block["id"],
-            "patch": {"content": block["content"]},
-            "ts": _now(),
-        }
+        payload = self._payload(
+            block_id=block["id"], patch={"content": block["content"]}, ts=_now()
+        )
         await self.emit("chat.block.update", payload)
         await self._emit_log(
             level="DEBUG",
             source="reasoning.update",
             message=f"reasoning {kind}: {clean}",
-            detail={
-                "event": "chat.block.update",
-                "session_id": self.session_id,
-                "turn_id": self.turn_id,
-                "block_id": block["id"],
-                "patch": {"content": _text_summary(block["content"])},
-                "ts": payload["ts"],
-                "line": _text_summary(line),
-                "kind": kind,
-                "entry": entry,
-            },
+            detail=self._payload(
+                event="chat.block.update",
+                block_id=block["id"],
+                patch={"content": _text_summary(block["content"])},
+                ts=payload["ts"],
+                line=_text_summary(line),
+                kind=kind,
+                entry=entry,
+            ),
         )
 
     async def _ensure_reasoning_block(self) -> dict[str, Any]:
-        if self._reasoning_block_id:
-            block = self._find_block(self._reasoning_block_id)
-            if block is not None:
-                return block
-        block = {
-            "id": f"reasoning-{uuid.uuid4().hex[:10]}",
-            "type": "reasoning",
-            "role": "assistant",
-            "content": "",
-            "status": "running",
-            "created_at": _now(),
-        }
-        self._reasoning_block_id = block["id"]
-        self.blocks.append(block)
-        payload = {
-            "session_id": self.session_id,
-            "turn_id": self.turn_id,
-            "block": block,
-            "ts": _now(),
-        }
-        await self.emit("chat.block.add", payload)
-        await self._emit_log(
-            level="DEBUG",
-            source="chat.block.add",
-            message=f"reasoning block {block['id']} added",
-            detail={
-                "event": "chat.block.add",
-                "session_id": self.session_id,
-                "turn_id": self.turn_id,
-                "block": _block_log_detail(block),
-                "ts": payload["ts"],
-            },
+        block = await self._ensure_block(
+            self._reasoning_block_id, "reasoning", extra_fields={"status": "running"}
         )
+        self._reasoning_block_id = block["id"]
         return block
 
     async def _emit_log(
@@ -484,8 +406,6 @@ def _tool_call_detail(tool_call: ToolCallRequest) -> dict[str, Any]:
         "id": tool_call.id,
         "name": tool_call.name,
         "arguments": tool_call.arguments,
-        "provider_specific_fields": tool_call.provider_specific_fields,
-        "function_provider_specific_fields": tool_call.function_provider_specific_fields,
         "openai_tool_call": tool_call.to_openai_tool_call(),
     }
 
@@ -497,10 +417,6 @@ def _task_node_detail(node: TaskNode) -> dict[str, Any]:
         "tool_name": node.tool_name,
         "arguments": node.arguments,
         "mode": node.mode,
-        "resources": [
-            {"kind": resource.kind, "key": resource.key, "access": resource.access}
-            for resource in node.resources
-        ],
         "deps": sorted(node.deps),
         "dependents": sorted(node.dependents),
         "state": str(node.state),

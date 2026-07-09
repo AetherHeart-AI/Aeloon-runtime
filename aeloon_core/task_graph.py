@@ -4,16 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlparse
 
 from aeloon_core.providers.base import ToolCallRequest
 
 if TYPE_CHECKING:
     from aeloon_core.tools.registry import ToolRegistry
-
-_WRITE_FILE_TOOL_NAMES = {"write", "edit"}
 
 
 class TaskState(StrEnum):
@@ -26,15 +22,6 @@ class TaskState(StrEnum):
     CANCELLED = "cancelled"
 
 
-@dataclass(frozen=True)
-class ResourceSpec:
-    """Static resource hint used for conflict analysis."""
-
-    kind: str
-    key: str
-    access: str
-
-
 @dataclass
 class TaskNode:
     """Internal representation of a single tool call in one agent turn."""
@@ -44,7 +31,6 @@ class TaskNode:
     tool_name: str
     arguments: dict[str, Any]
     mode: str
-    resources: list[ResourceSpec]
     deps: set[int] = field(default_factory=set)
     dependents: set[int] = field(default_factory=set)
     state: TaskState = TaskState.PENDING
@@ -52,72 +38,13 @@ class TaskNode:
     error: str | None = None
 
 
-def _normalize_path(path: str) -> str:
-    p = Path(path).expanduser()
-    try:
-        return str(p.resolve(strict=False))
-    except Exception:
-        return str(p)
-
-
-def _extract_resources(
-    tool_name: str,
-    args: dict[str, Any],
-    tools: ToolRegistry,
-) -> list[ResourceSpec]:
-    path = args.get("path")
-    if isinstance(path, str):
-        tool = tools.get(tool_name)
-        if tool is not None and hasattr(tool, "_resolve"):
-            try:
-                resolved = tool._resolve(path)
-                return [
-                    ResourceSpec(
-                        "fs",
-                        str(resolved),
-                        "write" if tool_name in _WRITE_FILE_TOOL_NAMES else "read",
-                    )
-                ]
-            except Exception:
-                pass
-        return [
-            ResourceSpec(
-                "fs",
-                _normalize_path(path),
-                "write" if tool_name in _WRITE_FILE_TOOL_NAMES else "read",
-            )
-        ]
-
-    if tool_name == "webfetch":
-        url = args.get("url")
-        if isinstance(url, str):
-            host = urlparse(url).netloc or url
-            return [ResourceSpec("network", host, "read")]
-
-    if tool_name == "websearch":
-        return [ResourceSpec("network", "search", "read")]
-    if tool_name == "exec":
-        return [ResourceSpec("process", "shell", "exclusive")]
-    if tool_name == "todowrite":
-        return [ResourceSpec("todo", "session", "write")]
-    return [ResourceSpec("unknown", tool_name, "exclusive")]
-
-
-def _conflicts(left: TaskNode, right: TaskNode) -> bool:
-    if left.mode == "exclusive" or right.mode == "exclusive":
-        return True
-    for lhs in left.resources:
-        for rhs in right.resources:
-            if lhs.kind != rhs.kind or lhs.key != rhs.key:
-                continue
-            if lhs.access == "read" and rhs.access == "read":
-                continue
-            return True
-    return False
-
-
 def build_task_graph(tool_calls: list[ToolCallRequest], tools: ToolRegistry) -> list[TaskNode]:
-    """Compile one LLM tool-call batch into an internal conflict graph."""
+    """Compile one LLM tool-call batch into a dependency graph by concurrency mode.
+
+    Independent ``read_only`` calls run concurrently; any ``mutating`` or
+    ``exclusive`` call is a barrier that waits for every earlier call and blocks
+    every later one, so reads never observe a half-applied write.
+    """
 
     nodes: list[TaskNode] = []
     for index, tool_call in enumerate(tool_calls):
@@ -131,13 +58,16 @@ def build_task_graph(tool_calls: list[ToolCallRequest], tools: ToolRegistry) -> 
                 tool_name=tool_call.name,
                 arguments=tool_call.arguments,
                 mode=mode,
-                resources=_extract_resources(tool_call.name, tool_call.arguments, tools),
             )
         )
 
-    for i in range(len(nodes)):
-        for j in range(i + 1, len(nodes)):
-            if _conflicts(nodes[i], nodes[j]):
-                nodes[j].deps.add(i)
-                nodes[i].dependents.add(j)
+    for node in nodes:
+        earlier = nodes[: node.index]
+        # A read waits only for prior barriers; a barrier waits for everything before it.
+        if node.mode == "read_only":
+            node.deps = {other.index for other in earlier if other.mode != "read_only"}
+        else:
+            node.deps = {other.index for other in earlier}
+        for dep in node.deps:
+            nodes[dep].dependents.add(node.index)
     return nodes

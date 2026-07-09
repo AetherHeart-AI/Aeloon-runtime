@@ -97,9 +97,26 @@ class CustomProvider(LLMProvider):
         return await resolve_max_tokens_for_model(
             model,
             max_tokens,
-            api_base=self.api_base,
             http_client=self._http_client,
         )
+
+    async def _create_with_tool_fallback(
+        self,
+        kwargs: dict[str, Any],
+        run: Callable[[dict[str, Any]], Awaitable[LLMResponse]],
+    ) -> LLMResponse:
+        """Run a completion, retrying without tools if the route rejects tooling."""
+
+        try:
+            return await run(kwargs)
+        except Exception as exc:
+            if kwargs.get("tools") and _is_tooling_unsupported_error(exc):
+                fallback = {k: v for k, v in kwargs.items() if k not in ("tools", "tool_choice")}
+                try:
+                    return await run(fallback)
+                except Exception as fallback_error:
+                    return LLMResponse(content=f"Error: {fallback_error}", finish_reason="error")
+            return LLMResponse(content=f"Error: {exc}", finish_reason="error")
 
     async def chat(
         self,
@@ -123,23 +140,11 @@ class CustomProvider(LLMProvider):
             tool_choice=tool_choice,
             response_format=response_format,
         )
-        try:
-            return self._parse(await self._client.chat.completions.create(**kwargs))
-        except Exception as exc:
-            if tools and _is_tooling_unsupported_error(exc):
-                fallback_kwargs = dict(kwargs)
-                fallback_kwargs.pop("tools", None)
-                fallback_kwargs.pop("tool_choice", None)
-                try:
-                    return self._parse(
-                        await self._client.chat.completions.create(**fallback_kwargs)
-                    )
-                except Exception as fallback_error:
-                    return LLMResponse(
-                        content=f"Error: {fallback_error}",
-                        finish_reason="error",
-                    )
-            return LLMResponse(content=f"Error: {exc}", finish_reason="error")
+
+        async def _run(kw: dict[str, Any]) -> LLMResponse:
+            return self._parse(await self._client.chat.completions.create(**kw))
+
+        return await self._create_with_tool_fallback(kwargs, _run)
 
     async def chat_stream(
         self,
@@ -165,8 +170,9 @@ class CustomProvider(LLMProvider):
         )
         kwargs["stream"] = True
         kwargs["stream_options"] = {"include_usage": True}
-        try:
-            stream = await self._client.chat.completions.create(**kwargs)
+
+        async def _run(kw: dict[str, Any]) -> LLMResponse:
+            stream = await self._client.chat.completions.create(**kw)
             if not hasattr(stream, "__aiter__"):
                 return self._parse(stream)
             return await self._collect_stream(
@@ -174,26 +180,8 @@ class CustomProvider(LLMProvider):
                 on_delta=on_delta,
                 on_reasoning_delta=on_reasoning_delta,
             )
-        except Exception as exc:
-            if tools and _is_tooling_unsupported_error(exc):
-                fallback_kwargs = dict(kwargs)
-                fallback_kwargs.pop("tools", None)
-                fallback_kwargs.pop("tool_choice", None)
-                try:
-                    stream = await self._client.chat.completions.create(**fallback_kwargs)
-                    if not hasattr(stream, "__aiter__"):
-                        return self._parse(stream)
-                    return await self._collect_stream(
-                        stream,
-                        on_delta=on_delta,
-                        on_reasoning_delta=on_reasoning_delta,
-                    )
-                except Exception as fallback_error:
-                    return LLMResponse(
-                        content=f"Error: {fallback_error}",
-                        finish_reason="error",
-                    )
-            return LLMResponse(content=f"Error: {exc}", finish_reason="error")
+
+        return await self._create_with_tool_fallback(kwargs, _run)
 
     async def _collect_stream(
         self,

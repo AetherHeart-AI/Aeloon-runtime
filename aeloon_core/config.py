@@ -183,9 +183,8 @@ def _parse_bool(value: str) -> bool:
     raise ValueError(f"invalid boolean value: {value!r}")
 
 
-def _split_env_list(value: str, *, separator: str | None = None) -> list[str]:
-    sep = os.pathsep if separator is None else separator
-    return [item.strip() for item in value.split(sep) if item.strip()]
+def _split_env_list(value: str) -> list[str]:
+    return [item.strip() for item in value.split(os.pathsep) if item.strip()]
 
 
 def _deep_update(target: dict[str, Any], updates: dict[str, Any]) -> None:

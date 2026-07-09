@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
-from aeloon_core.middleware import AgentMiddleware
 from aeloon_core.providers.base import LLMProvider, ToolCallRequest
 from aeloon_core.task_graph import TaskNode, TaskState, build_task_graph
 from aeloon_core.utils.helpers import build_assistant_message
@@ -89,8 +88,6 @@ class _ThinkTagDeltaFilter:
 
 
 def _provider_supports_streaming(provider: LLMProvider) -> bool:
-    if "chat_stream_with_retry" in getattr(provider, "__dict__", {}):
-        return True
     chat_stream = getattr(type(provider), "chat_stream", None)
     return chat_stream is not None and chat_stream is not LLMProvider.chat_stream
 
@@ -166,66 +163,17 @@ def _partition_duplicate_tool_calls(
     return executable, duplicates
 
 
-async def _call_llm_with_middlewares(
-    *,
-    middlewares: list[AgentMiddleware],
-    messages: list[dict],
-    tool_defs: list[dict],
-    call_llm: Callable[[list[dict], list[dict]], Awaitable[LLMResponse]],
-) -> LLMResponse:
-    async def _invoke(index: int, msgs: list[dict], defs: list[dict]) -> LLMResponse:
-        if index >= len(middlewares):
-            return await call_llm(msgs, defs)
-        middleware = middlewares[index]
-
-        async def _next(next_messages: list[dict], next_defs: list[dict]) -> LLMResponse:
-            return await _invoke(index + 1, next_messages, next_defs)
-
-        return await middleware.around_llm(msgs, defs, _next)
-
-    return await _invoke(0, messages, tool_defs)
-
-
-async def _call_tool_with_middlewares(
-    *,
-    middlewares: list[AgentMiddleware],
-    name: str,
-    args: dict | list | None,
-    execute: Callable[[], Awaitable[str]],
-) -> str:
-    async def _invoke(index: int) -> str:
-        if index >= len(middlewares):
-            return await execute()
-        middleware = middlewares[index]
-
-        async def _next() -> str:
-            return await _invoke(index + 1)
-
-        return await middleware.around_tool(name, args, _next)
-
-    return await _invoke(0)
-
-
 async def _execute_tool_batch(
     *,
     tool_calls: list[ToolCallRequest],
     tools: ToolRegistry,
-    middlewares: list[AgentMiddleware],
 ) -> list[TaskNode]:
     nodes = build_task_graph(tool_calls, tools)
     pending = {node.index: node for node in nodes}
     running: dict[int, asyncio.Task[str]] = {}
 
     async def _execute_node(node: TaskNode) -> str:
-        async def _do_tool_call() -> str:
-            return await tools.execute(node.tool_name, node.arguments)
-
-        return await _call_tool_with_middlewares(
-            middlewares=middlewares,
-            name=node.tool_name,
-            args=node.arguments,
-            execute=_do_tool_call,
-        )
+        return await tools.execute(node.tool_name, node.arguments)
 
     try:
         while pending or running:
@@ -438,7 +386,6 @@ async def run_agent_kernel(
     max_iterations: int = 25,
     max_auto_continue_iterations: int = 25,
     max_finalization_iterations: int = 2,
-    middlewares: list[AgentMiddleware] | None = None,
     on_progress: Callable[..., Awaitable[None]] | None = None,
     add_assistant_message: Callable[..., list[dict]] | None = None,
     add_tool_result: Callable[[list[dict], str, str, str], list[dict]] | None = None,
@@ -451,7 +398,6 @@ async def run_agent_kernel(
     add_tool = add_tool_result or _default_add_tool_result
     _strip = strip_think or _default_strip_think
     _tool_hint = tool_hint or _default_tool_hint
-    _middlewares = middlewares or []
 
     base_budget = max(0, max_iterations)
     auto_continue_budget = max(0, max_auto_continue_iterations)
@@ -547,6 +493,72 @@ async def run_agent_kernel(
         messages = add_assistant(messages, final_content)
         await _emit_hook("on_final", final_content, messages=messages)
 
+    async def _grant_more_or_finalize() -> None:
+        """When the budget is spent, grant an auto-continue or enter finalization."""
+        if iteration >= iteration_limit and not await _extend_iteration_budget():
+            await _switch_to_finalization()
+
+    async def _fail_if_unproductive(reason: str, *, immediate: bool = False) -> bool:
+        """Record an unproductive round; stop off-track and return True if over budget."""
+        stop_reason = _record_unproductive_tool_round(reason, immediate=immediate)
+        if stop_reason is None:
+            return False
+        await _stop_off_track(stop_reason)
+        return True
+
+    async def _do_llm_call(
+        current_messages: list[dict],
+        current_tool_defs: list[dict],
+    ) -> LLMResponse:
+        provider_messages = _shrink_answered_tool_args_for_provider(current_messages)
+        delta_hook = getattr(on_progress, "on_llm_delta", None) if on_progress else None
+        reasoning_delta_hook = (
+            getattr(on_progress, "on_llm_reasoning_delta", None) if on_progress else None
+        )
+        if (
+            delta_hook is not None or reasoning_delta_hook is not None
+        ) and _provider_supports_streaming(provider):
+            think_filter = _ThinkTagDeltaFilter()
+
+            async def _on_delta(delta: str) -> None:
+                if delta_hook is None:
+                    return
+                visible = think_filter.feed(delta)
+                if not visible:
+                    return
+                result = delta_hook(visible)
+                if inspect.isawaitable(result):
+                    await result
+
+            async def _on_reasoning_delta(delta: str) -> None:
+                if reasoning_delta_hook is None or not delta:
+                    return
+                result = reasoning_delta_hook(delta)
+                if inspect.isawaitable(result):
+                    await result
+
+            response = await provider.chat_stream_with_retry(
+                messages=provider_messages,
+                tools=current_tool_defs,
+                model=model,
+                on_delta=_on_delta if delta_hook is not None else None,
+                on_reasoning_delta=(
+                    _on_reasoning_delta if reasoning_delta_hook is not None else None
+                ),
+            )
+            tail = think_filter.flush() if delta_hook is not None else ""
+            if tail and delta_hook is not None:
+                result = delta_hook(tail)
+                if inspect.isawaitable(result):
+                    await result
+            return response
+
+        return await provider.chat_with_retry(
+            messages=provider_messages,
+            tools=current_tool_defs,
+            model=model,
+        )
+
     while True:
         if finalizing:
             if finalization_iteration >= finalization_budget:
@@ -576,65 +588,7 @@ async def run_agent_kernel(
                 "Thinking..." if iteration == 1 else f"Thinking (step {iteration})..."
             )
 
-        async def _do_llm_call(
-            current_messages: list[dict],
-            current_tool_defs: list[dict],
-        ) -> LLMResponse:
-            provider_messages = _shrink_answered_tool_args_for_provider(current_messages)
-            delta_hook = getattr(on_progress, "on_llm_delta", None) if on_progress else None
-            reasoning_delta_hook = (
-                getattr(on_progress, "on_llm_reasoning_delta", None) if on_progress else None
-            )
-            if (
-                delta_hook is not None or reasoning_delta_hook is not None
-            ) and _provider_supports_streaming(provider):
-                think_filter = _ThinkTagDeltaFilter()
-
-                async def _on_delta(delta: str) -> None:
-                    if delta_hook is None:
-                        return
-                    visible = think_filter.feed(delta)
-                    if not visible:
-                        return
-                    result = delta_hook(visible)
-                    if inspect.isawaitable(result):
-                        await result
-
-                async def _on_reasoning_delta(delta: str) -> None:
-                    if reasoning_delta_hook is None or not delta:
-                        return
-                    result = reasoning_delta_hook(delta)
-                    if inspect.isawaitable(result):
-                        await result
-
-                response = await provider.chat_stream_with_retry(
-                    messages=provider_messages,
-                    tools=current_tool_defs,
-                    model=model,
-                    on_delta=_on_delta if delta_hook is not None else None,
-                    on_reasoning_delta=(
-                        _on_reasoning_delta if reasoning_delta_hook is not None else None
-                    ),
-                )
-                tail = think_filter.flush() if delta_hook is not None else ""
-                if tail and delta_hook is not None:
-                    result = delta_hook(tail)
-                    if inspect.isawaitable(result):
-                        await result
-                return response
-
-            return await provider.chat_with_retry(
-                messages=provider_messages,
-                tools=current_tool_defs,
-                model=model,
-            )
-
-        response = await _call_llm_with_middlewares(
-            middlewares=_middlewares,
-            messages=call_messages,
-            tool_defs=tool_defs,
-            call_llm=_do_llm_call,
-        )
+        response = await _do_llm_call(call_messages, tool_defs)
         await _emit_hook("on_llm_response", response)
 
         if response.tool_calls:
@@ -686,16 +640,11 @@ async def run_agent_kernel(
                         _format_malformed_arguments_error(bad_call),
                     )
                 if not tool_calls:
-                    reason = _record_unproductive_tool_round(
+                    if await _fail_if_unproductive(
                         "the model only supplied malformed tool arguments"
-                    )
-                    if reason is not None:
-                        await _stop_off_track(reason)
+                    ):
                         break
-                    if iteration >= iteration_limit:
-                        if await _extend_iteration_budget():
-                            continue
-                        await _switch_to_finalization()
+                    await _grant_more_or_finalize()
                     continue
 
             executable_calls, duplicate_calls = _partition_duplicate_tool_calls(
@@ -714,17 +663,12 @@ async def run_agent_kernel(
                     duplicate_tool_result(duplicate.name),
                 )
             if duplicate_calls and not executable_calls:
-                reason = _record_unproductive_tool_round(
+                if await _fail_if_unproductive(
                     "the model repeated tool calls that already ran with identical arguments",
                     immediate=True,
-                )
-                if reason is not None:
-                    await _stop_off_track(reason)
+                ):
                     break
-                if iteration >= iteration_limit:
-                    if await _extend_iteration_budget():
-                        continue
-                    await _switch_to_finalization()
+                await _grant_more_or_finalize()
                 continue
 
             tool_calls = executable_calls
@@ -740,7 +684,6 @@ async def run_agent_kernel(
             executed_nodes = await _execute_tool_batch(
                 tool_calls=tool_calls,
                 tools=tools,
-                middlewares=_middlewares,
             )
             for node in sorted(executed_nodes, key=lambda item: item.index):
                 tools_used.append(node.tool_name)
@@ -752,18 +695,13 @@ async def run_agent_kernel(
                 )
                 await _emit_hook("on_tool_result", node)
             if executed_nodes and all(_tool_result_failed(node.result) for node in executed_nodes):
-                reason = _record_unproductive_tool_round(
+                if await _fail_if_unproductive(
                     "all tool calls in the latest round failed or returned errors"
-                )
-                if reason is not None:
-                    await _stop_off_track(reason)
+                ):
                     break
             else:
                 _record_productive_tool_round()
-            if iteration >= iteration_limit:
-                if await _extend_iteration_budget():
-                    continue
-                await _switch_to_finalization()
+            await _grant_more_or_finalize()
             continue
 
         clean = _strip(response.content)

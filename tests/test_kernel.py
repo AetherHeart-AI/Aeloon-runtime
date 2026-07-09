@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from pydantic import BaseModel
 
 from aeloon_core.kernel import run_agent_kernel
 from aeloon_core.providers.base import LLMProvider, LLMResponse, ToolCallRequest
@@ -10,14 +11,14 @@ from aeloon_core.tools.base import Tool
 from aeloon_core.tools.registry import ToolRegistry
 
 
+class ValueArgs(BaseModel):
+    value: str
+
+
 class EchoTool(Tool):
     name = "echo"
     description = "Echo a value."
-    parameters = {
-        "type": "object",
-        "properties": {"value": {"type": "string"}},
-        "required": ["value"],
-    }
+    args_model = ValueArgs
 
     async def execute(self, value: str) -> str:
         return f"echo:{value}"
@@ -26,11 +27,7 @@ class EchoTool(Tool):
 class FailingTool(Tool):
     name = "fail"
     description = "Return an error."
-    parameters = {
-        "type": "object",
-        "properties": {"value": {"type": "string"}},
-        "required": ["value"],
-    }
+    args_model = ValueArgs
 
     async def execute(self, value: str) -> str:
         return f"Error: failed for {value}"

@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import html
 from pathlib import Path
-from typing import Any
+
+from pydantic import BaseModel, Field
 
 from aeloon_core.skills import SkillInfo, SkillRegistry, xml_leaf
 from aeloon_core.tools.base import Tool
+
+
+class SkillArgs(BaseModel):
+    name: str = Field(description="The name of the skill from the available skills list.")
 
 
 class SkillTool(Tool):
@@ -27,23 +32,13 @@ class SkillTool(Tool):
             "The skill name must match one of the available skills in the system context.",
         ]
     )
-    parameters = {
-        "type": "object",
-        "properties": {
-            "name": {
-                "type": "string",
-                "description": "The name of the skill from the available skills list.",
-            }
-        },
-        "required": ["name"],
-    }
+    args_model = SkillArgs
     _FILE_LIMIT = 10
 
     def __init__(self, *, registry: SkillRegistry) -> None:
         self.registry = registry
 
-    async def execute(self, name: str, **kwargs: Any) -> str:
-        del kwargs
+    async def execute(self, name: str) -> str:
         skill = self.registry.get(name)
         if skill is None:
             available = ", ".join(self.registry.available_names) or "none"

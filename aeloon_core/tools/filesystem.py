@@ -2,46 +2,24 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any
+from pydantic import BaseModel, Field
 
-from aeloon_core.tools.base import Tool
-
-
-class _WorkspaceTool(Tool):
-    def __init__(self, *, workspace: Path) -> None:
-        self.workspace = workspace
-
-    def _resolve(self, path: str) -> Path:
-        candidate = Path(path).expanduser()
-        if not candidate.is_absolute():
-            candidate = self.workspace / candidate
-        return candidate.resolve(strict=False)
+from aeloon_core.tools.base import WorkspaceTool
 
 
-class ReadTool(_WorkspaceTool):
+class ReadArgs(BaseModel):
+    path: str = Field(description="File path to read.")
+    offset: int = Field(default=1, ge=1, description="Line number to start from, 1-indexed.")
+    limit: int | None = Field(default=None, ge=1, description="Maximum number of lines.")
+
+
+class ReadTool(WorkspaceTool):
     """Read file contents with line-numbered output."""
 
     name = "read"
     concurrency_mode = "read_only"
     description = "Read a UTF-8 text file. Returns numbered lines and supports offset/limit."
-    parameters = {
-        "type": "object",
-        "properties": {
-            "path": {"type": "string", "description": "File path to read."},
-            "offset": {
-                "type": "integer",
-                "description": "Line number to start from, 1-indexed.",
-                "minimum": 1,
-            },
-            "limit": {
-                "type": "integer",
-                "description": "Maximum number of lines.",
-                "minimum": 1,
-            },
-        },
-        "required": ["path"],
-    }
+    args_model = ReadArgs
 
     _MAX_CHARS = 128_000
     _DEFAULT_LIMIT = 2_000
@@ -51,9 +29,7 @@ class ReadTool(_WorkspaceTool):
         path: str,
         offset: int = 1,
         limit: int | None = None,
-        **kwargs: Any,
     ) -> str:
-        del kwargs
         try:
             fp = self._resolve(path)
             if not fp.exists():
@@ -106,7 +82,26 @@ class ReadTool(_WorkspaceTool):
             return f"Error reading file: {exc}"
 
 
-class WriteTool(_WorkspaceTool):
+class WriteArgs(BaseModel):
+    path: str = Field(description="File path to write.")
+    content: str = Field(
+        description="Complete content to write. For large files, end with end_marker."
+    )
+    overwrite: bool = Field(
+        default=False, description="Set true only when intentionally replacing an existing file."
+    )
+    end_marker: str | None = Field(
+        default=None,
+        min_length=8,
+        max_length=128,
+        description=(
+            "Optional completion marker. Required for large content. If set, content "
+            "must end with this exact marker and the marker is not written to disk."
+        ),
+    )
+
+
+class WriteTool(WorkspaceTool):
     """Write text content to a file."""
 
     name = "write"
@@ -116,30 +111,7 @@ class WriteTool(_WorkspaceTool):
         "existing files. Large writes must include end_marker and append that marker as "
         "the final characters of content; the marker is stripped before writing."
     )
-    parameters = {
-        "type": "object",
-        "properties": {
-            "path": {"type": "string", "description": "File path to write."},
-            "content": {
-                "type": "string",
-                "description": "Complete content to write. For large files, end with end_marker.",
-            },
-            "overwrite": {
-                "type": "boolean",
-                "description": "Set true only when intentionally replacing an existing file.",
-            },
-            "end_marker": {
-                "type": "string",
-                "description": (
-                    "Optional completion marker. Required for large content. If set, content "
-                    "must end with this exact marker and the marker is not written to disk."
-                ),
-                "minLength": 8,
-                "maxLength": 128,
-            },
-        },
-        "required": ["path", "content"],
-    }
+    args_model = WriteArgs
 
     _LARGE_CONTENT_CHARS = 16_000
 
@@ -149,9 +121,7 @@ class WriteTool(_WorkspaceTool):
         content: str,
         overwrite: bool = False,
         end_marker: str | None = None,
-        **kwargs: Any,
     ) -> str:
-        del kwargs
         try:
             fp = self._resolve(path)
             if fp.exists() and fp.is_dir():
@@ -204,7 +174,16 @@ def _find_match(content: str, old_text: str) -> tuple[str | None, int]:
     return None, 0
 
 
-class EditTool(_WorkspaceTool):
+class EditArgs(BaseModel):
+    path: str = Field(description="File path to edit.")
+    old_text: str = Field(description="Text to replace.")
+    new_text: str = Field(description="Replacement text.")
+    replace_all: bool = Field(
+        default=False, description="Replace every occurrence instead of just one."
+    )
+
+
+class EditTool(WorkspaceTool):
     """Edit a file by replacing text."""
 
     name = "edit"
@@ -213,19 +192,7 @@ class EditTool(_WorkspaceTool):
         "Edit a UTF-8 text file by replacing old_text with new_text. "
         "Set replace_all=true to replace every occurrence."
     )
-    parameters = {
-        "type": "object",
-        "properties": {
-            "path": {"type": "string", "description": "File path to edit."},
-            "old_text": {"type": "string", "description": "Text to replace."},
-            "new_text": {"type": "string", "description": "Replacement text."},
-            "replace_all": {
-                "type": "boolean",
-                "description": "Replace every occurrence instead of just one.",
-            },
-        },
-        "required": ["path", "old_text", "new_text"],
-    }
+    args_model = EditArgs
 
     async def execute(
         self,
@@ -233,9 +200,7 @@ class EditTool(_WorkspaceTool):
         old_text: str,
         new_text: str,
         replace_all: bool = False,
-        **kwargs: Any,
     ) -> str:
-        del kwargs
         try:
             fp = self._resolve(path)
             if not fp.exists():
