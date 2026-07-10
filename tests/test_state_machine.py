@@ -7,10 +7,9 @@ from typing import Any
 import pytest
 from pydantic import BaseModel
 
-from aeloon_core.kernel import run_agent_kernel
 from aeloon_core.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from aeloon_core.state import RunStatus
-from aeloon_core.state_machine import run_agent_loop, run_uasm_kernel
+from aeloon_core.state_machine import run_agent_loop
 from aeloon_core.tools.base import Tool
 from aeloon_core.tools.registry import ToolRegistry
 from aeloon_core.transitions import NodeKind
@@ -157,6 +156,109 @@ async def test_state_machine_routes_explicit_nodes_and_attributes_usage() -> Non
 
 
 @pytest.mark.asyncio
+async def test_a0_stops_after_empty_response_without_rule_recovery() -> None:
+    provider = ScriptedProvider(
+        [
+            LLMResponse(content=None, finish_reason="length"),
+            LLMResponse(content="must not be sampled"),
+        ]
+    )
+
+    state = await run_agent_loop(
+        provider=provider,
+        model="test-model",
+        tools=registry(EchoTool()),
+        messages=[{"role": "user", "content": "answer"}],
+        max_auto_continue_iterations=3,
+        max_finalization_iterations=2,
+        rule_engine_enabled=False,
+        temporary_guard_enabled=False,
+        minimal_context_enabled=False,
+    )
+
+    assert state.metadata.status == RunStatus.TERMINATED_BY_RULE
+    assert "recovery rules are disabled" in (state.metadata.final_content or "")
+    assert len(provider.calls) == 1
+    assert state.metadata.finalization_iteration == 0
+    assert state.guard_state.empty_stop_retries == 0
+    assert state.guard_state.unproductive_tool_rounds == 0
+
+
+@pytest.mark.asyncio
+async def test_a0_hard_iteration_limit_does_not_auto_continue_or_finalize() -> None:
+    provider = ScriptedProvider(
+        [
+            LLMResponse(
+                content=None,
+                tool_calls=[
+                    ToolCallRequest(id="call-1", name="echo", arguments={"value": "one"})
+                ],
+                finish_reason="tool_calls",
+            ),
+            LLMResponse(content="must not be sampled"),
+        ]
+    )
+
+    state = await run_agent_loop(
+        provider=provider,
+        model="test-model",
+        tools=registry(EchoTool()),
+        messages=[{"role": "user", "content": "echo once"}],
+        max_iterations=1,
+        max_auto_continue_iterations=3,
+        max_finalization_iterations=2,
+        rule_engine_enabled=False,
+        temporary_guard_enabled=False,
+        minimal_context_enabled=False,
+    )
+
+    assert state.metadata.status == RunStatus.TERMINATED_BY_RULE
+    assert "hard iteration limit (1)" in (state.metadata.final_content or "")
+    assert state.tools_used == ["echo"]
+    assert len(provider.calls) == 1
+    assert state.guard_state.auto_continue_remaining == 3
+    assert state.metadata.finalization_iteration == 0
+
+
+@pytest.mark.asyncio
+async def test_rule_engine_auto_continues_after_base_iteration_limit() -> None:
+    provider = ScriptedProvider(
+        [
+            LLMResponse(
+                content=None,
+                tool_calls=[
+                    ToolCallRequest(id="call-1", name="echo", arguments={"value": "one"})
+                ],
+                finish_reason="tool_calls",
+            ),
+            LLMResponse(content="done after echo", finish_reason="stop"),
+        ]
+    )
+
+    state = await run_agent_loop(
+        provider=provider,
+        model="test-model",
+        tools=registry(EchoTool()),
+        messages=[{"role": "user", "content": "echo once"}],
+        max_iterations=1,
+        max_auto_continue_iterations=1,
+        max_finalization_iterations=1,
+        temporary_guard_enabled=False,
+        minimal_context_enabled=False,
+    )
+
+    assert state.metadata.status == RunStatus.COMPLETED
+    assert state.metadata.final_content == "done after echo"
+    assert state.tools_used == ["echo"]
+    assert len(provider.calls) == 2
+    assert provider.calls[0]["tools"]
+    assert provider.calls[1]["tools"]
+    assert "MAXIMUM ITERATIONS REACHED" not in provider.calls[1]["messages"][-1]["content"]
+    assert state.guard_state.iteration_limit == 2
+    assert state.guard_state.auto_continue_remaining == 0
+
+
+@pytest.mark.asyncio
 async def test_a0_stops_immediately_after_tool_error_without_recovery_rules() -> None:
     provider = ScriptedProvider(
         [
@@ -184,6 +286,106 @@ async def test_a0_stops_immediately_after_tool_error_without_recovery_rules() ->
     assert "recovery rules are disabled" in (state.metadata.final_content or "")
     assert state.messages[-1]["role"] == "assistant"
     assert len(provider.calls) == 1
+    assert state.guard_state.unproductive_tool_rounds == 0
+
+
+@pytest.mark.asyncio
+async def test_rule_only_runtime_recovers_after_failed_tool_result() -> None:
+    provider = ScriptedProvider(
+        [
+            LLMResponse(
+                content=None,
+                tool_calls=[
+                    ToolCallRequest(id="fail-1", name="fail", arguments={"value": "one"})
+                ],
+                finish_reason="tool_calls",
+            ),
+            LLMResponse(content="recovered"),
+        ]
+    )
+
+    state = await run_agent_loop(
+        provider=provider,
+        model="test-model",
+        tools=registry(FailingTool()),
+        messages=[{"role": "user", "content": "recover"}],
+        temporary_guard_enabled=False,
+        minimal_context_enabled=False,
+    )
+
+    assert state.metadata.status == RunStatus.COMPLETED
+    assert state.metadata.final_content == "recovered"
+    assert state.tools_used == ["fail"]
+    assert len(provider.calls) == 2
+    assert "TOOL ERROR RECOVERY" in provider.calls[1]["messages"][-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_rule_only_runtime_recovers_after_exec_timeout() -> None:
+    provider = ScriptedProvider(
+        [
+            LLMResponse(
+                content=None,
+                tool_calls=[
+                    ToolCallRequest(
+                        id="exec-1",
+                        name="exec",
+                        arguments={"command": "slow command"},
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
+            LLMResponse(content="recovered"),
+        ]
+    )
+
+    state = await run_agent_loop(
+        provider=provider,
+        model="test-model",
+        tools=registry(TimeoutExecTool()),
+        messages=[{"role": "user", "content": "recover"}],
+        temporary_guard_enabled=False,
+        minimal_context_enabled=False,
+    )
+
+    assert state.metadata.status == RunStatus.COMPLETED
+    assert state.metadata.final_content == "recovered"
+    assert state.tools_used == ["exec"]
+    assert state.guard_state.exec_timeout_rounds == 1
+    assert "TOOL ERROR RECOVERY" in provider.calls[1]["messages"][-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_rule_only_runtime_stops_after_repeated_malformed_calls() -> None:
+    provider = ScriptedProvider(
+        [
+            LLMResponse(
+                content=None,
+                tool_calls=[ToolCallRequest(id="bad-1", name="echo", arguments=["bad"])],
+                finish_reason="tool_calls",
+            ),
+            LLMResponse(
+                content=None,
+                tool_calls=[ToolCallRequest(id="bad-2", name="echo", arguments=["bad"])],
+                finish_reason="tool_calls",
+            ),
+        ]
+    )
+
+    state = await run_agent_loop(
+        provider=provider,
+        model="test-model",
+        tools=registry(EchoTool()),
+        messages=[{"role": "user", "content": "malformed"}],
+        temporary_guard_enabled=False,
+        minimal_context_enabled=False,
+    )
+
+    assert state.metadata.status == RunStatus.TERMINATED_BY_RULE
+    assert "malformed tool arguments" in (state.metadata.final_content or "")
+    assert state.tools_used == []
+    assert state.guard_state.unproductive_tool_rounds == 2
+    assert len(provider.calls) == 2
 
 
 @pytest.mark.asyncio
@@ -308,24 +510,9 @@ async def test_preparation_persists_canonical_messages_and_context_usage() -> No
 
 
 @pytest.mark.asyncio
-async def test_uasm_tuple_wrapper_matches_public_result_shape() -> None:
-    result = await run_uasm_kernel(
-        provider=ScriptedProvider([LLMResponse(content="done")]),
-        model="test-model",
-        tools=registry(EchoTool()),
-        messages=[{"role": "user", "content": "answer"}],
-        minimal_context_enabled=False,
-    )
-
-    assert result[0] == "done"
-    assert result[1] == []
-    assert result[2][-1] == {"role": "assistant", "content": "done"}
-
-
-@pytest.mark.asyncio
-async def test_rule_only_uasm_matches_legacy_kernel_for_normal_tool_flow() -> None:
-    def responses() -> list[LLMResponse]:
-        return [
+async def test_preparation_runs_before_every_sampling_call() -> None:
+    provider = ScriptedProvider(
+        [
             LLMResponse(
                 content=None,
                 tool_calls=[
@@ -333,26 +520,104 @@ async def test_rule_only_uasm_matches_legacy_kernel_for_normal_tool_flow() -> No
                 ],
                 finish_reason="tool_calls",
             ),
-            LLMResponse(content="done"),
+            LLMResponse(content="done", finish_reason="stop"),
         ]
-
-    legacy = await run_agent_kernel(
-        provider=ScriptedProvider(responses()),
-        model="test-model",
-        tools=registry(EchoTool()),
-        messages=[{"role": "user", "content": "echo once"}],
     )
-    uasm = await run_uasm_kernel(
-        provider=ScriptedProvider(responses()),
+    preparations: list[list[dict[str, Any]]] = []
+
+    async def prepare_model_input(
+        messages: list[dict[str, Any]],
+        tool_defs: list[dict[str, Any]],
+        additional_messages: list[dict[str, Any]],
+    ) -> Any:
+        del tool_defs, additional_messages
+        preparations.append(copy.deepcopy(messages))
+        prepared_messages = messages
+        if messages[-1].get("role") == "tool":
+            prepared_messages = [
+                *messages,
+                {"role": "system", "content": "prepared after tool output"},
+            ]
+        return SimpleNamespace(messages=prepared_messages, usage={})
+
+    state = await run_agent_loop(
+        provider=provider,
         model="test-model",
         tools=registry(EchoTool()),
         messages=[{"role": "user", "content": "echo once"}],
+        prepare_model_input=prepare_model_input,
         temporary_guard_enabled=False,
         minimal_context_enabled=False,
-        transition_trace_enabled=False,
     )
 
-    assert uasm == legacy
+    assert state.metadata.status == RunStatus.COMPLETED
+    assert len(preparations) == 2
+    assert preparations[1][-1]["role"] == "tool"
+    assert provider.calls[1]["messages"][-1] == {
+        "role": "system",
+        "content": "prepared after tool output",
+    }
+    assert state.messages[-2] == {
+        "role": "system",
+        "content": "prepared after tool output",
+    }
+
+
+@pytest.mark.asyncio
+async def test_exhausted_auto_continue_budget_enters_finalization() -> None:
+    provider = ScriptedProvider(
+        [
+            LLMResponse(
+                content=None,
+                tool_calls=[
+                    ToolCallRequest(id="call-1", name="echo", arguments={"value": "one"})
+                ],
+                finish_reason="tool_calls",
+            ),
+            LLMResponse(
+                content=None,
+                tool_calls=[
+                    ToolCallRequest(id="call-2", name="echo", arguments={"value": "two"})
+                ],
+                finish_reason="tool_calls",
+            ),
+            LLMResponse(content="wrapped up", finish_reason="stop"),
+        ]
+    )
+    prepared_additional_messages: list[list[dict[str, Any]]] = []
+
+    async def prepare_model_input(
+        messages: list[dict[str, Any]],
+        tool_defs: list[dict[str, Any]],
+        additional_messages: list[dict[str, Any]],
+    ) -> Any:
+        del tool_defs
+        prepared_additional_messages.append(copy.deepcopy(additional_messages))
+        return SimpleNamespace(messages=messages, usage={})
+
+    state = await run_agent_loop(
+        provider=provider,
+        model="test-model",
+        tools=registry(EchoTool()),
+        messages=[{"role": "user", "content": "echo twice"}],
+        max_iterations=1,
+        max_auto_continue_iterations=1,
+        max_finalization_iterations=1,
+        prepare_model_input=prepare_model_input,
+        temporary_guard_enabled=False,
+        minimal_context_enabled=False,
+    )
+
+    assert state.metadata.status == RunStatus.COMPLETED
+    assert state.metadata.final_content == "wrapped up"
+    assert state.tools_used == ["echo", "echo"]
+    assert len(provider.calls) == 3
+    assert provider.calls[0]["tools"]
+    assert provider.calls[1]["tools"]
+    assert provider.calls[2]["tools"] == []
+    assert "MAXIMUM ITERATIONS REACHED" in provider.calls[2]["messages"][-1]["content"]
+    assert prepared_additional_messages[:2] == [[], []]
+    assert "MAXIMUM ITERATIONS REACHED" in prepared_additional_messages[2][0]["content"]
 
 
 @pytest.mark.asyncio
@@ -425,6 +690,106 @@ async def test_uasm_finalization_tool_violation_terminates_without_execution() -
     assert state.metadata.status == RunStatus.TERMINATED_BY_RULE
     assert "after tools were disabled" in (state.metadata.final_content or "")
     assert state.tools_used == ["echo"]
+
+
+@pytest.mark.asyncio
+async def test_output_budget_exhaustion_recovers_with_visible_text() -> None:
+    provider = ScriptedProvider(
+        [
+            LLMResponse(
+                content=None,
+                finish_reason="length",
+                reasoning_content="hidden reasoning used the whole output budget",
+            ),
+            LLMResponse(content="visible answer", finish_reason="stop"),
+        ]
+    )
+
+    state = await run_agent_loop(
+        provider=provider,
+        model="test-model",
+        tools=registry(EchoTool()),
+        messages=[{"role": "user", "content": "answer visibly"}],
+        max_iterations=5,
+        max_auto_continue_iterations=0,
+        max_finalization_iterations=1,
+        temporary_guard_enabled=False,
+        minimal_context_enabled=False,
+    )
+
+    assert state.metadata.status == RunStatus.COMPLETED
+    assert state.metadata.final_content == "visible answer"
+    assert state.tools_used == []
+    assert len(provider.calls) == 2
+    assert provider.calls[0]["tools"]
+    assert provider.calls[1]["tools"] == []
+    assert provider.calls[1]["messages"][-1]["role"] == "user"
+    assert "VISIBLE ANSWER REQUIRED" in provider.calls[1]["messages"][-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_repeated_output_budget_exhaustion_returns_visible_failure() -> None:
+    provider = ScriptedProvider(
+        [
+            LLMResponse(content=None, finish_reason="length", reasoning_content="hidden"),
+            LLMResponse(content=None, finish_reason="length", reasoning_content="hidden"),
+            LLMResponse(content=None, finish_reason="length", reasoning_content="hidden"),
+        ]
+    )
+
+    state = await run_agent_loop(
+        provider=provider,
+        model="test-model",
+        tools=registry(EchoTool()),
+        messages=[{"role": "user", "content": "answer visibly"}],
+        max_iterations=5,
+        max_auto_continue_iterations=0,
+        max_finalization_iterations=2,
+        temporary_guard_enabled=False,
+        minimal_context_enabled=False,
+    )
+
+    assert state.metadata.status == RunStatus.TERMINATED_BY_RULE
+    assert "repeatedly exhausted its output budget" in (state.metadata.final_content or "")
+    assert "No final artifact was produced" in (state.metadata.final_content or "")
+    assert state.messages[-1] == {
+        "role": "assistant",
+        "content": state.metadata.final_content,
+    }
+    assert len(provider.calls) == 3
+    assert provider.calls[0]["tools"]
+    assert provider.calls[1]["tools"] == []
+    assert provider.calls[2]["tools"] == []
+
+
+@pytest.mark.asyncio
+async def test_output_budget_exhaustion_without_finalization_retries_once() -> None:
+    provider = ScriptedProvider(
+        [
+            LLMResponse(content=None, finish_reason="length"),
+            LLMResponse(content=None, finish_reason="length"),
+        ]
+    )
+
+    state = await run_agent_loop(
+        provider=provider,
+        model="test-model",
+        tools=registry(EchoTool()),
+        messages=[{"role": "user", "content": "answer visibly"}],
+        max_iterations=5,
+        max_auto_continue_iterations=0,
+        max_finalization_iterations=0,
+        temporary_guard_enabled=False,
+        minimal_context_enabled=False,
+    )
+
+    assert state.metadata.status == RunStatus.TERMINATED_BY_RULE
+    assert "empty response" in (state.metadata.final_content or "")
+    assert state.metadata.finalization_iteration == 0
+    assert state.guard_state.empty_stop_retries == 1
+    assert len(provider.calls) == 2
+    assert provider.calls[0]["tools"]
+    assert provider.calls[1]["tools"]
 
 
 @pytest.mark.asyncio
@@ -523,96 +888,3 @@ async def test_temporary_guard_budget_extension_consumes_finite_auto_budget() ->
     assert state.guard_state.iteration_limit == 4
     assert state.guard_state.auto_continue_remaining == 0
     assert len(provider.calls) == 6
-
-
-@pytest.mark.asyncio
-async def test_rule_only_uasm_matches_legacy_across_recovery_and_terminal_paths() -> None:
-    def tool_call(
-        call_id: str,
-        name: str,
-        arguments: Any,
-    ) -> LLMResponse:
-        return LLMResponse(
-            content=None,
-            tool_calls=[ToolCallRequest(id=call_id, name=name, arguments=arguments)],
-            finish_reason="tool_calls",
-        )
-
-    cases = [
-        (
-            lambda: [
-                tool_call("call-1", "echo", {"value": "one"}),
-                tool_call("call-2", "echo", {"value": "two"}),
-                LLMResponse(content="wrapped"),
-            ],
-            lambda: registry(EchoTool()),
-            {
-                "max_iterations": 1,
-                "max_auto_continue_iterations": 1,
-                "max_finalization_iterations": 1,
-            },
-        ),
-        (
-            lambda: [
-                tool_call(f"call-{index}", "echo", {"value": "same"})
-                for index in range(1, 4)
-            ],
-            lambda: registry(EchoTool()),
-            {
-                "max_iterations": 1,
-                "max_auto_continue_iterations": 5,
-                "max_finalization_iterations": 1,
-            },
-        ),
-        (
-            lambda: [
-                tool_call("bad-1", "echo", ["invalid"]),
-                tool_call("bad-2", "echo", ["invalid"]),
-            ],
-            lambda: registry(EchoTool()),
-            {},
-        ),
-        (
-            lambda: [
-                tool_call("exec-1", "exec", {"command": "first"}),
-                tool_call("exec-2", "exec", {"command": "second"}),
-                LLMResponse(content="recovered"),
-            ],
-            lambda: registry(TimeoutExecTool()),
-            {},
-        ),
-        (
-            lambda: [
-                tool_call("fail-1", "fail", {"value": "one"}),
-                LLMResponse(content="recovered"),
-            ],
-            lambda: registry(FailingTool()),
-            {},
-        ),
-        (
-            lambda: [LLMResponse(content="provider failed", finish_reason="error")],
-            lambda: registry(EchoTool()),
-            {},
-        ),
-    ]
-
-    for responses, tools, limits in cases:
-        legacy = await run_agent_kernel(
-            provider=ScriptedProvider(responses()),
-            model="test-model",
-            tools=tools(),
-            messages=[{"role": "user", "content": "run case"}],
-            **limits,
-        )
-        uasm = await run_uasm_kernel(
-            provider=ScriptedProvider(responses()),
-            model="test-model",
-            tools=tools(),
-            messages=[{"role": "user", "content": "run case"}],
-            temporary_guard_enabled=False,
-            minimal_context_enabled=False,
-            transition_trace_enabled=False,
-            **limits,
-        )
-
-        assert uasm == legacy

@@ -79,26 +79,6 @@ class StateMetadata:
         self.finalization_iteration = max(0, int(self.finalization_iteration))
 
     @property
-    def node(self) -> AgentNode:
-        """Compatibility alias for code that names the phase after its node."""
-
-        return self.phase
-
-    @node.setter
-    def node(self, value: AgentNode | str) -> None:
-        self.phase = AgentNode(value)
-
-    @property
-    def finalization_message(self) -> Message | None:
-        """Compatibility alias for the legacy kernel variable name."""
-
-        return self.finalization_prompt
-
-    @finalization_message.setter
-    def finalization_message(self, value: Message | None) -> None:
-        self.finalization_prompt = value
-
-    @property
     def is_terminal(self) -> bool:
         return self.status.terminal
 

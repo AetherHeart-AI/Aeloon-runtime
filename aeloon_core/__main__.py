@@ -52,7 +52,6 @@ CONFIG_SETTERS = {
         "context_compaction",
         "summary_max_tokens",
     ),
-    "uasm-enabled": ("agents", "defaults", "uasm", "enabled"),
     "uasm-rule-engine-enabled": (
         "agents",
         "defaults",
@@ -411,7 +410,6 @@ def _coerce_config_value(key: str, value: str) -> Any:
         "skills-external",
         "skills-claude-code",
         "context-compaction-enabled",
-        "uasm-enabled",
         "uasm-rule-engine-enabled",
         "uasm-temporary-guard-enabled",
         "uasm-minimal-context-enabled",

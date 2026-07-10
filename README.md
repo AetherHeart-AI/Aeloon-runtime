@@ -1,8 +1,8 @@
 # Aeloon Core
 
-A minimal, independent Aeloon agent-loop playground. It keeps the reusable LLM
-and tool iteration kernel, an OpenAI-compatible provider, a small set of local
-tools, JSONL session persistence, and a terminal debugging CLI.
+A minimal, independent Aeloon agent-loop playground. It provides an explicit
+state-machine runtime, an OpenAI-compatible provider, a small set of local tools,
+JSONL session persistence, and a terminal debugging CLI.
 
 ## Quick Start
 
@@ -68,7 +68,6 @@ uv run aeloon-core config set max-auto-continue-iterations 25
 uv run aeloon-core config set max-finalization-iterations 2
 uv run aeloon-core config set context-compaction-enabled true
 uv run aeloon-core config set context-compaction-trigger-ratio 0.9
-uv run aeloon-core config set uasm-enabled true
 uv run aeloon-core config set uasm-guard-decision-mode full
 ```
 
@@ -109,11 +108,11 @@ table, falling back to `agents.defaults.context_window_tokens`. Tunables live un
 
 ## Unified Agentic State Machine
 
-The experimental UASM runtime is opt-in, so the existing kernel remains the
-default behavior and experiment baseline. Enable the full A3 path with:
+The Unified Agentic State Machine (UASM) is the only agent-loop runtime and uses
+the full A3 policy by default. Its policy components remain independently
+configurable:
 
 ```bash
-uv run aeloon-core config set uasm-enabled true
 uv run aeloon-core config set uasm-rule-engine-enabled true
 uv run aeloon-core config set uasm-temporary-guard-enabled true
 uv run aeloon-core config set uasm-minimal-context-enabled true
@@ -129,12 +128,19 @@ evidence object rather than the transcript.
 
 The experiment switches map to these ablations:
 
-| Group | Runtime configuration |
-| --- | --- |
-| A0 | UASM on; rule engine, TemporaryGuard, and minimal context off |
-| A1 | UASM off; unchanged legacy rule-engine baseline |
-| A2 | UASM, rule engine, and TemporaryGuard on; minimal context off |
-| A3 | UASM, rule engine, TemporaryGuard, and minimal context on |
+| Group | Rule engine | TemporaryGuard | Minimal context |
+| --- | --- | --- | --- |
+| A0 | off | off | off |
+| A1 | on | off | off |
+| A2 | on | on | off |
+| A3 | on | on | on |
+
+All four groups run through the same state machine. The pre-refactor dual-runtime
+implementation is preserved in the local `xzh-122-a1-baseline` branch, so a
+code-level comparison can be made with `git switch xzh-122-a1-baseline` and the
+single-runtime implementation restored with `git switch xz89166/xzh-122-mvp-v10`.
+The hard `max_iterations` cap remains a safety boundary in every group; A0 stops
+at that cap without auto-continuation, recovery prompts, or finalization passes.
 
 Completed UASM turns persist transition records separately at
 `~/.aeloon-core/traces/<session-id>.jsonl`. Each record includes state digests,

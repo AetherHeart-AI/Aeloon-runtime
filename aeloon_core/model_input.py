@@ -24,20 +24,17 @@ class TokenCountedPreparedModelInput(PreparedModelInput, Protocol):
     compacted_tokens: int
 
 
-PreparedModelInputResult: TypeAlias = list[Message] | PreparedModelInput
 PrepareModelInput: TypeAlias = Callable[
     [list[Message], list[Message], list[Message]],
-    Awaitable[PreparedModelInputResult],
+    Awaitable[PreparedModelInput],
 ]
 
 
 def unpack_prepared_model_input(
-    prepared: PreparedModelInputResult,
+    prepared: PreparedModelInput,
 ) -> tuple[list[Message], dict[str, int], int | None]:
-    """Validate and unpack either the legacy list or rich result shape."""
+    """Validate and unpack a typed model-input preparation result."""
 
-    if isinstance(prepared, list):
-        return prepared, {}, None
     messages = prepared.messages
     if not isinstance(messages, list):
         raise TypeError("prepared model input messages must be a list")

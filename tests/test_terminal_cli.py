@@ -51,17 +51,20 @@ def test_context_compaction_config_setters_are_registered() -> None:
 
 
 def test_uasm_config_setters_are_registered() -> None:
-    args = build_parser().parse_args(["config", "set", "uasm-enabled", "true"])
+    args = build_parser().parse_args(
+        ["config", "set", "uasm-rule-engine-enabled", "false"]
+    )
 
     assert args.config_command == "set"
-    assert args.key == "uasm-enabled"
+    assert args.key == "uasm-rule-engine-enabled"
+    assert "uasm-enabled" not in CONFIG_SETTERS
     assert CONFIG_SETTERS["uasm-temporary-guard-enabled"] == (
         "agents",
         "defaults",
         "uasm",
         "temporary_guard_enabled",
     )
-    assert _coerce_config_value("uasm-enabled", "true") is True
+    assert _coerce_config_value("uasm-rule-engine-enabled", "false") is False
     assert _coerce_config_value("uasm-minimal-context-recent-turns", "3") == 3
     assert _coerce_config_value("uasm-guard-decision-mode", "binary") == "binary"
 

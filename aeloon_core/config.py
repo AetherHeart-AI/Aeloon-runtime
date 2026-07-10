@@ -36,9 +36,8 @@ class ContextCompactionConfig(BaseModel):
 
 
 class UASMConfig(BaseModel):
-    """Opt-in Unified Agentic State Machine settings."""
+    """Unified Agentic State Machine policy settings."""
 
-    enabled: bool = False
     rule_engine_enabled: bool = True
     temporary_guard_enabled: bool = True
     minimal_context_enabled: bool = True

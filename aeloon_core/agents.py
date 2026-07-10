@@ -13,16 +13,6 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 
 from aeloon_core.context_compaction import estimate_request_tokens
-from aeloon_core.kernel import (
-    ThinkTagDeltaFilter,
-    default_add_assistant_message,
-    default_add_tool_result,
-    default_strip_think,
-    default_tool_hint,
-    execute_tool_batch,
-    provider_supports_streaming,
-    shrink_answered_tool_args_for_provider,
-)
 from aeloon_core.loop_guard import (
     AgentLoopGuard,
     LoopGuardAction,
@@ -32,6 +22,16 @@ from aeloon_core.loop_guard import (
 )
 from aeloon_core.minimal_context import ContextProcessor, IdentityContextProcessor
 from aeloon_core.model_input import PrepareModelInput, unpack_prepared_model_input
+from aeloon_core.runtime_support import (
+    ThinkTagDeltaFilter,
+    default_add_assistant_message,
+    default_add_tool_result,
+    default_strip_think,
+    default_tool_hint,
+    execute_tool_batch,
+    provider_supports_streaming,
+    shrink_answered_tool_args_for_provider,
+)
 from aeloon_core.state import AgentNode, LightweightState, RunStatus
 from aeloon_core.temporary_guard import GuardEvidence, TemporaryGuard
 from aeloon_core.transitions import NodeKind, TransitionRecorder, normalize_usage
@@ -196,7 +196,7 @@ class AgentRuntime:
         ):
             return False
         state.metadata.status = RunStatus.FINALIZING
-        state.metadata.finalization_message = (
+        state.metadata.finalization_prompt = (
             prompt_message or self.rule_engine.finalization_prompt_message()
         )
         logger.info(
@@ -216,8 +216,28 @@ class AgentRuntime:
         if state.metadata.iteration < self.rule_engine.iteration_limit:
             state.metadata.phase = AgentNode.MASTER
             return state
+        if not self.rule_engine_enabled:
+            return await self.stop_without_rules(
+                state,
+                f"the hard iteration limit ({self.rule_engine.iteration_limit}) was reached",
+            )
         decision = self.rule_engine.handle_iteration_budget_reached()
         return await self.apply_budget_decision(state, decision)
+
+    async def stop_without_rules(
+        self,
+        state: LightweightState,
+        reason: str,
+    ) -> LightweightState:
+        content = f"I stopped because deterministic recovery rules are disabled: {reason}."
+        self.describe_step({"action": "stop", "source": "no_harness"})
+        return await self.finish(
+            state,
+            content=content,
+            status=RunStatus.TERMINATED_BY_RULE,
+            reason=reason,
+            add_message=True,
+        )
 
     async def apply_budget_decision(
         self,
@@ -342,10 +362,7 @@ class WorkerAgent(BaseAgent):
             )
         else:
             if state.metadata.iteration >= guard.iteration_limit:
-                return await self.runtime.apply_budget_decision(
-                    state,
-                    guard.handle_iteration_budget_reached(),
-                )
+                return await self.runtime.grant_more_or_finalize(state)
             state.metadata.iteration += 1
             tool_defs = self.runtime.tools.get_definitions()
             await self.runtime.emit_progress(
@@ -355,7 +372,7 @@ class WorkerAgent(BaseAgent):
             )
 
         additional_messages = (
-            [state.metadata.finalization_message or guard.finalization_prompt_message()]
+            [state.metadata.finalization_prompt or guard.finalization_prompt_message()]
             if state.metadata.status == RunStatus.FINALIZING
             else []
         )
@@ -501,6 +518,11 @@ class WorkerAgent(BaseAgent):
             )
 
         if clean is None:
+            if not self.runtime.rule_engine_enabled:
+                return await self.runtime.stop_without_rules(
+                    state,
+                    "the model returned no visible response",
+                )
             decision = self.runtime.rule_engine.handle_empty_or_exhausted_response(
                 finish_reason=response.finish_reason,
                 finalizing=state.metadata.status == RunStatus.FINALIZING,
@@ -564,7 +586,8 @@ class ToolAgent(BaseAgent):
             await self.runtime.emit_progress(thought)
 
         malformed = self.runtime.rule_engine.handle_malformed_tool_calls(
-            state.pending_tool_calls
+            state.pending_tool_calls,
+            apply_rules=self.runtime.rule_engine_enabled,
         )
         malformed_ids = {tool_call.id for tool_call in malformed.malformed_calls}
         tool_call_dicts: list[dict[str, Any]] = []
@@ -589,7 +612,8 @@ class ToolAgent(BaseAgent):
             )
 
         if malformed.malformed_calls and not self.runtime.rule_engine_enabled:
-            return await self._stop_without_rules(
+            self._clear_pending(state)
+            return await self.runtime.stop_without_rules(
                 state,
                 "the model supplied malformed tool arguments",
             )
@@ -610,6 +634,7 @@ class ToolAgent(BaseAgent):
         duplicate = self.runtime.rule_engine.handle_duplicate_tool_calls(
             state.messages,
             malformed.executable_calls,
+            apply_rules=self.runtime.rule_engine_enabled,
         )
         for tool_call in duplicate.duplicate_calls:
             logger.warning(
@@ -624,7 +649,8 @@ class ToolAgent(BaseAgent):
                 tool_result.content,
             )
         if duplicate.duplicate_calls and not self.runtime.rule_engine_enabled:
-            return await self._stop_without_rules(
+            self._clear_pending(state)
+            return await self.runtime.stop_without_rules(
                 state,
                 "the model repeated a tool call that already ran",
             )
@@ -672,10 +698,13 @@ class ToolAgent(BaseAgent):
             and any(tool_result_failed(node.result) for node in executed_nodes)
             and not self.runtime.rule_engine_enabled
         ):
-            return await self._stop_without_rules(
+            return await self.runtime.stop_without_rules(
                 state,
                 "one or more tool calls in the latest round failed or returned errors",
             )
+
+        if not self.runtime.rule_engine_enabled:
+            return await self.runtime.grant_more_or_finalize(state)
 
         decision = self.runtime.rule_engine.handle_tool_results(executed_nodes)
         self.runtime.describe_step(_decision_summary(decision))
@@ -689,25 +718,6 @@ class ToolAgent(BaseAgent):
         if decision.action == LoopGuardAction.RETURN_TO_MODEL:
             return await self.runtime.return_to_model(state, decision)
         return await self.runtime.grant_more_or_finalize(state)
-
-    async def _stop_without_rules(
-        self,
-        state: LightweightState,
-        reason: str,
-    ) -> LightweightState:
-        self._clear_pending(state)
-        content = (
-            "I stopped after a tool error because deterministic recovery rules are "
-            f"disabled: {reason}."
-        )
-        self.runtime.describe_step({"action": "stop", "source": "no_harness"})
-        return await self.runtime.finish(
-            state,
-            content=content,
-            status=RunStatus.TERMINATED_BY_RULE,
-            reason=reason,
-            add_message=True,
-        )
 
     async def _escalate_or_stop(
         self,

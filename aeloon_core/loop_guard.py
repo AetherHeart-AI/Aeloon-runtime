@@ -490,6 +490,8 @@ class AgentLoopGuard:
     def handle_malformed_tool_calls(
         self,
         tool_calls: list[ToolCallRequest],
+        *,
+        apply_rules: bool = True,
     ) -> ToolCallGuardResult:
         valid: list[ToolCallRequest] = []
         malformed: list[ToolCallRequest] = []
@@ -508,7 +510,7 @@ class AgentLoopGuard:
             for tool_call in malformed
         ]
         decision = LoopGuardDecision(LoopGuardAction.CONTINUE)
-        if malformed and not valid:
+        if apply_rules and malformed and not valid:
             decision = self.handle_unproductive_tool_round(
                 "the model only supplied malformed tool arguments"
             )
@@ -523,6 +525,8 @@ class AgentLoopGuard:
         self,
         messages: list[dict],
         tool_calls: list[ToolCallRequest],
+        *,
+        apply_rules: bool = True,
     ) -> ToolCallGuardResult:
         executable, duplicates = _partition_duplicate_tool_calls(messages, tool_calls)
         tool_results = [
@@ -534,7 +538,7 @@ class AgentLoopGuard:
             for tool_call in duplicates
         ]
         decision = LoopGuardDecision(LoopGuardAction.CONTINUE)
-        if duplicates and not executable:
+        if apply_rules and duplicates and not executable:
             decision = self.handle_unproductive_tool_round(
                 "the model repeated tool calls that already ran with identical arguments"
             )

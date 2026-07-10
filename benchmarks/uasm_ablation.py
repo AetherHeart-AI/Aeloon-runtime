@@ -1,4 +1,4 @@
-"""Print deterministic A0-A3 UASM fault-injection ablations as JSON."""
+"""Print deterministic A0-A3 state-machine fault-injection ablations as JSON."""
 
 from __future__ import annotations
 

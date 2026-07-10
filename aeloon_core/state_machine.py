@@ -186,13 +186,6 @@ async def run_agent_loop(
     return state
 
 
-async def run_uasm_kernel(**kwargs: Any) -> tuple[str | None, list[str], list[dict[str, Any]]]:
-    """Compatibility wrapper returning the legacy kernel result tuple."""
-
-    state = await run_agent_loop(**kwargs)
-    return state.metadata.final_content, state.tools_used, state.messages
-
-
 def _active_tool_names(tool_defs: list[dict[str, Any]]) -> list[str]:
     names: list[str] = []
     for tool in tool_defs:

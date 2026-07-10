@@ -30,7 +30,10 @@ async def test_ablation_runs_all_groups_and_exposes_guard_delta() -> None:
     assert by_key[("duplicate_loop", "A1")]["success"] is False
     assert by_key[("duplicate_loop", "A2")]["success"] is True
     assert by_key[("duplicate_loop", "A2")]["tokens"]["harness"] > 0
-    assert by_key[("duplicate_loop", "A1")]["unproductive_rounds"] is None
+    assert by_key[("duplicate_loop", "A1")]["unproductive_rounds"] == 2
+    assert all(
+        row["unproductive_rounds"] == 0 for row in rows if row["group"] == "A0"
+    )
     assert by_key[("fail_n_then_succeed", "A0")]["success"] is False
     assert by_key[("fail_n_then_succeed", "A1")]["success"] is True
     assert (

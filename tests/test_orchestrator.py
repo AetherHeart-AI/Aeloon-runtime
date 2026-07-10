@@ -40,7 +40,7 @@ class ScriptedProvider(LLMProvider):
         return self.responses.pop(0)
 
 
-def config_for(tmp_path, *, uasm_enabled: bool) -> Config:
+def config_for(tmp_path, *, transition_trace_enabled: bool = True) -> Config:
     return Config.model_validate(
         {
             "workspace": tmp_path,
@@ -51,9 +51,9 @@ def config_for(tmp_path, *, uasm_enabled: bool) -> Config:
                     "model": "test-model",
                     "context_compaction": {"enabled": False},
                     "uasm": {
-                        "enabled": uasm_enabled,
                         "temporary_guard_enabled": False,
                         "minimal_context_enabled": False,
+                        "transition_trace_enabled": transition_trace_enabled,
                     },
                 }
             },
@@ -63,7 +63,7 @@ def config_for(tmp_path, *, uasm_enabled: bool) -> Config:
 
 @pytest.mark.asyncio
 async def test_orchestrator_persists_uasm_usage_and_independent_trace(tmp_path) -> None:
-    orchestrator = AeloonCoreOrchestrator(config_for(tmp_path, uasm_enabled=True))
+    orchestrator = AeloonCoreOrchestrator(config_for(tmp_path))
     orchestrator.provider = ScriptedProvider(
         [LLMResponse(content="done", usage={"total_tokens": 7})]
     )
@@ -88,14 +88,16 @@ async def test_orchestrator_persists_uasm_usage_and_independent_trace(tmp_path) 
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_keeps_legacy_kernel_as_default(tmp_path) -> None:
-    orchestrator = AeloonCoreOrchestrator(config_for(tmp_path, uasm_enabled=False))
-    orchestrator.provider = ScriptedProvider([LLMResponse(content="legacy done")])
+async def test_orchestrator_uses_state_machine_as_the_only_runtime(tmp_path) -> None:
+    orchestrator = AeloonCoreOrchestrator(
+        config_for(tmp_path, transition_trace_enabled=False)
+    )
+    orchestrator.provider = ScriptedProvider([LLMResponse(content="done")])
 
     result = await orchestrator.run_turn("answer", session_id="session-1")
 
-    assert result.status == "legacy"
-    assert result.final_content == "legacy done"
+    assert result.status == "completed"
+    assert result.final_content == "done"
     assert result.transitions == []
     assert orchestrator.sessions.transition_history("session-1") == []
 
@@ -105,7 +107,7 @@ async def test_orchestrator_trace_io_failure_is_observability_only(
     tmp_path,
     monkeypatch,
 ) -> None:
-    orchestrator = AeloonCoreOrchestrator(config_for(tmp_path, uasm_enabled=True))
+    orchestrator = AeloonCoreOrchestrator(config_for(tmp_path))
     orchestrator.provider = ScriptedProvider([LLMResponse(content="done")])
 
     def fail_trace(**_kwargs: Any) -> None:
