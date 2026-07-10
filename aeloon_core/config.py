@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -35,6 +35,19 @@ class ContextCompactionConfig(BaseModel):
     summary_max_tokens: int = Field(default=4096, ge=256)
 
 
+class UASMConfig(BaseModel):
+    """Opt-in Unified Agentic State Machine settings."""
+
+    enabled: bool = False
+    rule_engine_enabled: bool = True
+    temporary_guard_enabled: bool = True
+    minimal_context_enabled: bool = True
+    transition_trace_enabled: bool = True
+    guard_decision_mode: Literal["binary", "full"] = "full"
+    minimal_context_recent_turns: int = Field(default=2, ge=1)
+    minimal_context_tool_result_chars: int = Field(default=1_200, ge=128)
+
+
 class AgentDefaultsConfig(BaseModel):
     """Default generation settings."""
 
@@ -49,6 +62,7 @@ class AgentDefaultsConfig(BaseModel):
     context_compaction: ContextCompactionConfig = Field(
         default_factory=ContextCompactionConfig
     )
+    uasm: UASMConfig = Field(default_factory=UASMConfig)
 
 
 class AgentsConfig(BaseModel):

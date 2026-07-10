@@ -11,6 +11,7 @@ from typing import Any
 
 from aeloon_core.providers.base import ToolCallRequest
 from aeloon_core.task_graph import TaskNode
+from aeloon_core.transitions import accumulate_usage
 
 Emit = Callable[[str, dict[str, Any]], Awaitable[None]]
 LOG_TEXT_PREVIEW_CHARS = 240
@@ -29,6 +30,8 @@ class TurnEventProgress:
         self._reasoning_raw_open = False
         self._started = False
         self._turn_started_at: str | None = None
+        self.usage: dict[str, int] = {}
+        self.usage_by_node_kind: dict[str, dict[str, int]] = {}
 
     def _payload(self, **extra: Any) -> dict[str, Any]:
         """Build an event payload stamped with the session and turn ids."""
@@ -105,9 +108,14 @@ class TurnEventProgress:
                         ts=_now(),
                     ),
                 )
+        call_usage = getattr(response, "usage", {})
+        if isinstance(call_usage, dict):
+            self._record_usage(call_usage, node_kind="domain")
         payload = self._payload(
             finish_reason=getattr(response, "finish_reason", None),
-            usage=getattr(response, "usage", {}),
+            usage=call_usage if isinstance(call_usage, dict) else {},
+            call_usage=call_usage if isinstance(call_usage, dict) else {},
+            aggregate_usage=dict(self.usage),
             ts=_now(),
         )
         assistant_block = self._find_block(self._text_block_id) if self._text_block_id else None
@@ -135,6 +143,34 @@ class TurnEventProgress:
                 ],
             },
         )
+
+    async def on_usage(
+        self,
+        usage: dict[str, Any],
+        *,
+        node_kind: str,
+    ) -> None:
+        """Record non-domain provider usage and publish the turn aggregate."""
+
+        self._record_usage(usage, node_kind=node_kind)
+        await self.emit(
+            "chat.usage",
+            self._payload(
+                usage=dict(self.usage),
+                by_node_kind={
+                    kind: dict(values) for kind, values in self.usage_by_node_kind.items()
+                },
+                node_kind=node_kind,
+                ts=_now(),
+            ),
+        )
+
+    async def on_guard_decision(self, resolution: Any) -> None:
+        """Account for a TemporaryGuard call without exposing response text."""
+
+        usage = getattr(resolution, "usage", {})
+        if isinstance(usage, dict) and usage:
+            await self.on_usage(usage, node_kind="harness")
 
     async def on_tool_calls(self, tool_calls: list[ToolCallRequest]) -> None:
         for tool_call in tool_calls:
@@ -399,6 +435,11 @@ class TurnEventProgress:
             if block.get("id") == block_id:
                 return block
         return None
+
+    def _record_usage(self, usage: dict[str, Any], *, node_kind: str) -> None:
+        accumulate_usage(self.usage, usage)
+        bucket = self.usage_by_node_kind.setdefault(node_kind, {})
+        accumulate_usage(bucket, usage)
 
 
 def _tool_call_detail(tool_call: ToolCallRequest) -> dict[str, Any]:

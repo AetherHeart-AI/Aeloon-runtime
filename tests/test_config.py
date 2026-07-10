@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 
-from aeloon_core.config import load_config
+from aeloon_core.config import Config, load_config
 
 
 def test_legacy_output_budget_settings_are_ignored(monkeypatch, tmp_path) -> None:
@@ -42,3 +42,14 @@ def test_skill_env_overrides(monkeypatch, tmp_path) -> None:
     assert config.skills.external is False
     assert config.skills.claude_code is False
     assert config.skills.paths == ["one", "two"]
+
+
+def test_uasm_defaults_preserve_legacy_runtime() -> None:
+    uasm = Config().agents.defaults.uasm
+
+    assert uasm.enabled is False
+    assert uasm.rule_engine_enabled is True
+    assert uasm.temporary_guard_enabled is True
+    assert uasm.minimal_context_enabled is True
+    assert uasm.transition_trace_enabled is True
+    assert uasm.guard_decision_mode == "full"

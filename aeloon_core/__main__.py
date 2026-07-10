@@ -52,6 +52,49 @@ CONFIG_SETTERS = {
         "context_compaction",
         "summary_max_tokens",
     ),
+    "uasm-enabled": ("agents", "defaults", "uasm", "enabled"),
+    "uasm-rule-engine-enabled": (
+        "agents",
+        "defaults",
+        "uasm",
+        "rule_engine_enabled",
+    ),
+    "uasm-temporary-guard-enabled": (
+        "agents",
+        "defaults",
+        "uasm",
+        "temporary_guard_enabled",
+    ),
+    "uasm-minimal-context-enabled": (
+        "agents",
+        "defaults",
+        "uasm",
+        "minimal_context_enabled",
+    ),
+    "uasm-transition-trace-enabled": (
+        "agents",
+        "defaults",
+        "uasm",
+        "transition_trace_enabled",
+    ),
+    "uasm-guard-decision-mode": (
+        "agents",
+        "defaults",
+        "uasm",
+        "guard_decision_mode",
+    ),
+    "uasm-minimal-context-recent-turns": (
+        "agents",
+        "defaults",
+        "uasm",
+        "minimal_context_recent_turns",
+    ),
+    "uasm-minimal-context-tool-result-chars": (
+        "agents",
+        "defaults",
+        "uasm",
+        "minimal_context_tool_result_chars",
+    ),
     "skills-enabled": ("skills", "enabled"),
     "skills-external": ("skills", "external"),
     "skills-claude-code": ("skills", "claude_code"),
@@ -357,6 +400,8 @@ def _coerce_config_value(key: str, value: str) -> Any:
         "max-finalization-iterations",
         "context-compaction-preserve-recent-turns",
         "context-compaction-summary-max-tokens",
+        "uasm-minimal-context-recent-turns",
+        "uasm-minimal-context-tool-result-chars",
     }:
         return int(value)
     if key == "context-compaction-trigger-ratio":
@@ -366,6 +411,11 @@ def _coerce_config_value(key: str, value: str) -> Any:
         "skills-external",
         "skills-claude-code",
         "context-compaction-enabled",
+        "uasm-enabled",
+        "uasm-rule-engine-enabled",
+        "uasm-temporary-guard-enabled",
+        "uasm-minimal-context-enabled",
+        "uasm-transition-trace-enabled",
     }:
         return _parse_bool(value)
     if key == "skills-paths":

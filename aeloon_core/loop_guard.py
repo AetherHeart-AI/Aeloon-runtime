@@ -62,6 +62,62 @@ class ToolCallGuardResult:
     )
 
 
+@dataclass
+class LoopGuardState:
+    """Mutable counters owned by an agent state and updated by rule decisions."""
+
+    base_budget: int = 0
+    auto_continue_remaining: int = 0
+    finalization_budget: int = 0
+    iteration_limit: int = 0
+    unproductive_tool_rounds: int = 0
+    exec_timeout_rounds: int = 0
+    empty_stop_retries: int = 0
+
+    def __post_init__(self) -> None:
+        for name in (
+            "base_budget",
+            "auto_continue_remaining",
+            "finalization_budget",
+            "iteration_limit",
+            "unproductive_tool_rounds",
+            "exec_timeout_rounds",
+            "empty_stop_retries",
+        ):
+            setattr(self, name, max(0, int(getattr(self, name))))
+
+    @classmethod
+    def from_limits(
+        cls,
+        *,
+        max_iterations: int,
+        max_auto_continue_iterations: int,
+        max_finalization_iterations: int,
+    ) -> LoopGuardState:
+        """Build fresh counters from the public loop budget configuration."""
+
+        base_budget = max(0, max_iterations)
+        return cls(
+            base_budget=base_budget,
+            auto_continue_remaining=max(0, max_auto_continue_iterations),
+            finalization_budget=max(0, max_finalization_iterations),
+            iteration_limit=base_budget,
+        )
+
+    def to_dict(self) -> dict[str, int]:
+        """Return a stable, JSON-serializable counter snapshot."""
+
+        return {
+            "base_budget": self.base_budget,
+            "auto_continue_remaining": self.auto_continue_remaining,
+            "finalization_budget": self.finalization_budget,
+            "iteration_limit": self.iteration_limit,
+            "unproductive_tool_rounds": self.unproductive_tool_rounds,
+            "exec_timeout_rounds": self.exec_timeout_rounds,
+            "empty_stop_retries": self.empty_stop_retries,
+        }
+
+
 _MAX_UNPRODUCTIVE_TOOL_ROUNDS = 2
 _MAX_EXEC_TIMEOUT_ROUNDS = 3
 _MAX_EMPTY_STOP_RETRIES = 1
@@ -253,20 +309,81 @@ class AgentLoopGuard:
         max_unproductive_tool_rounds: int = _MAX_UNPRODUCTIVE_TOOL_ROUNDS,
         max_exec_timeout_rounds: int = _MAX_EXEC_TIMEOUT_ROUNDS,
         max_empty_stop_retries: int = _MAX_EMPTY_STOP_RETRIES,
+        state: LoopGuardState | None = None,
     ) -> None:
         self.max_iterations = max_iterations
         self.max_auto_continue_iterations = max_auto_continue_iterations
         self.max_finalization_iterations = max_finalization_iterations
-        self.base_budget = max(0, max_iterations)
-        self.auto_continue_remaining = max(0, max_auto_continue_iterations)
-        self.finalization_budget = max(0, max_finalization_iterations)
-        self.iteration_limit = self.base_budget
+        self.state = state or LoopGuardState.from_limits(
+            max_iterations=max_iterations,
+            max_auto_continue_iterations=max_auto_continue_iterations,
+            max_finalization_iterations=max_finalization_iterations,
+        )
         self.max_unproductive_tool_rounds = max(0, max_unproductive_tool_rounds)
         self.max_exec_timeout_rounds = max(0, max_exec_timeout_rounds)
         self.max_empty_stop_retries = max(0, max_empty_stop_retries)
-        self.unproductive_tool_rounds = 0
-        self.exec_timeout_rounds = 0
-        self.empty_stop_retries = 0
+
+    @property
+    def guard_state(self) -> LoopGuardState:
+        """Expose the injected counters under an explicit compatibility name."""
+
+        return self.state
+
+    @property
+    def base_budget(self) -> int:
+        return self.state.base_budget
+
+    @base_budget.setter
+    def base_budget(self, value: int) -> None:
+        self.state.base_budget = value
+
+    @property
+    def auto_continue_remaining(self) -> int:
+        return self.state.auto_continue_remaining
+
+    @auto_continue_remaining.setter
+    def auto_continue_remaining(self, value: int) -> None:
+        self.state.auto_continue_remaining = value
+
+    @property
+    def finalization_budget(self) -> int:
+        return self.state.finalization_budget
+
+    @finalization_budget.setter
+    def finalization_budget(self, value: int) -> None:
+        self.state.finalization_budget = value
+
+    @property
+    def iteration_limit(self) -> int:
+        return self.state.iteration_limit
+
+    @iteration_limit.setter
+    def iteration_limit(self, value: int) -> None:
+        self.state.iteration_limit = value
+
+    @property
+    def unproductive_tool_rounds(self) -> int:
+        return self.state.unproductive_tool_rounds
+
+    @unproductive_tool_rounds.setter
+    def unproductive_tool_rounds(self, value: int) -> None:
+        self.state.unproductive_tool_rounds = value
+
+    @property
+    def exec_timeout_rounds(self) -> int:
+        return self.state.exec_timeout_rounds
+
+    @exec_timeout_rounds.setter
+    def exec_timeout_rounds(self, value: int) -> None:
+        self.state.exec_timeout_rounds = value
+
+    @property
+    def empty_stop_retries(self) -> int:
+        return self.state.empty_stop_retries
+
+    @empty_stop_retries.setter
+    def empty_stop_retries(self, value: int) -> None:
+        self.state.empty_stop_retries = value
 
     def finalization_prompt_message(self) -> dict[str, str]:
         return {
@@ -531,3 +648,7 @@ class AgentLoopGuard:
             reason="empty response",
             final_content="Sorry, the AI model returned an empty response. Please try again.",
         )
+
+
+class SimpleRuleEngine(AgentLoopGuard):
+    """UASM name for the existing deterministic loop policy."""

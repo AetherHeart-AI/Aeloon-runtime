@@ -211,8 +211,13 @@ class TerminalEventRenderer:
             return
         if event == "chat.llm.response":
             self._finish_thinking_line()
-            usage = payload.get("usage")
+            usage = payload.get("aggregate_usage", payload.get("usage"))
             self.last_usage = usage if isinstance(usage, dict) else {}
+            return
+        if event == "chat.usage":
+            usage = payload.get("usage")
+            if isinstance(usage, dict):
+                self.last_usage = usage
             return
         if event == "chat.turn.end":
             duration = payload.get("duration_ms")

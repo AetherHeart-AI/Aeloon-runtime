@@ -68,6 +68,8 @@ uv run aeloon-core config set max-auto-continue-iterations 25
 uv run aeloon-core config set max-finalization-iterations 2
 uv run aeloon-core config set context-compaction-enabled true
 uv run aeloon-core config set context-compaction-trigger-ratio 0.9
+uv run aeloon-core config set uasm-enabled true
+uv run aeloon-core config set uasm-guard-decision-mode full
 ```
 
 You can override the path with `AELOON_CORE_CONFIG` or `--config`.
@@ -104,6 +106,47 @@ the model context window, it summarizes older turns into a synthetic system chec
 and keeps the recent tail intact. Context windows come from LiteLLM's public model
 table, falling back to `agents.defaults.context_window_tokens`. Tunables live under
 `agents.defaults.context_compaction`.
+
+## Unified Agentic State Machine
+
+The experimental UASM runtime is opt-in, so the existing kernel remains the
+default behavior and experiment baseline. Enable the full A3 path with:
+
+```bash
+uv run aeloon-core config set uasm-enabled true
+uv run aeloon-core config set uasm-rule-engine-enabled true
+uv run aeloon-core config set uasm-temporary-guard-enabled true
+uv run aeloon-core config set uasm-minimal-context-enabled true
+uv run aeloon-core config set uasm-transition-trace-enabled true
+```
+
+UASM makes the `MasterAgent -> WorkerAgent/ToolAgent` route explicit. Canonical
+conversation history lives in `LightweightState`; forward minimal context is a
+per-call view and does not replace persisted messages. Deterministic loop rules
+handle known failures. Only a repeated ambiguous failure that would otherwise
+stop the loop is escalated to a stateless `TemporaryGuard`, which sees a bounded
+evidence object rather than the transcript.
+
+The experiment switches map to these ablations:
+
+| Group | Runtime configuration |
+| --- | --- |
+| A0 | UASM on; rule engine, TemporaryGuard, and minimal context off |
+| A1 | UASM off; unchanged legacy rule-engine baseline |
+| A2 | UASM, rule engine, and TemporaryGuard on; minimal context off |
+| A3 | UASM, rule engine, TemporaryGuard, and minimal context on |
+
+Completed UASM turns persist transition records separately at
+`~/.aeloon-core/traces/<session-id>.jsonl`. Each record includes state digests,
+the node and decision, wall time, and token usage. Turn records aggregate tokens
+by `domain`, `harness`, and `context_processing` without mixing transition rows
+into session history.
+
+Run the deterministic offline fault-injection ablation without API credentials:
+
+```bash
+uv run python benchmarks/uasm_ablation.py
+```
 
 ## Core Tools
 

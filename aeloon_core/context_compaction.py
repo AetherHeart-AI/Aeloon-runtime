@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import tiktoken
@@ -46,6 +46,7 @@ class CompactionResult:
     compacted_tokens: int
     trigger_tokens: int
     summary: str | None = None
+    usage: dict[str, int] = field(default_factory=dict)
 
 
 async def maybe_compact_messages(
@@ -113,7 +114,7 @@ async def maybe_compact_messages(
         summary_max_tokens=config.summary_max_tokens,
     )
     source = truncate_middle_tokens(source, max_tokens=source_budget, model=model)
-    summary = await _summarize(
+    summary, usage = await _summarize(
         provider=provider,
         model=model,
         system_prefix=system_prefix,
@@ -137,6 +138,7 @@ async def maybe_compact_messages(
         compacted_tokens=compacted_tokens,
         trigger_tokens=trigger_tokens,
         summary=summary,
+        usage=usage,
     )
 
 
@@ -266,7 +268,7 @@ async def _summarize(
     system_prefix: list[dict[str, Any]],
     source: str,
     summary_max_tokens: int,
-) -> str:
+) -> tuple[str, dict[str, int]]:
     prompt = f"{SUMMARY_PROMPT}\n\nTranscript to compact:\n\n{source}"
     response = await provider.chat_with_retry(
         messages=[
@@ -283,8 +285,8 @@ async def _summarize(
     )
     summary = _strip_think(response.content)
     if response.finish_reason == "error" or not summary:
-        return _fallback_summary(source, model=model)
-    return summary
+        return _fallback_summary(source, model=model), dict(response.usage)
+    return summary, dict(response.usage)
 
 
 def _fallback_summary(source: str, *, model: str) -> str:

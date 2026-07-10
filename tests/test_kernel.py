@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -171,6 +172,37 @@ async def test_kernel_prepares_model_input_before_every_sampling_call() -> None:
         "role": "system",
         "content": "prepared after tool output",
     }
+
+
+@pytest.mark.asyncio
+async def test_kernel_accepts_rich_prepared_model_input_result() -> None:
+    provider = ScriptedProvider([LLMResponse(content="done", finish_reason="stop")])
+
+    async def prepare_model_input(
+        messages: list[dict[str, Any]],
+        tool_defs: list[dict[str, Any]],
+        additional_messages: list[dict[str, Any]],
+    ) -> Any:
+        del tool_defs, additional_messages
+        return SimpleNamespace(
+            messages=[*messages, {"role": "system", "content": "prepared"}],
+            usage={"total_tokens": 3},
+        )
+
+    final_content, _, messages = await run_agent_kernel(
+        provider=provider,
+        model="test-model",
+        tools=registry_with_echo(),
+        messages=[{"role": "user", "content": "answer"}],
+        prepare_model_input=prepare_model_input,
+    )
+
+    assert final_content == "done"
+    assert provider.calls[0]["messages"][-1] == {
+        "role": "system",
+        "content": "prepared",
+    }
+    assert messages[-2] == {"role": "system", "content": "prepared"}
 
 
 @pytest.mark.asyncio

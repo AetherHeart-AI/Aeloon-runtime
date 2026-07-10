@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from aeloon_core.loop_guard import AgentLoopGuard, LoopGuardAction
+from aeloon_core.loop_guard import AgentLoopGuard, LoopGuardAction, SimpleRuleEngine
 from aeloon_core.providers.base import ToolCallRequest
 
 
@@ -12,6 +12,17 @@ def _answered_tool_call() -> list[dict]:
         {"role": "assistant", "content": None, "tool_calls": [tool_call.to_openai_tool_call()]},
         {"role": "tool", "tool_call_id": "call-1", "name": "echo", "content": "echo:one"},
     ]
+
+
+def test_simple_rule_engine_exposes_the_compatible_deterministic_policy() -> None:
+    engine = SimpleRuleEngine(
+        max_iterations=1,
+        max_auto_continue_iterations=0,
+        max_finalization_iterations=1,
+    )
+
+    assert isinstance(engine, AgentLoopGuard)
+    assert engine.handle_iteration_budget_reached().action == LoopGuardAction.FINALIZE
 
 
 def test_duplicate_only_round_returns_to_model_then_stops() -> None:

@@ -15,6 +15,7 @@ from aeloon_core.__main__ import (
 )
 from aeloon_core.context import SYSTEM_PROMPT
 from aeloon_core.orchestrator import TurnResult
+from aeloon_core.providers.base import LLMResponse
 from aeloon_core.terminal_cli import TerminalEventRenderer
 from aeloon_core.turn_events import TurnEventProgress
 
@@ -47,6 +48,22 @@ def test_context_compaction_config_setters_are_registered() -> None:
     assert _coerce_config_value("context-compaction-trigger-ratio", "0.85") == 0.85
     assert _coerce_config_value("context-compaction-preserve-recent-tokens", "none") is None
     assert "max-tokens" not in CONFIG_SETTERS
+
+
+def test_uasm_config_setters_are_registered() -> None:
+    args = build_parser().parse_args(["config", "set", "uasm-enabled", "true"])
+
+    assert args.config_command == "set"
+    assert args.key == "uasm-enabled"
+    assert CONFIG_SETTERS["uasm-temporary-guard-enabled"] == (
+        "agents",
+        "defaults",
+        "uasm",
+        "temporary_guard_enabled",
+    )
+    assert _coerce_config_value("uasm-enabled", "true") is True
+    assert _coerce_config_value("uasm-minimal-context-recent-turns", "3") == 3
+    assert _coerce_config_value("uasm-guard-decision-mode", "binary") == "binary"
 
 
 def test_implicit_chat_invocations() -> None:
@@ -144,6 +161,69 @@ async def test_terminal_renderer_keeps_core_info_and_gateway_logs() -> None:
     assert "gateway INFO" in output
     assert "tool.result" in output
     assert renderer.last_turn_duration_ms == 2500
+
+
+@pytest.mark.asyncio
+async def test_turn_progress_aggregates_usage_across_model_calls() -> None:
+    events: list[tuple[str, dict]] = []
+
+    async def emit(event: str, payload: dict) -> None:
+        events.append((event, payload))
+
+    progress = TurnEventProgress(session_id="session-1", emit=emit)
+    await progress.on_llm_response(
+        LLMResponse(
+            content="first",
+            usage={"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        )
+    )
+    await progress.on_llm_response(
+        LLMResponse(
+            content="second",
+            usage={"prompt_tokens": 20, "completion_tokens": 3, "total_tokens": 23},
+        )
+    )
+
+    assert progress.usage == {
+        "prompt_tokens": 30,
+        "completion_tokens": 5,
+        "total_tokens": 35,
+    }
+    response_payloads = [payload for event, payload in events if event == "chat.llm.response"]
+    assert response_payloads[-1]["usage"]["total_tokens"] == 23
+    assert response_payloads[-1]["call_usage"]["total_tokens"] == 23
+    assert response_payloads[-1]["aggregate_usage"]["total_tokens"] == 35
+
+
+@pytest.mark.asyncio
+async def test_turn_progress_attributes_context_and_harness_usage() -> None:
+    events: list[tuple[str, dict]] = []
+
+    async def emit(event: str, payload: dict) -> None:
+        events.append((event, payload))
+
+    progress = TurnEventProgress(session_id="session-1", emit=emit)
+    await progress.on_usage({"total_tokens": 4}, node_kind="context_processing")
+    await progress.on_usage({"total_tokens": 3}, node_kind="harness")
+
+    assert progress.usage["total_tokens"] == 7
+    assert progress.usage_by_node_kind == {
+        "context_processing": {"total_tokens": 4},
+        "harness": {"total_tokens": 3},
+    }
+    assert [event for event, _payload in events] == ["chat.usage", "chat.usage"]
+
+
+@pytest.mark.asyncio
+async def test_terminal_renderer_updates_summary_from_usage_event() -> None:
+    renderer = TerminalEventRenderer(
+        Console(record=True, width=100),
+        show_gateway_logs=False,
+    )
+
+    await renderer.emit("chat.usage", {"usage": {"total_tokens": 9}})
+
+    assert renderer.last_usage == {"total_tokens": 9}
 
 
 def test_terminal_renderer_turn_summary_includes_duration_seconds() -> None:

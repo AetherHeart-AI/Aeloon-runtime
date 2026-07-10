@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import asyncio
+import inspect
+import uuid
+from dataclasses import dataclass, field
 from typing import Any
+
+from loguru import logger
 
 from aeloon_core.config import Config
 from aeloon_core.context import (
@@ -12,13 +17,14 @@ from aeloon_core.context import (
     build_initial_messages,
     refresh_initial_system_message,
 )
-from aeloon_core.context_compaction import maybe_compact_messages
+from aeloon_core.context_compaction import CompactionResult, maybe_compact_messages
 from aeloon_core.kernel import run_agent_kernel
 from aeloon_core.model_metadata import resolve_context_window
 from aeloon_core.providers.base import GenerationSettings
 from aeloon_core.providers.custom_provider import CustomProvider
 from aeloon_core.session import SessionStore
 from aeloon_core.skills import SkillRegistry
+from aeloon_core.state_machine import run_agent_loop
 from aeloon_core.tools.filesystem import EditTool, ReadTool, WriteTool
 from aeloon_core.tools.registry import ToolRegistry
 from aeloon_core.tools.search_grep import GlobTool, GrepTool
@@ -37,6 +43,10 @@ class TurnResult:
     tools_used: list[str]
     messages: list[dict[str, Any]]
     blocks: list[dict[str, Any]]
+    usage: dict[str, Any] = field(default_factory=dict)
+    transitions: list[dict[str, Any]] = field(default_factory=list)
+    status: str | None = None
+    turn_id: str | None = None
 
 
 class AeloonCoreOrchestrator:
@@ -99,6 +109,7 @@ class AeloonCoreOrchestrator:
         messages = refresh_initial_system_message(messages, workspace=self.config.workspace)
         messages = apply_skill_guidance(messages, self.skills.format_guidance())
         messages = append_user_message(messages, prompt)
+        turn_id = str(getattr(on_progress, "turn_id", "") or uuid.uuid4().hex[:12])
         prepare_model_input = None
         if defaults.context_compaction.enabled:
             context_window_tokens = await resolve_context_window(defaults.model)
@@ -108,7 +119,7 @@ class AeloonCoreOrchestrator:
                 current_messages: list[dict[str, Any]],
                 current_tools: list[dict[str, Any]],
                 additional_messages: list[dict[str, Any]],
-            ) -> list[dict[str, Any]]:
+            ) -> CompactionResult:
                 compaction = await maybe_compact_messages(
                     provider=self.provider,
                     model=defaults.model,
@@ -118,19 +129,105 @@ class AeloonCoreOrchestrator:
                     config=defaults.context_compaction,
                     context_window_tokens=context_window_tokens,
                 )
-                return compaction.messages
+                usage_hook = getattr(on_progress, "on_usage", None)
+                if compaction.usage and usage_hook is not None:
+                    hook_result = usage_hook(
+                        compaction.usage,
+                        node_kind="context_processing",
+                    )
+                    if inspect.isawaitable(hook_result):
+                        await hook_result
+                return compaction
 
-        final_content, tools_used, messages = await run_agent_kernel(
-            provider=self.provider,
-            model=defaults.model,
-            tools=self.registry,
-            messages=messages,
-            max_iterations=defaults.max_iterations,
-            max_auto_continue_iterations=defaults.max_auto_continue_iterations,
-            max_finalization_iterations=defaults.max_finalization_iterations,
-            on_progress=on_progress,
-            prepare_model_input=prepare_model_input,
-        )
+        uasm = defaults.uasm
+        if uasm.enabled:
+            trace_write_tail: asyncio.Task[None] | None = None
+            trace_write_failed = False
+
+            async def write_transition(
+                record: dict[str, Any],
+                previous: asyncio.Task[None] | None,
+            ) -> None:
+                nonlocal trace_write_failed
+                if previous is not None:
+                    await previous
+                if trace_write_failed:
+                    return
+                try:
+                    await asyncio.to_thread(
+                        self.sessions.append_transition,
+                        session_id=actual_session_id,
+                        turn_id=turn_id,
+                        transition=record,
+                    )
+                except OSError as exc:
+                    trace_write_failed = True
+                    logger.warning(
+                        "Disabling transition persistence after trace write failed: {}",
+                        exc,
+                    )
+
+            def persist_transition(record: Any) -> None:
+                nonlocal trace_write_tail
+                trace_write_tail = asyncio.create_task(
+                    write_transition(record.to_dict(), trace_write_tail)
+                )
+
+            try:
+                state = await run_agent_loop(
+                    provider=self.provider,
+                    model=defaults.model,
+                    tools=self.registry,
+                    messages=messages,
+                    max_iterations=defaults.max_iterations,
+                    max_auto_continue_iterations=defaults.max_auto_continue_iterations,
+                    max_finalization_iterations=defaults.max_finalization_iterations,
+                    rule_engine_enabled=uasm.rule_engine_enabled,
+                    temporary_guard_enabled=uasm.temporary_guard_enabled,
+                    minimal_context_enabled=uasm.minimal_context_enabled,
+                    transition_trace_enabled=uasm.transition_trace_enabled,
+                    guard_decision_mode=uasm.guard_decision_mode,
+                    minimal_context_recent_turns=uasm.minimal_context_recent_turns,
+                    minimal_context_tool_result_chars=(
+                        uasm.minimal_context_tool_result_chars
+                    ),
+                    session_id=actual_session_id,
+                    turn_id=turn_id,
+                    experiment_labels={"ablation_group": _ablation_group(uasm)},
+                    on_transition=(
+                        persist_transition if uasm.transition_trace_enabled else None
+                    ),
+                    on_progress=on_progress,
+                    prepare_model_input=prepare_model_input,
+                )
+            except BaseException:
+                if trace_write_tail is not None:
+                    trace_write_tail.cancel()
+                    await asyncio.gather(trace_write_tail, return_exceptions=True)
+                raise
+            if trace_write_tail is not None:
+                await trace_write_tail
+            final_content = state.metadata.final_content
+            tools_used = state.tools_used
+            messages = state.messages
+            usage = state.token_ledger.to_dict()
+            transitions = [record.to_dict() for record in state.transitions]
+            status = state.metadata.status.value
+        else:
+            final_content, tools_used, messages = await run_agent_kernel(
+                provider=self.provider,
+                model=defaults.model,
+                tools=self.registry,
+                messages=messages,
+                max_iterations=defaults.max_iterations,
+                max_auto_continue_iterations=defaults.max_auto_continue_iterations,
+                max_finalization_iterations=defaults.max_finalization_iterations,
+                on_progress=on_progress,
+                prepare_model_input=prepare_model_input,
+            )
+            usage = _progress_usage(on_progress)
+            transitions = []
+            status = "legacy"
         blocks = list(getattr(on_progress, "blocks", []) or [])
         self.sessions.append_turn(
             session_id=actual_session_id,
@@ -139,6 +236,8 @@ class AeloonCoreOrchestrator:
             tools_used=tools_used,
             messages=messages,
             blocks=blocks,
+            usage=usage,
+            turn_id=turn_id,
         )
         return TurnResult(
             session_id=actual_session_id,
@@ -146,4 +245,35 @@ class AeloonCoreOrchestrator:
             tools_used=tools_used,
             messages=messages,
             blocks=blocks,
+            usage=usage,
+            transitions=transitions,
+            status=status,
+            turn_id=turn_id,
         )
+
+
+def _progress_usage(on_progress: Any | None) -> dict[str, Any]:
+    totals = getattr(on_progress, "usage", {})
+    by_node_kind = getattr(on_progress, "usage_by_node_kind", {})
+    return {
+        "totals": dict(totals) if isinstance(totals, dict) else {},
+        "by_node_kind": (
+            {
+                str(kind): dict(values)
+                for kind, values in by_node_kind.items()
+                if isinstance(values, dict)
+            }
+            if isinstance(by_node_kind, dict)
+            else {}
+        ),
+    }
+
+
+def _ablation_group(uasm: Any) -> str:
+    if not uasm.rule_engine_enabled:
+        return "A0"
+    if uasm.temporary_guard_enabled and uasm.minimal_context_enabled:
+        return "A3"
+    if uasm.temporary_guard_enabled:
+        return "A2"
+    return "custom"

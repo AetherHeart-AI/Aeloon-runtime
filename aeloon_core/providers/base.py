@@ -12,6 +12,8 @@ from typing import Any
 
 from loguru import logger
 
+from aeloon_core.transitions import accumulate_usage
+
 ResponseFormat = dict[str, str]
 
 
@@ -206,9 +208,12 @@ class LLMProvider(ABC):
     ) -> LLMResponse:
         """Invoke attempt_call with retry on transient provider failures."""
 
+        accumulated_usage: dict[str, int] = {}
         for attempt, delay in enumerate(self._CHAT_RETRY_DELAYS, start=1):
             response = await attempt_call(attempt)
+            accumulate_usage(accumulated_usage, response.usage)
             if response.finish_reason != "error" or not self._is_transient_error(response.content):
+                response.usage = accumulated_usage
                 return response
             logger.warning(
                 "{} transient error (attempt {}/{}), retrying in {}s: {}",
@@ -219,7 +224,10 @@ class LLMProvider(ABC):
                 (response.content or "")[:120].lower(),
             )
             await asyncio.sleep(delay)
-        return await attempt_call(len(self._CHAT_RETRY_DELAYS) + 1)
+        response = await attempt_call(len(self._CHAT_RETRY_DELAYS) + 1)
+        accumulate_usage(accumulated_usage, response.usage)
+        response.usage = accumulated_usage
+        return response
 
     async def chat_stream(
         self,

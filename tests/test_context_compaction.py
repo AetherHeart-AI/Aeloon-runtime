@@ -77,7 +77,14 @@ async def test_maybe_compact_messages_skips_below_trigger() -> None:
 
 @pytest.mark.asyncio
 async def test_maybe_compact_messages_counts_tool_definitions() -> None:
-    provider = ScriptedProvider([LLMResponse(content="Summary from model")])
+    provider = ScriptedProvider(
+        [
+            LLMResponse(
+                content="Summary from model",
+                usage={"prompt_tokens": 30, "completion_tokens": 5, "total_tokens": 35},
+            )
+        ]
+    )
     messages = [
         {"role": "system", "content": "runtime rules"},
         {"role": "user", "content": "old request " + ("alpha " * 200)},
@@ -109,6 +116,11 @@ async def test_maybe_compact_messages_counts_tool_definitions() -> None:
     )
 
     assert result.compacted is True
+    assert result.usage == {
+        "prompt_tokens": 30,
+        "completion_tokens": 5,
+        "total_tokens": 35,
+    }
 
 
 @pytest.mark.asyncio

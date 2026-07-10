@@ -17,6 +17,7 @@ from aeloon_core.loop_guard import (
     LoopGuardDecision,
     rejected_arguments_summary,
 )
+from aeloon_core.model_input import PrepareModelInput, unpack_prepared_model_input
 from aeloon_core.providers.base import LLMProvider, ToolCallRequest
 from aeloon_core.task_graph import TaskNode, TaskState, build_task_graph
 from aeloon_core.utils.helpers import build_assistant_message
@@ -26,7 +27,7 @@ if TYPE_CHECKING:
     from aeloon_core.tools.registry import ToolRegistry
 
 
-def _default_strip_think(text: str | None) -> str | None:
+def default_strip_think(text: str | None) -> str | None:
     if not text:
         return None
     return re.sub(r"<think>[\s\S]*?</think>", "", text).strip() or None
@@ -40,7 +41,7 @@ def _suffix_prefix_len(text: str, prefix: str) -> int:
     return 0
 
 
-class _ThinkTagDeltaFilter:
+class ThinkTagDeltaFilter:
     """Hide streamed <think>...</think> spans while preserving visible deltas."""
 
     _OPEN = "<think>"
@@ -88,12 +89,12 @@ class _ThinkTagDeltaFilter:
         return tail
 
 
-def _provider_supports_streaming(provider: LLMProvider) -> bool:
+def provider_supports_streaming(provider: LLMProvider) -> bool:
     chat_stream = getattr(type(provider), "chat_stream", None)
     return chat_stream is not None and chat_stream is not LLMProvider.chat_stream
 
 
-def _default_tool_hint(tool_calls: list[ToolCallRequest]) -> str:
+def default_tool_hint(tool_calls: list[ToolCallRequest]) -> str:
     def _fmt(tool_call: ToolCallRequest) -> str:
         args = tool_call.arguments or {}
         val = next(iter(args.values()), None) if isinstance(args, dict) else None
@@ -106,7 +107,7 @@ def _default_tool_hint(tool_calls: list[ToolCallRequest]) -> str:
     return ", ".join(_fmt(tool_call) for tool_call in tool_calls)
 
 
-def _default_add_assistant_message(
+def default_add_assistant_message(
     messages: list[dict],
     content: str | None,
     tool_calls: list[dict[str, Any]] | None = None,
@@ -124,7 +125,7 @@ def _default_add_assistant_message(
     return messages
 
 
-def _default_add_tool_result(
+def default_add_tool_result(
     messages: list[dict],
     tool_call_id: str,
     tool_name: str,
@@ -141,7 +142,7 @@ def _default_add_tool_result(
     return messages
 
 
-async def _execute_tool_batch(
+async def execute_tool_batch(
     *,
     tool_calls: list[ToolCallRequest],
     tools: ToolRegistry,
@@ -217,7 +218,7 @@ def _shrink_oversized_tool_arguments(raw: str) -> str:
     )
 
 
-def _shrink_answered_tool_args_for_provider(messages: list[dict]) -> list[dict]:
+def shrink_answered_tool_args_for_provider(messages: list[dict]) -> list[dict]:
     answered = {
         message["tool_call_id"]
         for message in messages
@@ -264,10 +265,7 @@ async def run_agent_kernel(
     max_auto_continue_iterations: int = 25,
     max_finalization_iterations: int = 2,
     on_progress: Callable[..., Awaitable[None]] | None = None,
-    prepare_model_input: Callable[
-        [list[dict], list[dict], list[dict]], Awaitable[list[dict]]
-    ]
-    | None = None,
+    prepare_model_input: PrepareModelInput | None = None,
     add_assistant_message: Callable[..., list[dict]] | None = None,
     add_tool_result: Callable[[list[dict], str, str, str], list[dict]] | None = None,
     strip_think: Callable[[str | None], str | None] | None = None,
@@ -275,10 +273,10 @@ async def run_agent_kernel(
 ) -> tuple[str | None, list[str], list[dict]]:
     """Execute a reusable tool-augmented LLM loop."""
 
-    add_assistant = add_assistant_message or _default_add_assistant_message
-    add_tool = add_tool_result or _default_add_tool_result
-    _strip = strip_think or _default_strip_think
-    _tool_hint = tool_hint or _default_tool_hint
+    add_assistant = add_assistant_message or default_add_assistant_message
+    add_tool = add_tool_result or default_add_tool_result
+    _strip = strip_think or default_strip_think
+    _tool_hint = tool_hint or default_tool_hint
 
     guard = AgentLoopGuard(
         max_iterations=max_iterations,
@@ -377,15 +375,15 @@ async def run_agent_kernel(
         current_messages: list[dict],
         current_tool_defs: list[dict],
     ) -> LLMResponse:
-        provider_messages = _shrink_answered_tool_args_for_provider(current_messages)
+        provider_messages = shrink_answered_tool_args_for_provider(current_messages)
         delta_hook = getattr(on_progress, "on_llm_delta", None) if on_progress else None
         reasoning_delta_hook = (
             getattr(on_progress, "on_llm_reasoning_delta", None) if on_progress else None
         )
         if (
             delta_hook is not None or reasoning_delta_hook is not None
-        ) and _provider_supports_streaming(provider):
-            think_filter = _ThinkTagDeltaFilter()
+        ) and provider_supports_streaming(provider):
+            think_filter = ThinkTagDeltaFilter()
 
             async def _on_delta(delta: str) -> None:
                 if delta_hook is None:
@@ -454,7 +452,10 @@ async def run_agent_kernel(
             else []
         )
         if prepare_model_input is not None:
-            messages = await prepare_model_input(messages, tool_defs, additional_messages)
+            prepared = await prepare_model_input(messages, tool_defs, additional_messages)
+            messages, _preparation_usage, _prepared_tokens = unpack_prepared_model_input(
+                prepared
+            )
         call_messages = [*messages, *additional_messages]
 
         response = await _do_llm_call(call_messages, tool_defs)
@@ -548,7 +549,7 @@ async def run_agent_kernel(
                 args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                 logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
 
-            executed_nodes = await _execute_tool_batch(
+            executed_nodes = await execute_tool_batch(
                 tool_calls=tool_calls,
                 tools=tools,
             )
