@@ -25,6 +25,17 @@ class ProvidersConfig(BaseModel):
     custom: CustomProviderConfig = Field(default_factory=CustomProviderConfig)
 
 
+class ContextCompactionConfig(BaseModel):
+    """Automatic model-context compaction settings."""
+
+    enabled: bool = True
+    trigger_ratio: float = Field(default=0.9, ge=0.1, le=1.0)
+    buffer_tokens: int = Field(default=20_000, ge=0)
+    preserve_recent_turns: int = Field(default=2, ge=1)
+    preserve_recent_tokens: int | None = Field(default=None, ge=1)
+    summary_max_tokens: int = Field(default=4096, ge=256)
+
+
 class AgentDefaultsConfig(BaseModel):
     """Default generation settings."""
 
@@ -37,6 +48,9 @@ class AgentDefaultsConfig(BaseModel):
     max_iterations: int = 25
     max_auto_continue_iterations: int = 25
     max_finalization_iterations: int = 2
+    context_compaction: ContextCompactionConfig = Field(
+        default_factory=ContextCompactionConfig
+    )
 
 
 class AgentsConfig(BaseModel):

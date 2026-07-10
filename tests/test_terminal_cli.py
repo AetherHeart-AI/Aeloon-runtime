@@ -6,6 +6,8 @@ import pytest
 from rich.console import Console
 
 from aeloon_core.__main__ import (
+    CONFIG_SETTERS,
+    _coerce_config_value,
     _load_with_path_overrides,
     _looks_like_implicit_chat,
     _looks_like_legacy_run,
@@ -26,6 +28,25 @@ def test_chat_commands_are_registered() -> None:
     assert _looks_like_legacy_run(["chat"]) is False
     assert _looks_like_legacy_run(["tui"]) is False
     assert _looks_like_legacy_run(["webui"]) is False
+
+
+def test_context_compaction_config_setters_are_registered() -> None:
+    args = build_parser().parse_args(
+        ["config", "set", "context-compaction-trigger-ratio", "0.85"]
+    )
+
+    assert args.config_command == "set"
+    assert args.key == "context-compaction-trigger-ratio"
+    assert CONFIG_SETTERS["context-compaction-enabled"] == (
+        "agents",
+        "defaults",
+        "context_compaction",
+        "enabled",
+    )
+    assert _coerce_config_value("context-compaction-enabled", "false") is False
+    assert _coerce_config_value("context-compaction-trigger-ratio", "0.85") == 0.85
+    assert _coerce_config_value("context-compaction-preserve-recent-tokens", "none") is None
+    assert _coerce_config_value("context-compaction-buffer-tokens", "10000") == 10_000
 
 
 def test_implicit_chat_invocations() -> None:

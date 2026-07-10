@@ -12,7 +12,9 @@ from aeloon_core.context import (
     build_initial_messages,
     refresh_initial_system_message,
 )
+from aeloon_core.context_compaction import maybe_compact_messages
 from aeloon_core.kernel import run_agent_kernel
+from aeloon_core.model_metadata import GENERIC_DEFAULT_MAX_TOKENS, ModelLimits, resolve_model_limits
 from aeloon_core.providers.base import GenerationSettings
 from aeloon_core.providers.custom_provider import CustomProvider
 from aeloon_core.session import SessionStore
@@ -98,6 +100,18 @@ class AeloonCoreOrchestrator:
         messages = refresh_initial_system_message(messages, workspace=self.config.workspace)
         messages = apply_skill_guidance(messages, self.skills.format_guidance())
         messages = append_user_message(messages, prompt)
+        if defaults.context_compaction.enabled:
+            model_limits = await resolve_model_limits(defaults.model)
+            compaction = await maybe_compact_messages(
+                provider=self.provider,
+                model=defaults.model,
+                messages=messages,
+                config=defaults.context_compaction,
+                context_window_tokens=defaults.context_window_tokens,
+                output_tokens=_output_token_budget(defaults.max_tokens, model_limits),
+                model_limits=model_limits,
+            )
+            messages = compaction.messages
         final_content, tools_used, messages = await run_agent_kernel(
             provider=self.provider,
             model=defaults.model,
@@ -124,3 +138,14 @@ class AeloonCoreOrchestrator:
             messages=messages,
             blocks=blocks,
         )
+
+
+def _output_token_budget(
+    configured_max_tokens: int | None,
+    model_limits: ModelLimits | None,
+) -> int:
+    if configured_max_tokens is not None:
+        return max(1, configured_max_tokens)
+    if model_limits and model_limits.output_tokens is not None:
+        return max(1, model_limits.output_tokens)
+    return GENERIC_DEFAULT_MAX_TOKENS

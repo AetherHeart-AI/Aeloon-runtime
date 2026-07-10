@@ -67,6 +67,8 @@ uv run aeloon-core config set model gpt-4.1-mini
 uv run aeloon-core config set max-tokens auto
 uv run aeloon-core config set max-auto-continue-iterations 25
 uv run aeloon-core config set max-finalization-iterations 2
+uv run aeloon-core config set context-compaction-enabled true
+uv run aeloon-core config set context-compaction-trigger-ratio 0.9
 ```
 
 You can override the path with `AELOON_CORE_CONFIG` or `--config`.
@@ -100,6 +102,11 @@ Minimal file example:
 `max_tokens: null` means auto. Aeloon resolves the output budget from public
 model metadata before each call: LiteLLM's `model_prices_and_context_window.json`
 table, and 4,096 only when metadata is unavailable.
+
+Context compaction is enabled by default. When model-visible history nears the
+configured context window, Aeloon summarizes older turns into a synthetic system
+checkpoint and keeps the recent tail intact. Tunables live under
+`agents.defaults.context_compaction`.
 
 ## Core Tools
 

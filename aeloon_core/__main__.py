@@ -28,6 +28,37 @@ CONFIG_SETTERS = {
     "max-iterations": ("agents", "defaults", "max_iterations"),
     "max-auto-continue-iterations": ("agents", "defaults", "max_auto_continue_iterations"),
     "max-finalization-iterations": ("agents", "defaults", "max_finalization_iterations"),
+    "context-compaction-enabled": ("agents", "defaults", "context_compaction", "enabled"),
+    "context-compaction-trigger-ratio": (
+        "agents",
+        "defaults",
+        "context_compaction",
+        "trigger_ratio",
+    ),
+    "context-compaction-buffer-tokens": (
+        "agents",
+        "defaults",
+        "context_compaction",
+        "buffer_tokens",
+    ),
+    "context-compaction-preserve-recent-turns": (
+        "agents",
+        "defaults",
+        "context_compaction",
+        "preserve_recent_turns",
+    ),
+    "context-compaction-preserve-recent-tokens": (
+        "agents",
+        "defaults",
+        "context_compaction",
+        "preserve_recent_tokens",
+    ),
+    "context-compaction-summary-max-tokens": (
+        "agents",
+        "defaults",
+        "context_compaction",
+        "summary_max_tokens",
+    ),
     "skills-enabled": ("skills", "enabled"),
     "skills-external": ("skills", "external"),
     "skills-claude-code": ("skills", "claude_code"),
@@ -329,16 +360,27 @@ def _set_nested_value(data: dict[str, Any], path: tuple[str, ...], value: Any) -
 
 
 def _coerce_config_value(key: str, value: str) -> Any:
+    if key in {"max-tokens", "context-compaction-preserve-recent-tokens"}:
+        if value.strip().lower() in {"auto", "none", "null"}:
+            return None
+        return int(value)
     if key in {
-        "max-tokens",
         "max-iterations",
         "max-auto-continue-iterations",
         "max-finalization-iterations",
+        "context-compaction-buffer-tokens",
+        "context-compaction-preserve-recent-turns",
+        "context-compaction-summary-max-tokens",
     }:
-        if key == "max-tokens" and value.strip().lower() in {"auto", "none", "null"}:
-            return None
         return int(value)
-    if key in {"skills-enabled", "skills-external", "skills-claude-code"}:
+    if key == "context-compaction-trigger-ratio":
+        return float(value)
+    if key in {
+        "skills-enabled",
+        "skills-external",
+        "skills-claude-code",
+        "context-compaction-enabled",
+    }:
         return _parse_bool(value)
     if key == "skills-paths":
         return [item.strip() for item in value.split(",") if item.strip()]
