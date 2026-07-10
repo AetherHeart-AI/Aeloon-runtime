@@ -125,6 +125,55 @@ async def test_kernel_auto_continues_after_tool_iteration_limit() -> None:
 
 
 @pytest.mark.asyncio
+async def test_kernel_prepares_model_input_before_every_sampling_call() -> None:
+    provider = ScriptedProvider(
+        [
+            LLMResponse(
+                content=None,
+                tool_calls=[ToolCallRequest(id="call-1", name="echo", arguments={"value": "one"})],
+                finish_reason="tool_calls",
+            ),
+            LLMResponse(content="done", finish_reason="stop"),
+        ]
+    )
+    preparations: list[list[dict[str, Any]]] = []
+
+    async def prepare_model_input(
+        messages: list[dict[str, Any]],
+        tool_defs: list[dict[str, Any]],
+        additional_messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        del tool_defs, additional_messages
+        preparations.append(copy.deepcopy(messages))
+        if messages[-1].get("role") == "tool":
+            return [
+                *messages,
+                {"role": "system", "content": "prepared after tool output"},
+            ]
+        return messages
+
+    final_content, _, messages = await run_agent_kernel(
+        provider=provider,
+        model="test-model",
+        tools=registry_with_echo(),
+        messages=[{"role": "user", "content": "echo once"}],
+        prepare_model_input=prepare_model_input,
+    )
+
+    assert final_content == "done"
+    assert len(preparations) == 2
+    assert preparations[1][-1]["role"] == "tool"
+    assert provider.calls[1]["messages"][-1] == {
+        "role": "system",
+        "content": "prepared after tool output",
+    }
+    assert messages[-2] == {
+        "role": "system",
+        "content": "prepared after tool output",
+    }
+
+
+@pytest.mark.asyncio
 async def test_kernel_finalizes_after_auto_continue_budget_is_exhausted() -> None:
     provider = ScriptedProvider(
         [
@@ -141,6 +190,16 @@ async def test_kernel_finalizes_after_auto_continue_budget_is_exhausted() -> Non
             LLMResponse(content="wrapped up", finish_reason="stop"),
         ]
     )
+    prepared_additional_messages: list[list[dict[str, Any]]] = []
+
+    async def prepare_model_input(
+        messages: list[dict[str, Any]],
+        tool_defs: list[dict[str, Any]],
+        additional_messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        del tool_defs
+        prepared_additional_messages.append(copy.deepcopy(additional_messages))
+        return messages
 
     final_content, tools_used, messages = await run_agent_kernel(
         provider=provider,
@@ -150,6 +209,7 @@ async def test_kernel_finalizes_after_auto_continue_budget_is_exhausted() -> Non
         max_iterations=1,
         max_auto_continue_iterations=1,
         max_finalization_iterations=1,
+        prepare_model_input=prepare_model_input,
     )
 
     assert final_content == "wrapped up"
@@ -160,6 +220,8 @@ async def test_kernel_finalizes_after_auto_continue_budget_is_exhausted() -> Non
     assert provider.calls[1]["tools"]
     assert provider.calls[2]["tools"] == []
     assert "MAXIMUM ITERATIONS REACHED" in provider.calls[2]["messages"][-1]["content"]
+    assert prepared_additional_messages[:2] == [[], []]
+    assert "MAXIMUM ITERATIONS REACHED" in prepared_additional_messages[2][0]["content"]
 
 
 @pytest.mark.asyncio

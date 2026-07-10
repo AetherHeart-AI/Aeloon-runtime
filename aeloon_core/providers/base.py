@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -68,7 +69,6 @@ class GenerationSettings:
     """Default generation parameters for LLM calls."""
 
     temperature: float = 0.7
-    max_tokens: int | None = None
     reasoning_effort: str | None = None
 
 
@@ -77,16 +77,14 @@ class LLMProvider(ABC):
 
     _CHAT_RETRY_DELAYS = (1, 2, 4)
     _TRANSIENT_ERROR_MARKERS = (
-        "429",
         "rate limit",
-        "500",
-        "502",
-        "503",
-        "504",
         "overloaded",
         "connection",
         "server error",
         "temporarily unavailable",
+    )
+    _TRANSIENT_STATUS_RE = re.compile(
+        r"\b(?:error code|status(?: code)?|http)\s*[:=]?\s*(?:429|500|502|503|504)\b"
     )
     _SENTINEL = object()
 
@@ -152,7 +150,9 @@ class LLMProvider(ABC):
     @classmethod
     def _is_transient_error(cls, content: str | None) -> bool:
         err = (content or "").lower()
-        return any(marker in err for marker in cls._TRANSIENT_ERROR_MARKERS)
+        return bool(cls._TRANSIENT_STATUS_RE.search(err)) or any(
+            marker in err for marker in cls._TRANSIENT_ERROR_MARKERS
+        )
 
     async def _safe_call(self, coro: Awaitable[LLMResponse]) -> LLMResponse:
         """Await an LLM coroutine with a timeout, converting failures to errors."""
@@ -175,7 +175,7 @@ class LLMProvider(ABC):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
         model: str | None,
-        max_tokens: object,
+        max_tokens: int | None,
         temperature: object,
         reasoning_effort: object,
         tool_choice: str | dict[str, Any] | None,
@@ -186,7 +186,7 @@ class LLMProvider(ABC):
             messages=messages,
             tools=tools,
             model=model,
-            max_tokens=self.generation.max_tokens if max_tokens is self._SENTINEL else max_tokens,
+            max_tokens=max_tokens,
             temperature=(
                 self.generation.temperature if temperature is self._SENTINEL else temperature
             ),
@@ -251,7 +251,7 @@ class LLMProvider(ABC):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         model: str | None = None,
-        max_tokens: object = _SENTINEL,
+        max_tokens: int | None = None,
         temperature: object = _SENTINEL,
         reasoning_effort: object = _SENTINEL,
         tool_choice: str | dict[str, Any] | None = None,
@@ -278,7 +278,7 @@ class LLMProvider(ABC):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         model: str | None = None,
-        max_tokens: object = _SENTINEL,
+        max_tokens: int | None = None,
         temperature: object = _SENTINEL,
         reasoning_effort: object = _SENTINEL,
         tool_choice: str | dict[str, Any] | None = None,

@@ -10,7 +10,6 @@ import httpx
 import json_repair
 from openai import AsyncOpenAI
 
-from aeloon_core.model_metadata import resolve_max_tokens_for_model
 from aeloon_core.providers.base import (
     GenerationSettings,
     LLMProvider,
@@ -71,7 +70,7 @@ class CustomProvider(LLMProvider):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         model: str | None = None,
-        max_tokens: int = 4096,
+        max_tokens: int | None = None,
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
@@ -80,9 +79,10 @@ class CustomProvider(LLMProvider):
         kwargs: dict[str, Any] = {
             "model": model or self.default_model,
             "messages": self._sanitize_empty_content(messages),
-            "max_tokens": max(1, max_tokens),
             "temperature": temperature,
         }
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max(1, max_tokens)
         if reasoning_effort:
             kwargs["reasoning_effort"] = reasoning_effort
         if tools:
@@ -92,13 +92,6 @@ class CustomProvider(LLMProvider):
         if response_format is not None:
             kwargs["response_format"] = response_format
         return kwargs
-
-    async def _resolve_max_tokens(self, model: str, max_tokens: int | None) -> int:
-        return await resolve_max_tokens_for_model(
-            model,
-            max_tokens,
-            http_client=self._http_client,
-        )
 
     async def _create_with_tool_fallback(
         self,
@@ -134,7 +127,7 @@ class CustomProvider(LLMProvider):
             messages=messages,
             tools=tools,
             model=resolved_model,
-            max_tokens=await self._resolve_max_tokens(resolved_model, max_tokens),
+            max_tokens=max_tokens,
             temperature=temperature,
             reasoning_effort=reasoning_effort,
             tool_choice=tool_choice,
@@ -163,7 +156,7 @@ class CustomProvider(LLMProvider):
             messages=messages,
             tools=tools,
             model=resolved_model,
-            max_tokens=await self._resolve_max_tokens(resolved_model, max_tokens),
+            max_tokens=max_tokens,
             temperature=temperature,
             reasoning_effort=reasoning_effort,
             tool_choice=tool_choice,

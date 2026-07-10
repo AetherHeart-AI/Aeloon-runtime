@@ -46,7 +46,7 @@ def test_context_compaction_config_setters_are_registered() -> None:
     assert _coerce_config_value("context-compaction-enabled", "false") is False
     assert _coerce_config_value("context-compaction-trigger-ratio", "0.85") == 0.85
     assert _coerce_config_value("context-compaction-preserve-recent-tokens", "none") is None
-    assert _coerce_config_value("context-compaction-buffer-tokens", "10000") == 10_000
+    assert "max-tokens" not in CONFIG_SETTERS
 
 
 def test_implicit_chat_invocations() -> None:

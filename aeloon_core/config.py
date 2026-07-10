@@ -30,7 +30,6 @@ class ContextCompactionConfig(BaseModel):
 
     enabled: bool = True
     trigger_ratio: float = Field(default=0.9, ge=0.1, le=1.0)
-    buffer_tokens: int = Field(default=20_000, ge=0)
     preserve_recent_turns: int = Field(default=2, ge=1)
     preserve_recent_tokens: int | None = Field(default=None, ge=1)
     summary_max_tokens: int = Field(default=4096, ge=256)
@@ -41,7 +40,6 @@ class AgentDefaultsConfig(BaseModel):
 
     model: str = "default"
     temperature: float = 0.7
-    max_tokens: int | None = None
     reasoning_effort: str | None = None
     chat_timeout: int = 3600
     context_window_tokens: int = 128_000
@@ -143,10 +141,6 @@ def load_config(path: Path | str | None = None) -> Config:
         updates.setdefault("providers", {}).setdefault("custom", {})["api_base"] = api_base
     if model := os.environ.get("AELOON_CORE_MODEL"):
         updates.setdefault("agents", {}).setdefault("defaults", {})["model"] = model
-    if max_tokens := os.environ.get("AELOON_CORE_MAX_TOKENS"):
-        updates.setdefault("agents", {}).setdefault("defaults", {})["max_tokens"] = (
-            _parse_optional_int(max_tokens)
-        )
     if workspace := os.environ.get("AELOON_CORE_WORKSPACE"):
         updates["workspace"] = workspace
     if data_dir := os.environ.get("AELOON_CORE_DATA_DIR"):
@@ -179,13 +173,6 @@ def save_config(config: Config, path: Path | str | None = None) -> Path:
         encoding="utf-8",
     )
     return config_path
-
-
-def _parse_optional_int(value: str) -> int | None:
-    normalized = value.strip().lower()
-    if normalized in {"", "auto", "none", "null"}:
-        return None
-    return int(value)
 
 
 def _parse_bool(value: str) -> bool:

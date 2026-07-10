@@ -64,7 +64,6 @@ Inspect or update it later:
 uv run aeloon-core config path
 uv run aeloon-core config show
 uv run aeloon-core config set model gpt-4.1-mini
-uv run aeloon-core config set max-tokens auto
 uv run aeloon-core config set max-auto-continue-iterations 25
 uv run aeloon-core config set max-finalization-iterations 2
 uv run aeloon-core config set context-compaction-enabled true
@@ -77,7 +76,6 @@ Environment variables override file values:
 - `AELOON_CORE_API_KEY`
 - `AELOON_CORE_API_BASE`
 - `AELOON_CORE_MODEL`
-- `AELOON_CORE_MAX_TOKENS` (`auto` uses model-aware defaults)
 - `AELOON_CORE_DATA_DIR`
 
 Minimal file example:
@@ -92,20 +90,19 @@ Minimal file example:
   },
   "agents": {
     "defaults": {
-      "model": "gpt-4.1-mini",
-      "max_tokens": null
+      "model": "gpt-4.1-mini"
     }
   }
 }
 ```
 
-`max_tokens: null` means auto. Aeloon resolves the output budget from public
-model metadata before each call: LiteLLM's `model_prices_and_context_window.json`
-table, and 4,096 only when metadata is unavailable.
+Normal model calls do not set `max_tokens`; the provider controls output length.
 
-Context compaction is enabled by default. When model-visible history nears the
-configured context window, Aeloon summarizes older turns into a synthetic system
-checkpoint and keeps the recent tail intact. Tunables live under
+Context compaction is enabled by default. Before every agent-loop model call, Aeloon
+estimates the complete model-visible request, including tool definitions. At 90% of
+the model context window, it summarizes older turns into a synthetic system checkpoint
+and keeps the recent tail intact. Context windows come from LiteLLM's public model
+table, falling back to `agents.defaults.context_window_tokens`. Tunables live under
 `agents.defaults.context_compaction`.
 
 ## Core Tools

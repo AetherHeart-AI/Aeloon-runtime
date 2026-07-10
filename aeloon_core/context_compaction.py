@@ -10,7 +10,6 @@ from typing import Any
 import tiktoken
 
 from aeloon_core.config import ContextCompactionConfig
-from aeloon_core.model_metadata import ModelLimits
 from aeloon_core.providers.base import LLMProvider
 
 COMPACTION_MARKER = "[aeloon-core:context-compaction]"
@@ -54,20 +53,21 @@ async def maybe_compact_messages(
     provider: LLMProvider,
     model: str,
     messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    additional_messages: list[dict[str, Any]] | None = None,
     config: ContextCompactionConfig,
     context_window_tokens: int,
-    output_tokens: int,
-    model_limits: ModelLimits | None = None,
 ) -> CompactionResult:
     """Compact older history when the model-visible request is near the limit."""
 
-    original_tokens = estimate_messages_tokens(messages, model=model)
+    original_tokens = estimate_request_tokens(
+        [*messages, *(additional_messages or [])],
+        tools=tools,
+        model=model,
+    )
     trigger_tokens = _trigger_tokens(
         config=config,
-        context_window_tokens=model_limits.context_tokens
-        if model_limits and model_limits.context_tokens
-        else context_window_tokens,
-        output_tokens=output_tokens,
+        context_window_tokens=context_window_tokens,
     )
     if not config.enabled or original_tokens < trigger_tokens:
         return CompactionResult(
@@ -125,7 +125,11 @@ async def maybe_compact_messages(
         _compaction_message(summary),
         *tail,
     ]
-    compacted_tokens = estimate_messages_tokens(compacted, model=model)
+    compacted_tokens = estimate_request_tokens(
+        [*compacted, *(additional_messages or [])],
+        tools=tools,
+        model=model,
+    )
     return CompactionResult(
         messages=compacted,
         compacted=True,
@@ -137,7 +141,7 @@ async def maybe_compact_messages(
 
 
 def estimate_messages_tokens(messages: list[dict[str, Any]], *, model: str) -> int:
-    """Estimate chat message tokens with a stable tokenizer fallback."""
+    """Estimate serialized chat-message tokens with a stable tokenizer fallback."""
 
     encoding = _encoding_for_model(model)
     total = 0
@@ -155,6 +159,21 @@ def estimate_messages_tokens(messages: list[dict[str, Any]], *, model: str) -> i
             )
         )
     return total + 2
+
+
+def estimate_request_tokens(
+    messages: list[dict[str, Any]],
+    *,
+    tools: list[dict[str, Any]] | None,
+    model: str,
+) -> int:
+    """Estimate the complete model-visible input, including tool definitions."""
+
+    total = estimate_messages_tokens(messages, model=model)
+    if not tools:
+        return total
+    serialized_tools = json.dumps(tools, ensure_ascii=False, sort_keys=True, default=str)
+    return total + len(_encoding_for_model(model).encode(serialized_tools)) + 4
 
 
 def truncate_middle_tokens(text: str, *, max_tokens: int, model: str) -> str:
@@ -189,12 +208,9 @@ def _trigger_tokens(
     *,
     config: ContextCompactionConfig,
     context_window_tokens: int,
-    output_tokens: int,
 ) -> int:
     window = max(1, context_window_tokens)
-    ratio_limit = int(window * config.trigger_ratio)
-    reserved = min(config.buffer_tokens, max(1, output_tokens))
-    return max(1, min(ratio_limit, window - reserved))
+    return max(1, min(window, int(window * config.trigger_ratio)))
 
 
 def _runtime_system_prefix(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:

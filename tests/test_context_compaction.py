@@ -7,6 +7,7 @@ import pytest
 from aeloon_core.config import ContextCompactionConfig
 from aeloon_core.context_compaction import (
     COMPACTION_MARKER,
+    estimate_request_tokens,
     is_compaction_message,
     maybe_compact_messages,
     truncate_middle_tokens,
@@ -63,14 +64,51 @@ async def test_maybe_compact_messages_skips_below_trigger() -> None:
         provider=provider,
         model="test-model",
         messages=messages,
+        tools=[],
         config=compaction_config(),
         context_window_tokens=10_000,
-        output_tokens=100,
     )
 
     assert result.compacted is False
     assert result.messages == messages
+    assert result.trigger_tokens == 9_000
     assert provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_maybe_compact_messages_counts_tool_definitions() -> None:
+    provider = ScriptedProvider([LLMResponse(content="Summary from model")])
+    messages = [
+        {"role": "system", "content": "runtime rules"},
+        {"role": "user", "content": "old request " + ("alpha " * 200)},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "middle request"},
+        {"role": "assistant", "content": "middle answer"},
+        {"role": "user", "content": "current request"},
+    ]
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "large_tool",
+                "description": "schema " * 1_200,
+            },
+        }
+    ]
+
+    assert estimate_request_tokens(messages, tools=[], model="test-model") < 450
+    assert estimate_request_tokens(messages, tools=tools, model="test-model") >= 450
+
+    result = await maybe_compact_messages(
+        provider=provider,
+        model="test-model",
+        messages=messages,
+        tools=tools,
+        config=compaction_config(preserve_recent_turns=1, preserve_recent_tokens=50),
+        context_window_tokens=500,
+    )
+
+    assert result.compacted is True
 
 
 @pytest.mark.asyncio
@@ -107,9 +145,9 @@ async def test_maybe_compact_messages_preserves_system_prefix_and_recent_tail() 
         provider=provider,
         model="test-model",
         messages=messages,
+        tools=[],
         config=compaction_config(preserve_recent_turns=2, preserve_recent_tokens=2_000),
         context_window_tokens=1_100,
-        output_tokens=128,
     )
 
     assert result.compacted is True
@@ -147,9 +185,9 @@ async def test_maybe_compact_messages_replaces_prior_compaction_summary() -> Non
         provider=provider,
         model="test-model",
         messages=messages,
+        tools=[],
         config=compaction_config(preserve_recent_tokens=120),
         context_window_tokens=500,
-        output_tokens=64,
     )
 
     assert result.compacted is True
@@ -174,9 +212,9 @@ async def test_maybe_compact_messages_uses_extract_fallback_when_summary_fails()
         provider=provider,
         model="test-model",
         messages=messages,
+        tools=[],
         config=compaction_config(preserve_recent_tokens=120),
         context_window_tokens=500,
-        output_tokens=64,
     )
 
     assert result.compacted is True

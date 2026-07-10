@@ -1,26 +1,32 @@
 from __future__ import annotations
 
+import json
 import os
 
 from aeloon_core.config import load_config
 
 
-def test_env_max_tokens_override(monkeypatch, tmp_path) -> None:
-    config_path = tmp_path / "missing.json"
+def test_legacy_output_budget_settings_are_ignored(monkeypatch, tmp_path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "agents": {
+                    "defaults": {
+                        "max_tokens": 32_768,
+                        "context_compaction": {"buffer_tokens": 20_000},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
     monkeypatch.setenv("AELOON_CORE_MAX_TOKENS", "32768")
 
     config = load_config(config_path)
 
-    assert config.agents.defaults.max_tokens == 32768
-
-
-def test_env_max_tokens_auto(monkeypatch, tmp_path) -> None:
-    config_path = tmp_path / "missing.json"
-    monkeypatch.setenv("AELOON_CORE_MAX_TOKENS", "auto")
-
-    config = load_config(config_path)
-
-    assert config.agents.defaults.max_tokens is None
+    assert "max_tokens" not in config.agents.defaults.model_dump()
+    assert "buffer_tokens" not in config.agents.defaults.context_compaction.model_dump()
 
 
 def test_skill_env_overrides(monkeypatch, tmp_path) -> None:

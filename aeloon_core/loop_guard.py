@@ -183,7 +183,7 @@ def _finalization_exhausted_message(finalization_budget: int) -> str:
         "I stopped because the model repeatedly exhausted its output budget "
         "without producing a visible final answer. No final artifact was produced. "
         f"The text-only recovery budget was {finalization_budget} attempt(s). "
-        "Increase max_tokens or ask for a smaller first step, then retry."
+        "Ask for a smaller first step, then retry."
     )
 
 

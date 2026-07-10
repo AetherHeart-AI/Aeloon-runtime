@@ -23,7 +23,6 @@ CONFIG_SETTERS = {
     "api-key": ("providers", "custom", "api_key"),
     "api-base": ("providers", "custom", "api_base"),
     "model": ("agents", "defaults", "model"),
-    "max-tokens": ("agents", "defaults", "max_tokens"),
     "reasoning-effort": ("agents", "defaults", "reasoning_effort"),
     "max-iterations": ("agents", "defaults", "max_iterations"),
     "max-auto-continue-iterations": ("agents", "defaults", "max_auto_continue_iterations"),
@@ -34,12 +33,6 @@ CONFIG_SETTERS = {
         "defaults",
         "context_compaction",
         "trigger_ratio",
-    ),
-    "context-compaction-buffer-tokens": (
-        "agents",
-        "defaults",
-        "context_compaction",
-        "buffer_tokens",
     ),
     "context-compaction-preserve-recent-turns": (
         "agents",
@@ -172,11 +165,6 @@ def _add_config_write_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--api-key", default=None, help="OpenAI-compatible API key.")
     parser.add_argument("--api-base", default=None, help="OpenAI-compatible API base URL.")
     parser.add_argument("--model", default=None, help="Default model.")
-    parser.add_argument(
-        "--max-tokens",
-        default=None,
-        help="Output token budget per model call. Use 'auto' for model-aware defaults.",
-    )
 
 
 class _PlainTextProgressSink:
@@ -310,7 +298,6 @@ def _config_with_write_args(config: Config, args: argparse.Namespace) -> Config:
         "api_key": "api-key",
         "api_base": "api-base",
         "model": "model",
-        "max_tokens": "max-tokens",
     }
     data = config.model_dump(mode="json")
     for attr, key in write_arg_keys.items():
@@ -360,7 +347,7 @@ def _set_nested_value(data: dict[str, Any], path: tuple[str, ...], value: Any) -
 
 
 def _coerce_config_value(key: str, value: str) -> Any:
-    if key in {"max-tokens", "context-compaction-preserve-recent-tokens"}:
+    if key == "context-compaction-preserve-recent-tokens":
         if value.strip().lower() in {"auto", "none", "null"}:
             return None
         return int(value)
@@ -368,7 +355,6 @@ def _coerce_config_value(key: str, value: str) -> Any:
         "max-iterations",
         "max-auto-continue-iterations",
         "max-finalization-iterations",
-        "context-compaction-buffer-tokens",
         "context-compaction-preserve-recent-turns",
         "context-compaction-summary-max-tokens",
     }:

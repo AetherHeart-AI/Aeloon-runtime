@@ -14,7 +14,7 @@ from aeloon_core.context import (
 )
 from aeloon_core.context_compaction import maybe_compact_messages
 from aeloon_core.kernel import run_agent_kernel
-from aeloon_core.model_metadata import GENERIC_DEFAULT_MAX_TOKENS, ModelLimits, resolve_model_limits
+from aeloon_core.model_metadata import resolve_context_window
 from aeloon_core.providers.base import GenerationSettings
 from aeloon_core.providers.custom_provider import CustomProvider
 from aeloon_core.session import SessionStore
@@ -54,7 +54,6 @@ class AeloonCoreOrchestrator:
             proxy=provider_config.proxy,
             generation=GenerationSettings(
                 temperature=defaults.temperature,
-                max_tokens=defaults.max_tokens,
                 reasoning_effort=defaults.reasoning_effort,
             ),
             chat_timeout=defaults.chat_timeout,
@@ -100,18 +99,27 @@ class AeloonCoreOrchestrator:
         messages = refresh_initial_system_message(messages, workspace=self.config.workspace)
         messages = apply_skill_guidance(messages, self.skills.format_guidance())
         messages = append_user_message(messages, prompt)
+        prepare_model_input = None
         if defaults.context_compaction.enabled:
-            model_limits = await resolve_model_limits(defaults.model)
-            compaction = await maybe_compact_messages(
-                provider=self.provider,
-                model=defaults.model,
-                messages=messages,
-                config=defaults.context_compaction,
-                context_window_tokens=defaults.context_window_tokens,
-                output_tokens=_output_token_budget(defaults.max_tokens, model_limits),
-                model_limits=model_limits,
-            )
-            messages = compaction.messages
+            context_window_tokens = await resolve_context_window(defaults.model)
+            context_window_tokens = context_window_tokens or defaults.context_window_tokens
+
+            async def prepare_model_input(
+                current_messages: list[dict[str, Any]],
+                current_tools: list[dict[str, Any]],
+                additional_messages: list[dict[str, Any]],
+            ) -> list[dict[str, Any]]:
+                compaction = await maybe_compact_messages(
+                    provider=self.provider,
+                    model=defaults.model,
+                    messages=current_messages,
+                    tools=current_tools,
+                    additional_messages=additional_messages,
+                    config=defaults.context_compaction,
+                    context_window_tokens=context_window_tokens,
+                )
+                return compaction.messages
+
         final_content, tools_used, messages = await run_agent_kernel(
             provider=self.provider,
             model=defaults.model,
@@ -121,6 +129,7 @@ class AeloonCoreOrchestrator:
             max_auto_continue_iterations=defaults.max_auto_continue_iterations,
             max_finalization_iterations=defaults.max_finalization_iterations,
             on_progress=on_progress,
+            prepare_model_input=prepare_model_input,
         )
         blocks = list(getattr(on_progress, "blocks", []) or [])
         self.sessions.append_turn(
@@ -138,14 +147,3 @@ class AeloonCoreOrchestrator:
             messages=messages,
             blocks=blocks,
         )
-
-
-def _output_token_budget(
-    configured_max_tokens: int | None,
-    model_limits: ModelLimits | None,
-) -> int:
-    if configured_max_tokens is not None:
-        return max(1, configured_max_tokens)
-    if model_limits and model_limits.output_tokens is not None:
-        return max(1, model_limits.output_tokens)
-    return GENERIC_DEFAULT_MAX_TOKENS

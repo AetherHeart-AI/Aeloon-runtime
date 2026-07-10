@@ -264,6 +264,10 @@ async def run_agent_kernel(
     max_auto_continue_iterations: int = 25,
     max_finalization_iterations: int = 2,
     on_progress: Callable[..., Awaitable[None]] | None = None,
+    prepare_model_input: Callable[
+        [list[dict], list[dict], list[dict]], Awaitable[list[dict]]
+    ]
+    | None = None,
     add_assistant_message: Callable[..., list[dict]] | None = None,
     add_tool_result: Callable[[list[dict], str, str, str], list[dict]] | None = None,
     strip_think: Callable[[str | None], str | None] | None = None,
@@ -428,10 +432,6 @@ async def run_agent_kernel(
                 break
             finalization_iteration += 1
             tool_defs: list[dict] = []
-            call_messages = [
-                *messages,
-                finalization_message or guard.finalization_prompt_message(),
-            ]
             await _emit_progress(
                 "Wrapping up..."
                 if finalization_iteration == 1
@@ -444,10 +444,18 @@ async def run_agent_kernel(
                 continue
             iteration += 1
             tool_defs = tools.get_definitions()
-            call_messages = messages
             await _emit_progress(
                 "Thinking..." if iteration == 1 else f"Thinking (step {iteration})..."
             )
+
+        additional_messages = (
+            [finalization_message or guard.finalization_prompt_message()]
+            if finalizing
+            else []
+        )
+        if prepare_model_input is not None:
+            messages = await prepare_model_input(messages, tool_defs, additional_messages)
+        call_messages = [*messages, *additional_messages]
 
         response = await _do_llm_call(call_messages, tool_defs)
         await _emit_hook("on_llm_response", response)
