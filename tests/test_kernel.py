@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 import pytest
@@ -65,7 +66,9 @@ class ScriptedProvider(LLMProvider):
         response_format: dict[str, str] | None = None,
     ) -> LLMResponse:
         del model, max_tokens, temperature, reasoning_effort, tool_choice, response_format
-        self.calls.append({"messages": messages, "tools": tools or []})
+        self.calls.append(
+            {"messages": copy.deepcopy(messages), "tools": copy.deepcopy(tools or [])}
+        )
         if not self.responses:
             raise AssertionError("No scripted response left")
         return self.responses.pop(0)
@@ -339,7 +342,7 @@ async def test_kernel_stops_after_consecutive_duplicate_tool_rounds() -> None:
 
 
 @pytest.mark.asyncio
-async def test_kernel_stops_after_consecutive_failed_tool_rounds() -> None:
+async def test_kernel_continues_after_failed_tool_rounds_with_system_recovery_prompt() -> None:
     provider = ScriptedProvider(
         [
             LLMResponse(
@@ -352,10 +355,11 @@ async def test_kernel_stops_after_consecutive_failed_tool_rounds() -> None:
                 tool_calls=[ToolCallRequest(id="call-2", name="fail", arguments={"value": "two"})],
                 finish_reason="tool_calls",
             ),
+            LLMResponse(content="recovered after tool errors", finish_reason="stop"),
         ]
     )
 
-    final_content, tools_used, _messages = await run_agent_kernel(
+    final_content, tools_used, messages = await run_agent_kernel(
         provider=provider,
         model="test-model",
         tools=registry_with_echo_and_fail(),
@@ -365,10 +369,20 @@ async def test_kernel_stops_after_consecutive_failed_tool_rounds() -> None:
         max_finalization_iterations=1,
     )
 
-    assert "off track" in (final_content or "")
-    assert "failed or returned errors" in (final_content or "")
+    assert final_content == "recovered after tool errors"
     assert tools_used == ["fail", "fail"]
-    assert len(provider.calls) == 2
+    assert messages[-1] == {"role": "assistant", "content": "recovered after tool errors"}
+    assert len(provider.calls) == 3
+
+    first_recovery = provider.calls[1]["messages"][-1]
+    assert first_recovery["role"] == "system"
+    assert "TOOL ERROR RECOVERY" in first_recovery["content"]
+    assert "Error: failed for one" in first_recovery["content"]
+    assert "Do not repeat a failed call" in first_recovery["content"]
+
+    second_recovery = provider.calls[2]["messages"][-1]
+    assert second_recovery["role"] == "system"
+    assert "Error: failed for two" in second_recovery["content"]
 
 
 @pytest.mark.asyncio

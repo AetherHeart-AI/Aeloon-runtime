@@ -65,6 +65,9 @@ class ToolCallGuardResult:
 _MAX_UNPRODUCTIVE_TOOL_ROUNDS = 2
 _MAX_EXEC_TIMEOUT_ROUNDS = 3
 _MAX_EMPTY_STOP_RETRIES = 1
+_TOOL_RECOVERY_MAX_FAILURES = 5
+_TOOL_RECOVERY_RESULT_MAX_CHARS = 1_200
+_TOOL_RECOVERY_ARGUMENTS_MAX_CHARS = 600
 _MAX_ITERATIONS_FINALIZATION_PROMPT = """CRITICAL - MAXIMUM ITERATIONS REACHED
 
 The normal tool-call iteration budget for this task has been reached.
@@ -91,6 +94,21 @@ STRICT REQUIREMENTS:
 
 Respond with text ONLY."""
 _OUTPUT_EXHAUSTED_FINISH_REASONS = {"length", "max_tokens", "max_output_tokens"}
+_TOOL_ERROR_RECOVERY_PROMPT = """TOOL ERROR RECOVERY
+
+The latest tool round failed. The tool results below may be recoverable error
+signals, not a reason to abandon the user's task.
+
+Reason: {reason}
+Failed tool call(s):
+{failures}
+
+Continue the user's task. Before calling tools again, choose a corrected
+approach based on the exact error text above. Do not repeat a failed call
+unchanged. If a write failed, use edit for existing files when possible; for an
+intentional full replacement, pass overwrite=true, and for large writes pass an
+end_marker and make content end with that marker, or split the change into
+smaller edits."""
 
 
 def rejected_arguments_summary(tool_call: ToolCallRequest) -> str:
@@ -167,6 +185,60 @@ def _finalization_exhausted_message(finalization_budget: int) -> str:
         f"The text-only recovery budget was {finalization_budget} attempt(s). "
         "Increase max_tokens or ask for a smaller first step, then retry."
     )
+
+
+def _preview(value: Any, *, limit: int) -> str:
+    text = "" if value is None else str(value)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"... [truncated {len(text) - limit} chars]"
+
+
+def _json_preview(value: Any, *, limit: int) -> str:
+    try:
+        text = json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        text = repr(value)
+    return _preview(text, limit=limit)
+
+
+def _indent(text: str) -> str:
+    return "\n   ".join(text.splitlines()) if text else "(empty)"
+
+
+def _tool_error_recovery_prompt_message(
+    reason: str,
+    executed_nodes: list[Any],
+) -> dict[str, str]:
+    failures: list[str] = []
+    for index, node in enumerate(executed_nodes[:_TOOL_RECOVERY_MAX_FAILURES], start=1):
+        tool_name = str(getattr(node, "tool_name", "tool"))
+        arguments = _json_preview(
+            getattr(node, "arguments", {}),
+            limit=_TOOL_RECOVERY_ARGUMENTS_MAX_CHARS,
+        )
+        result = _preview(
+            getattr(node, "result", None) or getattr(node, "error", None),
+            limit=_TOOL_RECOVERY_RESULT_MAX_CHARS,
+        )
+        failures.append(
+            f"{index}. {tool_name} arguments: {arguments}\n"
+            f"   result: {_indent(result)}"
+        )
+    if len(executed_nodes) > _TOOL_RECOVERY_MAX_FAILURES:
+        failures.append(
+            f"... {len(executed_nodes) - _TOOL_RECOVERY_MAX_FAILURES} more failed "
+            "tool call(s) omitted."
+        )
+    if not failures:
+        failures.append("1. No structured tool result was available.")
+    return {
+        "role": "system",
+        "content": _TOOL_ERROR_RECOVERY_PROMPT.format(
+            reason=reason,
+            failures="\n".join(failures),
+        ),
+    }
 
 
 class AgentLoopGuard:
@@ -253,7 +325,10 @@ class AgentLoopGuard:
         )
         return LoopGuardDecision(LoopGuardAction.RETURN_TO_MODEL, reason=reason)
 
-    def handle_exec_timeout_round(self) -> LoopGuardDecision:
+    def handle_exec_timeout_round(
+        self,
+        executed_nodes: list[Any] | None = None,
+    ) -> LoopGuardDecision:
         reason = (
             "the latest exec command timed out; if it was starting a long-running server, "
             "retry with a truly detached command or verify the server with a short command"
@@ -267,7 +342,33 @@ class AgentLoopGuard:
             self.max_exec_timeout_rounds,
             reason,
         )
-        return LoopGuardDecision(LoopGuardAction.RETURN_TO_MODEL, reason=reason)
+        return LoopGuardDecision(
+            LoopGuardAction.RETURN_TO_MODEL,
+            reason=reason,
+            prompt_message=_tool_error_recovery_prompt_message(
+                reason,
+                executed_nodes or [],
+            ),
+            progress_message="Tool error recovery prompt added; continuing.",
+        )
+
+    def handle_recoverable_tool_error_round(
+        self,
+        reason: str,
+        executed_nodes: list[Any],
+    ) -> LoopGuardDecision:
+        self.unproductive_tool_rounds += 1
+        logger.info(
+            "Recoverable tool error round ({}): {}",
+            self.unproductive_tool_rounds,
+            reason,
+        )
+        return LoopGuardDecision(
+            LoopGuardAction.RETURN_TO_MODEL,
+            reason=reason,
+            prompt_message=_tool_error_recovery_prompt_message(reason, executed_nodes),
+            progress_message="Tool error recovery prompt added; continuing.",
+        )
 
     def handle_malformed_tool_calls(
         self,
@@ -330,9 +431,10 @@ class AgentLoopGuard:
     def handle_tool_results(self, executed_nodes: list[Any]) -> LoopGuardDecision:
         if executed_nodes and all(tool_result_failed(node.result) for node in executed_nodes):
             if all(_exec_command_timed_out(node) for node in executed_nodes):
-                return self.handle_exec_timeout_round()
-            return self.handle_unproductive_tool_round(
-                "all tool calls in the latest round failed or returned errors"
+                return self.handle_exec_timeout_round(executed_nodes)
+            return self.handle_recoverable_tool_error_round(
+                "all tool calls in the latest round failed or returned errors",
+                executed_nodes,
             )
         self.record_productive_tool_round()
         return LoopGuardDecision(LoopGuardAction.CONTINUE)

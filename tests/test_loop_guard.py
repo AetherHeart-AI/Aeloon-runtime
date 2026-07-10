@@ -78,19 +78,28 @@ def test_productive_round_resets_unproductive_counter() -> None:
     assert guard.unproductive_tool_rounds == 1
 
 
-def test_consecutive_failed_tool_rounds_stop_off_track() -> None:
+def test_failed_tool_rounds_return_recovery_system_prompt() -> None:
     guard = AgentLoopGuard(
         max_iterations=1,
         max_auto_continue_iterations=5,
         max_finalization_iterations=1,
     )
-    failed_node = SimpleNamespace(result="Error: failed")
+    failed_node = SimpleNamespace(
+        tool_name="write",
+        arguments={"path": "game.html"},
+        result="Error: File already exists",
+    )
 
     first = guard.handle_tool_results([failed_node])
     second = guard.handle_tool_results([failed_node])
 
     assert first.action == LoopGuardAction.RETURN_TO_MODEL
-    assert second.action == LoopGuardAction.STOP_OFF_TRACK
+    assert first.prompt_message is not None
+    assert first.prompt_message["role"] == "system"
+    assert "TOOL ERROR RECOVERY" in first.prompt_message["content"]
+    assert "Error: File already exists" in first.prompt_message["content"]
+    assert "overwrite=true" in first.prompt_message["content"]
+    assert second.action == LoopGuardAction.RETURN_TO_MODEL
     assert "failed or returned errors" in second.reason
 
 
@@ -110,6 +119,9 @@ def test_exec_timeout_rounds_get_extra_recovery_before_stopping() -> None:
     third = guard.handle_tool_results([timed_out_node])
 
     assert first.action == LoopGuardAction.RETURN_TO_MODEL
+    assert first.prompt_message is not None
+    assert first.prompt_message["role"] == "system"
+    assert "Command timed out" in first.prompt_message["content"]
     assert second.action == LoopGuardAction.RETURN_TO_MODEL
     assert third.action == LoopGuardAction.STOP_OFF_TRACK
     assert "repeatedly timed out" in third.reason

@@ -353,6 +353,16 @@ async def run_agent_kernel(
             return True
         return False
 
+    async def _return_to_model_with_guard_context(decision: LoopGuardDecision) -> bool:
+        """Append guard recovery context before the next model call."""
+
+        nonlocal messages
+        if decision.prompt_message:
+            messages.append(decision.prompt_message)
+        if decision.progress_message:
+            await _emit_progress(decision.progress_message)
+        return await _grant_more_or_finalize()
+
     async def _grant_more_or_finalize() -> bool:
         """When the budget is spent, grant an auto-continue or enter finalization."""
         if iteration < guard.iteration_limit:
@@ -495,7 +505,7 @@ async def run_agent_kernel(
                     await _finish_with_guard_decision(malformed_result.decision)
                     break
                 if malformed_result.decision.action == LoopGuardAction.RETURN_TO_MODEL:
-                    if await _grant_more_or_finalize():
+                    if await _return_to_model_with_guard_context(malformed_result.decision):
                         break
                     continue
 
@@ -516,7 +526,7 @@ async def run_agent_kernel(
                 await _finish_with_guard_decision(duplicate_result.decision)
                 break
             if duplicate_result.decision.action == LoopGuardAction.RETURN_TO_MODEL:
-                if await _grant_more_or_finalize():
+                if await _return_to_model_with_guard_context(duplicate_result.decision):
                     break
                 continue
 
@@ -547,6 +557,10 @@ async def run_agent_kernel(
             if tool_result_decision.action == LoopGuardAction.STOP_OFF_TRACK:
                 await _finish_with_guard_decision(tool_result_decision)
                 break
+            if tool_result_decision.action == LoopGuardAction.RETURN_TO_MODEL:
+                if await _return_to_model_with_guard_context(tool_result_decision):
+                    break
+                continue
             if await _grant_more_or_finalize():
                 break
             continue
