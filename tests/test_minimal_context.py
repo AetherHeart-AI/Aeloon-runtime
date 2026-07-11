@@ -10,7 +10,6 @@ import pytest
 from aeloon_core.context_compaction import COMPACTION_MARKER
 from aeloon_core.minimal_context import (
     LAZY_TOOL_RESULT_MARKER,
-    IdentityContextProcessor,
     MinimalContextProcessor,
 )
 
@@ -53,29 +52,6 @@ def tool_result(call_id: str, content: str, name: str = "read") -> dict[str, Any
         "name": name,
         "content": content,
     }
-
-
-def test_identity_processor_returns_fresh_complete_call_view() -> None:
-    state = FakeState(active_tools=["read"])
-    messages = [
-        {"role": "system", "content": "rules"},
-        {"role": "user", "content": "question"},
-    ]
-    original = copy.deepcopy(messages)
-    tools = [tool_definition("read"), tool_definition("write")]
-    additional = [{"role": "user", "content": "finalize"}]
-
-    result = IdentityContextProcessor().process(
-        state=state,
-        messages=messages,
-        tools=tools,
-        additional_messages=additional,
-    )
-
-    assert result.messages == [*messages, *additional]
-    assert result.messages is not messages
-    assert result.tools == tools
-    assert messages == original
 
 
 def test_minimal_processor_keeps_prefix_latest_checkpoint_and_recent_turns() -> None:

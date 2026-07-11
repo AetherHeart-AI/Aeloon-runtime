@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -38,11 +38,7 @@ class ContextCompactionConfig(BaseModel):
 class UASMConfig(BaseModel):
     """Unified Agentic State Machine policy settings."""
 
-    rule_engine_enabled: bool = True
-    temporary_guard_enabled: bool = True
-    minimal_context_enabled: bool = True
     transition_trace_enabled: bool = True
-    guard_decision_mode: Literal["binary", "full"] = "full"
     minimal_context_recent_turns: int = Field(default=2, ge=1)
     minimal_context_tool_result_chars: int = Field(default=1_200, ge=128)
 
@@ -58,6 +54,11 @@ class AgentDefaultsConfig(BaseModel):
     max_iterations: int = 25
     max_auto_continue_iterations: int = 25
     max_finalization_iterations: int = 2
+    profile_id: str | None = Field(
+        default="coding",
+        pattern=r"^[a-z][a-z0-9_-]{0,63}$",
+    )
+    max_handoffs: int = Field(default=8, ge=0)
     context_compaction: ContextCompactionConfig = Field(
         default_factory=ContextCompactionConfig
     )
@@ -154,6 +155,12 @@ def load_config(path: Path | str | None = None) -> Config:
         updates.setdefault("providers", {}).setdefault("custom", {})["api_base"] = api_base
     if model := os.environ.get("AELOON_CORE_MODEL"):
         updates.setdefault("agents", {}).setdefault("defaults", {})["model"] = model
+    if profile_id := os.environ.get("AELOON_CORE_PROFILE_ID"):
+        updates.setdefault("agents", {}).setdefault("defaults", {})["profile_id"] = (
+            None
+            if profile_id.strip().lower() in {"none", "null", "off"}
+            else profile_id
+        )
     if workspace := os.environ.get("AELOON_CORE_WORKSPACE"):
         updates["workspace"] = workspace
     if data_dir := os.environ.get("AELOON_CORE_DATA_DIR"):

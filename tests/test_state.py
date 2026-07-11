@@ -1,8 +1,15 @@
 from __future__ import annotations
 
 from aeloon_core.loop_guard import AgentLoopGuard, LoopGuardAction, LoopGuardState
-from aeloon_core.state import AgentNode, LazyValue, LightweightState, RunStatus, StateMetadata
-from aeloon_core.transitions import NodeKind, TransitionRecord
+from aeloon_core.state import (
+    AgentNode,
+    LazyValue,
+    LightweightState,
+    ProfileRef,
+    RunStatus,
+    StateMetadata,
+)
+from aeloon_core.transitions import NodeKind, TokenLedger, TransitionRecord
 
 
 def test_lightweight_state_defaults_to_a_detached_model_context() -> None:
@@ -106,3 +113,49 @@ def test_agent_loop_guard_mutates_an_injected_state() -> None:
     assert guard.state is state.guard_state
     assert state.guard_state.iteration_limit == 4
     assert state.guard_state.auto_continue_remaining == 1
+
+
+def test_profile_state_is_omitted_until_a_turn_pins_an_artifact() -> None:
+    state = LightweightState(messages=[{"role": "user", "content": "work"}])
+    no_profile_digest = state.digest()
+
+    state.profile_ref = ProfileRef(
+        profile_id="coding-team",
+        revision=1,
+        artifact_id="artifact-1",
+        generation=2,
+    )
+    pinned_digest = state.digest()
+    state.active_agent_id = "implementer"
+
+    assert pinned_digest != no_profile_digest
+    assert state.digest() != pinned_digest
+
+
+def test_profile_fields_do_not_change_v1_positional_constructor_abi() -> None:
+    metadata = StateMetadata()
+    guard = LoopGuardState()
+    ledger = TokenLedger()
+    state = LightweightState(
+        [{"role": "user", "content": "legacy"}],
+        [{"role": "user", "content": "minimal"}],
+        {"read": True},
+        ["read"],
+        metadata,
+        guard,
+        None,
+        [],
+        [],
+        None,
+        None,
+        True,
+        ["read"],
+        [],
+        ledger,
+        {},
+    )
+
+    assert state.final_emitted is True
+    assert state.tools_used == ["read"]
+    assert state.token_ledger is ledger
+    assert state.profile_ref is None

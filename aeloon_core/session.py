@@ -75,6 +75,7 @@ class SessionStore:
         blocks: list[dict[str, Any]] | None = None,
         usage: dict[str, Any] | None = None,
         turn_id: str | None = None,
+        profile: dict[str, Any] | None = None,
     ) -> None:
         """Append one completed turn."""
 
@@ -92,6 +93,8 @@ class SessionStore:
             "blocks": blocks or [],
             "usage": usage or {},
         }
+        if profile is not None:
+            record["profile"] = profile
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 

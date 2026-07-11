@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import signal
+import sys
+from collections.abc import Iterable
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -33,8 +36,14 @@ class ExecTool(WorkspaceTool):
 
     _MAX_OUTPUT = 12_000
 
-    def __init__(self, *, workspace: Path, timeout: int = 60) -> None:
-        super().__init__(workspace=workspace)
+    def __init__(
+        self,
+        *,
+        workspace: Path,
+        timeout: int = 60,
+        denied_paths: Iterable[Path] = (),
+    ) -> None:
+        super().__init__(workspace=workspace, denied_paths=denied_paths)
         self.timeout = timeout
 
     async def execute(
@@ -46,14 +55,30 @@ class ExecTool(WorkspaceTool):
         cwd = self._resolve(working_dir)
         effective_timeout = min(timeout or self.timeout, 600)
         try:
-            process = await asyncio.create_subprocess_shell(
-                command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=str(cwd),
-                env=os.environ.copy(),
-                start_new_session=True,
-            )
+            sandbox_argv = self._sandbox_argv(command)
+            if sandbox_argv is None and self.denied_paths:
+                return (
+                    "Error: exec is disabled because this host cannot isolate protected "
+                    "runtime data from shell commands"
+                )
+            if sandbox_argv is None:
+                process = await asyncio.create_subprocess_shell(
+                    command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=str(cwd),
+                    env=os.environ.copy(),
+                    start_new_session=True,
+                )
+            else:
+                process = await asyncio.create_subprocess_exec(
+                    *sandbox_argv,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=str(cwd),
+                    env=os.environ.copy(),
+                    start_new_session=True,
+                )
             try:
                 stdout, stderr = await asyncio.wait_for(
                     process.communicate(),
@@ -76,6 +101,43 @@ class ExecTool(WorkspaceTool):
         except Exception as exc:
             return f"Error executing command: {exc}"
 
+    def _sandbox_argv(self, command: str) -> list[str] | None:
+        if not self.denied_paths:
+            return None
+        sandbox_exec = Path("/usr/bin/sandbox-exec")
+        if sys.platform == "darwin" and sandbox_exec.exists():
+            denied_rules = "\n".join(
+                "(deny file-read* file-write* (subpath "
+                f'"{_sandbox_literal(path)}"))'
+                for path in self.denied_paths
+            )
+            profile = f"(version 1)\n(allow default)\n{denied_rules}\n"
+            return [str(sandbox_exec), "-p", profile, "/bin/sh", "-c", command]
+
+        bubblewrap = shutil.which("bwrap")
+        if bubblewrap is None:
+            return None
+        argv = [
+            bubblewrap,
+            "--die-with-parent",
+            "--ro-bind",
+            "/",
+            "/",
+            "--dev",
+            "/dev",
+            "--proc",
+            "/proc",
+            "--tmpfs",
+            "/tmp",
+            "--bind",
+            str(self.workspace),
+            str(self.workspace),
+        ]
+        for path in self.denied_paths:
+            if path.exists() and path.is_dir():
+                argv.extend(("--tmpfs", str(path)))
+        return [*argv, "/bin/sh", "-c", command]
+
     @staticmethod
     def _kill_process_group(process: asyncio.subprocess.Process) -> None:
         pid = process.pid
@@ -94,3 +156,7 @@ class ExecTool(WorkspaceTool):
         half = self._MAX_OUTPUT // 2
         omitted = len(result) - self._MAX_OUTPUT
         return result[:half] + f"\n\n... ({omitted:,} chars truncated) ...\n\n" + result[-half:]
+
+
+def _sandbox_literal(path: Path) -> str:
+    return str(path).replace("\\", "\\\\").replace('"', '\\"')

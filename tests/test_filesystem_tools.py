@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from aeloon_core.tools.filesystem import ReadTool, WriteTool
+from aeloon_core.tools.shell import ExecTool
 
 
 @pytest.mark.asyncio
@@ -86,3 +87,54 @@ async def test_write_tool_strips_marker_before_saving(tmp_path, monkeypatch) -> 
 
     assert result.startswith("Successfully wrote")
     assert (tmp_path / "large.txt").read_text(encoding="utf-8") == "hello world"
+
+
+@pytest.mark.asyncio
+async def test_workspace_tools_reject_outside_and_protected_paths(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    protected = workspace / ".runtime-data"
+    outside = tmp_path / "outside.txt"
+    workspace.mkdir()
+    protected.mkdir()
+    outside.write_text("outside")
+    (protected / "secret.txt").write_text("secret")
+    (workspace / "linked-runtime-data").symlink_to(protected, target_is_directory=True)
+    read = ReadTool(workspace=workspace, denied_paths=(protected,))
+    write = WriteTool(workspace=workspace, denied_paths=(protected,))
+
+    outside_result = await read.execute(str(outside))
+    protected_result = await read.execute("linked-runtime-data/secret.txt")
+    write_result = await write.execute(".runtime-data/owned.txt", "owned")
+
+    assert "path escapes workspace" in outside_result
+    assert "protected from agent tools" in protected_result
+    assert "protected from agent tools" in write_result
+    assert not (protected / "owned.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_unprotected_workspace_tool_preserves_v1_absolute_path_access(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside.txt"
+    workspace.mkdir()
+    outside.write_text("legacy access", encoding="utf-8")
+
+    result = await ReadTool(workspace=workspace).execute(str(outside))
+
+    assert "legacy access" in result
+
+
+@pytest.mark.asyncio
+async def test_unprotected_exec_preserves_v1_outside_working_directory(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+
+    result = await ExecTool(workspace=workspace).execute(
+        command="pwd",
+        working_dir=str(outside),
+    )
+
+    assert str(outside.resolve()) in result
+    assert "Exit code: 0" in result

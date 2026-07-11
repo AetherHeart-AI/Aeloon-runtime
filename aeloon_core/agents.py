@@ -18,10 +18,16 @@ from aeloon_core.loop_guard import (
     LoopGuardAction,
     LoopGuardDecision,
     rejected_arguments_summary,
-    tool_result_failed,
 )
-from aeloon_core.minimal_context import ContextProcessor, IdentityContextProcessor
+from aeloon_core.minimal_context import ContextProcessor
 from aeloon_core.model_input import PrepareModelInput, unpack_prepared_model_input
+from aeloon_core.profile_runtime import (
+    CONTROL_TOOL_DEFINITIONS,
+    CONTROL_TOOL_NAMES,
+    LLMProfileMaster,
+    fallback_agent_id,
+    role_context_messages,
+)
 from aeloon_core.runtime_support import (
     ThinkTagDeltaFilter,
     default_add_assistant_message,
@@ -34,9 +40,11 @@ from aeloon_core.runtime_support import (
 )
 from aeloon_core.state import AgentNode, LightweightState, RunStatus
 from aeloon_core.temporary_guard import GuardEvidence, TemporaryGuard
+from aeloon_core.tools.registry import ScopedToolRegistry
 from aeloon_core.transitions import NodeKind, TransitionRecorder, normalize_usage
 
 if TYPE_CHECKING:
+    from aeloon_core.profiles import RuntimeAgentSpec, RuntimeProfileSpec
     from aeloon_core.providers.base import LLMProvider, LLMResponse, ToolCallRequest
     from aeloon_core.task_graph import TaskNode
     from aeloon_core.tools.registry import ToolRegistry
@@ -52,7 +60,9 @@ class AgentRuntime:
     context_processor: ContextProcessor
     recorder: TransitionRecorder
     temporary_guard: TemporaryGuard | None = None
-    rule_engine_enabled: bool = True
+    profile: RuntimeProfileSpec | None = None
+    profile_master: LLMProfileMaster | None = None
+    max_handoffs: int = 8
     trace_enabled: bool = True
     on_progress: Callable[..., Awaitable[None]] | None = None
     prepare_model_input: PrepareModelInput | None = None
@@ -68,6 +78,16 @@ class AgentRuntime:
     last_usage: dict[str, int] = field(default_factory=dict)
     step_before_digest: str | None = None
     segment_started_at: float | None = None
+
+    def profile_handoff_limit(self) -> int:
+        if self.profile is None:
+            return 0
+        return max(0, min(int(self.profile.max_handoffs), max(0, int(self.max_handoffs))))
+
+    def active_profile_agent(self, state: LightweightState) -> RuntimeAgentSpec:
+        if self.profile is None or state.active_agent_id is None:
+            raise RuntimeError("an active profile role is required")
+        return self.profile.agent(state.active_agent_id)
 
     def begin_step(
         self,
@@ -99,7 +119,22 @@ class AgentRuntime:
         hook = getattr(self.on_progress, name, None)
         if hook is None:
             return
-        result = hook(*args, **kwargs)
+        try:
+            parameters = inspect.signature(hook).parameters.values()
+        except (TypeError, ValueError):
+            filtered_kwargs = kwargs
+        else:
+            accepts_arbitrary_kwargs = any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+            accepted_names = {parameter.name for parameter in parameters}
+            filtered_kwargs = (
+                kwargs
+                if accepts_arbitrary_kwargs
+                else {key: value for key, value in kwargs.items() if key in accepted_names}
+            )
+        result = hook(*args, **filtered_kwargs)
         if inspect.isawaitable(result):
             await result
 
@@ -183,6 +218,49 @@ class AgentRuntime:
             await self.emit_hook("on_final", final_content, messages=state.messages)
         return state
 
+    async def profile_protocol_error(
+        self,
+        state: LightweightState,
+        *,
+        reason: str,
+        visible_content: str | None = None,
+        correction: str | None = None,
+    ) -> LightweightState:
+        """Correct one profile protocol violation, then terminate on repetition."""
+
+        state.control_protocol_retries += 1
+        if state.control_protocol_retries >= 2:
+            content = (
+                (visible_content or "").strip()
+                or f"The profile role stopped after a repeated protocol violation: {reason}."
+            )
+            self.describe_step(
+                {"action": "terminate", "source": "control_protocol", "reason": reason},
+                usage=self.last_usage,
+            )
+            return await self.finish(
+                state,
+                content=content,
+                status=RunStatus.TERMINATED_BY_RULE,
+                reason=f"profile control protocol violation: {reason}",
+                add_message=False,
+            )
+
+        message = correction or (
+            "PROFILE CONTROL PROTOCOL: Your previous response was rejected. External "
+            "work must use only your visible external tools. To finish, call "
+            "complete_task as the only tool call. To transfer work, call handoff_agent "
+            "as the only tool call. Do not mix a control call with any other call."
+        )
+        state.pending_profile_correction = message
+        state.metadata.phase = AgentNode.MASTER
+        self.describe_step(
+            {"action": "correct", "source": "control_protocol", "reason": reason},
+            usage=self.last_usage,
+        )
+        await self.emit_progress("Correcting the active profile role's control response...")
+        return state
+
     async def switch_to_finalization(
         self,
         state: LightweightState,
@@ -216,28 +294,8 @@ class AgentRuntime:
         if state.metadata.iteration < self.rule_engine.iteration_limit:
             state.metadata.phase = AgentNode.MASTER
             return state
-        if not self.rule_engine_enabled:
-            return await self.stop_without_rules(
-                state,
-                f"the hard iteration limit ({self.rule_engine.iteration_limit}) was reached",
-            )
         decision = self.rule_engine.handle_iteration_budget_reached()
         return await self.apply_budget_decision(state, decision)
-
-    async def stop_without_rules(
-        self,
-        state: LightweightState,
-        reason: str,
-    ) -> LightweightState:
-        content = f"I stopped because deterministic recovery rules are disabled: {reason}."
-        self.describe_step({"action": "stop", "source": "no_harness"})
-        return await self.finish(
-            state,
-            content=content,
-            status=RunStatus.TERMINATED_BY_RULE,
-            reason=reason,
-            add_message=True,
-        )
 
     async def apply_budget_decision(
         self,
@@ -293,6 +351,8 @@ class AgentRuntime:
             iteration=state.metadata.iteration,
             node="minimal_context",
             node_kind=NodeKind.CONTEXT_PROCESSING,
+            component="minimal_context",
+            profile=(state.profile_ref.to_dict() if state.profile_ref is not None else None),
             before_digest=self.step_before_digest or before_digest,
             after_digest=state.digest(),
             decision=decision,
@@ -313,6 +373,14 @@ class BaseAgent(ABC):
     def __init__(self, runtime: AgentRuntime) -> None:
         self.runtime = runtime
 
+    def node_kind_for(self, state: LightweightState) -> NodeKind:
+        del state
+        return self.node_kind
+
+    def component_for(self, state: LightweightState) -> str:
+        del state
+        return self.node.value
+
     @abstractmethod
     async def run(self, state: LightweightState) -> LightweightState:
         """Execute one explicit transition."""
@@ -323,13 +391,83 @@ class MasterAgent(BaseAgent):
 
     node = AgentNode.MASTER
 
+    def node_kind_for(self, state: LightweightState) -> NodeKind:
+        return NodeKind.HARNESS if state.profile_ref is not None else self.node_kind
+
+    def component_for(self, state: LightweightState) -> str:
+        return "profile_master" if state.profile_ref is not None else self.node.value
+
     async def run(self, state: LightweightState) -> LightweightState:
         if state.metadata.is_terminal:
             next_node = AgentNode.DONE
         elif state.pending_guard_evidence is not None:
             next_node = AgentNode.TEMPORARY_GUARD
+        elif state.metadata.status == RunStatus.FINALIZING:
+            next_node = AgentNode.WORKER
+        elif state.pending_control_call is not None:
+            next_node = AgentNode.CONTROL
         elif state.pending_tool_calls:
             next_node = AgentNode.TOOL
+        elif state.profile_ref is not None and state.resume_agent_id is not None:
+            state.active_agent_id = state.resume_agent_id
+            state.resume_agent_id = None
+            next_node = AgentNode.WORKER
+        elif (
+            state.profile_ref is not None
+            and self.runtime.profile is not None
+            and (state.active_agent_id is None or state.pending_handoff is not None)
+        ):
+            selector = self.runtime.profile_master
+            if selector is None:
+                raise RuntimeError("profile runtime requires a profile master")
+            result = await selector.select(
+                profile=self.runtime.profile,
+                state=state,
+                handoff=state.pending_handoff,
+            )
+            selected_agent_id = result.agent_id
+            source = result.source
+            fallback_used = result.fallback_used
+            diagnostic = result.diagnostic
+            declared_agent_ids = {agent.id for agent in self.runtime.profile.agents}
+            if selected_agent_id not in declared_agent_ids:
+                selected_agent_id = fallback_agent_id(
+                    self.runtime.profile,
+                    state.pending_handoff,
+                )
+                source = "fallback"
+                fallback_used = True
+                diagnostic = "profile master strategy returned an undeclared role"
+            state.active_agent_id = selected_agent_id
+            usage = state.token_ledger.record(
+                NodeKind.HARNESS,
+                result.usage,
+                component="profile_master",
+            )
+            self.runtime.describe_step(
+                {
+                    "route": f"domain:{selected_agent_id}",
+                    "source": source,
+                    "fallback_used": fallback_used,
+                    "diagnostic": diagnostic,
+                },
+                usage=usage,
+            )
+            await self.runtime.emit_hook(
+                "on_profile_route",
+                selected_agent_id,
+                source=source,
+                fallback_used=fallback_used,
+            )
+            if result.usage:
+                await self.runtime.emit_hook(
+                    "on_usage",
+                    result.usage,
+                    node_kind=NodeKind.HARNESS.value,
+                    component="profile_master",
+                )
+            state.metadata.phase = AgentNode.WORKER
+            return state
         else:
             next_node = AgentNode.WORKER
         state.metadata.phase = next_node
@@ -341,6 +479,11 @@ class WorkerAgent(BaseAgent):
     """Construct model input and perform one domain-model call."""
 
     node = AgentNode.WORKER
+
+    def component_for(self, state: LightweightState) -> str:
+        if state.profile_ref is not None and state.active_agent_id is not None:
+            return f"domain:{state.active_agent_id}"
+        return self.node.value
 
     async def run(self, state: LightweightState) -> LightweightState:
         guard = self.runtime.rule_engine
@@ -364,18 +507,48 @@ class WorkerAgent(BaseAgent):
             if state.metadata.iteration >= guard.iteration_limit:
                 return await self.runtime.grant_more_or_finalize(state)
             state.metadata.iteration += 1
-            tool_defs = self.runtime.tools.get_definitions()
+            if self.runtime.profile is not None:
+                agent = self.runtime.active_profile_agent(state)
+                scoped = ScopedToolRegistry(
+                    self.runtime.tools,
+                    (name for name in agent.tools if name not in CONTROL_TOOL_NAMES),
+                )
+                tool_defs = scoped.get_definitions()
+                state.active_tools = _active_tool_names(tool_defs)
+                tool_defs = [*tool_defs, *(dict(item) for item in CONTROL_TOOL_DEFINITIONS)]
+            else:
+                tool_defs = self.runtime.tools.get_definitions()
             await self.runtime.emit_progress(
                 "Thinking..."
                 if state.metadata.iteration == 1
                 else f"Thinking (step {state.metadata.iteration})..."
             )
 
-        additional_messages = (
-            [state.metadata.finalization_prompt or guard.finalization_prompt_message()]
-            if state.metadata.status == RunStatus.FINALIZING
-            else []
-        )
+        if state.metadata.status == RunStatus.FINALIZING:
+            additional_messages = [
+                state.metadata.finalization_prompt or guard.finalization_prompt_message()
+            ]
+        elif self.runtime.profile is not None:
+            active_agent = self.runtime.active_profile_agent(state)
+            additional_messages = role_context_messages(
+                self.runtime.profile,
+                active_agent,
+                effective_tools=list(state.active_tools),
+                handoff=state.pending_handoff,
+                handoff_count=state.handoff_count,
+                handoff_limit=self.runtime.profile_handoff_limit(),
+            )
+            if state.pending_profile_correction is not None:
+                additional_messages.append(
+                    {
+                        "role": "system",
+                        "content": state.pending_profile_correction,
+                    }
+                )
+                state.pending_profile_correction = None
+            state.pending_handoff = None
+        else:
+            additional_messages = []
         context_before = (
             self.runtime.step_before_digest or state.digest()
             if self.runtime.trace_enabled
@@ -410,14 +583,10 @@ class WorkerAgent(BaseAgent):
             additional_messages=additional_messages,
         )
         state.minimal_context = context.messages
-        compact_tokens = (
-            original_tokens
-            if isinstance(self.runtime.context_processor, IdentityContextProcessor)
-            else estimate_request_tokens(
-                context.messages,
-                tools=context.tools,
-                model=self.runtime.model,
-            )
+        compact_tokens = estimate_request_tokens(
+            context.messages,
+            tools=context.tools,
+            model=self.runtime.model,
         )
         context_metrics = {
             **context_usage,
@@ -428,6 +597,7 @@ class WorkerAgent(BaseAgent):
         normalized_context_usage = state.token_ledger.record(
             NodeKind.CONTEXT_PROCESSING,
             context_metrics,
+            component="minimal_context",
         )
         self.runtime.record_context_transition(
             state,
@@ -442,7 +612,12 @@ class WorkerAgent(BaseAgent):
         )
 
         response = await self.runtime.do_llm_call(context.messages, context.tools)
-        domain_usage = state.token_ledger.record(NodeKind.DOMAIN, response.usage)
+        component = self.component_for(state)
+        domain_usage = state.token_ledger.record(
+            NodeKind.DOMAIN,
+            response.usage,
+            component=component,
+        )
         self.runtime.describe_step(
             {
                 "finish_reason": response.finish_reason,
@@ -450,16 +625,67 @@ class WorkerAgent(BaseAgent):
             },
             usage=domain_usage,
         )
-        await self.runtime.emit_hook("on_llm_response", response)
+        await self.runtime.emit_hook(
+            "on_llm_response",
+            response,
+            component=component,
+        )
 
         if response.tool_calls:
             if state.metadata.status == RunStatus.FINALIZING:
                 return await self._handle_finalization_tool_calls(state, response)
+            if self.runtime.profile is not None:
+                control_calls = [
+                    tool_call
+                    for tool_call in response.tool_calls
+                    if tool_call.name in CONTROL_TOOL_NAMES
+                ]
+                if control_calls and len(response.tool_calls) != 1:
+                    return await self._reject_mixed_control_batch(state, response)
+                if control_calls:
+                    state.pending_response = response
+                    state.pending_control_call = control_calls[0]
+                    state.pending_tool_calls = []
+                    state.metadata.phase = AgentNode.MASTER
+                    return state
+                state.resume_agent_id = state.active_agent_id
             state.pending_response = response
             state.pending_tool_calls = list(response.tool_calls)
             state.metadata.phase = AgentNode.MASTER
             return state
         return await self._handle_text_response(state, response)
+
+    async def _reject_mixed_control_batch(
+        self,
+        state: LightweightState,
+        response: LLMResponse,
+    ) -> LightweightState:
+        """Pair every rejected call locally without executing any external handler."""
+
+        call_dicts = [tool_call.to_openai_tool_call() for tool_call in response.tool_calls]
+        state.messages = self.runtime.add_assistant_message(
+            state.messages,
+            response.content,
+            tool_calls=call_dicts,
+            reasoning_content=response.reasoning_content,
+            thinking_blocks=response.thinking_blocks,
+        )
+        for tool_call in response.tool_calls:
+            state.messages = self.runtime.add_tool_result(
+                state.messages,
+                tool_call.id,
+                tool_call.name,
+                "Error: Control calls must be the response's only tool call; the entire "
+                "batch was rejected without external execution.",
+            )
+        state.pending_response = None
+        state.pending_control_call = None
+        state.pending_tool_calls = []
+        state.resume_agent_id = None
+        return await self.runtime.profile_protocol_error(
+            state,
+            reason="mixed control and external tool calls",
+        )
 
     async def _handle_finalization_tool_calls(
         self,
@@ -518,11 +744,6 @@ class WorkerAgent(BaseAgent):
             )
 
         if clean is None:
-            if not self.runtime.rule_engine_enabled:
-                return await self.runtime.stop_without_rules(
-                    state,
-                    "the model returned no visible response",
-                )
             decision = self.runtime.rule_engine.handle_empty_or_exhausted_response(
                 finish_reason=response.finish_reason,
                 finalizing=state.metadata.status == RunStatus.FINALIZING,
@@ -558,6 +779,19 @@ class WorkerAgent(BaseAgent):
             reasoning_content=response.reasoning_content,
             thinking_blocks=response.thinking_blocks,
         )
+        if (
+            self.runtime.profile is not None
+            and state.metadata.status != RunStatus.FINALIZING
+        ):
+            return await self.runtime.profile_protocol_error(
+                state,
+                reason="bare text completion",
+                visible_content=clean,
+                correction=(
+                    "PROFILE CONTROL PROTOCOL: Bare text cannot complete this profile "
+                    "turn. Call complete_task(final_content=...) as the only tool call."
+                ),
+            )
         return await self.runtime.finish(
             state,
             content=clean,
@@ -571,6 +805,10 @@ class ToolAgent(BaseAgent):
     """Apply deterministic rules and execute one tool-call batch."""
 
     node = AgentNode.TOOL
+
+    def component_for(self, state: LightweightState) -> str:
+        del state
+        return "tool"
 
     async def run(self, state: LightweightState) -> LightweightState:
         response = state.pending_response
@@ -587,7 +825,7 @@ class ToolAgent(BaseAgent):
 
         malformed = self.runtime.rule_engine.handle_malformed_tool_calls(
             state.pending_tool_calls,
-            apply_rules=self.runtime.rule_engine_enabled,
+            apply_rules=True,
         )
         malformed_ids = {tool_call.id for tool_call in malformed.malformed_calls}
         tool_call_dicts: list[dict[str, Any]] = []
@@ -611,12 +849,6 @@ class ToolAgent(BaseAgent):
                 tool_result.content,
             )
 
-        if malformed.malformed_calls and not self.runtime.rule_engine_enabled:
-            self._clear_pending(state)
-            return await self.runtime.stop_without_rules(
-                state,
-                "the model supplied malformed tool arguments",
-            )
         if malformed.decision.action == LoopGuardAction.STOP_OFF_TRACK:
             return await self._escalate_or_stop(
                 state,
@@ -634,7 +866,7 @@ class ToolAgent(BaseAgent):
         duplicate = self.runtime.rule_engine.handle_duplicate_tool_calls(
             state.messages,
             malformed.executable_calls,
-            apply_rules=self.runtime.rule_engine_enabled,
+            apply_rules=True,
         )
         for tool_call in duplicate.duplicate_calls:
             logger.warning(
@@ -647,12 +879,6 @@ class ToolAgent(BaseAgent):
                 tool_result.call_id,
                 tool_result.tool_name,
                 tool_result.content,
-            )
-        if duplicate.duplicate_calls and not self.runtime.rule_engine_enabled:
-            self._clear_pending(state)
-            return await self.runtime.stop_without_rules(
-                state,
-                "the model repeated a tool call that already ran",
             )
         if duplicate.decision.action == LoopGuardAction.STOP_OFF_TRACK:
             return await self._escalate_or_stop(
@@ -677,13 +903,19 @@ class ToolAgent(BaseAgent):
             args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
             logger.info("UASM tool call: {}({})", tool_call.name, args_str[:200])
 
+        execution_tools = (
+            ScopedToolRegistry(self.runtime.tools, state.active_tools)
+            if self.runtime.profile is not None
+            else self.runtime.tools
+        )
         executed_nodes = await execute_tool_batch(
             tool_calls=tool_calls,
-            tools=self.runtime.tools,
+            tools=execution_tools,
         )
         state.pending_tool_nodes = executed_nodes
         for node in sorted(executed_nodes, key=lambda item: item.index):
-            state.tools_used.append(node.tool_name)
+            if self.runtime.profile is None or node.tool_name in state.active_tools:
+                state.tools_used.append(node.tool_name)
             state.messages = self.runtime.add_tool_result(
                 state.messages,
                 node.call_id,
@@ -692,19 +924,6 @@ class ToolAgent(BaseAgent):
             )
             await self.runtime.emit_hook("on_tool_result", node)
         self._clear_pending(state)
-
-        if (
-            executed_nodes
-            and any(tool_result_failed(node.result) for node in executed_nodes)
-            and not self.runtime.rule_engine_enabled
-        ):
-            return await self.runtime.stop_without_rules(
-                state,
-                "one or more tool calls in the latest round failed or returned errors",
-            )
-
-        if not self.runtime.rule_engine_enabled:
-            return await self.runtime.grant_more_or_finalize(state)
 
         decision = self.runtime.rule_engine.handle_tool_results(executed_nodes)
         self.runtime.describe_step(_decision_summary(decision))
@@ -794,7 +1013,11 @@ class TemporaryGuardAgent(BaseAgent):
             return state
 
         resolution = await guard.decide(evidence, fallback)
-        usage = state.token_ledger.record(NodeKind.HARNESS, resolution.usage)
+        usage = state.token_ledger.record(
+            NodeKind.HARNESS,
+            resolution.usage,
+            component="temporary_guard",
+        )
         decision = resolution.decision
         self.runtime.describe_step(
             {
@@ -877,6 +1100,16 @@ def _node_failures(nodes: list[TaskNode]) -> tuple[Mapping[str, Any], ...]:
 
 
 def agent_node_kind(node: AgentNode) -> NodeKind:
-    if node == AgentNode.TEMPORARY_GUARD:
+    if node in {AgentNode.CONTROL, AgentNode.TEMPORARY_GUARD}:
         return NodeKind.HARNESS
     return NodeKind.DOMAIN
+
+
+def _active_tool_names(tool_defs: list[dict[str, Any]]) -> list[str]:
+    names: list[str] = []
+    for definition in tool_defs:
+        function = definition.get("function")
+        name = function.get("name") if isinstance(function, dict) else None
+        if isinstance(name, str):
+            names.append(name)
+    return names

@@ -32,6 +32,7 @@ class TurnEventProgress:
         self._turn_started_at: str | None = None
         self.usage: dict[str, int] = {}
         self.usage_by_node_kind: dict[str, dict[str, int]] = {}
+        self.usage_by_component: dict[str, dict[str, int]] = {}
 
     def _payload(self, **extra: Any) -> dict[str, Any]:
         """Build an event payload stamped with the session and turn ids."""
@@ -91,7 +92,12 @@ class TurnEventProgress:
         )
         await self.emit("chat.block.delta", payload)
 
-    async def on_llm_response(self, response: Any) -> None:
+    async def on_llm_response(
+        self,
+        response: Any,
+        *,
+        component: str = "worker",
+    ) -> None:
         reasoning = str(getattr(response, "reasoning_content", None) or "").strip()
         if reasoning:
             block = await self._ensure_reasoning_block()
@@ -110,12 +116,20 @@ class TurnEventProgress:
                 )
         call_usage = getattr(response, "usage", {})
         if isinstance(call_usage, dict):
-            self._record_usage(call_usage, node_kind="domain")
+            self._record_usage(
+                call_usage,
+                node_kind="domain",
+                component=component,
+            )
         payload = self._payload(
             finish_reason=getattr(response, "finish_reason", None),
+            component=component,
             usage=call_usage if isinstance(call_usage, dict) else {},
             call_usage=call_usage if isinstance(call_usage, dict) else {},
             aggregate_usage=dict(self.usage),
+            aggregate_by_component={
+                name: dict(values) for name, values in self.usage_by_component.items()
+            },
             ts=_now(),
         )
         assistant_block = self._find_block(self._text_block_id) if self._text_block_id else None
@@ -149,10 +163,18 @@ class TurnEventProgress:
         usage: dict[str, Any],
         *,
         node_kind: str,
+        component: str | None = None,
     ) -> None:
         """Record non-domain provider usage and publish the turn aggregate."""
 
-        self._record_usage(usage, node_kind=node_kind)
+        resolved_component = component or (
+            "minimal_context" if node_kind == "context_processing" else node_kind
+        )
+        self._record_usage(
+            usage,
+            node_kind=node_kind,
+            component=resolved_component,
+        )
         await self.emit(
             "chat.usage",
             self._payload(
@@ -160,7 +182,11 @@ class TurnEventProgress:
                 by_node_kind={
                     kind: dict(values) for kind, values in self.usage_by_node_kind.items()
                 },
+                by_component={
+                    name: dict(values) for name, values in self.usage_by_component.items()
+                },
                 node_kind=node_kind,
+                component=resolved_component,
                 ts=_now(),
             ),
         )
@@ -170,7 +196,80 @@ class TurnEventProgress:
 
         usage = getattr(resolution, "usage", {})
         if isinstance(usage, dict) and usage:
-            await self.on_usage(usage, node_kind="harness")
+            await self.on_usage(
+                usage,
+                node_kind="harness",
+                component="temporary_guard",
+            )
+
+    async def on_profile_pinned(self, profile: dict[str, Any]) -> None:
+        """Expose immutable turn provenance before any profile routing."""
+
+        await self.emit(
+            "chat.profile.pinned",
+            self._payload(profile=_json_safe(profile), ts=_now()),
+        )
+
+    async def on_profile_route(
+        self,
+        agent_id: str,
+        *,
+        source: str,
+        fallback_used: bool,
+    ) -> None:
+        await self.emit(
+            "chat.profile.route",
+            self._payload(
+                agent_id=agent_id,
+                source=source,
+                fallback_used=fallback_used,
+                ts=_now(),
+            ),
+        )
+        await self._append_reasoning_line(
+            f"Profile selected role {agent_id}",
+            kind="profile_route",
+            data={
+                "agent_id": agent_id,
+                "source": source,
+                "fallback_used": fallback_used,
+            },
+        )
+
+    async def on_profile_handoff(
+        self,
+        from_agent_id: str,
+        recommended_agent_id: str | None,
+        summary: str,
+        *,
+        handoff_count: int,
+        handoff_limit: int,
+    ) -> None:
+        await self.emit(
+            "chat.profile.handoff",
+            self._payload(
+                from_agent_id=from_agent_id,
+                recommended_agent_id=recommended_agent_id,
+                summary=summary,
+                handoff_count=handoff_count,
+                handoff_limit=handoff_limit,
+                ts=_now(),
+            ),
+        )
+
+    async def on_profile_completion(
+        self,
+        agent_id: str | None,
+        final_content: str,
+    ) -> None:
+        await self.emit(
+            "chat.profile.completion",
+            self._payload(
+                agent_id=agent_id,
+                final=_text_summary(final_content),
+                ts=_now(),
+            ),
+        )
 
     async def on_tool_calls(self, tool_calls: list[ToolCallRequest]) -> None:
         for tool_call in tool_calls:
@@ -436,10 +535,18 @@ class TurnEventProgress:
                 return block
         return None
 
-    def _record_usage(self, usage: dict[str, Any], *, node_kind: str) -> None:
+    def _record_usage(
+        self,
+        usage: dict[str, Any],
+        *,
+        node_kind: str,
+        component: str,
+    ) -> None:
         accumulate_usage(self.usage, usage)
         bucket = self.usage_by_node_kind.setdefault(node_kind, {})
         accumulate_usage(bucket, usage)
+        component_bucket = self.usage_by_component.setdefault(component, {})
+        accumulate_usage(component_bucket, usage)
 
 
 def _tool_call_detail(tool_call: ToolCallRequest) -> dict[str, Any]:

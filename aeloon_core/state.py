@@ -31,6 +31,7 @@ class AgentNode(StrEnum):
 
     MASTER = "master"
     WORKER = "worker"
+    CONTROL = "control"
     TOOL = "tool"
     TEMPORARY_GUARD = "temporary_guard"
     DONE = "done"
@@ -56,6 +57,33 @@ class RunStatus(StrEnum):
         }
 
 
+@dataclass(frozen=True)
+class ProfileRef:
+    """Immutable artifact provenance pinned for one runtime turn."""
+
+    profile_id: str
+    revision: int
+    artifact_id: str
+    generation: int
+
+    def to_dict(self) -> dict[str, str | int]:
+        return {
+            "profile_id": self.profile_id,
+            "revision": self.revision,
+            "artifact_id": self.artifact_id,
+            "generation": self.generation,
+        }
+
+
+@dataclass(frozen=True)
+class PendingHandoff:
+    """Validated handoff intent waiting for profile-master routing."""
+
+    from_agent_id: str
+    summary: str
+    recommended_agent_id: str | None = None
+
+
 @dataclass
 class StateMetadata:
     """Small, typed control plane for a ``LightweightState``."""
@@ -69,7 +97,6 @@ class StateMetadata:
     termination_reason: str | None = None
     session_id: str | None = None
     turn_id: str | None = None
-    experiment_labels: dict[str, str] = field(default_factory=dict)
     extras: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -237,10 +264,20 @@ class LightweightState:
     transitions: list[TransitionRecord] = field(default_factory=list)
     token_ledger: TokenLedger = field(default_factory=TokenLedger)
     lazy_values: dict[str, LazyValue] = field(default_factory=dict, repr=False)
+    profile_ref: ProfileRef | None = None
+    active_agent_id: str | None = None
+    resume_agent_id: str | None = None
+    handoff_count: int = 0
+    pending_handoff: PendingHandoff | None = None
+    pending_control_call: ToolCallRequest | None = None
+    pending_profile_correction: str | None = None
+    control_protocol_retries: int = 0
 
     def __post_init__(self) -> None:
         if self.minimal_context is None:
             self.minimal_context = list(self.messages)
+        self.handoff_count = max(0, int(self.handoff_count))
+        self.control_protocol_retries = max(0, int(self.control_protocol_retries))
 
     @classmethod
     def from_messages(
@@ -317,7 +354,6 @@ class LightweightState:
                 "termination_reason": self.metadata.termination_reason,
                 "session_id": self.metadata.session_id,
                 "turn_id": self.metadata.turn_id,
-                "experiment_labels": _canonicalize(self.metadata.experiment_labels),
                 "extras": _canonicalize(self.metadata.extras),
             },
             "guard_state": self.guard_state.to_dict(),
@@ -338,6 +374,19 @@ class LightweightState:
                 for ref, lazy in sorted(self.lazy_values.items())
             },
         }
+        if self.profile_ref is not None:
+            payload["profile"] = {
+                "ref": self.profile_ref.to_dict(),
+                "active_agent_id": self.active_agent_id,
+                "resume_agent_id": self.resume_agent_id,
+                "handoff_count": self.handoff_count,
+                "pending_handoff": _value_summary(self.pending_handoff),
+                "pending_control_call": _value_summary(self.pending_control_call),
+                "pending_profile_correction": _value_summary(
+                    self.pending_profile_correction
+                ),
+                "control_protocol_retries": self.control_protocol_retries,
+            }
         return _stable_hash(payload)
 
     def digest(self) -> str:

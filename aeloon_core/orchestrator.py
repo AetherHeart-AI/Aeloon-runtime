@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
+import json
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
 from loguru import logger
 
-from aeloon_core.config import Config, UASMConfig
+from aeloon_core.config import Config
 from aeloon_core.context import (
     append_user_message,
     apply_skill_guidance,
@@ -18,7 +20,9 @@ from aeloon_core.context import (
     refresh_initial_system_message,
 )
 from aeloon_core.context_compaction import CompactionResult, maybe_compact_messages
+from aeloon_core.default_profile import DEFAULT_PROFILE_ID, load_default_profile
 from aeloon_core.model_metadata import resolve_context_window
+from aeloon_core.profile_artifacts import CompatibilityPolicy, ProfileArtifactStore
 from aeloon_core.providers.base import GenerationSettings
 from aeloon_core.providers.custom_provider import CustomProvider
 from aeloon_core.session import SessionStore
@@ -46,6 +50,7 @@ class TurnResult:
     transitions: list[dict[str, Any]] = field(default_factory=list)
     status: str | None = None
     turn_id: str | None = None
+    profile: dict[str, Any] | None = None
 
 
 class AeloonCoreOrchestrator:
@@ -68,25 +73,40 @@ class AeloonCoreOrchestrator:
             chat_timeout=defaults.chat_timeout,
         )
         self.registry = ToolRegistry()
+        self.profile_registry = ToolRegistry()
         self.skills = SkillRegistry.discover(config)
         workspace = config.workspace
-        for tool in (
-            ExecTool(workspace=workspace, timeout=config.tools.exec.timeout),
-            ReadTool(workspace=workspace),
-            WriteTool(workspace=workspace),
-            EditTool(workspace=workspace),
-            GlobTool(workspace=workspace),
-            GrepTool(workspace=workspace),
-            WebFetchTool(config=config.tools.web),
-            WebSearchTool(config=config.tools.web),
-        ):
-            self.registry.register(tool)
-        # Only expose the tool when there is something to advertise, matching the
-        # guidance text (which lists described skills only).
-        if self.skills.enabled and self.skills.described():
-            self.registry.register(SkillTool(registry=self.skills))
         self.todo_tool = TodoWriteTool(data_dir=config.data_dir)
-        self.registry.register(self.todo_tool)
+        for registry, protected_paths in (
+            (self.registry, ()),
+            (self.profile_registry, (config.data_dir,)),
+        ):
+            for tool in (
+                ExecTool(
+                    workspace=workspace,
+                    timeout=config.tools.exec.timeout,
+                    denied_paths=protected_paths,
+                ),
+                ReadTool(workspace=workspace, denied_paths=protected_paths),
+                WriteTool(workspace=workspace, denied_paths=protected_paths),
+                EditTool(workspace=workspace, denied_paths=protected_paths),
+                GlobTool(workspace=workspace, denied_paths=protected_paths),
+                GrepTool(workspace=workspace, denied_paths=protected_paths),
+                WebFetchTool(config=config.tools.web),
+                WebSearchTool(config=config.tools.web),
+            ):
+                registry.register(tool)
+            # Only expose the tool when there is something to advertise, matching the
+            # guidance text (which lists described skills only).
+            if self.skills.enabled and self.skills.described():
+                registry.register(SkillTool(registry=self.skills))
+            registry.register(self.todo_tool)
+        self.profile_store = ProfileArtifactStore(
+            data_dir=config.data_dir,
+            compatibility=CompatibilityPolicy(
+                tool_schema_fingerprints=_tool_schema_fingerprints(self.registry)
+            ),
+        )
         self.sessions = SessionStore(data_dir=config.data_dir, workspace=config.workspace)
 
     async def run_turn(
@@ -101,6 +121,15 @@ class AeloonCoreOrchestrator:
         actual_session_id = session_id or self.sessions.new_session()
         self.todo_tool.set_session_id(actual_session_id)
         defaults = self.config.agents.defaults
+        if defaults.profile_id == DEFAULT_PROFILE_ID:
+            profile = await load_default_profile(
+                self.profile_store,
+                workspace=self.config.workspace,
+            )
+        elif defaults.profile_id is not None:
+            profile = self.profile_store.load_active(defaults.profile_id)
+        else:
+            profile = None
         messages = self.sessions.load_messages(
             actual_session_id,
             initial_messages=build_initial_messages(workspace=self.config.workspace),
@@ -175,26 +204,23 @@ class AeloonCoreOrchestrator:
             state = await run_agent_loop(
                 provider=self.provider,
                 model=defaults.model,
-                tools=self.registry,
+                tools=self.profile_registry if profile is not None else self.registry,
                 messages=messages,
                 max_iterations=defaults.max_iterations,
                 max_auto_continue_iterations=defaults.max_auto_continue_iterations,
                 max_finalization_iterations=defaults.max_finalization_iterations,
-                rule_engine_enabled=policy.rule_engine_enabled,
-                temporary_guard_enabled=policy.temporary_guard_enabled,
-                minimal_context_enabled=policy.minimal_context_enabled,
                 transition_trace_enabled=policy.transition_trace_enabled,
-                guard_decision_mode=policy.guard_decision_mode,
                 minimal_context_recent_turns=policy.minimal_context_recent_turns,
                 minimal_context_tool_result_chars=policy.minimal_context_tool_result_chars,
                 session_id=actual_session_id,
                 turn_id=turn_id,
-                experiment_labels={"ablation_group": _ablation_group(policy)},
                 on_transition=(
                     persist_transition if policy.transition_trace_enabled else None
                 ),
                 on_progress=on_progress,
                 prepare_model_input=prepare_model_input,
+                profile=profile,
+                max_handoffs=defaults.max_handoffs,
             )
         except BaseException:
             if trace_write_tail is not None:
@@ -209,6 +235,7 @@ class AeloonCoreOrchestrator:
         usage = state.token_ledger.to_dict()
         transitions = [record.to_dict() for record in state.transitions]
         status = state.metadata.status.value
+        profile_ref = state.profile_ref.to_dict() if state.profile_ref is not None else None
         blocks = list(getattr(on_progress, "blocks", []) or [])
         self.sessions.append_turn(
             session_id=actual_session_id,
@@ -219,6 +246,7 @@ class AeloonCoreOrchestrator:
             blocks=blocks,
             usage=usage,
             turn_id=turn_id,
+            profile=profile_ref,
         )
         return TurnResult(
             session_id=actual_session_id,
@@ -230,18 +258,25 @@ class AeloonCoreOrchestrator:
             transitions=transitions,
             status=status,
             turn_id=turn_id,
+            profile=profile_ref,
         )
 
 
-def _ablation_group(policy: UASMConfig) -> str:
-    switches = (
-        policy.rule_engine_enabled,
-        policy.temporary_guard_enabled,
-        policy.minimal_context_enabled,
-    )
-    return {
-        (False, False, False): "A0",
-        (True, False, False): "A1",
-        (True, True, False): "A2",
-        (True, True, True): "A3",
-    }.get(switches, "custom")
+def _tool_schema_fingerprints(registry: ToolRegistry) -> dict[str, str]:
+    """Hash canonical host schemas for artifact compatibility checks."""
+
+    fingerprints: dict[str, str] = {}
+    for definition in registry.get_definitions():
+        function = definition.get("function")
+        name = function.get("name") if isinstance(function, dict) else None
+        if not isinstance(name, str):
+            continue
+        payload = json.dumps(
+            definition,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        fingerprints[name] = hashlib.sha256(payload).hexdigest()
+    return fingerprints

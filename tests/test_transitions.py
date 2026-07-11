@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from aeloon_core.loop_guard import LoopGuardAction, LoopGuardDecision
 from aeloon_core.state import AgentNode
-from aeloon_core.transitions import NodeKind, TokenLedger, TransitionRecorder
+from aeloon_core.transitions import (
+    NodeKind,
+    TokenLedger,
+    TransitionRecord,
+    TransitionRecorder,
+)
 
 
 def test_token_ledger_aggregates_usage_by_node_kind() -> None:
@@ -31,6 +36,15 @@ def test_token_ledger_aggregates_usage_by_node_kind() -> None:
         },
         "harness": {"total_tokens": 3},
     }
+    assert ledger.to_dict()["by_component"] == {
+        "domain": {
+            "prompt_tokens": 10,
+            "completion_tokens": 4,
+            "total_tokens": 14,
+        },
+        "harness": {"total_tokens": 3},
+    }
+    assert ledger.is_conserved()
 
 
 def test_transition_recorder_sequences_serializes_and_persists() -> None:
@@ -45,6 +59,8 @@ def test_transition_recorder_sequences_serializes_and_persists() -> None:
         iteration=1,
         node=AgentNode.WORKER,
         node_kind=NodeKind.DOMAIN,
+        component="domain:implementer",
+        profile={"profile_id": "coding-team", "artifact_id": "artifact-1"},
         before_digest="before",
         after_digest="after",
         decision=LoopGuardDecision(
@@ -70,6 +86,11 @@ def test_transition_recorder_sequences_serializes_and_persists() -> None:
     assert payload["turn_id"] == "turn-1"
     assert payload["node"] == "worker"
     assert payload["node_kind"] == "domain"
+    assert payload["component"] == "domain:implementer"
+    assert payload["profile"] == {
+        "profile_id": "coding-team",
+        "artifact_id": "artifact-1",
+    }
     assert payload["decision"] == {
         "action": "return_to_model",
         "reason": "recover",
@@ -114,3 +135,26 @@ def test_transition_recorder_fails_open_after_trace_io_error() -> None:
     assert recorder.records == [first, second]
     assert recorder.persistence_error == "disk full"
     assert attempts == 1
+
+
+def test_additive_transition_fields_preserve_v1_positional_constructor_order() -> None:
+    record = TransitionRecord(
+        1,
+        2,
+        "worker",
+        NodeKind.DOMAIN,
+        "before",
+        "after",
+        "session-1",
+        "turn-1",
+        {"legacy": "decision"},
+        {"total_tokens": 3},
+        1.5,
+        "2026-07-11T00:00:00+00:00",
+        1,
+    )
+
+    assert record.decision == {"legacy": "decision"}
+    assert record.token_usage == {"total_tokens": 3}
+    assert record.component is None
+    assert record.profile is None

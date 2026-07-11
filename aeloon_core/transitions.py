@@ -84,19 +84,25 @@ class TransitionRecord:
     wall_time_ms: float = 0.0
     created_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
     schema_version: int = 1
+    component: str | None = None
+    profile: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "sequence", max(0, int(self.sequence)))
         object.__setattr__(self, "iteration", max(0, int(self.iteration)))
         object.__setattr__(self, "node", str(self.node))
         object.__setattr__(self, "node_kind", NodeKind(self.node_kind))
+        if self.component is not None:
+            object.__setattr__(self, "component", str(self.component))
+        if self.profile is not None:
+            object.__setattr__(self, "profile", _json_safe(self.profile))
         object.__setattr__(self, "token_usage", normalize_usage(self.token_usage))
         object.__setattr__(self, "wall_time_ms", max(0.0, float(self.wall_time_ms)))
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize without leaking enum or dataclass implementation details."""
 
-        return {
+        payload = {
             "schema_version": self.schema_version,
             "session_id": self.session_id,
             "turn_id": self.turn_id,
@@ -111,28 +117,38 @@ class TransitionRecord:
             "wall_time_ms": self.wall_time_ms,
             "created_at": self.created_at,
         }
+        if self.component is not None:
+            payload["component"] = self.component
+        if self.profile is not None:
+            payload["profile"] = dict(self.profile)
+        return payload
 
 
 @dataclass
 class TokenLedger:
-    """Aggregate provider token usage globally and by node category."""
+    """Aggregate usage globally, by node category, and by exact component."""
 
     totals: dict[str, int] = field(default_factory=dict)
     by_node_kind: dict[NodeKind, dict[str, int]] = field(default_factory=dict)
+    by_component: dict[str, dict[str, int]] = field(default_factory=dict)
 
     def record(
         self,
         node_kind: NodeKind | str,
         usage: Mapping[str, Any] | None,
+        *,
+        component: str | None = None,
     ) -> dict[str, int]:
         """Add one usage sample and return its normalized counters."""
 
         kind = NodeKind(node_kind)
         normalized = normalize_usage(usage)
         bucket = self.by_node_kind.setdefault(kind, {})
+        component_bucket = self.by_component.setdefault(component or kind.value, {})
         for key, value in normalized.items():
             self.totals[key] = self.totals.get(key, 0) + value
             bucket[key] = bucket.get(key, 0) + value
+            component_bucket[key] = component_bucket.get(key, 0) + value
         return normalized
 
     add = record
@@ -141,6 +157,22 @@ class TokenLedger:
         """Return a detached usage snapshot for one category."""
 
         return dict(self.by_node_kind.get(NodeKind(node_kind), {}))
+
+    def for_component(self, component: str) -> dict[str, int]:
+        """Return a detached usage snapshot for one runtime component."""
+
+        return dict(self.by_component.get(component, {}))
+
+    def is_conserved(self) -> bool:
+        """Return whether every total is conserved in both attribution views."""
+
+        keys = set(self.totals)
+        return all(
+            sum(bucket.get(key, 0) for bucket in self.by_node_kind.values())
+            == self.totals[key]
+            == sum(bucket.get(key, 0) for bucket in self.by_component.values())
+            for key in keys
+        )
 
     @property
     def total_tokens(self) -> int:
@@ -158,6 +190,10 @@ class TokenLedger:
             "by_node_kind": {
                 kind.value: dict(usage)
                 for kind, usage in sorted(self.by_node_kind.items(), key=lambda item: item[0].value)
+            },
+            "by_component": {
+                component: dict(usage)
+                for component, usage in sorted(self.by_component.items())
             },
         }
 
@@ -187,6 +223,8 @@ class TransitionRecorder:
         iteration: int,
         node: str | Enum,
         node_kind: NodeKind | str,
+        component: str | None = None,
+        profile: Mapping[str, Any] | None = None,
         before_digest: str,
         after_digest: str,
         decision: Any = None,
@@ -207,6 +245,8 @@ class TransitionRecorder:
             after_digest=after_digest,
             session_id=session_id if session_id is not None else self.session_id,
             turn_id=turn_id if turn_id is not None else self.turn_id,
+            component=component,
+            profile=dict(profile) if profile is not None else None,
             decision=decision,
             token_usage=normalize_usage(token_usage),
             wall_time_ms=wall_time_ms,

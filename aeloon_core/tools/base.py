@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 
@@ -52,8 +53,16 @@ def _strip_titles(node: Any) -> Any:
 class WorkspaceTool(Tool):
     """A tool bound to a workspace directory, with shared path resolution."""
 
-    def __init__(self, *, workspace: Path) -> None:
-        self.workspace = workspace
+    def __init__(
+        self,
+        *,
+        workspace: Path,
+        denied_paths: Iterable[Path] = (),
+    ) -> None:
+        self.workspace = Path(workspace).expanduser().resolve(strict=False)
+        self.denied_paths = tuple(
+            Path(path).expanduser().resolve(strict=False) for path in denied_paths
+        )
 
     def _resolve(self, path: str | None) -> Path:
         """Resolve a path against the workspace; empty/None resolves to the root."""
@@ -63,4 +72,10 @@ class WorkspaceTool(Tool):
         candidate = Path(path).expanduser()
         if not candidate.is_absolute():
             candidate = self.workspace / candidate
-        return candidate.resolve(strict=False)
+        resolved = candidate.resolve(strict=False)
+        if self.denied_paths and not resolved.is_relative_to(self.workspace):
+            raise ValueError(f"path escapes workspace: {path}")
+        for denied in self.denied_paths:
+            if resolved == denied or resolved.is_relative_to(denied):
+                raise PermissionError(f"path is protected from agent tools: {path}")
+        return resolved

@@ -50,23 +50,15 @@ def test_context_compaction_config_setters_are_registered() -> None:
     assert "max-tokens" not in CONFIG_SETTERS
 
 
-def test_uasm_config_setters_are_registered() -> None:
+def test_uasm_config_setters_keep_runtime_trace_and_context_controls() -> None:
     args = build_parser().parse_args(
-        ["config", "set", "uasm-rule-engine-enabled", "false"]
+        ["config", "set", "uasm-minimal-context-recent-turns", "3"]
     )
 
     assert args.config_command == "set"
-    assert args.key == "uasm-rule-engine-enabled"
-    assert "uasm-enabled" not in CONFIG_SETTERS
-    assert CONFIG_SETTERS["uasm-temporary-guard-enabled"] == (
-        "agents",
-        "defaults",
-        "uasm",
-        "temporary_guard_enabled",
-    )
-    assert _coerce_config_value("uasm-rule-engine-enabled", "false") is False
+    assert args.key == "uasm-minimal-context-recent-turns"
     assert _coerce_config_value("uasm-minimal-context-recent-turns", "3") == 3
-    assert _coerce_config_value("uasm-guard-decision-mode", "binary") == "binary"
+    assert "uasm-rule-engine-enabled" not in CONFIG_SETTERS
 
 
 def test_implicit_chat_invocations() -> None:
@@ -206,13 +198,25 @@ async def test_turn_progress_attributes_context_and_harness_usage() -> None:
         events.append((event, payload))
 
     progress = TurnEventProgress(session_id="session-1", emit=emit)
-    await progress.on_usage({"total_tokens": 4}, node_kind="context_processing")
-    await progress.on_usage({"total_tokens": 3}, node_kind="harness")
+    await progress.on_usage(
+        {"total_tokens": 4},
+        node_kind="context_processing",
+        component="minimal_context",
+    )
+    await progress.on_usage(
+        {"total_tokens": 3},
+        node_kind="harness",
+        component="profile_master",
+    )
 
     assert progress.usage["total_tokens"] == 7
     assert progress.usage_by_node_kind == {
         "context_processing": {"total_tokens": 4},
         "harness": {"total_tokens": 3},
+    }
+    assert progress.usage_by_component == {
+        "minimal_context": {"total_tokens": 4},
+        "profile_master": {"total_tokens": 3},
     }
     assert [event for event, _payload in events] == ["chat.usage", "chat.usage"]
 
@@ -227,6 +231,62 @@ async def test_terminal_renderer_updates_summary_from_usage_event() -> None:
     await renderer.emit("chat.usage", {"usage": {"total_tokens": 9}})
 
     assert renderer.last_usage == {"total_tokens": 9}
+
+
+@pytest.mark.asyncio
+async def test_profile_events_expose_provenance_routing_and_control() -> None:
+    console = Console(record=True, width=120)
+    renderer = TerminalEventRenderer(console, show_gateway_logs=False)
+    progress = TurnEventProgress(session_id="session-1", emit=renderer.emit)
+
+    await progress.on_profile_pinned(
+        {
+            "profile_id": "coding-team",
+            "revision": 2,
+            "artifact_id": "abcdef1234567890",
+            "generation": 4,
+        }
+    )
+    await progress.on_profile_route(
+        "planner",
+        source="profile_master",
+        fallback_used=False,
+    )
+    await progress.on_profile_handoff(
+        "planner",
+        "implementer",
+        "plan ready",
+        handoff_count=1,
+        handoff_limit=8,
+    )
+    await progress.on_profile_completion("implementer", "done")
+
+    output = console.export_text()
+    assert "profile coding-team revision 2 generation 4 artifact abcdef123456" in output
+    assert "发起了 子agent planner" in output
+    assert "子agent 任务更新 planner: plan ready → implementer (1/8)" in output
+    assert "子agent implementer 已完成任务" in output
+
+
+@pytest.mark.asyncio
+async def test_subagent_task_update_is_single_line_and_bounded() -> None:
+    console = Console(record=True, width=240)
+    renderer = TerminalEventRenderer(console, show_gateway_logs=False)
+    progress = TurnEventProgress(session_id="session-1", emit=renderer.emit)
+    summary = "first line\n" + ("detail " * 40)
+
+    await progress.on_profile_handoff(
+        "planner",
+        "implementer",
+        summary,
+        handoff_count=1,
+        handoff_limit=8,
+    )
+
+    output = console.export_text()
+    update = next(line for line in output.splitlines() if "子agent 任务更新" in line)
+    assert "first line detail" in update
+    assert "chars]" in update
 
 
 def test_terminal_renderer_turn_summary_includes_duration_seconds() -> None:

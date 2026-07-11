@@ -219,12 +219,63 @@ class TerminalEventRenderer:
             if isinstance(usage, dict):
                 self.last_usage = usage
             return
+        if event.startswith("chat.profile."):
+            self._render_profile_event(event, payload)
+            return
         if event == "chat.turn.end":
             duration = payload.get("duration_ms")
             self.last_turn_duration_ms = duration if isinstance(duration, int) else None
             self._flush_text_blocks()
             self._finish_thinking_line()
             self._finish_stream_line()
+
+    def _render_profile_event(self, event: str, payload: dict[str, Any]) -> None:
+        self._finish_stream_line()
+        self._finish_thinking_line()
+        text = Text(style="dim")
+        if event == "chat.profile.pinned":
+            profile = payload.get("profile") if isinstance(payload.get("profile"), dict) else {}
+            artifact = str(profile.get("artifact_id") or "")
+            text.append("profile ")
+            text.append(str(profile.get("profile_id") or "unknown"), style="cyan")
+            text.append(
+                f" revision {profile.get('revision', '?')} generation "
+                f"{profile.get('generation', '?')} artifact {artifact[:12]}"
+            )
+        elif event == "chat.profile.route":
+            text.append("● ", style="cyan")
+            text.append("发起了 子agent ")
+            text.append(
+                str(payload.get("agent_id") or "unknown"),
+                style="bold cyan",
+            )
+            if payload.get("fallback_used"):
+                text.append("（回退选择）", style="yellow")
+        elif event == "chat.profile.handoff":
+            target = payload.get("recommended_agent_id") or "profile master"
+            source = str(payload.get("from_agent_id") or "unknown")
+            summary = _one_line(str(payload.get("summary") or "任务已交接"), limit=160)
+            text.append("↳ ", style="cyan")
+            text.append("子agent 任务更新 ")
+            text.append(source, style="bold cyan")
+            text.append(f": {summary}")
+            text.append(
+                f" → {target} "
+                f"({payload.get('handoff_count', '?')}/"
+                f"{payload.get('handoff_limit', '?')})",
+                style="dim",
+            )
+        elif event == "chat.profile.completion":
+            text.append("✓ ", style="green")
+            text.append("子agent ")
+            text.append(
+                str(payload.get("agent_id") or "unknown"),
+                style="bold green",
+            )
+            text.append(" 已完成任务", style="green")
+        else:
+            return
+        self.console.print(text)
 
     def _render_block_add(self, payload: dict[str, Any]) -> None:
         block = payload.get("block") if isinstance(payload.get("block"), dict) else {}

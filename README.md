@@ -78,6 +78,7 @@ Environment variables override file values:
 - `AELOON_CORE_API_BASE`
 - `AELOON_CORE_MODEL`
 - `AELOON_CORE_DATA_DIR`
+- `AELOON_CORE_PROFILE_ID`
 
 Minimal file example:
 
@@ -108,14 +109,10 @@ table, falling back to `agents.defaults.context_window_tokens`. Tunables live un
 
 ## Unified Agentic State Machine
 
-The Unified Agentic State Machine (UASM) is the only agent-loop runtime and uses
-the full A3 policy by default. Its policy components remain independently
-configurable:
+The Unified Agentic State Machine (UASM) is the only agent-loop runtime. Rule
+handling, TemporaryGuard, and bounded minimal context are always enabled:
 
 ```bash
-uv run aeloon-core config set uasm-rule-engine-enabled true
-uv run aeloon-core config set uasm-temporary-guard-enabled true
-uv run aeloon-core config set uasm-minimal-context-enabled true
 uv run aeloon-core config set uasm-transition-trace-enabled true
 ```
 
@@ -126,33 +123,121 @@ handle known failures. Only a repeated ambiguous failure that would otherwise
 stop the loop is escalated to a stateless `TemporaryGuard`, which sees a bounded
 evidence object rather than the transcript.
 
-The experiment switches map to these ablations:
-
-| Group | Rule engine | TemporaryGuard | Minimal context |
-| --- | --- | --- | --- |
-| A0 | off | off | off |
-| A1 | on | off | off |
-| A2 | on | on | off |
-| A3 | on | on | on |
-
-All four groups run through the same state machine. The pre-refactor dual-runtime
-implementation is preserved in the local `xzh-122-a1-baseline` branch, so a
-code-level comparison can be made with `git switch xzh-122-a1-baseline` and the
-single-runtime implementation restored with `git switch xz89166/xzh-122-mvp-v10`.
-The hard `max_iterations` cap remains a safety boundary in every group; A0 stops
-at that cap without auto-continuation, recovery prompts, or finalization passes.
-
 Completed UASM turns persist transition records separately at
 `~/.aeloon-core/traces/<session-id>.jsonl`. Each record includes state digests,
 the node and decision, wall time, and token usage. Turn records aggregate tokens
 by `domain`, `harness`, and `context_processing` without mixing transition rows
-into session history.
+into session history. The additive `by_component` view distinguishes
+`profile_master`, `domain:<role>`, `tool`, `control`, `temporary_guard`, and
+`minimal_context`; both views conserve the same aggregate counters.
 
-Run the deterministic offline fault-injection ablation without API credentials:
+## Agent Profiles (v1.5)
+
+Profiles provide explicitly declared agent teams while keeping the same
+`run_agent_loop`. Aeloon ships with `coding` as the zero-config default: a
+`planner`, `implementer`, and independent `reviewer`. On the first turn, the
+host deterministically compiles the package-owned source, records a system
+approval and activation audit, then pins the immutable artifact for the turn.
+It also copies the source to `.aeloon-core/profiles/coding/PROFILE.md` without
+overwriting an existing workspace file.
+
+Disable profiles explicitly with `uv run aeloon-core config set profile-id none`.
+That preserves the v1.0 deterministic-master path: text completes the turn and
+neither compiler nor profile-master calls occur.
+
+A profile lives at `.aeloon-core/profiles/<profile-id>/PROFILE.md` and declares
+roles and requested tools in strict YAML, followed by shared, master, and role
+instructions in Markdown:
+
+```markdown
+---
+schema_version: 1
+id: coding-team
+revision: 1
+description: Coding and review team
+default_agent: implementer
+max_handoffs: 8
+agents:
+  - id: planner
+    description: Analyze requirements
+    tools: [read, glob, grep]
+  - id: implementer
+    description: Implement and verify changes
+    tools: [read, write, edit, exec]
+---
+
+## Shared
+Keep changes scoped and verified.
+
+## Master
+Select the role that owns the next step.
+
+## Agent: planner
+Inspect the repository and produce an implementation approach.
+
+## Agent: implementer
+Implement, verify, and report the result.
+```
+
+Custom profiles are built and activated explicitly:
 
 ```bash
-uv run python benchmarks/uasm_ablation.py
+PROFILE=.aeloon-core/profiles/coding-team/PROFILE.md
+
+uv run aeloon-core profile validate "$PROFILE"
+uv run aeloon-core profile compile "$PROFILE" --compiler deterministic
+uv run aeloon-core profile inspect <artifact-id>
+uv run aeloon-core profile approve <artifact-id> --approved-by operator
+uv run aeloon-core profile activate <artifact-id>
+uv run aeloon-core config set profile-id coding-team
+uv run aeloon-core profile status coding-team
 ```
+
+The deterministic compiler is the reference backend. The optional `llm`
+backend is explicit and offline from turns:
+
+```bash
+uv run aeloon-core profile compile "$PROFILE" --compiler llm --model gpt-4.1-mini
+```
+
+It has no tools, uses temperature zero, receives one repair attempt, and may
+rewrite prompts only. It cannot alter role ids, descriptions, tools, the
+default role, or handoff budget. Keep it experimental unless a golden-corpus
+evaluation shows measurable gains over the deterministic artifact.
+
+Compiled Python is an inert review format: only one constant-only
+`CompiledProfile` class is allowed, values are decoded with `ast.literal_eval`,
+and generated source is never imported, executed, or passed to `compile`.
+Artifacts must move through `validated -> approved -> active`; activation is an
+audited, cross-process-serialized commit whose active pointer is published last.
+During Profile turns, filesystem tools cannot access the operator data directory,
+and exec is sandboxed away from it (or disabled when that isolation is
+unavailable). A turn pins the active artifact once, so activation during a turn
+affects only the next turn.
+
+At runtime, the profile master can select only a declared role. Roles see the
+intersection of their requested tools and the host registry plus two internal
+control operations:
+
+- `handoff_agent(summary, recommended_agent?)`
+- `complete_task(final_content)`
+
+Control calls must be the response's only tool call. External tools are hidden
+by role and checked again immediately before execution. Tool results always
+return to the calling role; only an accepted handoff invokes the profile master
+again. A second protocol violation stops with visible output. Finalization,
+TemporaryGuard, and provider-failure termination remain host-controlled.
+
+Rollback selects a prior approved compatible artifact for future turns; it
+cannot undo tool side effects from completed turns:
+
+```bash
+uv run aeloon-core profile rollback <prior-artifact-id>
+uv run aeloon-core config set profile-id none  # restore the v1.0 path
+```
+
+See [UASM profile operations](docs/uasm-profiles.md) for the artifact layout,
+failure handling, compatibility rules, and operational checklist.
 
 ## Core Tools
 

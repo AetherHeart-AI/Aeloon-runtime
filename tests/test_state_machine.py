@@ -132,7 +132,6 @@ async def test_state_machine_routes_explicit_nodes_and_attributes_usage() -> Non
         messages=[{"role": "user", "content": "echo once"}],
         session_id="session-1",
         turn_id="turn-1",
-        minimal_context_enabled=False,
     )
 
     assert state.metadata.status == RunStatus.COMPLETED
@@ -153,71 +152,6 @@ async def test_state_machine_routes_explicit_nodes_and_attributes_usage() -> Non
         for previous, current in zip(state.transitions, state.transitions[1:], strict=False)
     )
     assert all(record.session_id == "session-1" for record in state.transitions)
-
-
-@pytest.mark.asyncio
-async def test_a0_stops_after_empty_response_without_rule_recovery() -> None:
-    provider = ScriptedProvider(
-        [
-            LLMResponse(content=None, finish_reason="length"),
-            LLMResponse(content="must not be sampled"),
-        ]
-    )
-
-    state = await run_agent_loop(
-        provider=provider,
-        model="test-model",
-        tools=registry(EchoTool()),
-        messages=[{"role": "user", "content": "answer"}],
-        max_auto_continue_iterations=3,
-        max_finalization_iterations=2,
-        rule_engine_enabled=False,
-        temporary_guard_enabled=False,
-        minimal_context_enabled=False,
-    )
-
-    assert state.metadata.status == RunStatus.TERMINATED_BY_RULE
-    assert "recovery rules are disabled" in (state.metadata.final_content or "")
-    assert len(provider.calls) == 1
-    assert state.metadata.finalization_iteration == 0
-    assert state.guard_state.empty_stop_retries == 0
-    assert state.guard_state.unproductive_tool_rounds == 0
-
-
-@pytest.mark.asyncio
-async def test_a0_hard_iteration_limit_does_not_auto_continue_or_finalize() -> None:
-    provider = ScriptedProvider(
-        [
-            LLMResponse(
-                content=None,
-                tool_calls=[
-                    ToolCallRequest(id="call-1", name="echo", arguments={"value": "one"})
-                ],
-                finish_reason="tool_calls",
-            ),
-            LLMResponse(content="must not be sampled"),
-        ]
-    )
-
-    state = await run_agent_loop(
-        provider=provider,
-        model="test-model",
-        tools=registry(EchoTool()),
-        messages=[{"role": "user", "content": "echo once"}],
-        max_iterations=1,
-        max_auto_continue_iterations=3,
-        max_finalization_iterations=2,
-        rule_engine_enabled=False,
-        temporary_guard_enabled=False,
-        minimal_context_enabled=False,
-    )
-
-    assert state.metadata.status == RunStatus.TERMINATED_BY_RULE
-    assert "hard iteration limit (1)" in (state.metadata.final_content or "")
-    assert state.tools_used == ["echo"]
-    assert len(provider.calls) == 1
-    assert state.guard_state.auto_continue_remaining == 3
-    assert state.metadata.finalization_iteration == 0
 
 
 @pytest.mark.asyncio
@@ -243,8 +177,6 @@ async def test_rule_engine_auto_continues_after_base_iteration_limit() -> None:
         max_iterations=1,
         max_auto_continue_iterations=1,
         max_finalization_iterations=1,
-        temporary_guard_enabled=False,
-        minimal_context_enabled=False,
     )
 
     assert state.metadata.status == RunStatus.COMPLETED
@@ -259,38 +191,7 @@ async def test_rule_engine_auto_continues_after_base_iteration_limit() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a0_stops_immediately_after_tool_error_without_recovery_rules() -> None:
-    provider = ScriptedProvider(
-        [
-            LLMResponse(
-                content=None,
-                tool_calls=[
-                    ToolCallRequest(id="call-1", name="fail", arguments={"value": "one"})
-                ],
-                finish_reason="tool_calls",
-            )
-        ]
-    )
-
-    state = await run_agent_loop(
-        provider=provider,
-        model="test-model",
-        tools=registry(FailingTool()),
-        messages=[{"role": "user", "content": "fail"}],
-        rule_engine_enabled=False,
-        temporary_guard_enabled=False,
-        minimal_context_enabled=False,
-    )
-
-    assert state.metadata.status == RunStatus.TERMINATED_BY_RULE
-    assert "recovery rules are disabled" in (state.metadata.final_content or "")
-    assert state.messages[-1]["role"] == "assistant"
-    assert len(provider.calls) == 1
-    assert state.guard_state.unproductive_tool_rounds == 0
-
-
-@pytest.mark.asyncio
-async def test_rule_only_runtime_recovers_after_failed_tool_result() -> None:
+async def test_runtime_recovers_after_failed_tool_result() -> None:
     provider = ScriptedProvider(
         [
             LLMResponse(
@@ -309,8 +210,6 @@ async def test_rule_only_runtime_recovers_after_failed_tool_result() -> None:
         model="test-model",
         tools=registry(FailingTool()),
         messages=[{"role": "user", "content": "recover"}],
-        temporary_guard_enabled=False,
-        minimal_context_enabled=False,
     )
 
     assert state.metadata.status == RunStatus.COMPLETED
@@ -321,7 +220,7 @@ async def test_rule_only_runtime_recovers_after_failed_tool_result() -> None:
 
 
 @pytest.mark.asyncio
-async def test_rule_only_runtime_recovers_after_exec_timeout() -> None:
+async def test_runtime_recovers_after_exec_timeout() -> None:
     provider = ScriptedProvider(
         [
             LLMResponse(
@@ -344,8 +243,6 @@ async def test_rule_only_runtime_recovers_after_exec_timeout() -> None:
         model="test-model",
         tools=registry(TimeoutExecTool()),
         messages=[{"role": "user", "content": "recover"}],
-        temporary_guard_enabled=False,
-        minimal_context_enabled=False,
     )
 
     assert state.metadata.status == RunStatus.COMPLETED
@@ -356,7 +253,7 @@ async def test_rule_only_runtime_recovers_after_exec_timeout() -> None:
 
 
 @pytest.mark.asyncio
-async def test_rule_only_runtime_stops_after_repeated_malformed_calls() -> None:
+async def test_runtime_stops_after_repeated_malformed_calls() -> None:
     provider = ScriptedProvider(
         [
             LLMResponse(
@@ -377,15 +274,13 @@ async def test_rule_only_runtime_stops_after_repeated_malformed_calls() -> None:
         model="test-model",
         tools=registry(EchoTool()),
         messages=[{"role": "user", "content": "malformed"}],
-        temporary_guard_enabled=False,
-        minimal_context_enabled=False,
     )
 
     assert state.metadata.status == RunStatus.TERMINATED_BY_RULE
     assert "malformed tool arguments" in (state.metadata.final_content or "")
     assert state.tools_used == []
     assert state.guard_state.unproductive_tool_rounds == 2
-    assert len(provider.calls) == 2
+    assert len(provider.calls) == 3
 
 
 @pytest.mark.asyncio
@@ -418,8 +313,6 @@ async def test_repeated_duplicate_escalates_to_temporary_guard_then_recovers() -
         messages=[{"role": "user", "content": "echo once"}],
         max_iterations=10,
         max_auto_continue_iterations=0,
-        guard_decision_mode="binary",
-        minimal_context_enabled=False,
     )
 
     assert state.metadata.status == RunStatus.COMPLETED
@@ -467,7 +360,6 @@ async def test_invalid_temporary_guard_output_falls_back_to_rule_termination() -
         messages=[{"role": "user", "content": "echo once"}],
         max_iterations=10,
         max_auto_continue_iterations=0,
-        minimal_context_enabled=False,
     )
 
     assert state.metadata.status == RunStatus.TERMINATED_BY_RULE
@@ -496,7 +388,6 @@ async def test_preparation_persists_canonical_messages_and_context_usage() -> No
         tools=registry(EchoTool()),
         messages=[{"role": "user", "content": "answer"}],
         prepare_model_input=prepare_model_input,
-        minimal_context_enabled=False,
     )
 
     assert state.messages[-2] == {"role": "system", "content": "prepared"}
@@ -546,8 +437,6 @@ async def test_preparation_runs_before_every_sampling_call() -> None:
         tools=registry(EchoTool()),
         messages=[{"role": "user", "content": "echo once"}],
         prepare_model_input=prepare_model_input,
-        temporary_guard_enabled=False,
-        minimal_context_enabled=False,
     )
 
     assert state.metadata.status == RunStatus.COMPLETED
@@ -604,8 +493,6 @@ async def test_exhausted_auto_continue_budget_enters_finalization() -> None:
         max_auto_continue_iterations=1,
         max_finalization_iterations=1,
         prepare_model_input=prepare_model_input,
-        temporary_guard_enabled=False,
-        minimal_context_enabled=False,
     )
 
     assert state.metadata.status == RunStatus.COMPLETED
@@ -643,8 +530,6 @@ async def test_uasm_budget_exhaustion_enters_text_only_finalization() -> None:
         max_iterations=1,
         max_auto_continue_iterations=0,
         max_finalization_iterations=1,
-        temporary_guard_enabled=False,
-        minimal_context_enabled=False,
     )
 
     assert state.metadata.status == RunStatus.COMPLETED
@@ -683,8 +568,6 @@ async def test_uasm_finalization_tool_violation_terminates_without_execution() -
         max_iterations=1,
         max_auto_continue_iterations=0,
         max_finalization_iterations=1,
-        temporary_guard_enabled=False,
-        minimal_context_enabled=False,
     )
 
     assert state.metadata.status == RunStatus.TERMINATED_BY_RULE
@@ -713,8 +596,6 @@ async def test_output_budget_exhaustion_recovers_with_visible_text() -> None:
         max_iterations=5,
         max_auto_continue_iterations=0,
         max_finalization_iterations=1,
-        temporary_guard_enabled=False,
-        minimal_context_enabled=False,
     )
 
     assert state.metadata.status == RunStatus.COMPLETED
@@ -745,8 +626,6 @@ async def test_repeated_output_budget_exhaustion_returns_visible_failure() -> No
         max_iterations=5,
         max_auto_continue_iterations=0,
         max_finalization_iterations=2,
-        temporary_guard_enabled=False,
-        minimal_context_enabled=False,
     )
 
     assert state.metadata.status == RunStatus.TERMINATED_BY_RULE
@@ -779,8 +658,6 @@ async def test_output_budget_exhaustion_without_finalization_retries_once() -> N
         max_iterations=5,
         max_auto_continue_iterations=0,
         max_finalization_iterations=0,
-        temporary_guard_enabled=False,
-        minimal_context_enabled=False,
     )
 
     assert state.metadata.status == RunStatus.TERMINATED_BY_RULE
@@ -805,7 +682,6 @@ async def test_uasm_provider_error_is_failed_and_emits_final_once_without_trace(
         messages=[{"role": "user", "content": "answer"}],
         transition_trace_enabled=False,
         on_progress=progress,
-        minimal_context_enabled=False,
     )
 
     assert state.metadata.status == RunStatus.FAILED
@@ -841,7 +717,6 @@ async def test_trace_persistence_failure_does_not_interrupt_tool_side_effect_pat
         tools=registry(EchoTool()),
         messages=[{"role": "user", "content": "echo once"}],
         on_transition=fail_trace,
-        minimal_context_enabled=False,
     )
 
     assert state.metadata.status == RunStatus.COMPLETED
@@ -880,7 +755,6 @@ async def test_temporary_guard_budget_extension_consumes_finite_auto_budget() ->
         max_iterations=3,
         max_auto_continue_iterations=1,
         max_finalization_iterations=0,
-        minimal_context_enabled=False,
     )
 
     assert state.metadata.status == RunStatus.TERMINATED_BY_RULE

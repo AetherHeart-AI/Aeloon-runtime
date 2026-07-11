@@ -1,7 +1,8 @@
-"""Tool registry for dynamic tool management."""
+"""Tool registries for dynamic and role-scoped capability management."""
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Any
 
 from pydantic import ValidationError
@@ -36,7 +37,7 @@ class ToolRegistry:
         hint = "\n\n[Analyze the error above and try a different approach.]"
         tool = self._tools.get(name)
         if not tool:
-            return f"Error: Tool '{name}' not found. Available: {', '.join(self._tools)}"
+            return _tool_not_found(name, self._tools)
         try:
             args = tool.args_model.model_validate(params)
         except ValidationError as exc:
@@ -49,6 +50,57 @@ class ToolRegistry:
             return result
         except Exception as exc:
             return f"Error executing {name}: {exc}" + hint
+
+
+class ScopedToolRegistry:
+    """A read/execute-only view that can only narrow a host registry."""
+
+    def __init__(self, registry: ToolRegistry, allowed_tools: Iterable[str]) -> None:
+        self._registry = registry
+        requested = frozenset(allowed_tools)
+        self._allowed_names = tuple(
+            name
+            for definition in registry.get_definitions()
+            if (name := _definition_name(definition)) is not None and name in requested
+        )
+
+    def get(self, name: str) -> Tool | None:
+        """Return a tool only when it remains present in the allowed host scope."""
+
+        if name not in self._allowed_names:
+            return None
+        return self._registry.get(name)
+
+    def get_definitions(self) -> list[dict[str, Any]]:
+        """Return schemas for currently present tools in the fixed allowed scope."""
+
+        return [
+            tool.to_schema()
+            for name in self._allowed_names
+            if (tool := self.get(name)) is not None
+        ]
+
+    async def execute(self, name: str, params: dict[str, Any]) -> str:
+        """Re-check scope immediately before delegating an allowed execution."""
+
+        if self.get(name) is None:
+            return _tool_not_found(name, self._available_names())
+        return await self._registry.execute(name, params)
+
+    def _available_names(self) -> tuple[str, ...]:
+        return tuple(name for name in self._allowed_names if self.get(name) is not None)
+
+
+def _definition_name(definition: dict[str, Any]) -> str | None:
+    function = definition.get("function")
+    if not isinstance(function, dict):
+        return None
+    name = function.get("name")
+    return name if isinstance(name, str) else None
+
+
+def _tool_not_found(name: str, available: Iterable[str]) -> str:
+    return f"Error: Tool '{name}' not found. Available: {', '.join(available)}"
 
 
 def _format_error(error: dict[str, Any]) -> str:

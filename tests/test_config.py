@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import os
 
+import pytest
+from pydantic import ValidationError
+
 from aeloon_core.config import Config, load_config
 
 
@@ -48,8 +51,24 @@ def test_state_machine_policy_defaults_enable_full_runtime() -> None:
     uasm = Config().agents.defaults.uasm
 
     assert not hasattr(uasm, "enabled")
-    assert uasm.rule_engine_enabled is True
-    assert uasm.temporary_guard_enabled is True
-    assert uasm.minimal_context_enabled is True
     assert uasm.transition_trace_enabled is True
-    assert uasm.guard_decision_mode == "full"
+
+
+def test_profile_defaults_and_environment_selection(monkeypatch, tmp_path) -> None:
+    defaults = Config().agents.defaults
+    assert defaults.profile_id == "coding"
+    assert defaults.max_handoffs == 8
+
+    disabled = Config.model_validate({"agents": {"defaults": {"profile_id": None}}})
+    assert disabled.agents.defaults.profile_id is None
+
+    monkeypatch.setenv("AELOON_CORE_PROFILE_ID", "coding-team")
+    config = load_config(tmp_path / "missing.json")
+    assert config.agents.defaults.profile_id == "coding-team"
+
+    monkeypatch.setenv("AELOON_CORE_PROFILE_ID", "none")
+    config = load_config(tmp_path / "missing.json")
+    assert config.agents.defaults.profile_id is None
+
+    with pytest.raises(ValidationError, match="string_pattern_mismatch"):
+        Config.model_validate({"agents": {"defaults": {"profile_id": "Coding.Team"}}})
