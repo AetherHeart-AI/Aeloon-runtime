@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
 from aeloon_core.model_input import Message
@@ -155,6 +156,7 @@ async def execute_tool_batch(
     *,
     tool_calls: list[ToolCallRequest],
     tools: ToolRegistry,
+    on_node_complete: Callable[[TaskNode], Awaitable[None]] | None = None,
 ) -> list[TaskNode]:
     nodes = build_task_graph(tool_calls, tools)
     pending = {node.index: node for node in nodes}
@@ -162,6 +164,10 @@ async def execute_tool_batch(
 
     async def _execute_node(node: TaskNode) -> str:
         return await tools.execute(node.tool_name, node.arguments)
+
+    async def _notify(node: TaskNode) -> None:
+        if on_node_complete is not None:
+            await on_node_complete(node)
 
     try:
         while pending or running:
@@ -191,12 +197,23 @@ async def execute_tool_batch(
                     node.error = str(exc)
                     node.result = f"Error executing {node.tool_name}: {exc}"
 
+                await _notify(node)
                 for dependent_index in node.dependents:
                     nodes[dependent_index].deps.discard(index)
-    except asyncio.CancelledError:
+    except BaseException:
         for task in running.values():
             task.cancel()
         await asyncio.gather(*running.values(), return_exceptions=True)
+        for node in nodes:
+            if node.state not in {TaskState.PENDING, TaskState.RUNNING}:
+                continue
+            node.state = TaskState.CANCELLED
+            node.error = "cancelled"
+            node.result = f"Error: Tool '{node.tool_name}' execution was cancelled."
+            try:
+                await _notify(node)
+            except BaseException:
+                pass
         raise
     return nodes
 

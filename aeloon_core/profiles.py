@@ -228,10 +228,17 @@ class RuntimeProfileSpec(_FrozenStrictModel):
     agents: tuple[RuntimeAgentSpec, ...] = Field(min_length=1, max_length=16)
     artifact_id: NonEmptyText | None = None
     generation: int = Field(default=0, ge=0)
+    control_protocol_version: Literal[1, 2] = 1
 
     @model_validator(mode="after")
     def _validate_agent_references(self) -> Self:
         _validate_agents(self.agents, default_agent_id=self.default_agent_id)
+        if self.control_protocol_version == 2 and any(
+            "delegate_tasks" in agent.tools for agent in self.agents
+        ):
+            raise ValueError(
+                "control protocol v2 reserves delegate_tasks as an internal tool"
+            )
         return self
 
     @property

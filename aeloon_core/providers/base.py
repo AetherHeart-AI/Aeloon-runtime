@@ -8,7 +8,7 @@ import re
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 
 from loguru import logger
 
@@ -76,6 +76,8 @@ class GenerationSettings:
 
 class LLMProvider(ABC):
     """Abstract base class for LLM providers."""
+
+    supports_concurrent_calls: ClassVar[bool] = False
 
     _CHAT_RETRY_DELAYS = (1, 2, 4)
     _TRANSIENT_ERROR_MARKERS = (

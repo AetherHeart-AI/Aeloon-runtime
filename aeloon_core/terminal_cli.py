@@ -83,6 +83,7 @@ class TerminalEventRenderer:
         self.block_types: dict[str, str] = {}
         self.block_names: dict[str, str] = {}
         self.block_arguments: dict[str, Any] = {}
+        self.block_agents: dict[str, str] = {}
         self.block_content_lengths: dict[str, int] = {}
         self.block_contents: dict[str, str] = {}
         self.last_usage: dict[str, Any] = {}
@@ -228,6 +229,9 @@ class TerminalEventRenderer:
         if event == "chat.guard.decision":
             self._render_guard_decision(payload)
             return
+        if event == "chat.profile.delegate.guard":
+            self._render_guard_decision(payload)
+            return
         if event == "chat.block.add":
             self._render_block_add(payload)
             return
@@ -270,6 +274,47 @@ class TerminalEventRenderer:
             text.append(" · 启动", style=SEMANTIC_STYLES["muted"])
             if payload.get("fallback_used"):
                 text.append(" · 回退选择", style=SEMANTIC_STYLES["guard"])
+        elif event == "chat.profile.delegate.start":
+            label = str(payload.get("label") or payload.get("agent_id") or "unknown")
+            task = _one_line(
+                str(payload.get("task") or "并行任务"),
+                limit=TRANSCRIPT_DETAIL_CHARS,
+            )
+            text.append("◆ ", style=SEMANTIC_STYLES["agent"])
+            text.append("子agent ", style=SEMANTIC_STYLES["muted"])
+            text.append(label, style=SEMANTIC_STYLES["agent"])
+            text.append(" · 并行启动", style=SEMANTIC_STYLES["muted"])
+            if task:
+                text.append(" · ", style=SEMANTIC_STYLES["muted"])
+                text.append(task)
+        elif event == "chat.profile.delegate.complete":
+            label = str(payload.get("label") or payload.get("agent_id") or "unknown")
+            status = str(payload.get("status") or "failed")
+            succeeded = status == "completed"
+            style = SEMANTIC_STYLES["success"] if succeeded else SEMANTIC_STYLES["error"]
+            text.append("✓ " if succeeded else "✕ ", style=style)
+            text.append("子agent ", style=SEMANTIC_STYLES["muted"])
+            text.append(label, style=style)
+            text.append(" · 完成" if succeeded else " · 失败", style=SEMANTIC_STYLES["muted"])
+            duration = _compact_duration(payload.get("duration_ms"))
+            if duration:
+                text.append(f" · {duration}", style=SEMANTIC_STYLES["muted"])
+            summary = _one_line(
+                str(payload.get("summary") or ""),
+                limit=TRANSCRIPT_DETAIL_CHARS,
+            )
+            if summary:
+                text.append(" · ", style=SEMANTIC_STYLES["muted"])
+                text.append(summary)
+        elif event == "chat.profile.delegate.join":
+            count = payload.get("branch_count", "?")
+            succeeded = payload.get("succeeded", "?")
+            text.append("↳ ", style=SEMANTIC_STYLES["agent"])
+            text.append("并行子agent", style=SEMANTIC_STYLES["agent"])
+            text.append(f" · 汇总 {succeeded}/{count}", style=SEMANTIC_STYLES["muted"])
+            duration = _compact_duration(payload.get("duration_ms"))
+            if duration:
+                text.append(f" · {duration}", style=SEMANTIC_STYLES["muted"])
         elif event == "chat.profile.handoff":
             target = str(payload.get("recommended_agent_id") or "profile master")
             source = str(payload.get("from_agent_id") or "unknown")
@@ -309,6 +354,9 @@ class TerminalEventRenderer:
         text = Text(no_wrap=True, overflow="ellipsis")
         text.append("✕ " if stopped else "⚠ ", style=style)
         source = str(payload.get("source") or "rule_engine")
+        subagent_label = str(payload.get("subagent_label") or "")
+        if subagent_label:
+            source = f"{source}/{subagent_label}"
         text.append("Guard", style=style)
         text.append(f" [{source}]", style=SEMANTIC_STYLES["muted"])
         guard_event = str(payload.get("event") or "")
@@ -341,6 +389,8 @@ class TerminalEventRenderer:
                 self.block_names[block_id] = str(block.get("name"))
             if "arguments" in block:
                 self.block_arguments[block_id] = block.get("arguments")
+            if block.get("subagent_label"):
+                self.block_agents[block_id] = str(block.get("subagent_label"))
             if "content" in block:
                 self.block_contents[block_id] = str(block.get("content") or "")
         if block_type == "tool_call":
@@ -352,6 +402,7 @@ class TerminalEventRenderer:
                     name=name,
                     status="running",
                     detail=_tool_call_detail_text(name, block.get("arguments")),
+                    subagent_label=self.block_agents.get(block_id),
                 )
             )
 
@@ -412,6 +463,7 @@ class TerminalEventRenderer:
                 name=name,
                 status=rendered_status,
                 detail=detail,
+                subagent_label=self.block_agents.get(block_id),
             )
         )
 
@@ -741,6 +793,7 @@ def _tool_line(
     name: str,
     status: str,
     detail: str,
+    subagent_label: str | None = None,
 ) -> Text:
     failed = status == "error"
     completed = status == "done"
@@ -756,10 +809,21 @@ def _tool_line(
     text.append(f"{icon} ", style=icon_style)
     text.append("工具 ", style=SEMANTIC_STYLES["muted"])
     text.append(name, style=SEMANTIC_STYLES["tool"])
+    if subagent_label:
+        text.append(f" [{subagent_label}]", style=SEMANTIC_STYLES["agent"])
     if detail:
         text.append(" · ", style=SEMANTIC_STYLES["muted"])
         text.append(_one_line(detail, limit=TRANSCRIPT_DETAIL_CHARS))
     return text
+
+
+def _compact_duration(value: Any) -> str:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return ""
+    milliseconds = max(0, int(value))
+    if milliseconds < 1_000:
+        return f"{milliseconds} ms"
+    return f"{milliseconds / 1_000:.1f}s"
 
 
 def _tool_call_detail_text(name: str, arguments: Any) -> str:

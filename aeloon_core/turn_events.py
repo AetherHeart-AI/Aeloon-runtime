@@ -303,20 +303,129 @@ class TurnEventProgress:
             ),
         )
 
-    async def on_tool_calls(self, tool_calls: list[ToolCallRequest]) -> None:
+    async def on_profile_delegate_branch_start(
+        self,
+        branch_id: str,
+        label: str,
+        agent_id: str,
+        task: str,
+    ) -> None:
+        await self.emit(
+            "chat.profile.delegate.start",
+            self._payload(
+                branch_id=branch_id,
+                label=label,
+                agent_id=agent_id,
+                task=_preview_text(task),
+                ts=_now(),
+            ),
+        )
+
+    async def on_profile_delegate_branch_complete(
+        self,
+        branch_id: str,
+        label: str,
+        agent_id: str,
+        *,
+        status: str,
+        summary: str,
+        duration_ms: int,
+        tools_used: list[str],
+    ) -> None:
+        await self.emit(
+            "chat.profile.delegate.complete",
+            self._payload(
+                branch_id=branch_id,
+                label=label,
+                agent_id=agent_id,
+                status=status,
+                summary=_preview_text(summary),
+                duration_ms=max(0, int(duration_ms)),
+                tool_count=len(tools_used),
+                ts=_now(),
+            ),
+        )
+
+    async def on_profile_delegate_join(
+        self,
+        source_agent_id: str,
+        *,
+        delegation_round: int,
+        branch_count: int,
+        succeeded: int,
+        duration_ms: int,
+    ) -> None:
+        await self.emit(
+            "chat.profile.delegate.join",
+            self._payload(
+                source_agent_id=source_agent_id,
+                delegation_round=max(0, int(delegation_round)),
+                branch_count=max(0, int(branch_count)),
+                succeeded=max(0, int(succeeded)),
+                duration_ms=max(0, int(duration_ms)),
+                ts=_now(),
+            ),
+        )
+
+    async def on_profile_delegate_guard_decision(
+        self,
+        branch_id: str,
+        subagent_label: str,
+        decision: Any,
+        *,
+        event: str,
+        source: str,
+        fallback_used: bool = False,
+        budget_grant: int | None = None,
+    ) -> None:
+        if source not in {"rule_engine", "temporary_guard", "rule_fallback"}:
+            raise ValueError(f"unsupported guard decision source: {source}")
+        action = getattr(decision, "action", "")
+        action_value = getattr(action, "value", action)
+        resolved_budget_grant = (
+            getattr(decision, "budget_grant", 0)
+            if budget_grant is None
+            else budget_grant
+        )
+        await self.emit(
+            "chat.profile.delegate.guard",
+            self._payload(
+                ts=_now(),
+                branch_id=branch_id,
+                subagent_label=subagent_label,
+                source=source,
+                event=event,
+                action=str(action_value),
+                reason=str(getattr(decision, "reason", "") or ""),
+                budget_grant=max(0, int(resolved_budget_grant or 0)),
+                fallback_used=bool(fallback_used),
+            ),
+        )
+
+    async def on_tool_calls(
+        self,
+        tool_calls: list[ToolCallRequest],
+        *,
+        subagent_label: str | None = None,
+        record_reasoning: bool = True,
+    ) -> None:
         for tool_call in tool_calls:
             tool_detail = _tool_call_detail(tool_call)
             summary = f"Call {tool_call.name}"
-            await self._append_reasoning_line(
-                summary,
-                kind="tool_call",
-                data={
+            if record_reasoning:
+                reasoning_data = {
                     "call_id": tool_call.id,
                     "tool_name": tool_call.name,
                     "arguments": tool_call.arguments,
                     "summary": summary,
-                },
-            )
+                }
+                if subagent_label is not None:
+                    reasoning_data["subagent_label"] = subagent_label
+                await self._append_reasoning_line(
+                    summary,
+                    kind="tool_call",
+                    data=reasoning_data,
+                )
             block = {
                 "id": tool_call.id,
                 "type": "tool_call",
@@ -326,6 +435,8 @@ class TurnEventProgress:
                 "result": None,
                 "created_at": _now(),
             }
+            if subagent_label is not None:
+                block["subagent_label"] = subagent_label
             self.blocks.append(block)
             payload = self._payload(block=block, ts=_now())
             await self.emit("chat.block.add", payload)
@@ -340,7 +451,13 @@ class TurnEventProgress:
                 },
             )
 
-    async def on_tool_result(self, node: TaskNode) -> None:
+    async def on_tool_result(
+        self,
+        node: TaskNode,
+        *,
+        subagent_label: str | None = None,
+        record_reasoning: bool = True,
+    ) -> None:
         result = str(node.result or "")
         status = "error" if tool_result_failed(node.result) else "done"
         block = self._find_block(node.call_id)
@@ -352,25 +469,30 @@ class TurnEventProgress:
                 "arguments": node.arguments,
                 "created_at": _now(),
             }
+            if subagent_label is not None:
+                block["subagent_label"] = subagent_label
             self.blocks.append(block)
+        elif subagent_label is not None:
+            block["subagent_label"] = subagent_label
         block["status"] = status
         block["result"] = result
         block["completed_at"] = _now()
         duration_ms = _duration_ms(block.get("created_at"), block["completed_at"])
         block["duration_ms"] = duration_ms
-        await self._append_reasoning_line(
-            f"{node.tool_name} returned {len(result)} characters",
-            kind="tool_result",
-            data={
-                "call_id": node.call_id,
-                "tool_name": node.tool_name,
-                "arguments": node.arguments,
-                "status": status,
-                "result_length": len(result),
-                "duration_ms": duration_ms,
-                "summary": f"{node.tool_name} returned {len(result)} characters",
-            },
-        )
+        if record_reasoning:
+            await self._append_reasoning_line(
+                f"{node.tool_name} returned {len(result)} characters",
+                kind="tool_result",
+                data={
+                    "call_id": node.call_id,
+                    "tool_name": node.tool_name,
+                    "arguments": node.arguments,
+                    "status": status,
+                    "result_length": len(result),
+                    "duration_ms": duration_ms,
+                    "summary": f"{node.tool_name} returned {len(result)} characters",
+                },
+            )
         ui_patch = {
             "status": block["status"],
             "result": block["result"],

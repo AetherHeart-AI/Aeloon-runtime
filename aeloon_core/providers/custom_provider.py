@@ -33,6 +33,8 @@ def _is_tooling_unsupported_error(exc: Exception) -> bool:
 class CustomProvider(LLMProvider):
     """OpenAI-compatible chat provider."""
 
+    supports_concurrent_calls = True
+
     def __init__(
         self,
         api_key: str = "no-key",

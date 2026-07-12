@@ -364,9 +364,7 @@ async def _run_chat(args: argparse.Namespace) -> None:
     prompt = " ".join(args.prompt).strip() or None
     gateway_log_level = args.gateway_log_level or "INFO"
     show_gateway_logs = not args.hide_gateway_logs and (
-        args.show_gateway_logs
-        or args.gateway_log_level is not None
-        or args.gateway_log_detail
+        args.show_gateway_logs or args.gateway_log_level is not None or args.gateway_log_detail
     )
     await run_terminal_cli(
         config,

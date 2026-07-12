@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
 from aeloon_core.context_compaction import is_compaction_message
-from aeloon_core.profile_runtime import CONTROL_TOOL_NAMES
+from aeloon_core.profile_runtime import CONTROL_TOOL_NAMES, DELEGATE_TOOL_NAME
 
 if TYPE_CHECKING:
     from aeloon_core.state import LightweightState
@@ -66,12 +66,24 @@ class MinimalContextProcessor:
     ) -> ForwardContextResult:
         selected_indexes = _selected_message_indexes(messages, self.preserve_recent_turns)
         selected_indexes = _complete_tool_pairs(messages, selected_indexes)
+        current_turn_start = max(
+            (
+                index
+                for index, message in enumerate(messages)
+                if message.get("role") == "user"
+            ),
+            default=-1,
+        )
 
         lazy_references: list[str] = []
         call_messages = []
         for index in sorted(selected_indexes):
             message = _copy_message(messages[index])
-            reference = self._replace_large_tool_result(state, message)
+            reference = self._replace_large_tool_result(
+                state,
+                message,
+                preserve_current_delegation=index > current_turn_start,
+            )
             if reference is not None and reference not in lazy_references:
                 lazy_references.append(reference)
             call_messages.append(message)
@@ -92,8 +104,15 @@ class MinimalContextProcessor:
         self,
         state: LightweightState,
         message: dict[str, Any],
+        *,
+        preserve_current_delegation: bool,
     ) -> str | None:
         if message.get("role") != "tool" or "content" not in message:
+            return None
+        if (
+            preserve_current_delegation
+            and message.get("name") == DELEGATE_TOOL_NAME
+        ):
             return None
         content = message.get("content")
         serialized = _serialized_content(content)

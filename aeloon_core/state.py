@@ -272,12 +272,16 @@ class LightweightState:
     pending_control_call: ToolCallRequest | None = None
     pending_profile_correction: str | None = None
     control_protocol_retries: int = 0
+    delegation_count: int = 0
+    last_delegation_fingerprint: str | None = None
+    last_delegation_succeeded: bool = False
 
     def __post_init__(self) -> None:
         if self.minimal_context is None:
             self.minimal_context = list(self.messages)
         self.handoff_count = max(0, int(self.handoff_count))
         self.control_protocol_retries = max(0, int(self.control_protocol_retries))
+        self.delegation_count = max(0, int(self.delegation_count))
 
     @classmethod
     def from_messages(
@@ -386,6 +390,9 @@ class LightweightState:
                     self.pending_profile_correction
                 ),
                 "control_protocol_retries": self.control_protocol_retries,
+                "delegation_count": self.delegation_count,
+                "last_delegation_fingerprint": self.last_delegation_fingerprint,
+                "last_delegation_succeeded": self.last_delegation_succeeded,
             }
         return _stable_hash(payload)
 

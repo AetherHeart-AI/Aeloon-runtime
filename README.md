@@ -153,12 +153,21 @@ into session history. The additive `by_component` view distinguishes
 ## Agent Profiles (v1.5)
 
 Profiles provide explicitly declared agent teams while keeping the same
-`run_agent_loop`. Aeloon ships with `coding` as the zero-config default: a
-`planner`, `implementer`, and independent `reviewer`. On the first turn, the
-host deterministically compiles the package-owned source, records a system
-approval and activation audit, then pins the immutable artifact for the turn.
-It also copies the source to `.aeloon-core/profiles/coding/PROFILE.md` without
-overwriting an existing workspace file.
+`run_agent_loop`. Aeloon ships with two built-in profiles:
+
+- `coding` is the zero-config default with a `planner`, `implementer`, and
+  independent `reviewer`.
+- `research` coordinates two to four parallel read-only research branches and
+  independent fact checking before synthesis.
+
+Select research with `uv run aeloon-core config set profile-id research`. On the
+first turn with a selected built-in, the host deterministically compiles the
+package-owned source, records a system approval and activation audit, then pins
+the immutable artifact for the turn. It also best-effort copies the source in
+that bootstrap workspace to
+`.aeloon-core/profiles/<profile-id>/PROFILE.md` for inspection without
+overwriting an existing workspace file; runtime trust remains anchored to the
+packaged source and approved artifact, not that workspace copy.
 
 Disable profiles explicitly with `uv run aeloon-core config set profile-id none`.
 That preserves the v1.0 deterministic-master path: text completes the turn and
@@ -235,17 +244,33 @@ unavailable). A turn pins the active artifact once, so activation during a turn
 affects only the next turn.
 
 At runtime, the profile master can select only a declared role. Roles see the
-intersection of their requested tools and the host registry plus two internal
+intersection of their requested tools and the host registry plus three internal
 control operations:
 
 - `handoff_agent(summary, recommended_agent?)`
+- `delegate_tasks(tasks=[{agent_id, task}, ...])`
 - `complete_task(final_content)`
 
 Control calls must be the response's only tool call. External tools are hidden
 by role and checked again immediately before execution. Tool results always
 return to the calling role; only an accepted handoff invokes the profile master
-again. A second protocol violation stops with visible output. Finalization,
-TemporaryGuard, and provider-failure termination remain host-controlled.
+again.
+
+`delegate_tasks` is a bounded fork/join primitive for research and other
+independent read-only work. It accepts two to four tasks, starts each task in an
+isolated declared-role loop with the shared provider, and joins the bounded
+reports in input order before resuming the coordinator. Delegated roles may
+contain only `read_only` tools, and the provider must explicitly advertise
+concurrent-call support; branch model text is not streamed into the main
+answer, while branch lifecycle, labeled tool calls, failures, and Guard decisions
+remain visible in the TUI. Joined reports are fairly trimmed to a 12,000-character
+round budget. A turn may run at most two delegation rounds, and
+delegated branches cannot hand off, complete the parent task, or delegate again.
+
+A second protocol violation stops with visible output. Finalization,
+TemporaryGuard, and provider-failure termination remain host-controlled. Adding
+the fork/join operation advances the profile control protocol to version 2, so
+older custom artifacts must be recompiled, approved, and activated before use.
 
 Rollback selects a prior approved compatible artifact for future turns; it
 cannot undo tool side effects from completed turns:

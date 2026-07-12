@@ -2,14 +2,25 @@
 
 from __future__ import annotations
 
+from time import perf_counter
+
 from aeloon_core.agents import BaseAgent, WorkerAgent
+from aeloon_core.loop_guard import LoopGuardAction, LoopGuardDecision
+from aeloon_core.profile_delegation import (
+    joined_tool_result,
+    prepare_delegation,
+    run_parallel_delegation,
+)
 from aeloon_core.profile_runtime import (
+    MAX_DELEGATION_ROUNDS,
     CompleteArguments,
+    DelegateArguments,
     HandoffArguments,
+    delegation_fingerprint,
     parse_control_arguments,
 )
 from aeloon_core.state import AgentNode, LightweightState, PendingHandoff, RunStatus
-from aeloon_core.transitions import NodeKind
+from aeloon_core.transitions import NodeKind, accumulate_usage
 
 
 class ProfileDomainAgent(WorkerAgent):
@@ -112,6 +123,9 @@ class ControlAgent(BaseAgent):
                 add_message=False,
             )
 
+        if isinstance(arguments, DelegateArguments):
+            return await self._run_delegation(state, tool_call.id, tool_call.name, arguments)
+
         limit = self.runtime.profile_handoff_limit()
         if state.handoff_count >= limit:
             content = (
@@ -175,8 +189,145 @@ class ControlAgent(BaseAgent):
         )
         return state
 
+    async def _run_delegation(
+        self,
+        state: LightweightState,
+        tool_call_id: str,
+        tool_name: str,
+        arguments: DelegateArguments,
+    ) -> LightweightState:
+        if state.delegation_count >= MAX_DELEGATION_ROUNDS:
+            state.messages = self.runtime.add_tool_result(
+                state.messages,
+                tool_call_id,
+                tool_name,
+                "Error: Parallel delegation budget exhausted "
+                f"({state.delegation_count}/{MAX_DELEGATION_ROUNDS}).",
+            )
+            self._clear_pending(state)
+            return await self.runtime.profile_protocol_error(
+                state,
+                reason="parallel delegation budget exhausted",
+            )
+
+        round_number = state.delegation_count + 1
+        fingerprint = delegation_fingerprint(arguments)
+        if (
+            fingerprint == state.last_delegation_fingerprint
+            and state.last_delegation_succeeded
+        ):
+            state.messages = self.runtime.add_tool_result(
+                state.messages,
+                tool_call_id,
+                tool_name,
+                "Error: This successful parallel delegation was already completed; "
+                "change the task set or synthesize the existing reports.",
+            )
+            self._clear_pending(state)
+            state.resume_agent_id = state.active_agent_id
+            decision = LoopGuardDecision(
+                LoopGuardAction.RETURN_TO_MODEL,
+                reason="duplicate successful parallel delegation was rejected",
+                prompt_message={
+                    "role": "system",
+                    "content": (
+                        "Do not repeat the completed delegation. Use its existing reports, "
+                        "change the task set for a material evidence gap, or complete the task."
+                    ),
+                },
+            )
+            await self.runtime.emit_guard_decision(
+                decision,
+                event="duplicate_delegation",
+            )
+            return await self.runtime.return_to_model(state, decision)
+        try:
+            branches = prepare_delegation(
+                self.runtime,
+                arguments,
+                round_number=round_number,
+            )
+        except (KeyError, ValueError) as exc:
+            state.messages = self.runtime.add_tool_result(
+                state.messages,
+                tool_call_id,
+                tool_name,
+                f"Error: Invalid parallel delegation: {exc}",
+            )
+            self._clear_pending(state)
+            return await self.runtime.profile_protocol_error(
+                state,
+                reason="invalid parallel delegation",
+            )
+
+        source_agent = state.active_agent_id or self.runtime.profile.default_agent_id
+        state.delegation_count = round_number
+        started_at = perf_counter()
+        results = await run_parallel_delegation(self.runtime, state, branches)
+        aggregate_usage: dict[str, int] = {}
+        for result in results:
+            usage = state.token_ledger.merge(
+                result.ledger,
+                component_prefix=(
+                    f"subagent:{result.branch.branch_id}:{result.branch.label}"
+                ),
+            )
+            accumulate_usage(aggregate_usage, usage)
+            state.tools_used.extend(result.tools_used)
+            component_prefix = f"subagent:{result.branch.branch_id}:{result.branch.label}"
+            for component, component_usage in result.ledger.by_component.items():
+                if component_usage:
+                    node_kind = _subagent_component_node_kind(component)
+                    await self.runtime.emit_hook(
+                        "on_usage",
+                        component_usage,
+                        node_kind=node_kind.value,
+                        component=f"{component_prefix}:{component}",
+                    )
+
+        state.messages = self.runtime.add_tool_result(
+            state.messages,
+            tool_call_id,
+            tool_name,
+            joined_tool_result(results),
+        )
+        self._clear_pending(state)
+        state.resume_agent_id = source_agent
+        state.metadata.phase = AgentNode.MASTER
+        succeeded = sum(result.succeeded for result in results)
+        state.last_delegation_fingerprint = fingerprint
+        state.last_delegation_succeeded = succeeded == len(results)
+        duration_ms = max(0, int((perf_counter() - started_at) * 1_000))
+        self.runtime.describe_step(
+            {
+                "action": "delegate",
+                "source_agent_id": source_agent,
+                "delegation_round": round_number,
+                "branches": len(results),
+                "succeeded": succeeded,
+            },
+            usage=aggregate_usage,
+        )
+        await self.runtime.emit_hook(
+            "on_profile_delegate_join",
+            source_agent,
+            delegation_round=round_number,
+            branch_count=len(results),
+            succeeded=succeeded,
+            duration_ms=duration_ms,
+        )
+        return state
+
     @staticmethod
     def _clear_pending(state: LightweightState) -> None:
         state.pending_response = None
         state.pending_control_call = None
         state.pending_tool_calls = []
+
+
+def _subagent_component_node_kind(component: str) -> NodeKind:
+    if component == "minimal_context":
+        return NodeKind.CONTEXT_PROCESSING
+    if component in {"profile_master", "temporary_guard", "control"}:
+        return NodeKind.HARNESS
+    return NodeKind.DOMAIN

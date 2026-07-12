@@ -115,7 +115,9 @@ def test_approval_activation_and_rollback_use_pointer_and_audit(tmp_path: Path) 
     activated = store.activate(first["artifact_id"])
     assert activated["state"] == "active"
     assert store.status("coding-team")["artifact_id"] == first["artifact_id"]
-    assert store.load_active("coding-team").profile_id == "coding-team"
+    active_profile = store.load_active("coding-team")
+    assert active_profile.profile_id == "coding-team"
+    assert active_profile.control_protocol_version == 2
     assert list((tmp_path / "profile-artifacts" / "activation-audit").glob("*.json"))
     assert store.rollback(first["artifact_id"])["rollback"] is True
 
@@ -144,6 +146,37 @@ def test_activation_requires_approval_and_compatible_tools(tmp_path: Path) -> No
     )
     with pytest.raises(ArtifactCompatibilityError):
         incompatible.activate(artifact["artifact_id"])
+
+
+@pytest.mark.asyncio
+async def test_v1_control_artifact_remains_inspectable_but_requires_recompile(
+    tmp_path: Path,
+) -> None:
+    legacy = ProfileArtifactStore(
+        data_dir=tmp_path,
+        compatibility=CompatibilityPolicy(
+            control_protocol_version=1,
+            runtime_profile_spec_version="1",
+            tool_schema_fingerprints={"read": "read", "write": "write"},
+        ),
+    )
+    old = await legacy.compile(PROFILE)
+    legacy.approve(old["artifact_id"])
+    legacy.activate(old["artifact_id"])
+
+    current = store_for(tmp_path)
+    assert current.inspect(old["artifact_id"])["state"] == "active"
+    assert current.status("coding-team")["compatible"] is False
+    with pytest.raises(ArtifactCompatibilityError, match="control_protocol_version"):
+        current.load_active("coding-team")
+
+    rebuilt = await current.compile(PROFILE)
+    assert rebuilt["artifact_id"] != old["artifact_id"]
+    current.approve(rebuilt["artifact_id"])
+    activated = current.activate(rebuilt["artifact_id"])
+
+    assert activated["generation"] == 2
+    assert current.load_active("coding-team").control_protocol_version == 2
 
 
 def test_pointer_or_audit_tampering_is_rejected(tmp_path: Path) -> None:

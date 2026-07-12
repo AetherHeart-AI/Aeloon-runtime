@@ -40,11 +40,11 @@ from aeloon_core.profiles import (
 ARTIFACT_SCHEMA_VERSION = 2
 DEFAULT_COMPILED_API_VERSION = 1
 DEFAULT_UASM_API_VERSION = 1
-DEFAULT_CONTROL_PROTOCOL_VERSION = 1
+DEFAULT_CONTROL_PROTOCOL_VERSION = 2
 DEFAULT_VALIDATOR_VERSION = "1"
 DEFAULT_GRAMMAR_VERSION = "1"
 DEFAULT_AST_POLICY_VERSION = "1"
-DEFAULT_RUNTIME_PROFILE_SPEC_VERSION = "1"
+DEFAULT_RUNTIME_PROFILE_SPEC_VERSION = "2"
 
 SOURCE_FILENAME = "source_profile.md"
 COMPILED_FILENAME = "compiled_profile.py"
@@ -233,10 +233,19 @@ class ProfileArtifactStore:
             if not compatible:
                 raise ArtifactCompatibilityError("; ".join(reasons))
             source = (self._artifact_dir(pointer["artifact_id"]) / COMPILED_FILENAME).read_text()
-            return parse_compiled_profile(
+            runtime = parse_compiled_profile(
                 source,
                 artifact_id=pointer["artifact_id"],
                 generation=pointer["generation"],
+            )
+            return runtime.model_copy(
+                update={
+                    "control_protocol_version": int(
+                        manifest["identity"]["compatibility"][
+                            "control_protocol_version"
+                        ]
+                    )
+                }
             )
 
     def inspect(self, artifact_id: str) -> dict[str, Any]:
@@ -362,7 +371,16 @@ class ProfileArtifactStore:
         compiled_bytes = outcome.compiled_source.encode()
         report_bytes = _canonical_json_bytes(outcome.report)
         diff_bytes = _canonical_json_bytes(outcome.semantic_diff)
-        spec_payload = _to_plain(outcome.runtime_spec)
+        runtime_spec = (
+            outcome.runtime_spec.model_copy(
+                update={
+                    "control_protocol_version": self.compatibility.control_protocol_version
+                }
+            )
+            if outcome.runtime_spec is not None
+            else None
+        )
+        spec_payload = _to_plain(runtime_spec)
         identity = {
             "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
             "source_snapshot_hash": _sha256(source_bytes),
@@ -447,7 +465,15 @@ class ProfileArtifactStore:
             if declared.get(key) != value
         )
         host = self.compatibility.tool_schema_fingerprints
-        for name, fingerprint in declared.get("requested_tool_schema_fingerprints", {}).items():
+        requested_fingerprints = declared.get("requested_tool_schema_fingerprints", {})
+        if (
+            declared.get("control_protocol_version") == 2
+            and "delegate_tasks" in requested_fingerprints
+        ):
+            errors.append(
+                "requested tool conflicts with profile control operation: delegate_tasks"
+            )
+        for name, fingerprint in requested_fingerprints.items():
             current = host.get(name) if host is not None else None
             if fingerprint is None or current is None:
                 errors.append(f"requested tool is missing: {name}")

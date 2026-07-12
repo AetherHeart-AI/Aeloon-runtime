@@ -401,6 +401,35 @@ async def test_turn_progress_emits_sanitized_guard_decision_and_usage() -> None:
 
 
 @pytest.mark.asyncio
+async def test_delegated_guard_uses_separate_branch_correlated_event() -> None:
+    events: list[tuple[str, dict]] = []
+
+    async def emit(event: str, payload: dict) -> None:
+        events.append((event, payload))
+
+    progress = TurnEventProgress(session_id="session-1", emit=emit)
+    await progress.on_profile_delegate_guard_decision(
+        "delegate-2-3",
+        "fact_checker#1",
+        LoopGuardDecision(
+            LoopGuardAction.RETURN_TO_MODEL,
+            reason="retry one branch",
+            final_content="private final",
+            prompt_message={"role": "system", "content": "private prompt"},
+        ),
+        event="tool_result_failed",
+        source="rule_engine",
+    )
+
+    assert [event for event, _payload in events] == ["chat.profile.delegate.guard"]
+    payload = events[0][1]
+    assert payload["branch_id"] == "delegate-2-3"
+    assert payload["subagent_label"] == "fact_checker#1"
+    assert payload["reason"] == "retry one branch"
+    assert "private" not in json.dumps(payload)
+
+
+@pytest.mark.asyncio
 async def test_turn_progress_tool_result_includes_duration_and_guard_aligned_error() -> None:
     events: list[tuple[str, dict]] = []
 
@@ -479,6 +508,75 @@ async def test_profile_events_hide_provenance_and_keep_subagent_lifecycle() -> N
     assert "◆ 子agent planner · 启动" in output
     assert "↳ 子agent planner → implementer · 交接 1/8 · plan ready" in output
     assert "✓ 子agent implementer · 完成" in output
+
+
+@pytest.mark.asyncio
+async def test_parallel_subagent_events_and_tools_are_labeled() -> None:
+    console = Console(record=True, width=120)
+    renderer = TerminalEventRenderer(console, show_gateway_logs=False)
+    progress = TurnEventProgress(session_id="session-1", emit=renderer.emit)
+
+    await progress.on_profile_delegate_branch_start(
+        "delegate-1-1",
+        "source_scout#1",
+        "source_scout",
+        "find primary biography sources",
+    )
+    await progress.on_tool_calls(
+        [
+            ToolCallRequest(
+                id="delegate-1-1:search-1",
+                name="websearch",
+                arguments={"query": "primary biography"},
+            )
+        ],
+        subagent_label="source_scout#1",
+    )
+    await progress.on_tool_result(
+        TaskNode(
+            index=0,
+            call_id="delegate-1-1:search-1",
+            tool_name="websearch",
+            arguments={"query": "primary biography"},
+            mode="read_only",
+            result="1. source",
+        ),
+        subagent_label="source_scout#1",
+    )
+    await progress.on_profile_delegate_branch_complete(
+        "delegate-1-1",
+        "source_scout#1",
+        "source_scout",
+        status="completed",
+        summary="verified biography sources",
+        duration_ms=123,
+        tools_used=["websearch"],
+    )
+    await progress.on_profile_delegate_join(
+        "research_lead",
+        delegation_round=1,
+        branch_count=1,
+        succeeded=1,
+        duration_ms=125,
+    )
+    await progress.on_profile_delegate_guard_decision(
+        "delegate-1-1",
+        "source_scout#1",
+        LoopGuardDecision(
+            LoopGuardAction.RETURN_TO_MODEL,
+            reason="retry failed source",
+        ),
+        event="tool_result_failed",
+        source="rule_engine",
+    )
+
+    output = console.export_text()
+    assert "◆ 子agent source_scout#1 · 并行启动" in output
+    assert "◇ 工具 websearch [source_scout#1]" in output
+    assert "✓ 工具 websearch [source_scout#1]" in output
+    assert "✓ 子agent source_scout#1 · 完成 · 123 ms" in output
+    assert "↳ 并行子agent · 汇总 1/1 · 125 ms" in output
+    assert "Guard [rule_engine/source_scout#1] · 重试 · retry failed source" in output
 
 
 @pytest.mark.asyncio

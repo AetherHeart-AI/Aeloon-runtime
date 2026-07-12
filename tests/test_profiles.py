@@ -72,6 +72,12 @@ def test_parse_profile_returns_frozen_exact_source_model() -> None:
         profile.agent_map["reviewer"] = profile.agents[0]  # type: ignore[index]
 
 
+def test_v1_profile_keeps_preexisting_delegate_tasks_role_identifier_valid() -> None:
+    profile = parse_profile(VALID_PROFILE.replace("planner", "delegate_tasks"))
+
+    assert profile.agent("delegate_tasks").id == "delegate_tasks"
+
+
 @pytest.mark.parametrize(
     "bad_source, expected",
     [

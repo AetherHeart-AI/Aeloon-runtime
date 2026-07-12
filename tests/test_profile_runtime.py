@@ -4,7 +4,7 @@ import copy
 from typing import Any
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from aeloon_core.profiles import RuntimeAgentSpec, RuntimeProfileSpec
 from aeloon_core.providers.base import LLMProvider, LLMResponse, ToolCallRequest
@@ -217,6 +217,73 @@ async def test_profile_routes_then_requires_explicit_completion() -> None:
     assert progress.routes == ["planner"]
     assert progress.completions == ["planner"]
     assert progress.finals == ["finished"]
+
+
+@pytest.mark.asyncio
+async def test_delegate_control_is_hidden_when_provider_disallows_concurrency() -> None:
+    provider = ScriptedProvider(
+        [
+            LLMResponse(content='{"agent_id":"planner"}'),
+            control_call("complete-1", "complete_task", {"final_content": "done"}),
+        ]
+    )
+
+    state = await run_agent_loop(
+        provider=provider,
+        model="test-model",
+        tools=registry(RecordingTool("echo")),
+        messages=[{"role": "user", "content": "work"}],
+        profile=profile().model_copy(update={"control_protocol_version": 2}),
+    )
+
+    assert state.metadata.final_content == "done"
+    assert "delegate_tasks" not in tool_names(provider.calls[1])
+    role_prompt = next(
+        str(message.get("content") or "")
+        for message in provider.calls[1]["messages"]
+        if "Role instructions" in str(message.get("content") or "")
+    )
+    assert "Parallel delegation is unavailable" in role_prompt
+
+
+@pytest.mark.asyncio
+async def test_v1_profile_preserves_external_delegate_tasks_tool() -> None:
+    external_delegate = RecordingTool("delegate_tasks")
+    provider = ScriptedProvider(
+        [
+            LLMResponse(content='{"agent_id":"planner"}'),
+            control_call("external-1", "delegate_tasks", {"value": "external"}),
+            control_call("complete-1", "complete_task", {"final_content": "done"}),
+        ]
+    )
+
+    state = await run_agent_loop(
+        provider=provider,
+        model="test-model",
+        tools=registry(external_delegate),
+        messages=[{"role": "user", "content": "use the external tool"}],
+        profile=profile(planner_tools=("delegate_tasks",)),
+    )
+
+    assert state.metadata.final_content == "done"
+    assert external_delegate.calls == ["external"]
+    assert state.tools_used == ["delegate_tasks"]
+
+
+def test_runtime_profile_rejects_unknown_future_control_protocol() -> None:
+    payload = profile().model_dump()
+    payload["control_protocol_version"] = 999
+
+    with pytest.raises(ValidationError, match="control_protocol_version"):
+        RuntimeProfileSpec.model_validate(payload)
+
+
+def test_runtime_profile_v2_rejects_external_delegate_name_collision() -> None:
+    payload = profile(planner_tools=("delegate_tasks",)).model_dump()
+    payload["control_protocol_version"] = 2
+
+    with pytest.raises(ValidationError, match="reserves delegate_tasks"):
+        RuntimeProfileSpec.model_validate(payload)
 
 
 @pytest.mark.asyncio
@@ -624,7 +691,7 @@ async def test_invalid_control_arguments_are_corrected_without_side_effects(
         model="test-model",
         tools=registry(RecordingTool("echo")),
         messages=[{"role": "user", "content": "work"}],
-        profile=profile(),
+        profile=profile().model_copy(update={"control_protocol_version": 2}),
     )
 
     assert state.metadata.status == RunStatus.COMPLETED
@@ -635,6 +702,14 @@ async def test_invalid_control_arguments_are_corrected_without_side_effects(
         and message["content"].startswith("Error: Invalid profile control call")
         for message in state.messages
     )
+    correction = next(
+        str(message.get("content") or "")
+        for message in provider.calls[2]["messages"]
+        if str(message.get("content") or "").startswith(
+            "PROFILE CONTROL PROTOCOL:"
+        )
+    )
+    assert "delegate_tasks" not in correction
 
 
 @pytest.mark.asyncio

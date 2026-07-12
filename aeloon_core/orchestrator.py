@@ -20,7 +20,7 @@ from aeloon_core.context import (
     refresh_initial_system_message,
 )
 from aeloon_core.context_compaction import CompactionResult, maybe_compact_messages
-from aeloon_core.default_profile import DEFAULT_PROFILE_ID, load_default_profile
+from aeloon_core.default_profile import BUILTIN_PROFILE_IDS, load_builtin_profile
 from aeloon_core.model_metadata import resolve_context_window
 from aeloon_core.profile_artifacts import CompatibilityPolicy, ProfileArtifactStore
 from aeloon_core.providers.base import GenerationSettings
@@ -121,10 +121,11 @@ class AeloonCoreOrchestrator:
         actual_session_id = session_id or self.sessions.new_session()
         self.todo_tool.set_session_id(actual_session_id)
         defaults = self.config.agents.defaults
-        if defaults.profile_id == DEFAULT_PROFILE_ID:
-            profile = await load_default_profile(
+        if defaults.profile_id in BUILTIN_PROFILE_IDS:
+            profile = await load_builtin_profile(
                 self.profile_store,
                 workspace=self.config.workspace,
+                profile_id=defaults.profile_id,
             )
         elif defaults.profile_id is not None:
             profile = self.profile_store.load_active(defaults.profile_id)

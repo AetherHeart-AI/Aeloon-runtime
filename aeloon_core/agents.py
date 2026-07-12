@@ -22,8 +22,11 @@ from aeloon_core.loop_guard import (
 from aeloon_core.minimal_context import ContextProcessor
 from aeloon_core.model_input import PrepareModelInput, unpack_prepared_model_input
 from aeloon_core.profile_runtime import (
+    COMPLETE_TOOL_NAME,
     CONTROL_TOOL_DEFINITIONS,
-    CONTROL_TOOL_NAMES,
+    DELEGATE_TOOL_NAME,
+    HANDOFF_TOOL_NAME,
+    MAX_DELEGATION_ROUNDS,
     LLMProfileMaster,
     fallback_agent_id,
     role_context_messages,
@@ -83,6 +86,19 @@ class AgentRuntime:
         if self.profile is None:
             return 0
         return max(0, min(int(self.profile.max_handoffs), max(0, int(self.max_handoffs))))
+
+    def profile_delegation_enabled(self) -> bool:
+        return bool(
+            self.profile is not None
+            and self.profile.control_protocol_version == 2
+            and self.provider.supports_concurrent_calls
+        )
+
+    def profile_control_tool_names(self) -> frozenset[str]:
+        names = {HANDOFF_TOOL_NAME, COMPLETE_TOOL_NAME}
+        if self.profile is not None and self.profile.control_protocol_version == 2:
+            names.add(DELEGATE_TOOL_NAME)
+        return frozenset(names)
 
     def active_profile_agent(self, state: LightweightState) -> RuntimeAgentSpec:
         if self.profile is None or state.active_agent_id is None:
@@ -266,12 +282,22 @@ class AgentRuntime:
                 add_message=False,
             )
 
-        message = correction or (
-            "PROFILE CONTROL PROTOCOL: Your previous response was rejected. External "
-            "work must use only your visible external tools. To finish, call "
-            "complete_task as the only tool call. To transfer work, call handoff_agent "
-            "as the only tool call. Do not mix a control call with any other call."
-        )
+        if correction is None:
+            delegation_guidance = (
+                " To run independent read-only branches, call delegate_tasks as the only "
+                "tool call."
+                if self.profile_delegation_enabled()
+                else ""
+            )
+            message = (
+                "PROFILE CONTROL PROTOCOL: Your previous response was rejected. External "
+                "work must use only your visible external tools. To finish, call "
+                "complete_task as the only tool call. To transfer work, call handoff_agent "
+                "as the only tool call."
+                f"{delegation_guidance} Do not mix a control call with any other call."
+            )
+        else:
+            message = correction
         state.pending_profile_correction = message
         state.metadata.phase = AgentNode.MASTER
         self.describe_step(
@@ -538,13 +564,21 @@ class WorkerAgent(BaseAgent):
             state.metadata.iteration += 1
             if self.runtime.profile is not None:
                 agent = self.runtime.active_profile_agent(state)
+                control_names = self.runtime.profile_control_tool_names()
                 scoped = ScopedToolRegistry(
                     self.runtime.tools,
-                    (name for name in agent.tools if name not in CONTROL_TOOL_NAMES),
+                    (name for name in agent.tools if name not in control_names),
                 )
                 tool_defs = scoped.get_definitions()
                 state.active_tools = _active_tool_names(tool_defs)
-                tool_defs = [*tool_defs, *(dict(item) for item in CONTROL_TOOL_DEFINITIONS)]
+                delegation_enabled = self.runtime.profile_delegation_enabled()
+                control_definitions = [
+                    dict(item)
+                    for item in CONTROL_TOOL_DEFINITIONS
+                    if delegation_enabled
+                    or item.get("function", {}).get("name") != DELEGATE_TOOL_NAME
+                ]
+                tool_defs = [*tool_defs, *control_definitions]
             else:
                 tool_defs = self.runtime.tools.get_definitions()
             await self.runtime.emit_progress(
@@ -566,6 +600,11 @@ class WorkerAgent(BaseAgent):
                 handoff=state.pending_handoff,
                 handoff_count=state.handoff_count,
                 handoff_limit=self.runtime.profile_handoff_limit(),
+                delegation_count=state.delegation_count,
+                delegation_limit=MAX_DELEGATION_ROUNDS,
+                delegation_enabled=(
+                    self.runtime.profile_delegation_enabled()
+                ),
             )
             if state.pending_profile_correction is not None:
                 additional_messages.append(
@@ -664,10 +703,11 @@ class WorkerAgent(BaseAgent):
             if state.metadata.status == RunStatus.FINALIZING:
                 return await self._handle_finalization_tool_calls(state, response)
             if self.runtime.profile is not None:
+                control_names = self.runtime.profile_control_tool_names()
                 control_calls = [
                     tool_call
                     for tool_call in response.tool_calls
-                    if tool_call.name in CONTROL_TOOL_NAMES
+                    if tool_call.name in control_names
                 ]
                 if control_calls and len(response.tool_calls) != 1:
                     return await self._reject_mixed_control_batch(state, response)
@@ -977,9 +1017,13 @@ class ToolAgent(BaseAgent):
             if self.runtime.profile is not None
             else self.runtime.tools
         )
+        async def report_tool_result(node: TaskNode) -> None:
+            await self.runtime.emit_hook("on_tool_result", node)
+
         executed_nodes = await execute_tool_batch(
             tool_calls=tool_calls,
             tools=execution_tools,
+            on_node_complete=report_tool_result,
         )
         state.pending_tool_nodes = executed_nodes
         for node in sorted(executed_nodes, key=lambda item: item.index):
@@ -991,7 +1035,6 @@ class ToolAgent(BaseAgent):
                 node.tool_name,
                 node.result or f"Error executing {node.tool_name}: unknown failure",
             )
-            await self.runtime.emit_hook("on_tool_result", node)
         self._clear_pending(state)
 
         decision = self.runtime.rule_engine.handle_tool_results(executed_nodes)

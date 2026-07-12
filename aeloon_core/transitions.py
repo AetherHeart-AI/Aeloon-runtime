@@ -153,6 +153,28 @@ class TokenLedger:
 
     add = record
 
+    def merge(
+        self,
+        other: TokenLedger,
+        *,
+        component_prefix: str | None = None,
+    ) -> dict[str, int]:
+        """Merge one isolated ledger while preserving conservation and attribution."""
+
+        normalized_totals = normalize_usage(other.totals)
+        for key, value in normalized_totals.items():
+            self.totals[key] = self.totals.get(key, 0) + value
+        for kind, usage in other.by_node_kind.items():
+            bucket = self.by_node_kind.setdefault(kind, {})
+            for key, value in normalize_usage(usage).items():
+                bucket[key] = bucket.get(key, 0) + value
+        for component, usage in other.by_component.items():
+            resolved = f"{component_prefix}:{component}" if component_prefix else component
+            bucket = self.by_component.setdefault(resolved, {})
+            for key, value in normalize_usage(usage).items():
+                bucket[key] = bucket.get(key, 0) + value
+        return normalized_totals
+
     def for_kind(self, node_kind: NodeKind | str) -> dict[str, int]:
         """Return a detached usage snapshot for one category."""
 
