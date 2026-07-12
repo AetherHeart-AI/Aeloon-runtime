@@ -17,7 +17,12 @@ from aeloon_core.turn_events import TurnEventProgress
 
 COMMANDS = {"run", "chat", "tui", "config", "profile"}
 REMOVED_COMMANDS = {"webui"}
-CHAT_ONLY_OPTIONS = {"--hide-gateway-logs", "--gateway-log-detail", "--gateway-log-level"}
+CHAT_ONLY_OPTIONS = {
+    "--show-gateway-logs",
+    "--hide-gateway-logs",
+    "--gateway-log-detail",
+    "--gateway-log-level",
+}
 CONFIG_SETTERS = {
     "workspace": ("workspace",),
     "data-dir": ("data_dir",),
@@ -238,20 +243,25 @@ def _add_chat_args(parser: argparse.ArgumentParser) -> None:
     )
     _add_path_args(parser, session=True)
     parser.add_argument(
+        "--show-gateway-logs",
+        action="store_true",
+        help="Show compact gateway log lines.",
+    )
+    parser.add_argument(
         "--hide-gateway-logs",
         action="store_true",
-        help="Hide compact gateway log lines.",
+        help="Hide gateway log lines, overriding other gateway log options.",
     )
     parser.add_argument(
         "--gateway-log-level",
         choices=sorted(LOG_LEVELS),
-        default="INFO",
-        help="Minimum gateway log level to display.",
+        default=None,
+        help="Minimum gateway log level to display (default: INFO); also enables logs.",
     )
     parser.add_argument(
         "--gateway-log-detail",
         action="store_true",
-        help="Print gateway log detail JSON.",
+        help="Print gateway log detail JSON; also enables logs.",
     )
 
 
@@ -352,12 +362,18 @@ async def _run_chat(args: argparse.Namespace) -> None:
         data_dir=getattr(args, "data_dir", None),
     )
     prompt = " ".join(args.prompt).strip() or None
+    gateway_log_level = args.gateway_log_level or "INFO"
+    show_gateway_logs = not args.hide_gateway_logs and (
+        args.show_gateway_logs
+        or args.gateway_log_level is not None
+        or args.gateway_log_detail
+    )
     await run_terminal_cli(
         config,
         prompt=prompt,
         session_id=args.session,
-        show_gateway_logs=not args.hide_gateway_logs,
-        gateway_log_level=args.gateway_log_level,
+        show_gateway_logs=show_gateway_logs,
+        gateway_log_level=gateway_log_level,
         gateway_log_detail=args.gateway_log_detail,
     )
 
@@ -536,6 +552,8 @@ def _looks_like_implicit_chat(argv: list[str]) -> bool:
     first = _first_positional(argv)
     if first is None:
         return True
+    if first in COMMANDS or first in REMOVED_COMMANDS:
+        return False
     return any(_is_chat_only_option(token) for token in argv)
 
 

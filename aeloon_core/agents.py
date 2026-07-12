@@ -138,6 +138,26 @@ class AgentRuntime:
         if inspect.isawaitable(result):
             await result
 
+    async def emit_guard_decision(
+        self,
+        decision: LoopGuardDecision,
+        *,
+        event: str,
+        source: str = "rule_engine",
+        fallback_used: bool = False,
+        budget_grant: int | None = None,
+    ) -> None:
+        """Emit the sanitized control outcome without forwarding guard evidence."""
+
+        await self.emit_hook(
+            "on_loop_guard_decision",
+            decision,
+            event=event,
+            source=source,
+            fallback_used=fallback_used,
+            budget_grant=budget_grant,
+        )
+
     async def do_llm_call(
         self,
         messages: list[dict[str, Any]],
@@ -302,6 +322,7 @@ class AgentRuntime:
         state: LightweightState,
         decision: LoopGuardDecision,
     ) -> LightweightState:
+        await self.emit_guard_decision(decision, event="iteration_budget")
         self.describe_step(_decision_summary(decision), usage=self.last_usage)
         if decision.action == LoopGuardAction.EXTEND_BUDGET:
             if decision.progress_message:
@@ -489,6 +510,14 @@ class WorkerAgent(BaseAgent):
         guard = self.runtime.rule_engine
         if state.metadata.status == RunStatus.FINALIZING:
             if state.metadata.finalization_iteration >= guard.finalization_budget:
+                decision = LoopGuardDecision(
+                    LoopGuardAction.FINAL_RESPONSE,
+                    reason="finalization budget exhausted",
+                )
+                await self.runtime.emit_guard_decision(
+                    decision,
+                    event="output_exhausted",
+                )
                 return await self.runtime.finish(
                     state,
                     content=guard.finalization_exhausted_message(),
@@ -698,6 +727,16 @@ class WorkerAgent(BaseAgent):
         )
         clean = self.runtime.strip_think(response.content)
         if clean is not None:
+            await self.runtime.emit_guard_decision(
+                LoopGuardDecision(
+                    LoopGuardAction.FINALIZE,
+                    reason=(
+                        "tool calls attempted during finalization were ignored because "
+                        "visible text was available"
+                    ),
+                ),
+                event="finalization_violation",
+            )
             state.messages = self.runtime.add_assistant_message(
                 state.messages,
                 clean,
@@ -712,6 +751,10 @@ class WorkerAgent(BaseAgent):
                 add_message=False,
             )
         decision = self.runtime.rule_engine.handle_finalization_tool_call_violation()
+        await self.runtime.emit_guard_decision(
+            decision,
+            event="finalization_violation",
+        )
         self.runtime.describe_step(_decision_summary(decision), usage=self.runtime.last_usage)
         return await self.runtime.finish(
             state,
@@ -748,6 +791,10 @@ class WorkerAgent(BaseAgent):
                 finish_reason=response.finish_reason,
                 finalizing=state.metadata.status == RunStatus.FINALIZING,
                 finalization_iteration=state.metadata.finalization_iteration,
+            )
+            await self.runtime.emit_guard_decision(
+                decision,
+                event=_empty_response_event(response.finish_reason),
             )
             self.runtime.describe_step(
                 _decision_summary(decision), usage=self.runtime.last_usage
@@ -853,11 +900,22 @@ class ToolAgent(BaseAgent):
             return await self._escalate_or_stop(
                 state,
                 malformed.decision,
-                event="repeated_malformed_tool_calls",
+                event="malformed_tool_calls",
                 failures=_tool_call_failures(
                     malformed.malformed_calls,
                     malformed.tool_results,
                 ),
+            )
+        if malformed.malformed_calls:
+            visible_decision = malformed.decision
+            if visible_decision.action == LoopGuardAction.CONTINUE:
+                visible_decision = LoopGuardDecision(
+                    LoopGuardAction.CONTINUE,
+                    reason=("malformed tool calls were rejected while valid calls continue"),
+                )
+            await self.runtime.emit_guard_decision(
+                visible_decision,
+                event="malformed_tool_calls",
             )
         if malformed.decision.action == LoopGuardAction.RETURN_TO_MODEL:
             self._clear_pending(state)
@@ -884,11 +942,22 @@ class ToolAgent(BaseAgent):
             return await self._escalate_or_stop(
                 state,
                 duplicate.decision,
-                event="repeated_duplicate_tool_calls",
+                event="duplicate_tool_calls",
                 failures=_tool_call_failures(
                     duplicate.duplicate_calls,
                     duplicate.tool_results,
                 ),
+            )
+        if duplicate.duplicate_calls:
+            visible_decision = duplicate.decision
+            if visible_decision.action == LoopGuardAction.CONTINUE:
+                visible_decision = LoopGuardDecision(
+                    LoopGuardAction.CONTINUE,
+                    reason=("duplicate tool calls were skipped while new calls continue"),
+                )
+            await self.runtime.emit_guard_decision(
+                visible_decision,
+                event="duplicate_tool_calls",
             )
         if duplicate.decision.action == LoopGuardAction.RETURN_TO_MODEL:
             self._clear_pending(state)
@@ -931,10 +1000,14 @@ class ToolAgent(BaseAgent):
             return await self._escalate_or_stop(
                 state,
                 decision,
-                event="repeated_tool_failure",
+                event=_tool_result_guard_event(decision),
                 failures=_node_failures(executed_nodes),
             )
         if decision.action == LoopGuardAction.RETURN_TO_MODEL:
+            await self.runtime.emit_guard_decision(
+                decision,
+                event=_tool_result_guard_event(decision),
+            )
             return await self.runtime.return_to_model(state, decision)
         return await self.runtime.grant_more_or_finalize(state)
 
@@ -949,6 +1022,7 @@ class ToolAgent(BaseAgent):
         self._clear_pending(state)
         if self.runtime.temporary_guard is None:
             self.runtime.describe_step(_decision_summary(decision))
+            await self.runtime.emit_guard_decision(decision, event=event)
             return await self.runtime.finish(
                 state,
                 content=decision.final_content,
@@ -1027,12 +1101,29 @@ class TemporaryGuardAgent(BaseAgent):
             },
             usage=usage,
         )
-        await self.runtime.emit_hook("on_guard_decision", resolution)
 
         terminal_status = (
             RunStatus.TERMINATED_BY_RULE
             if resolution.fallback_used
             else RunStatus.TERMINATED_BY_GUARD
+        )
+        effective_budget_grant = decision.budget_grant
+        if decision.action == LoopGuardAction.EXTEND_BUDGET:
+            requested = max(1, decision.budget_grant)
+            effective_budget_grant = min(
+                requested,
+                state.guard_state.auto_continue_remaining,
+            )
+        await self.runtime.emit_hook("on_guard_decision", resolution)
+        if decision.action == LoopGuardAction.EXTEND_BUDGET:
+            state.guard_state.iteration_limit += effective_budget_grant
+            state.guard_state.auto_continue_remaining -= effective_budget_grant
+        await self.runtime.emit_guard_decision(
+            decision,
+            event=evidence.event,
+            source=resolution.source,
+            fallback_used=resolution.fallback_used,
+            budget_grant=effective_budget_grant,
         )
         if decision.action == LoopGuardAction.CONTINUE:
             state.metadata.phase = AgentNode.MASTER
@@ -1040,11 +1131,7 @@ class TemporaryGuardAgent(BaseAgent):
         if decision.action == LoopGuardAction.RETURN_TO_MODEL:
             return await self.runtime.return_to_model(state, decision)
         if decision.action == LoopGuardAction.EXTEND_BUDGET:
-            requested = max(1, decision.budget_grant)
-            grant = min(requested, state.guard_state.auto_continue_remaining)
-            state.guard_state.iteration_limit += grant
-            state.guard_state.auto_continue_remaining -= grant
-            if grant > 0 and decision.progress_message:
+            if effective_budget_grant > 0 and decision.progress_message:
                 await self.runtime.emit_progress(decision.progress_message)
             state.metadata.phase = AgentNode.MASTER
             return state
@@ -1071,6 +1158,16 @@ def _decision_summary(decision: LoopGuardDecision) -> dict[str, Any]:
         "reason": decision.reason,
         "budget_grant": decision.budget_grant,
     }
+
+
+def _empty_response_event(finish_reason: str) -> str:
+    if finish_reason in {"length", "max_tokens", "max_output_tokens"}:
+        return "output_exhausted"
+    return "empty_response"
+
+
+def _tool_result_guard_event(decision: LoopGuardDecision) -> str:
+    return "tool_timeout" if "timed out" in decision.reason.lower() else "tool_result_failed"
 
 
 def _tool_call_failures(

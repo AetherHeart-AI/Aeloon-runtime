@@ -22,9 +22,15 @@ uv run aeloon-core
 uv run aeloon-core chat
 ```
 
-Inside the CLI, type prompts directly. The terminal view keeps the core turn
-information visible: workspace, model, session id, streamed assistant output,
-tool calls, tool results, token usage, and compact gateway logs. Useful commands:
+Inside the CLI, type prompts directly. The default terminal view is deliberately
+quiet: it keeps the workspace, model, session id, streamed assistant output,
+tool and sub-agent lifecycles, flow-changing Guard decisions, errors, and compact
+token statistics. Raw reasoning, routine status updates, profile artifact
+metadata, turn UUID separators, and gateway logs are hidden by default. A Guard
+decision is rendered as a concise line such as
+`⚠ Guard [rule_engine] · 重试 · malformed tool call`.
+
+Useful interactive commands:
 
 ```text
 /help
@@ -40,7 +46,20 @@ You can also run one rich-rendered turn and exit:
 
 ```bash
 uv run aeloon-core chat "List the current directory"
-uv run aeloon-core tui --gateway-log-level DEBUG "Read README.md"
+uv run aeloon-core tui "Read README.md"
+```
+
+Enable gateway diagnostics explicitly when needed:
+
+```bash
+# Compact gateway logs at the default INFO level
+uv run aeloon-core chat --show-gateway-logs
+
+# Setting a level or requesting detail also enables gateway logs
+uv run aeloon-core tui --gateway-log-level DEBUG --gateway-log-detail "Read README.md"
+
+# The compatibility flag always wins when options are composed by scripts
+uv run aeloon-core chat --gateway-log-level DEBUG --hide-gateway-logs
 ```
 
 Runtime commands use the directory where you invoke `aeloon-core` as the

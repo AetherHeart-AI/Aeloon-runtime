@@ -14,12 +14,12 @@ from prompt_toolkit.styles import Style
 from rich import box
 from rich.console import Console
 from rich.panel import Panel
-from rich.rule import Rule
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
 from aeloon_core.config import Config
+from aeloon_core.loop_guard import tool_result_failed
 from aeloon_core.orchestrator import AeloonCoreOrchestrator, TurnResult
 from aeloon_core.turn_events import TurnEventProgress
 
@@ -41,6 +41,25 @@ LOG_STYLES = {
     "ERROR": "red",
     "CRITICAL": "bold red",
 }
+SEMANTIC_STYLES = {
+    "user": "bold magenta",
+    "assistant": "bold cyan",
+    "tool": "cyan",
+    "agent": "bold bright_blue",
+    "guard": "bold yellow",
+    "success": "bold green",
+    "error": "bold red",
+    "muted": "dim",
+}
+GUARD_ACTION_LABELS = {
+    "continue": "继续",
+    "return_to_model": "重试",
+    "extend_budget": "扩容",
+    "finalize": "收尾",
+    "final_response": "停止",
+    "stop_off_track": "停止",
+}
+TRANSCRIPT_DETAIL_CHARS = 160
 HISTORY_PREVIEW_CHARS = 160
 PROMPT_STYLE = Style.from_dict({"prompt": "ansicyan bold"})
 
@@ -52,7 +71,7 @@ class TerminalEventRenderer:
         self,
         console: Console | None = None,
         *,
-        show_gateway_logs: bool = True,
+        show_gateway_logs: bool = False,
         gateway_log_level: str = "INFO",
         gateway_log_detail: bool = False,
     ) -> None:
@@ -69,7 +88,6 @@ class TerminalEventRenderer:
         self.last_usage: dict[str, Any] = {}
         self.last_turn_duration_ms: int | None = None
         self._assistant_streaming = False
-        self._thinking_streaming = False
         self._lock = asyncio.Lock()
 
     async def emit(self, event: str, payload: dict[str, Any]) -> None:
@@ -84,10 +102,22 @@ class TerminalEventRenderer:
         table = Table.grid(expand=True)
         table.add_column(ratio=1)
         table.add_column(justify="right")
-        table.add_row("[bold cyan]Aeloon Core[/]", f"[cyan]{config.agents.defaults.model}[/]")
-        table.add_row(str(config.workspace), f"session [bold]{session_id}[/]")
-        table.add_row(str(config.data_dir), "gateway logs on" if self.show_gateway_logs else "")
-        self.console.print(Panel(table, title="CLI", border_style="cyan", box=box.ROUNDED))
+        table.add_row(
+            Text("Aeloon Core", style=SEMANTIC_STYLES["assistant"]),
+            Text(str(config.agents.defaults.model), style=SEMANTIC_STYLES["tool"]),
+        )
+        table.add_row(
+            Text(str(config.workspace), style=SEMANTIC_STYLES["muted"]),
+            Text(f"session {session_id}", style=SEMANTIC_STYLES["muted"]),
+        )
+        self.console.print(
+            Panel(
+                table,
+                border_style=SEMANTIC_STYLES["tool"],
+                box=box.ROUNDED,
+                padding=(0, 1),
+            )
+        )
 
     def print_help(self) -> None:
         """Print interactive commands."""
@@ -109,21 +139,20 @@ class TerminalEventRenderer:
         """Print a user turn."""
 
         self._finish_stream_line()
-        self.console.print(Text(f"You: {prompt}", style="bold magenta"))
+        self.console.print(Text(f"› {prompt}", style=SEMANTIC_STYLES["user"]))
 
     def print_turn_summary(self, result: TurnResult) -> None:
         """Print final session metadata for a turn."""
 
         self._finish_stream_line()
-        tools = ", ".join(result.tools_used) if result.tools_used else "none"
         usage = _format_usage(self.last_usage)
-        summary = f"session {result.session_id} | tools {tools}"
         duration = _format_duration(self.last_turn_duration_ms)
+        parts = ["完成"]
         if duration:
-            summary = f"{summary} | duration {duration}"
+            parts.append(f"耗时 {duration}")
         if usage:
-            summary = f"{summary} | {usage}"
-        self.console.print(Text(summary, style="dim"))
+            parts.append(usage)
+        self.console.print(Text(" · ".join(parts), style=SEMANTIC_STYLES["muted"]))
         self.last_usage = {}
         self.last_turn_duration_ms = None
 
@@ -131,7 +160,7 @@ class TerminalEventRenderer:
         """Print an error without treating it as assistant output."""
 
         self._finish_stream_line()
-        self.console.print(Panel(message, title="Error", border_style="red"))
+        self.console.print(Panel(message, title="Error", border_style=SEMANTIC_STYLES["error"]))
 
     def print_sessions(self, sessions: list[Any], *, current_session_id: str) -> None:
         """Print saved sessions."""
@@ -193,12 +222,11 @@ class TerminalEventRenderer:
             return
         if event == "chat.turn.start":
             self._finish_stream_line()
-            self._finish_thinking_line()
-            self.console.print(Rule(f"turn {payload.get('turn_id', '')}", style="cyan"))
             return
         if event == "chat.status":
-            self._finish_stream_line()
-            self._finish_thinking_line()
+            return
+        if event == "chat.guard.decision":
+            self._render_guard_decision(payload)
             return
         if event == "chat.block.add":
             self._render_block_add(payload)
@@ -210,7 +238,6 @@ class TerminalEventRenderer:
             self._render_block_update(payload)
             return
         if event == "chat.llm.response":
-            self._finish_thinking_line()
             usage = payload.get("aggregate_usage", payload.get("usage"))
             self.last_usage = usage if isinstance(usage, dict) else {}
             return
@@ -226,56 +253,83 @@ class TerminalEventRenderer:
             duration = payload.get("duration_ms")
             self.last_turn_duration_ms = duration if isinstance(duration, int) else None
             self._flush_text_blocks()
-            self._finish_thinking_line()
             self._finish_stream_line()
 
     def _render_profile_event(self, event: str, payload: dict[str, Any]) -> None:
-        self._finish_stream_line()
-        self._finish_thinking_line()
-        text = Text(style="dim")
         if event == "chat.profile.pinned":
-            profile = payload.get("profile") if isinstance(payload.get("profile"), dict) else {}
-            artifact = str(profile.get("artifact_id") or "")
-            text.append("profile ")
-            text.append(str(profile.get("profile_id") or "unknown"), style="cyan")
-            text.append(
-                f" revision {profile.get('revision', '?')} generation "
-                f"{profile.get('generation', '?')} artifact {artifact[:12]}"
-            )
-        elif event == "chat.profile.route":
-            text.append("● ", style="cyan")
-            text.append("发起了 子agent ")
+            return
+        self._finish_stream_line()
+        text = Text(no_wrap=True, overflow="ellipsis")
+        if event == "chat.profile.route":
+            text.append("◆ ", style=SEMANTIC_STYLES["agent"])
+            text.append("子agent ", style=SEMANTIC_STYLES["muted"])
             text.append(
                 str(payload.get("agent_id") or "unknown"),
-                style="bold cyan",
+                style=SEMANTIC_STYLES["agent"],
             )
+            text.append(" · 启动", style=SEMANTIC_STYLES["muted"])
             if payload.get("fallback_used"):
-                text.append("（回退选择）", style="yellow")
+                text.append(" · 回退选择", style=SEMANTIC_STYLES["guard"])
         elif event == "chat.profile.handoff":
-            target = payload.get("recommended_agent_id") or "profile master"
+            target = str(payload.get("recommended_agent_id") or "profile master")
             source = str(payload.get("from_agent_id") or "unknown")
-            summary = _one_line(str(payload.get("summary") or "任务已交接"), limit=160)
-            text.append("↳ ", style="cyan")
-            text.append("子agent 任务更新 ")
-            text.append(source, style="bold cyan")
-            text.append(f": {summary}")
-            text.append(
-                f" → {target} "
-                f"({payload.get('handoff_count', '?')}/"
-                f"{payload.get('handoff_limit', '?')})",
-                style="dim",
+            summary = _one_line(
+                str(payload.get("summary") or "任务已交接"),
+                limit=TRANSCRIPT_DETAIL_CHARS,
             )
+            text.append("↳ ", style=SEMANTIC_STYLES["agent"])
+            text.append("子agent ", style=SEMANTIC_STYLES["muted"])
+            text.append(source, style=SEMANTIC_STYLES["agent"])
+            text.append(" → ", style=SEMANTIC_STYLES["muted"])
+            text.append(target, style=SEMANTIC_STYLES["agent"])
+            text.append(
+                f" · 交接 {payload.get('handoff_count', '?')}/{payload.get('handoff_limit', '?')}",
+                style=SEMANTIC_STYLES["muted"],
+            )
+            if summary:
+                text.append(" · ", style=SEMANTIC_STYLES["muted"])
+                text.append(summary)
         elif event == "chat.profile.completion":
-            text.append("✓ ", style="green")
-            text.append("子agent ")
+            text.append("✓ ", style=SEMANTIC_STYLES["success"])
+            text.append("子agent ", style=SEMANTIC_STYLES["muted"])
             text.append(
                 str(payload.get("agent_id") or "unknown"),
-                style="bold green",
+                style=SEMANTIC_STYLES["success"],
             )
-            text.append(" 已完成任务", style="green")
+            text.append(" · 完成", style=SEMANTIC_STYLES["muted"])
         else:
             return
-        self.console.print(text)
+        self._print_transcript_line(text)
+
+    def _render_guard_decision(self, payload: dict[str, Any]) -> None:
+        action = str(payload.get("action") or "").lower()
+        self._finish_stream_line()
+        stopped = action in {"final_response", "stop_off_track"}
+        style = SEMANTIC_STYLES["error"] if stopped else SEMANTIC_STYLES["guard"]
+        text = Text(no_wrap=True, overflow="ellipsis")
+        text.append("✕ " if stopped else "⚠ ", style=style)
+        source = str(payload.get("source") or "rule_engine")
+        text.append("Guard", style=style)
+        text.append(f" [{source}]", style=SEMANTIC_STYLES["muted"])
+        guard_event = str(payload.get("event") or "")
+        if action == "continue" and guard_event in {"empty_response", "output_exhausted"}:
+            label = "重试"
+        else:
+            label = GUARD_ACTION_LABELS.get(action, action or "决策")
+        grant = payload.get("budget_grant")
+        if action == "extend_budget" and isinstance(grant, int) and grant > 0:
+            label = f"{label} +{grant}"
+        text.append(f" · {label}", style=style)
+        if payload.get("fallback_used"):
+            text.append(" · 回退", style=SEMANTIC_STYLES["guard"])
+        reason = _one_line(
+            str(payload.get("reason") or payload.get("event") or ""),
+            limit=TRANSCRIPT_DETAIL_CHARS,
+        )
+        if reason:
+            text.append(" · ", style=SEMANTIC_STYLES["muted"])
+            text.append(reason)
+        self._print_transcript_line(text)
 
     def _render_block_add(self, payload: dict[str, Any]) -> None:
         block = payload.get("block") if isinstance(payload.get("block"), dict) else {}
@@ -292,13 +346,11 @@ class TerminalEventRenderer:
         if block_type == "tool_call":
             self._consume_pending_text_blocks()
             self._finish_stream_line()
-            self._finish_thinking_line()
             name = str(block.get("name") or "tool")
-            status = _tool_running_status(name)
-            self.console.print(
+            self._print_transcript_line(
                 _tool_line(
                     name=name,
-                    status=status,
+                    status="running",
                     detail=_tool_call_detail_text(name, block.get("arguments")),
                 )
             )
@@ -313,7 +365,7 @@ class TerminalEventRenderer:
         if block_type == "text":
             self._render_text_stream(block_id)
         elif block_type == "reasoning":
-            self._render_reasoning_delta(block_id)
+            self.block_content_lengths[block_id] = len(self.block_contents[block_id])
 
     def _render_block_update(self, payload: dict[str, Any]) -> None:
         block_id = str(payload.get("block_id") or "")
@@ -324,9 +376,10 @@ class TerminalEventRenderer:
             return
         if block_type == "reasoning":
             if "content" in patch:
-                self._render_reasoning_content(block_id, str(patch.get("content") or ""))
-            if patch.get("status") == "done":
-                self._render_reasoning_content(block_id, self.block_contents.get(block_id, ""))
+                self.block_contents[block_id] = str(patch.get("content") or "")
+            self.block_content_lengths[block_id] = len(
+                self.block_contents.get(block_id, "")
+            )
             return
         if block_type == "tool_call":
             self._render_tool_result(block_id, patch)
@@ -339,24 +392,26 @@ class TerminalEventRenderer:
         if "result" not in patch and "status" not in patch:
             return
         self._finish_stream_line()
-        self._finish_thinking_line()
         status = str(patch.get("status") or "done")
         name = self.block_names.get(block_id, "tool")
-        style = "red" if status == "error" else "green"
+        raw_result = patch.get("result")
+        failed = status.lower() in {"error", "failed", "failure"} or tool_result_failed(
+            "" if raw_result is None else str(raw_result)
+        )
+        rendered_status = "error" if failed else "done"
         duration = patch.get("duration_ms")
         detail = _tool_result_detail_text(
             name,
-            patch.get("result"),
+            raw_result,
             arguments=self.block_arguments.get(block_id),
-            status=status,
+            status=rendered_status,
             duration_ms=duration,
         )
-        self.console.print(
+        self._print_transcript_line(
             _tool_line(
                 name=name,
-                status=status,
+                status=rendered_status,
                 detail=detail,
-                style=style,
             )
         )
 
@@ -368,7 +423,6 @@ class TerminalEventRenderer:
         if LOG_LEVELS.get(level, 20) < LOG_LEVELS.get(self.gateway_log_level, 20):
             return
         self._finish_stream_line()
-        self._finish_thinking_line()
         source = str(payload.get("source") or "gateway")
         message = _preview(payload.get("message"), limit=280)
         ts = _short_time(str(payload.get("ts") or ""))
@@ -393,14 +447,13 @@ class TerminalEventRenderer:
 
     def _append_assistant(self, text: str) -> None:
         if not self._assistant_streaming:
-            self._finish_thinking_line()
-            self.console.print("[bold cyan]Assistant[/]")
+            self.console.print(Text("Aeloon", style=SEMANTIC_STYLES["assistant"]))
             self._assistant_streaming = True
         self.console.print(Text(text), end="")
+        self._flush_console()
 
     def _flush_text_blocks(self) -> None:
         self._finish_stream_line()
-        self._finish_thinking_line()
         for block_id, block_type in self.block_types.items():
             if block_type == "text":
                 self._render_text_block(block_id)
@@ -433,42 +486,15 @@ class TerminalEventRenderer:
         self._append_assistant(new_text)
         self.block_content_lengths[block_id] = len(content)
 
-    def _render_reasoning_delta(self, block_id: str) -> None:
-        content = self.block_contents.get(block_id, "")
-        new_text = self._unprinted_suffix(block_id, content)
-        if new_text:
-            self._append_thinking(new_text)
-        self.block_content_lengths[block_id] = len(content)
-
-    def _render_reasoning_content(self, block_id: str, content: str) -> None:
-        new_text = self._unprinted_suffix(block_id, content)
-        self.block_contents[block_id] = content
-        raw_text = _reasoning_display_text(new_text)
-        if raw_text:
-            self._append_thinking(raw_text)
-        self.block_content_lengths[block_id] = len(content)
-
-    def _append_thinking(self, text: str) -> None:
-        if not text:
-            return
-        if not self._thinking_streaming:
-            self._finish_stream_line()
-            self.console.print("[bold blue]Thinking[/]")
-            self._thinking_streaming = True
-        self.console.print(Text(text, style="blue"), end="")
-        self._flush_console()
-
     def _finish_stream_line(self) -> None:
         if not self._assistant_streaming:
             return
         self.console.print()
         self._assistant_streaming = False
 
-    def _finish_thinking_line(self) -> None:
-        if not self._thinking_streaming:
-            return
-        self.console.print()
-        self._thinking_streaming = False
+    def _print_transcript_line(self, text: Text) -> None:
+        text.truncate(max(1, self.console.size.width), overflow="ellipsis")
+        self.console.print(text, soft_wrap=True)
 
     def _flush_console(self) -> None:
         flush = getattr(self.console.file, "flush", None)
@@ -484,7 +510,7 @@ class TerminalChatCli:
         config: Config,
         *,
         session_id: str | None = None,
-        show_gateway_logs: bool = True,
+        show_gateway_logs: bool = False,
         gateway_log_level: str = "INFO",
         gateway_log_detail: bool = False,
         console: Console | None = None,
@@ -666,7 +692,7 @@ async def run_terminal_cli(
     *,
     prompt: str | None = None,
     session_id: str | None = None,
-    show_gateway_logs: bool = True,
+    show_gateway_logs: bool = False,
     gateway_log_level: str = "INFO",
     gateway_log_detail: bool = False,
 ) -> None:
@@ -715,24 +741,25 @@ def _tool_line(
     name: str,
     status: str,
     detail: str,
-    style: str = "yellow",
 ) -> Text:
-    text = Text(no_wrap=True, overflow="crop")
-    text.append("Tool ", style="dim")
-    text.append(name, style=style if status != "running" else "yellow")
-    text.append(f" -> {status}", style=style if status != "running" else "yellow")
+    failed = status == "error"
+    completed = status == "done"
+    icon = "✕" if failed else "✓" if completed else "◇"
+    icon_style = (
+        SEMANTIC_STYLES["error"]
+        if failed
+        else SEMANTIC_STYLES["success"]
+        if completed
+        else SEMANTIC_STYLES["guard"]
+    )
+    text = Text(no_wrap=True, overflow="ellipsis")
+    text.append(f"{icon} ", style=icon_style)
+    text.append("工具 ", style=SEMANTIC_STYLES["muted"])
+    text.append(name, style=SEMANTIC_STYLES["tool"])
     if detail:
-        text.append(" | ", style="dim")
-        text.append(_one_line(detail, limit=180))
+        text.append(" · ", style=SEMANTIC_STYLES["muted"])
+        text.append(_one_line(detail, limit=TRANSCRIPT_DETAIL_CHARS))
     return text
-
-
-def _tool_running_status(name: str) -> str:
-    if name == "write":
-        return "writing ~"
-    if name == "edit":
-        return "editing ~"
-    return "running"
 
 
 def _tool_call_detail_text(name: str, arguments: Any) -> str:
@@ -921,7 +948,7 @@ def _line_count(text: str) -> int:
 
 
 def _join_parts(*parts: str) -> str:
-    return " | ".join(part for part in parts if part)
+    return " · ".join(part for part in parts if part)
 
 
 def _one_line(value: str, *, limit: int) -> str:
@@ -929,20 +956,6 @@ def _one_line(value: str, *, limit: int) -> str:
     if len(text) <= limit:
         return text
     return f"{text[:limit]}... [{len(text) - limit} chars]"
-
-
-def _reasoning_display_text(text: str) -> str:
-    raw_lines: list[str] = []
-    for raw_line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
-        line = raw_line.strip()
-        if not line:
-            continue
-        marker_start = line.find(" [")
-        marker_end = line.find("] ", marker_start + 2)
-        if marker_start < 0 or marker_end < 0:
-            raw_lines.append(raw_line)
-            continue
-    return "\n".join(raw_lines)
 
 
 def _short_time(value: str) -> str:

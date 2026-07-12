@@ -9,6 +9,7 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 
+from aeloon_core.loop_guard import tool_result_failed
 from aeloon_core.providers.base import ToolCallRequest
 from aeloon_core.task_graph import TaskNode
 from aeloon_core.transitions import accumulate_usage
@@ -192,7 +193,7 @@ class TurnEventProgress:
         )
 
     async def on_guard_decision(self, resolution: Any) -> None:
-        """Account for a TemporaryGuard call without exposing response text."""
+        """Preserve the TemporaryGuard callback contract and account for its usage."""
 
         usage = getattr(resolution, "usage", {})
         if isinstance(usage, dict) and usage:
@@ -201,6 +202,37 @@ class TurnEventProgress:
                 node_kind="harness",
                 component="temporary_guard",
             )
+
+    async def on_loop_guard_decision(
+        self,
+        decision: Any,
+        *,
+        event: str,
+        source: str,
+        fallback_used: bool = False,
+        budget_grant: int | None = None,
+    ) -> None:
+        """Publish one sanitized loop-control decision."""
+
+        if source not in {"rule_engine", "temporary_guard", "rule_fallback"}:
+            raise ValueError(f"unsupported guard decision source: {source}")
+        action = getattr(decision, "action", "")
+        action_value = getattr(action, "value", action)
+        resolved_budget_grant = (
+            getattr(decision, "budget_grant", 0) if budget_grant is None else budget_grant
+        )
+        await self.emit(
+            "chat.guard.decision",
+            self._payload(
+                ts=_now(),
+                source=source,
+                event=event,
+                action=str(action_value),
+                reason=str(getattr(decision, "reason", "") or ""),
+                budget_grant=max(0, int(resolved_budget_grant or 0)),
+                fallback_used=bool(fallback_used),
+            ),
+        )
 
     async def on_profile_pinned(self, profile: dict[str, Any]) -> None:
         """Expose immutable turn provenance before any profile routing."""
@@ -310,7 +342,7 @@ class TurnEventProgress:
 
     async def on_tool_result(self, node: TaskNode) -> None:
         result = str(node.result or "")
-        status = "error" if result.startswith("Error") else "done"
+        status = "error" if tool_result_failed(node.result) else "done"
         block = self._find_block(node.call_id)
         if block is None:
             block = {
@@ -325,6 +357,7 @@ class TurnEventProgress:
         block["result"] = result
         block["completed_at"] = _now()
         duration_ms = _duration_ms(block.get("created_at"), block["completed_at"])
+        block["duration_ms"] = duration_ms
         await self._append_reasoning_line(
             f"{node.tool_name} returned {len(result)} characters",
             kind="tool_result",
@@ -342,6 +375,7 @@ class TurnEventProgress:
             "status": block["status"],
             "result": block["result"],
             "completed_at": block["completed_at"],
+            "duration_ms": duration_ms,
         }
         payload = self._payload(block_id=node.call_id, patch=ui_patch, ts=_now())
         await self.emit("chat.block.update", payload)

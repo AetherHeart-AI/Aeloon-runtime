@@ -87,6 +87,8 @@ class ScriptedProvider(LLMProvider):
 class ProgressRecorder:
     def __init__(self) -> None:
         self.final_calls: list[str] = []
+        self.guard_resolutions: list[Any] = []
+        self.guard_calls: list[tuple[Any, dict[str, Any]]] = []
 
     async def __call__(self, text: str, *, tool_hint: bool = False) -> None:
         del text, tool_hint
@@ -97,6 +99,12 @@ class ProgressRecorder:
     async def on_final(self, content: str, **kwargs: Any) -> None:
         del kwargs
         self.final_calls.append(content)
+
+    async def on_guard_decision(self, resolution: Any) -> None:
+        self.guard_resolutions.append(resolution)
+
+    async def on_loop_guard_decision(self, decision: Any, **kwargs: Any) -> None:
+        self.guard_calls.append((decision, kwargs))
 
 
 def registry(*tools: Tool) -> ToolRegistry:
@@ -156,6 +164,7 @@ async def test_state_machine_routes_explicit_nodes_and_attributes_usage() -> Non
 
 @pytest.mark.asyncio
 async def test_rule_engine_auto_continues_after_base_iteration_limit() -> None:
+    progress = ProgressRecorder()
     provider = ScriptedProvider(
         [
             LLMResponse(
@@ -177,6 +186,7 @@ async def test_rule_engine_auto_continues_after_base_iteration_limit() -> None:
         max_iterations=1,
         max_auto_continue_iterations=1,
         max_finalization_iterations=1,
+        on_progress=progress,
     )
 
     assert state.metadata.status == RunStatus.COMPLETED
@@ -188,6 +198,11 @@ async def test_rule_engine_auto_continues_after_base_iteration_limit() -> None:
     assert "MAXIMUM ITERATIONS REACHED" not in provider.calls[1]["messages"][-1]["content"]
     assert state.guard_state.iteration_limit == 2
     assert state.guard_state.auto_continue_remaining == 0
+    decision, metadata = progress.guard_calls[-1]
+    assert decision.action.value == "extend_budget"
+    assert decision.budget_grant == 1
+    assert metadata["event"] == "iteration_budget"
+    assert metadata["source"] == "rule_engine"
 
 
 @pytest.mark.asyncio
@@ -221,6 +236,7 @@ async def test_runtime_recovers_after_failed_tool_result() -> None:
 
 @pytest.mark.asyncio
 async def test_runtime_recovers_after_exec_timeout() -> None:
+    progress = ProgressRecorder()
     provider = ScriptedProvider(
         [
             LLMResponse(
@@ -243,6 +259,7 @@ async def test_runtime_recovers_after_exec_timeout() -> None:
         model="test-model",
         tools=registry(TimeoutExecTool()),
         messages=[{"role": "user", "content": "recover"}],
+        on_progress=progress,
     )
 
     assert state.metadata.status == RunStatus.COMPLETED
@@ -250,6 +267,10 @@ async def test_runtime_recovers_after_exec_timeout() -> None:
     assert state.tools_used == ["exec"]
     assert state.guard_state.exec_timeout_rounds == 1
     assert "TOOL ERROR RECOVERY" in provider.calls[1]["messages"][-1]["content"]
+    decision, metadata = progress.guard_calls[-1]
+    assert decision.action.value == "return_to_model"
+    assert metadata["event"] == "tool_timeout"
+    assert metadata["source"] == "rule_engine"
 
 
 @pytest.mark.asyncio
@@ -285,6 +306,7 @@ async def test_runtime_stops_after_repeated_malformed_calls() -> None:
 
 @pytest.mark.asyncio
 async def test_repeated_duplicate_escalates_to_temporary_guard_then_recovers() -> None:
+    progress = ProgressRecorder()
     duplicate_call = lambda call_id: LLMResponse(  # noqa: E731
         content=None,
         tool_calls=[
@@ -313,6 +335,7 @@ async def test_repeated_duplicate_escalates_to_temporary_guard_then_recovers() -
         messages=[{"role": "user", "content": "echo once"}],
         max_iterations=10,
         max_auto_continue_iterations=0,
+        on_progress=progress,
     )
 
     assert state.metadata.status == RunStatus.COMPLETED
@@ -322,10 +345,29 @@ async def test_repeated_duplicate_escalates_to_temporary_guard_then_recovers() -
     assert provider.calls[3]["response_format"] == {"type": "json_object"}
     assert state.token_ledger.for_kind(NodeKind.HARNESS)["total_tokens"] == 3
     assert any(record.node == "temporary_guard" for record in state.transitions)
+    decision, metadata = progress.guard_calls[-1]
+    assert decision.action.value == "continue"
+    assert metadata["event"] == "duplicate_tool_calls"
+    assert metadata["source"] == "temporary_guard"
+    assert metadata["fallback_used"] is False
+    assert len(progress.guard_resolutions) == 1
+    assert progress.guard_resolutions[0].decision is decision
+    assert progress.guard_resolutions[0].usage == {"total_tokens": 3}
+    assert (
+        len(
+            [
+                item
+                for item in progress.guard_calls
+                if item[1]["source"] in {"temporary_guard", "rule_fallback"}
+            ]
+        )
+        == 1
+    )
 
 
 @pytest.mark.asyncio
 async def test_invalid_temporary_guard_output_falls_back_to_rule_termination() -> None:
+    progress = ProgressRecorder()
     provider = ScriptedProvider(
         [
             LLMResponse(
@@ -360,11 +402,19 @@ async def test_invalid_temporary_guard_output_falls_back_to_rule_termination() -
         messages=[{"role": "user", "content": "echo once"}],
         max_iterations=10,
         max_auto_continue_iterations=0,
+        on_progress=progress,
     )
 
     assert state.metadata.status == RunStatus.TERMINATED_BY_RULE
     assert "repeated tool calls" in (state.metadata.final_content or "")
     assert state.token_ledger.for_kind(NodeKind.HARNESS)["total_tokens"] == 2
+    decision, metadata = progress.guard_calls[-1]
+    assert decision.action.value == "stop_off_track"
+    assert metadata["source"] == "rule_fallback"
+    assert metadata["fallback_used"] is True
+    assert len(progress.guard_resolutions) == 1
+    assert progress.guard_resolutions[0].source == "rule_fallback"
+    assert progress.guard_resolutions[0].fallback_used is True
 
 
 @pytest.mark.asyncio
