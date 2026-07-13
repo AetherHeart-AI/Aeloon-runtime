@@ -8,6 +8,8 @@ from dataclasses import dataclass, replace
 from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
+from loguru import logger
+
 from aeloon_core.profile_runtime import (
     CONTROL_TOOL_NAMES,
     DELEGATE_RESULT_CHARS,
@@ -28,8 +30,6 @@ if TYPE_CHECKING:
     from aeloon_core.profiles import RuntimeAgentSpec
 
 DELEGATE_MAX_ITERATIONS = 8
-DELEGATE_MAX_AUTO_CONTINUE_ITERATIONS = 2
-DELEGATE_MAX_FINALIZATION_ITERATIONS = 1
 DELEGATE_BRANCH_TIMEOUT_SECONDS = 300.0
 DELEGATE_LIFECYCLE_TIMEOUT_SECONDS = 5.0
 DELEGATE_JOIN_CHARS = 12_000
@@ -261,8 +261,6 @@ async def _run_branch(
                 tools=scoped_tools,
                 messages=_branch_messages(parent_state, runtime, branch, scoped_tools),
                 max_iterations=DELEGATE_MAX_ITERATIONS,
-                max_auto_continue_iterations=DELEGATE_MAX_AUTO_CONTINUE_ITERATIONS,
-                max_finalization_iterations=DELEGATE_MAX_FINALIZATION_ITERATIONS,
                 transition_trace_enabled=False,
                 minimal_context_recent_turns=2,
                 session_id=parent_state.metadata.session_id,
@@ -332,8 +330,11 @@ async def _emit_lifecycle_hook(
     *args: Any,
     **kwargs: Any,
 ) -> None:
-    async with asyncio.timeout(DELEGATE_LIFECYCLE_TIMEOUT_SECONDS):
-        await runtime.emit_hook(name, *args, **kwargs)
+    try:
+        async with asyncio.timeout(DELEGATE_LIFECYCLE_TIMEOUT_SECONDS):
+            await runtime.emit_hook(name, *args, **kwargs)
+    except TimeoutError:
+        logger.warning("Ignoring timed-out delegated lifecycle hook: {}", name)
 
 
 def _branch_messages(
@@ -441,14 +442,20 @@ class _DelegatedProgress:
             component=component or node_kind,
         )
 
-    async def on_guard_decision(self, resolution: Any) -> None:
+    async def on_guard_resolution(self, resolution: Any) -> None:
         usage = getattr(resolution, "usage", {})
         if isinstance(usage, dict):
             self.observed_ledger.record(
                 NodeKind.HARNESS,
                 usage,
-                component="temporary_guard",
+                component="guard",
             )
+        await self.runtime.emit_hook(
+            "on_profile_delegate_guard_resolution",
+            self.branch.branch_id,
+            self.branch.label,
+            resolution,
+        )
 
     async def on_tool_calls(self, tool_calls: list[ToolCallRequest]) -> None:
         prefixed = [
@@ -474,26 +481,6 @@ class _DelegatedProgress:
             replace(node, call_id=self._call_id(node.call_id)),
             subagent_label=self.branch.label,
             record_reasoning=False,
-        )
-
-    async def on_loop_guard_decision(
-        self,
-        decision: Any,
-        *,
-        event: str,
-        source: str,
-        fallback_used: bool = False,
-        budget_grant: int | None = None,
-    ) -> None:
-        await self.runtime.emit_hook(
-            "on_profile_delegate_guard_decision",
-            self.branch.branch_id,
-            self.branch.label,
-            decision,
-            event=event,
-            source=source,
-            fallback_used=fallback_used,
-            budget_grant=budget_grant,
         )
 
     def _call_id(self, call_id: str) -> str:

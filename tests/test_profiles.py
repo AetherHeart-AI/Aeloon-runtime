@@ -152,7 +152,7 @@ def test_profile_identifier_must_match_contract(bad_id: str) -> None:
         "master",
         "worker",
         "tool",
-        "temporary_guard",
+        "guard",
         "control",
         "done",
         "handoff_agent",

@@ -55,11 +55,8 @@ SEMANTIC_STYLES = {
 }
 GUARD_ACTION_LABELS = {
     "continue": "继续",
-    "return_to_model": "重试",
-    "extend_budget": "扩容",
+    "retry": "重试",
     "finalize": "收尾",
-    "final_response": "停止",
-    "stop_off_track": "停止",
 }
 TRANSCRIPT_DETAIL_CHARS = 160
 HISTORY_PREVIEW_CHARS = 160
@@ -505,29 +502,22 @@ class TerminalEventRenderer:
     def _render_guard_decision(self, payload: dict[str, Any]) -> None:
         action = str(payload.get("action") or "").lower()
         self._finish_stream_line()
-        stopped = action in {"final_response", "stop_off_track"}
+        stopped = action == "finalize"
         style = SEMANTIC_STYLES["error"] if stopped else SEMANTIC_STYLES["guard"]
         text = Text(no_wrap=True, overflow="ellipsis")
         text.append("✕ " if stopped else "⚠ ", style=style)
-        source = str(payload.get("source") or "rule_engine")
+        source = str(payload.get("source") or "guard")
         subagent_label = str(payload.get("subagent_label") or "")
         if subagent_label:
             source = f"{source}/{subagent_label}"
         text.append("Guard", style=style)
         text.append(f" [{source}]", style=SEMANTIC_STYLES["muted"])
-        guard_event = str(payload.get("event") or "")
-        if action == "continue" and guard_event in {"empty_response", "output_exhausted"}:
-            label = "重试"
-        else:
-            label = GUARD_ACTION_LABELS.get(action, action or "决策")
-        grant = payload.get("budget_grant")
-        if action == "extend_budget" and isinstance(grant, int) and grant > 0:
-            label = f"{label} +{grant}"
+        label = GUARD_ACTION_LABELS.get(action, action or "决策")
         text.append(f" · {label}", style=style)
-        if payload.get("fallback_used"):
+        if source == "fallback":
             text.append(" · 回退", style=SEMANTIC_STYLES["guard"])
         reason = _one_line(
-            str(payload.get("reason") or payload.get("event") or ""),
+            str(payload.get("event") or ""),
             limit=TRANSCRIPT_DETAIL_CHARS,
         )
         if reason:

@@ -65,9 +65,10 @@ Profile roles receive only declared tools intersected with the host registry;
 
 `handoff_agent`, `delegate_tasks`, and `complete_task` are internal control
 calls. A control call must be the sole tool call in the response. Mixed batches
-have no external side effects. The first protocol error receives a correction;
-the second terminates with visible output. Handoffs are counted against the
-profile and host caps.
+have no external side effects. Protocol errors enter the same exception-only
+Guard used by the base loop; a retry receives a host-owned correction and a
+finalize decision produces a text-only honest wrap-up. Handoffs are counted
+against the profile and host caps.
 
 `delegate_tasks` runs two to four isolated branches concurrently and joins their
 bounded reports back into the calling role. Every delegated role is preflighted

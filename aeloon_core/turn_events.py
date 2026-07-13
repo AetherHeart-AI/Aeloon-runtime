@@ -209,46 +209,19 @@ class TurnEventProgress:
             ),
         )
 
-    async def on_guard_decision(self, resolution: Any) -> None:
-        """Preserve the TemporaryGuard callback contract and account for its usage."""
-
+    async def on_guard_resolution(self, resolution: Any) -> None:
+        """Account for and publish one bounded Guard control decision."""
         usage = getattr(resolution, "usage", {})
         if isinstance(usage, dict) and usage:
             await self.on_usage(
                 usage,
                 node_kind="harness",
-                component="temporary_guard",
+                component="guard",
             )
-
-    async def on_loop_guard_decision(
-        self,
-        decision: Any,
-        *,
-        event: str,
-        source: str,
-        fallback_used: bool = False,
-        budget_grant: int | None = None,
-    ) -> None:
-        """Publish one sanitized loop-control decision."""
-
-        if source not in {"rule_engine", "temporary_guard", "rule_fallback"}:
-            raise ValueError(f"unsupported guard decision source: {source}")
-        action = getattr(decision, "action", "")
-        action_value = getattr(action, "value", action)
-        resolved_budget_grant = (
-            getattr(decision, "budget_grant", 0) if budget_grant is None else budget_grant
-        )
+        record = resolution.to_record()
         await self.emit(
             "chat.guard.decision",
-            self._payload(
-                ts=_now(),
-                source=source,
-                event=event,
-                action=str(action_value),
-                reason=str(getattr(decision, "reason", "") or ""),
-                budget_grant=max(0, int(resolved_budget_grant or 0)),
-                fallback_used=bool(fallback_used),
-            ),
+            self._payload(ts=_now(), **record),
         )
 
     async def on_worker_lifecycle(
@@ -382,21 +355,16 @@ class TurnEventProgress:
             ),
         )
 
-    async def on_worker_guard_decision(
+    async def on_worker_guard_resolution(
         self,
         *,
         worker_id: str,
         run_id: str,
         profile_id: str,
         label: str,
-        decision: Any,
-        event: str,
-        source: str,
-        fallback_used: bool = False,
-        budget_grant: int | None = None,
+        resolution: Any,
     ) -> None:
-        action = getattr(decision, "action", "")
-        action_value = getattr(action, "value", action)
+        record = resolution.to_record()
         await self.emit(
             "chat.worker.guard",
             self._payload(
@@ -404,12 +372,7 @@ class TurnEventProgress:
                 run_id=run_id,
                 profile_id=profile_id,
                 subagent_label=label,
-                source=source,
-                event=event,
-                action=str(action_value),
-                reason=event,
-                budget_grant=max(0, int(budget_grant or 0)),
-                fallback_used=fallback_used,
+                **record,
                 ts=_now(),
             ),
         )
@@ -547,38 +510,20 @@ class TurnEventProgress:
             ),
         )
 
-    async def on_profile_delegate_guard_decision(
+    async def on_profile_delegate_guard_resolution(
         self,
         branch_id: str,
         subagent_label: str,
-        decision: Any,
-        *,
-        event: str,
-        source: str,
-        fallback_used: bool = False,
-        budget_grant: int | None = None,
+        resolution: Any,
     ) -> None:
-        if source not in {"rule_engine", "temporary_guard", "rule_fallback"}:
-            raise ValueError(f"unsupported guard decision source: {source}")
-        action = getattr(decision, "action", "")
-        action_value = getattr(action, "value", action)
-        resolved_budget_grant = (
-            getattr(decision, "budget_grant", 0)
-            if budget_grant is None
-            else budget_grant
-        )
+        record = resolution.to_record()
         await self.emit(
             "chat.profile.delegate.guard",
             self._payload(
                 ts=_now(),
                 branch_id=branch_id,
                 subagent_label=subagent_label,
-                source=source,
-                event=event,
-                action=str(action_value),
-                reason=str(getattr(decision, "reason", "") or ""),
-                budget_grant=max(0, int(resolved_budget_grant or 0)),
-                fallback_used=bool(fallback_used),
+                **record,
             ),
         )
 

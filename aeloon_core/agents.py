@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import inspect
 import json
+import unicodedata
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from time import perf_counter
 from typing import TYPE_CHECKING, Any
@@ -14,10 +15,21 @@ from loguru import logger
 
 from aeloon_core.context_compaction import estimate_request_tokens
 from aeloon_core.loop_guard import (
-    AgentLoopGuard,
-    LoopGuardAction,
-    LoopGuardDecision,
+    GuardAction,
+    GuardEvent,
+    GuardEvidence,
+    GuardRequest,
+    GuardResolution,
+    GuardReviewer,
+    GuardSource,
+    classify_malformed_tool_calls,
+    finalization_prompt_message,
+    guard_progress_message,
+    local_failure_message,
+    recovery_prompt_message,
     rejected_arguments_summary,
+    suppress_successful_side_effect_duplicates,
+    tool_result_failed,
 )
 from aeloon_core.minimal_context import ContextProcessor
 from aeloon_core.model_input import PrepareModelInput, unpack_prepared_model_input
@@ -42,7 +54,6 @@ from aeloon_core.runtime_support import (
     shrink_answered_tool_args_for_provider,
 )
 from aeloon_core.state import AgentNode, LightweightState, RunStatus
-from aeloon_core.temporary_guard import GuardEvidence, TemporaryGuard
 from aeloon_core.tools.registry import ScopedToolRegistry
 from aeloon_core.transitions import NodeKind, TransitionRecorder, normalize_usage
 
@@ -59,10 +70,10 @@ class AgentRuntime:
     provider: LLMProvider
     model: str
     tools: ToolRegistry
-    rule_engine: AgentLoopGuard
+    guard: GuardReviewer
+    base_iteration_budget: int
     context_processor: ContextProcessor
     recorder: TransitionRecorder
-    temporary_guard: TemporaryGuard | None = None
     profile: RuntimeProfileSpec | None = None
     profile_master: LLMProfileMaster | None = None
     max_handoffs: int = 8
@@ -127,7 +138,10 @@ class AgentRuntime:
 
     async def emit_progress(self, text: str, *, tool_hint: bool = False) -> None:
         if self.on_progress is not None:
-            await self.on_progress(text, tool_hint=tool_hint)
+            try:
+                await self.on_progress(text, tool_hint=tool_hint)
+            except Exception as exc:
+                logger.warning("Ignoring progress callback failure: {}", exc)
 
     async def emit_hook(self, name: str, *args: Any, **kwargs: Any) -> None:
         if self.on_progress is None:
@@ -150,42 +164,34 @@ class AgentRuntime:
                 if accepts_arbitrary_kwargs
                 else {key: value for key, value in kwargs.items() if key in accepted_names}
             )
-        result = hook(*args, **filtered_kwargs)
-        if inspect.isawaitable(result):
-            await result
+        try:
+            result = hook(*args, **filtered_kwargs)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:
+            logger.warning("Ignoring telemetry hook {} failure: {}", name, exc)
 
-    async def emit_guard_decision(
-        self,
-        decision: LoopGuardDecision,
-        *,
-        event: str,
-        source: str = "rule_engine",
-        fallback_used: bool = False,
-        budget_grant: int | None = None,
-    ) -> None:
-        """Emit the sanitized control outcome without forwarding guard evidence."""
+    async def emit_guard_resolution(self, resolution: GuardResolution) -> None:
+        """Emit the same bounded record used by traces and accounting."""
 
-        await self.emit_hook(
-            "on_loop_guard_decision",
-            decision,
-            event=event,
-            source=source,
-            fallback_used=fallback_used,
-            budget_grant=budget_grant,
-        )
+        await self.emit_hook("on_guard_resolution", resolution)
 
     async def do_llm_call(
         self,
         messages: list[dict[str, Any]],
         tool_defs: list[dict[str, Any]],
+        *,
+        allow_streaming: bool = True,
     ) -> LLMResponse:
         provider_messages = shrink_answered_tool_args_for_provider(messages)
         delta_hook = (
-            getattr(self.on_progress, "on_llm_delta", None) if self.on_progress else None
+            getattr(self.on_progress, "on_llm_delta", None)
+            if self.on_progress and allow_streaming
+            else None
         )
         reasoning_delta_hook = (
             getattr(self.on_progress, "on_llm_reasoning_delta", None)
-            if self.on_progress
+            if self.on_progress and allow_streaming
             else None
         )
         if (
@@ -251,7 +257,10 @@ class AgentRuntime:
         )
         if not state.final_emitted:
             state.final_emitted = True
-            await self.emit_hook("on_final", final_content, messages=state.messages)
+            try:
+                await self.emit_hook("on_final", final_content, messages=state.messages)
+            except Exception as exc:
+                logger.warning("Ignoring final telemetry callback failure: {}", exc)
         return state
 
     async def profile_protocol_error(
@@ -262,25 +271,7 @@ class AgentRuntime:
         visible_content: str | None = None,
         correction: str | None = None,
     ) -> LightweightState:
-        """Correct one profile protocol violation, then terminate on repetition."""
-
-        state.control_protocol_retries += 1
-        if state.control_protocol_retries >= 2:
-            content = (
-                (visible_content or "").strip()
-                or f"The profile role stopped after a repeated protocol violation: {reason}."
-            )
-            self.describe_step(
-                {"action": "terminate", "source": "control_protocol", "reason": reason},
-                usage=self.last_usage,
-            )
-            return await self.finish(
-                state,
-                content=content,
-                status=RunStatus.TERMINATED_BY_RULE,
-                reason=f"profile control protocol violation: {reason}",
-                add_message=False,
-            )
+        """Normalize every profile protocol violation into a Guard review."""
 
         if correction is None:
             delegation_guidance = (
@@ -299,89 +290,100 @@ class AgentRuntime:
         else:
             message = correction
         state.pending_profile_correction = message
-        state.metadata.phase = AgentNode.MASTER
-        self.describe_step(
-            {"action": "correct", "source": "control_protocol", "reason": reason},
-            usage=self.last_usage,
+        outcomes = ((visible_content or "").strip(),) if visible_content else ()
+        return await self.queue_guard(
+            state,
+            event=GuardEvent.RUNTIME_ERROR,
+            cause=f"profile control protocol error: {reason}",
+            recent_outcomes=outcomes,
         )
-        await self.emit_progress("Correcting the active profile role's control response...")
+
+    async def queue_guard(
+        self,
+        state: LightweightState,
+        *,
+        event: GuardEvent,
+        cause: str,
+        failures: tuple[Mapping[str, Any], ...] = (),
+        recent_outcomes: tuple[Any, ...] = (),
+        successful_side_effects: tuple[Mapping[str, Any], ...] = (),
+        allowed_actions: tuple[GuardAction, ...] | None = None,
+    ) -> LightweightState:
+        if allowed_actions is None:
+            allowed_actions = (
+                (GuardAction.CONTINUE, GuardAction.FINALIZE)
+                if event == GuardEvent.BUDGET_EXHAUSTED
+                else (GuardAction.RETRY, GuardAction.FINALIZE)
+            )
+        evidence = GuardEvidence(
+            event=event,
+            cause=cause,
+            goal=_last_user_goal(state),
+            iteration=state.metadata.iteration,
+            iteration_limit=state.metadata.iteration_limit,
+            phase=state.metadata.status.value,
+            node=state.metadata.phase.value,
+            state_digest=_safe_state_digest(state),
+            failures=failures,
+            recent_outcomes=recent_outcomes or _recent_outcomes(state),
+            successful_side_effects=successful_side_effects,
+            context={
+                "message_count": len(state.messages),
+                "minimal_context_count": len(state.minimal_context or []),
+                "lazy_reference_count": len(state.lazy_values),
+                "active_agent_id": state.active_agent_id or "",
+            },
+        )
+        state.pending_guard_request = GuardRequest(
+            evidence=evidence,
+            allowed_actions=allowed_actions,
+            fallback_action=(
+                GuardAction.RETRY
+                if event == GuardEvent.TOOL_ERROR
+                and GuardAction.RETRY in allowed_actions
+                and state.metadata.iteration < state.metadata.iteration_limit
+                else GuardAction.FINALIZE
+            ),
+        )
+        state.metadata.phase = AgentNode.MASTER
+        self.describe_step({"action": "review", "event": event.value, "cause": cause})
+        await self.emit_progress(guard_progress_message(event))
         return state
 
     async def switch_to_finalization(
         self,
         state: LightweightState,
-        prompt_message: dict[str, str] | None,
         *,
-        reason: str,
-    ) -> bool:
-        if (
-            state.metadata.status == RunStatus.FINALIZING
-            or self.rule_engine.finalization_budget <= 0
-        ):
-            return False
+        evidence: GuardEvidence,
+        source: GuardSource,
+    ) -> LightweightState:
         state.metadata.status = RunStatus.FINALIZING
-        state.metadata.finalization_prompt = (
-            prompt_message or self.rule_engine.finalization_prompt_message()
-        )
-        logger.info(
-            "Entering UASM finalization because {}; base={}, auto_continue={}, finalization={}",
-            reason,
-            self.rule_engine.max_iterations,
-            self.rule_engine.max_auto_continue_iterations,
-            self.rule_engine.max_finalization_iterations,
-        )
-        await self.emit_progress(
-            f"{reason}; asking for a text-only wrap-up with tools disabled."
-        )
+        state.metadata.finalization_prompt = finalization_prompt_message(evidence)
+        state.metadata.finalization_source = source
+        state.metadata.finalization_evidence = evidence
         state.metadata.phase = AgentNode.MASTER
-        return True
+        return state
 
     async def grant_more_or_finalize(self, state: LightweightState) -> LightweightState:
-        if state.metadata.iteration < self.rule_engine.iteration_limit:
+        if state.metadata.iteration < state.metadata.iteration_limit:
             state.metadata.phase = AgentNode.MASTER
             return state
-        decision = self.rule_engine.handle_iteration_budget_reached()
-        return await self.apply_budget_decision(state, decision)
-
-    async def apply_budget_decision(
-        self,
-        state: LightweightState,
-        decision: LoopGuardDecision,
-    ) -> LightweightState:
-        await self.emit_guard_decision(decision, event="iteration_budget")
-        self.describe_step(_decision_summary(decision), usage=self.last_usage)
-        if decision.action == LoopGuardAction.EXTEND_BUDGET:
-            if decision.progress_message:
-                await self.emit_progress(decision.progress_message)
-            state.metadata.phase = AgentNode.MASTER
-            return state
-        if decision.action == LoopGuardAction.FINALIZE:
-            switched = await self.switch_to_finalization(
-                state,
-                decision.prompt_message,
-                reason=decision.reason or "iteration budgets exhausted",
-            )
-            if switched:
-                return state
-        return await self.finish(
+        return await self.queue_guard(
             state,
-            content=decision.final_content,
-            status=RunStatus.TERMINATED_BY_RULE,
-            reason=decision.reason or "iteration budgets exhausted",
-            add_message=False,
+            event=GuardEvent.BUDGET_EXHAUSTED,
+            cause="agent loop iteration budget reached",
         )
 
     async def return_to_model(
         self,
         state: LightweightState,
-        decision: LoopGuardDecision,
+        evidence: GuardEvidence,
     ) -> LightweightState:
-        if decision.prompt_message:
-            state.messages.append(dict(decision.prompt_message))
-        if decision.progress_message:
-            await self.emit_progress(decision.progress_message)
-        self.describe_step(_decision_summary(decision), usage=self.last_usage)
-        return await self.grant_more_or_finalize(state)
+        state.messages.append(recovery_prompt_message(evidence))
+        if state.metadata.iteration >= state.metadata.iteration_limit:
+            state.metadata.iteration_limit += 1
+        state.metadata.phase = AgentNode.MASTER
+        return state
 
     def record_context_transition(
         self,
@@ -447,8 +449,8 @@ class MasterAgent(BaseAgent):
     async def run(self, state: LightweightState) -> LightweightState:
         if state.metadata.is_terminal:
             next_node = AgentNode.DONE
-        elif state.pending_guard_evidence is not None:
-            next_node = AgentNode.TEMPORARY_GUARD
+        elif state.pending_guard_request is not None:
+            next_node = AgentNode.GUARD
         elif state.metadata.status == RunStatus.FINALIZING:
             next_node = AgentNode.WORKER
         elif state.pending_control_call is not None:
@@ -533,38 +535,16 @@ class WorkerAgent(BaseAgent):
         return self.node.value
 
     async def run(self, state: LightweightState) -> LightweightState:
-        guard = self.runtime.rule_engine
         if state.metadata.status == RunStatus.FINALIZING:
-            if state.metadata.finalization_iteration >= guard.finalization_budget:
-                decision = LoopGuardDecision(
-                    LoopGuardAction.FINAL_RESPONSE,
-                    reason="finalization budget exhausted",
-                )
-                await self.runtime.emit_guard_decision(
-                    decision,
-                    event="output_exhausted",
-                )
-                return await self.runtime.finish(
-                    state,
-                    content=guard.finalization_exhausted_message(),
-                    status=RunStatus.TERMINATED_BY_RULE,
-                    reason="finalization budget exhausted",
-                    add_message=True,
-                )
-            state.metadata.finalization_iteration += 1
             tool_defs: list[dict[str, Any]] = []
             await self.runtime.emit_hook(
                 "on_agent_activity",
                 phase="finalizing",
                 role_id=state.active_agent_id,
             )
-            await self.runtime.emit_progress(
-                "Wrapping up..."
-                if state.metadata.finalization_iteration == 1
-                else f"Wrapping up (attempt {state.metadata.finalization_iteration})..."
-            )
+            await self.runtime.emit_progress("Wrapping up...")
         else:
-            if state.metadata.iteration >= guard.iteration_limit:
+            if state.metadata.iteration >= state.metadata.iteration_limit:
                 return await self.runtime.grant_more_or_finalize(state)
             state.metadata.iteration += 1
             if self.runtime.profile is not None:
@@ -598,9 +578,10 @@ class WorkerAgent(BaseAgent):
             )
 
         if state.metadata.status == RunStatus.FINALIZING:
-            additional_messages = [
-                state.metadata.finalization_prompt or guard.finalization_prompt_message()
-            ]
+            additional_messages = [state.metadata.finalization_prompt or {
+                "role": "user",
+                "content": "Respond with one concise, honest text-only wrap-up.",
+            }]
         elif self.runtime.profile is not None:
             active_agent = self.runtime.active_profile_agent(state)
             additional_messages = role_context_messages(
@@ -689,7 +670,11 @@ class WorkerAgent(BaseAgent):
             started_at=context_started,
         )
 
-        response = await self.runtime.do_llm_call(context.messages, context.tools)
+        response = await self.runtime.do_llm_call(
+            context.messages,
+            context.tools,
+            allow_streaming=state.metadata.status != RunStatus.FINALIZING,
+        )
         component = self.component_for(state)
         domain_usage = state.token_ledger.record(
             NodeKind.DOMAIN,
@@ -775,42 +760,15 @@ class WorkerAgent(BaseAgent):
             "Ignoring {} tool call(s) attempted during UASM finalization",
             len(response.tool_calls),
         )
-        clean = self.runtime.strip_think(response.content)
-        if clean is not None:
-            await self.runtime.emit_guard_decision(
-                LoopGuardDecision(
-                    LoopGuardAction.FINALIZE,
-                    reason=(
-                        "tool calls attempted during finalization were ignored because "
-                        "visible text was available"
-                    ),
-                ),
-                event="finalization_violation",
-            )
-            state.messages = self.runtime.add_assistant_message(
-                state.messages,
-                clean,
-                reasoning_content=response.reasoning_content,
-                thinking_blocks=response.thinking_blocks,
-            )
-            return await self.runtime.finish(
-                state,
-                content=clean,
-                status=RunStatus.COMPLETED,
-                reason="finalization completed with visible text",
-                add_message=False,
-            )
-        decision = self.runtime.rule_engine.handle_finalization_tool_call_violation()
-        await self.runtime.emit_guard_decision(
-            decision,
-            event="finalization_violation",
+        evidence = state.metadata.finalization_evidence or _fallback_evidence(
+            state,
+            cause="model attempted tools during text-only finalization",
         )
-        self.runtime.describe_step(_decision_summary(decision), usage=self.runtime.last_usage)
         return await self.runtime.finish(
             state,
-            content=decision.final_content,
-            status=RunStatus.TERMINATED_BY_RULE,
-            reason=decision.reason,
+            content=local_failure_message(evidence),
+            status=RunStatus.FAILED,
+            reason="tool call attempted during finalization",
             add_message=True,
         )
 
@@ -826,48 +784,63 @@ class WorkerAgent(BaseAgent):
             (response.reasoning_content or "")[:200],
             response.finish_reason,
         )
-        if response.finish_reason == "error":
-            final_content = clean or "Sorry, I encountered an error calling the AI model."
+        if state.metadata.status == RunStatus.FINALIZING:
+            evidence = state.metadata.finalization_evidence or _fallback_evidence(
+                state,
+                cause="finalization failed",
+            )
+            if (
+                response.finish_reason != "stop"
+                or clean is None
+                or _is_bare_dsml_tool_envelope(clean)
+            ):
+                return await self.runtime.finish(
+                    state,
+                    content=local_failure_message(evidence),
+                    status=RunStatus.FAILED,
+                    reason="text-only finalization failed",
+                    add_message=True,
+                )
+            state.messages = self.runtime.add_assistant_message(
+                state.messages,
+                clean,
+                reasoning_content=response.reasoning_content,
+                thinking_blocks=response.thinking_blocks,
+            )
+            status = (
+                RunStatus.TERMINATED_BY_GUARD
+                if state.metadata.finalization_source == "guard"
+                else RunStatus.FAILED
+            )
             return await self.runtime.finish(
                 state,
-                content=final_content,
-                status=RunStatus.FAILED,
-                reason="provider error",
+                content=clean,
+                status=status,
+                reason="guard requested an honest wrap-up",
                 add_message=False,
             )
 
-        if clean is None:
-            decision = self.runtime.rule_engine.handle_empty_or_exhausted_response(
-                finish_reason=response.finish_reason,
-                finalizing=state.metadata.status == RunStatus.FINALIZING,
-                finalization_iteration=state.metadata.finalization_iteration,
-            )
-            await self.runtime.emit_guard_decision(
-                decision,
-                event=_empty_response_event(response.finish_reason),
-            )
-            self.runtime.describe_step(
-                _decision_summary(decision), usage=self.runtime.last_usage
-            )
-            if decision.action == LoopGuardAction.CONTINUE:
-                state.metadata.phase = AgentNode.MASTER
-                return state
-            if decision.action == LoopGuardAction.FINALIZE:
-                if decision.progress_message:
-                    await self.runtime.emit_progress(decision.progress_message)
-                switched = await self.runtime.switch_to_finalization(
-                    state,
-                    decision.prompt_message,
-                    reason=decision.reason or "output budget exhausted without visible answer",
-                )
-                if switched:
-                    return state
-            return await self.runtime.finish(
+        if response.finish_reason == "error":
+            return await self.runtime.queue_guard(
                 state,
-                content=decision.final_content,
-                status=RunStatus.TERMINATED_BY_RULE,
-                reason=decision.reason or "empty response",
-                add_message=True,
+                event=GuardEvent.RUNTIME_ERROR,
+                cause=clean or "provider returned finish_reason=error",
+            )
+
+        if clean is None:
+            exhausted = response.finish_reason in {
+                "length",
+                "max_tokens",
+                "max_output_tokens",
+            }
+            return await self.runtime.queue_guard(
+                state,
+                event=GuardEvent.RUNTIME_ERROR,
+                cause=(
+                    "model exhausted its output budget without visible text"
+                    if exhausted
+                    else "model returned an empty response"
+                ),
             )
 
         state.messages = self.runtime.add_assistant_message(
@@ -899,7 +872,7 @@ class WorkerAgent(BaseAgent):
 
 
 class ToolAgent(BaseAgent):
-    """Apply deterministic rules and execute one tool-call batch."""
+    """Validate and execute one batch, escalating any failed call to Guard."""
 
     node = AgentNode.TOOL
 
@@ -910,21 +883,18 @@ class ToolAgent(BaseAgent):
     async def run(self, state: LightweightState) -> LightweightState:
         response = state.pending_response
         if response is None or not state.pending_tool_calls:
-            state.pending_response = None
-            state.pending_tool_calls = []
+            self._clear_pending(state)
             state.metadata.phase = AgentNode.MASTER
             self.runtime.describe_step({"route": "master", "reason": "no pending tools"})
             return state
 
+        state.pending_tool_nodes = []
         thought = self.runtime.strip_think(response.content)
         if thought:
             await self.runtime.emit_progress(thought)
 
-        malformed = self.runtime.rule_engine.handle_malformed_tool_calls(
-            state.pending_tool_calls,
-            apply_rules=True,
-        )
-        malformed_ids = {tool_call.id for tool_call in malformed.malformed_calls}
+        malformed = classify_malformed_tool_calls(state.pending_tool_calls)
+        malformed_ids = {call.id for call in malformed.rejected_calls}
         tool_call_dicts: list[dict[str, Any]] = []
         for tool_call in state.pending_tool_calls:
             call_dict = tool_call.to_openai_tool_call()
@@ -938,181 +908,84 @@ class ToolAgent(BaseAgent):
             reasoning_content=response.reasoning_content,
             thinking_blocks=response.thinking_blocks,
         )
-        for tool_result in malformed.tool_results:
-            state.messages = self.runtime.add_tool_result(
-                state.messages,
-                tool_result.call_id,
-                tool_result.tool_name,
-                tool_result.content,
-            )
-
-        if malformed.decision.action == LoopGuardAction.STOP_OFF_TRACK:
-            return await self._escalate_or_stop(
-                state,
-                malformed.decision,
-                event="malformed_tool_calls",
-                failures=_tool_call_failures(
-                    malformed.malformed_calls,
-                    malformed.tool_results,
-                ),
-            )
-        if malformed.malformed_calls:
-            visible_decision = malformed.decision
-            if visible_decision.action == LoopGuardAction.CONTINUE:
-                visible_decision = LoopGuardDecision(
-                    LoopGuardAction.CONTINUE,
-                    reason=("malformed tool calls were rejected while valid calls continue"),
-                )
-            await self.runtime.emit_guard_decision(
-                visible_decision,
-                event="malformed_tool_calls",
-            )
-        if malformed.decision.action == LoopGuardAction.RETURN_TO_MODEL:
-            self._clear_pending(state)
-            return await self.runtime.return_to_model(state, malformed.decision)
-
-        duplicate = self.runtime.rule_engine.handle_duplicate_tool_calls(
-            state.messages,
-            malformed.executable_calls,
-            apply_rules=True,
-        )
-        for tool_call in duplicate.duplicate_calls:
-            logger.warning(
-                "Skipping duplicate UASM tool_call '{}' with identical arguments",
-                tool_call.name,
-            )
-        for tool_result in duplicate.tool_results:
-            state.messages = self.runtime.add_tool_result(
-                state.messages,
-                tool_result.call_id,
-                tool_result.tool_name,
-                tool_result.content,
-            )
-        if duplicate.decision.action == LoopGuardAction.STOP_OFF_TRACK:
-            return await self._escalate_or_stop(
-                state,
-                duplicate.decision,
-                event="duplicate_tool_calls",
-                failures=_tool_call_failures(
-                    duplicate.duplicate_calls,
-                    duplicate.tool_results,
-                ),
-            )
-        if duplicate.duplicate_calls:
-            visible_decision = duplicate.decision
-            if visible_decision.action == LoopGuardAction.CONTINUE:
-                visible_decision = LoopGuardDecision(
-                    LoopGuardAction.CONTINUE,
-                    reason=("duplicate tool calls were skipped while new calls continue"),
-                )
-            await self.runtime.emit_guard_decision(
-                visible_decision,
-                event="duplicate_tool_calls",
-            )
-        if duplicate.decision.action == LoopGuardAction.RETURN_TO_MODEL:
-            self._clear_pending(state)
-            return await self.runtime.return_to_model(state, duplicate.decision)
-
-        tool_calls = duplicate.executable_calls
-        hint = self.runtime.strip_think(self.runtime.tool_hint(tool_calls))
-        if hint:
-            await self.runtime.emit_progress(hint, tool_hint=True)
-        await self.runtime.emit_hook("on_tool_calls", tool_calls)
-        for tool_call in tool_calls:
-            args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-            logger.info("UASM tool call: {}({})", tool_call.name, args_str[:200])
+        _append_tool_patches(state, self.runtime, malformed.tool_results)
 
         execution_tools = (
             ScopedToolRegistry(self.runtime.tools, state.active_tools)
             if self.runtime.profile is not None
             else self.runtime.tools
         )
-        async def report_tool_result(node: TaskNode) -> None:
-            await self.runtime.emit_hook("on_tool_result", node)
-
-        executed_nodes = await execute_tool_batch(
-            tool_calls=tool_calls,
-            tools=execution_tools,
-            on_node_complete=report_tool_result,
+        tool_modes = {
+            call.name: (
+                tool.concurrency_mode
+                if (tool := execution_tools.get(call.name)) is not None
+                else "exclusive"
+            )
+            for call in malformed.executable_calls
+        }
+        duplicates = suppress_successful_side_effect_duplicates(
+            state.messages,
+            malformed.executable_calls,
+            tool_modes=tool_modes,
         )
-        state.pending_tool_nodes = executed_nodes
-        for node in sorted(executed_nodes, key=lambda item: item.index):
-            if self.runtime.profile is None or node.tool_name in state.active_tools:
-                state.tools_used.append(node.tool_name)
-            state.messages = self.runtime.add_tool_result(
-                state.messages,
-                node.call_id,
-                node.tool_name,
-                node.result or f"Error executing {node.tool_name}: unknown failure",
-            )
-        self._clear_pending(state)
+        _append_tool_patches(state, self.runtime, duplicates.tool_results)
 
-        decision = self.runtime.rule_engine.handle_tool_results(executed_nodes)
-        self.runtime.describe_step(_decision_summary(decision))
-        if decision.action == LoopGuardAction.STOP_OFF_TRACK:
-            return await self._escalate_or_stop(
+        tool_calls = list(duplicates.executable_calls)
+        executed_nodes: list[TaskNode] = []
+        if tool_calls:
+            hint = self.runtime.strip_think(self.runtime.tool_hint(tool_calls))
+            if hint:
+                await self.runtime.emit_progress(hint, tool_hint=True)
+            await self.runtime.emit_hook("on_tool_calls", tool_calls)
+            for tool_call in tool_calls:
+                args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
+                logger.info("UASM tool call: {}({})", tool_call.name, args_str[:200])
+
+            state.pending_tool_nodes = []
+
+            async def report_tool_result(node: TaskNode) -> None:
+                state.pending_tool_nodes.append(node)
+                await self.runtime.emit_hook("on_tool_result", node)
+
+            executed_nodes = await execute_tool_batch(
+                tool_calls=tool_calls,
+                tools=execution_tools,
+                on_node_complete=report_tool_result,
+            )
+            state.pending_tool_nodes = executed_nodes
+            for node in sorted(executed_nodes, key=lambda item: item.index):
+                if self.runtime.profile is None or node.tool_name in state.active_tools:
+                    state.tools_used.append(node.tool_name)
+                state.messages = self.runtime.add_tool_result(
+                    state.messages,
+                    node.call_id,
+                    node.tool_name,
+                    node.result or f"Error executing {node.tool_name}: unknown failure",
+                )
+
+        failures = (*malformed.failures, *duplicates.failures, *_node_failures(executed_nodes))
+        side_effects = _successful_side_effects(executed_nodes)
+        outcomes = tuple(
+            node.result or node.error or "unknown tool outcome" for node in executed_nodes
+        )
+        self._clear_pending(state)
+        self.runtime.describe_step(
+            {
+                "executed": len(executed_nodes),
+                "failed": len(failures),
+                "rejected": len(malformed.rejected_calls) + len(duplicates.rejected_calls),
+            }
+        )
+        if failures:
+            return await self.runtime.queue_guard(
                 state,
-                decision,
-                event=_tool_result_guard_event(decision),
-                failures=_node_failures(executed_nodes),
+                event=GuardEvent.TOOL_ERROR,
+                cause="one or more calls in the latest tool round failed",
+                failures=tuple(failures),
+                recent_outcomes=outcomes,
+                successful_side_effects=side_effects,
             )
-        if decision.action == LoopGuardAction.RETURN_TO_MODEL:
-            await self.runtime.emit_guard_decision(
-                decision,
-                event=_tool_result_guard_event(decision),
-            )
-            return await self.runtime.return_to_model(state, decision)
         return await self.runtime.grant_more_or_finalize(state)
-
-    async def _escalate_or_stop(
-        self,
-        state: LightweightState,
-        decision: LoopGuardDecision,
-        *,
-        event: str,
-        failures: tuple[Mapping[str, Any], ...],
-    ) -> LightweightState:
-        self._clear_pending(state)
-        if self.runtime.temporary_guard is None:
-            self.runtime.describe_step(_decision_summary(decision))
-            await self.runtime.emit_guard_decision(decision, event=event)
-            return await self.runtime.finish(
-                state,
-                content=decision.final_content,
-                status=RunStatus.TERMINATED_BY_RULE,
-                reason=decision.reason,
-                add_message=True,
-            )
-        state.pending_guard_evidence = GuardEvidence(
-            event=event,
-            reason=decision.reason,
-            iteration=state.metadata.iteration,
-            phase=state.metadata.status.value,
-            state_digest=state.digest(),
-            budgets={
-                "iteration_limit": self.runtime.rule_engine.iteration_limit,
-                "auto_continue_remaining": (
-                    self.runtime.rule_engine.auto_continue_remaining
-                ),
-                "finalization_budget": self.runtime.rule_engine.finalization_budget,
-            },
-            counters={
-                "unproductive_tool_rounds": (
-                    self.runtime.rule_engine.unproductive_tool_rounds
-                ),
-                "exec_timeout_rounds": self.runtime.rule_engine.exec_timeout_rounds,
-                "empty_stop_retries": self.runtime.rule_engine.empty_stop_retries,
-            },
-            context={
-                "message_count": len(state.minimal_context or []),
-                "lazy_reference_count": len(state.lazy_values),
-            },
-            failures=failures,
-        )
-        state.pending_guard_fallback = decision
-        state.metadata.phase = AgentNode.MASTER
-        self.runtime.describe_step({"action": "escalate", "event": event})
-        return state
 
     @staticmethod
     def _clear_pending(state: LightweightState) -> None:
@@ -1120,137 +993,135 @@ class ToolAgent(BaseAgent):
         state.pending_tool_calls = []
 
 
-class TemporaryGuardAgent(BaseAgent):
-    """Invoke the stateless LLM guard only for an eligible ambiguous event."""
+class GuardAgent(BaseAgent):
+    """Run the stateless reviewer on the exceptional branch only."""
 
-    node = AgentNode.TEMPORARY_GUARD
+    node = AgentNode.GUARD
     node_kind = NodeKind.HARNESS
 
     async def run(self, state: LightweightState) -> LightweightState:
-        guard = self.runtime.temporary_guard
-        evidence = state.pending_guard_evidence
-        fallback = state.pending_guard_fallback
-        state.pending_guard_evidence = None
-        state.pending_guard_fallback = None
-        if guard is None or not isinstance(evidence, GuardEvidence) or not isinstance(
-            fallback, LoopGuardDecision
-        ):
+        request = state.pending_guard_request
+        state.pending_guard_request = None
+        if request is None:
             state.metadata.phase = AgentNode.MASTER
-            self.runtime.describe_step({"route": "master", "reason": "no guard evidence"})
+            self.runtime.describe_step({"route": "master", "reason": "no guard request"})
             return state
 
-        resolution = await guard.decide(evidence, fallback)
+        resolution = await self.runtime.guard.decide(request)
         usage = state.token_ledger.record(
             NodeKind.HARNESS,
             resolution.usage,
-            component="temporary_guard",
+            component="guard",
         )
-        decision = resolution.decision
-        self.runtime.describe_step(
-            {
-                **_decision_summary(decision),
-                "source": resolution.source,
-                "fallback_used": resolution.fallback_used,
-            },
-            usage=usage,
-        )
+        self.runtime.describe_step(resolution.to_record(), usage=usage)
+        await self.runtime.emit_guard_resolution(resolution)
 
-        terminal_status = (
-            RunStatus.TERMINATED_BY_RULE
-            if resolution.fallback_used
-            else RunStatus.TERMINATED_BY_GUARD
-        )
-        effective_budget_grant = decision.budget_grant
-        if decision.action == LoopGuardAction.EXTEND_BUDGET:
-            requested = max(1, decision.budget_grant)
-            effective_budget_grant = min(
-                requested,
-                state.guard_state.auto_continue_remaining,
-            )
-        await self.runtime.emit_hook("on_guard_decision", resolution)
-        if decision.action == LoopGuardAction.EXTEND_BUDGET:
-            state.guard_state.iteration_limit += effective_budget_grant
-            state.guard_state.auto_continue_remaining -= effective_budget_grant
-        await self.runtime.emit_guard_decision(
-            decision,
-            event=evidence.event,
-            source=resolution.source,
-            fallback_used=resolution.fallback_used,
-            budget_grant=effective_budget_grant,
-        )
-        if decision.action == LoopGuardAction.CONTINUE:
+        if resolution.action == GuardAction.RETRY:
+            return await self.runtime.return_to_model(state, request.evidence)
+        if resolution.action == GuardAction.CONTINUE:
+            state.metadata.iteration_limit += self.runtime.base_iteration_budget
             state.metadata.phase = AgentNode.MASTER
             return state
-        if decision.action == LoopGuardAction.RETURN_TO_MODEL:
-            return await self.runtime.return_to_model(state, decision)
-        if decision.action == LoopGuardAction.EXTEND_BUDGET:
-            if effective_budget_grant > 0 and decision.progress_message:
-                await self.runtime.emit_progress(decision.progress_message)
-            state.metadata.phase = AgentNode.MASTER
-            return state
-        if decision.action == LoopGuardAction.FINALIZE:
-            switched = await self.runtime.switch_to_finalization(
-                state,
-                decision.prompt_message,
-                reason=decision.reason or "temporary guard requested finalization",
-            )
-            if switched:
-                return state
-        return await self.runtime.finish(
+        return await self.runtime.switch_to_finalization(
             state,
-            content=decision.final_content,
-            status=terminal_status,
-            reason=decision.reason or "temporary guard stopped the loop",
-            add_message=True,
+            evidence=request.evidence,
+            source=resolution.source,
         )
 
 
-def _decision_summary(decision: LoopGuardDecision) -> dict[str, Any]:
-    return {
-        "action": decision.action.value,
-        "reason": decision.reason,
-        "budget_grant": decision.budget_grant,
-    }
+def _append_tool_patches(
+    state: LightweightState,
+    runtime: AgentRuntime,
+    patches: Sequence[Any],
+) -> None:
+    for patch in patches:
+        state.messages = runtime.add_tool_result(
+            state.messages,
+            patch.call_id,
+            patch.tool_name,
+            patch.content,
+        )
 
 
-def _empty_response_event(finish_reason: str) -> str:
-    if finish_reason in {"length", "max_tokens", "max_output_tokens"}:
-        return "output_exhausted"
-    return "empty_response"
-
-
-def _tool_result_guard_event(decision: LoopGuardDecision) -> str:
-    return "tool_timeout" if "timed out" in decision.reason.lower() else "tool_result_failed"
-
-
-def _tool_call_failures(
-    tool_calls: list[ToolCallRequest],
-    tool_results: list[Any],
-) -> tuple[Mapping[str, Any], ...]:
-    result_by_id = {result.call_id: result.content for result in tool_results}
-    return tuple(
-        {
-            "tool_name": tool_call.name,
-            "arguments": tool_call.arguments,
-            "result": result_by_id.get(tool_call.id, "rejected tool call"),
-        }
-        for tool_call in tool_calls
-    )
-
-
-def _node_failures(nodes: list[TaskNode]) -> tuple[Mapping[str, Any], ...]:
+def _node_failures(nodes: Sequence[TaskNode]) -> tuple[Mapping[str, Any], ...]:
     return tuple(
         {
             "tool_name": node.tool_name,
             "arguments": node.arguments,
             "result": node.result or node.error or "unknown tool failure",
+            "kind": "tool_result",
         }
         for node in nodes
+        if tool_result_failed(node.result or node.error)
     )
 
 
+def _successful_side_effects(
+    nodes: Sequence[TaskNode],
+) -> tuple[Mapping[str, Any], ...]:
+    return tuple(
+        {
+            "tool_name": node.tool_name,
+            "arguments": node.arguments,
+            "result": node.result or "completed",
+        }
+        for node in nodes
+        if node.mode != "read_only"
+        and not tool_result_failed(node.result or node.error)
+    )
+
+
+def _last_user_goal(state: LightweightState) -> str:
+    for message in reversed(state.messages):
+        if message.get("role") == "user":
+            return str(message.get("content") or "")
+    return ""
+
+
+def _recent_outcomes(state: LightweightState) -> tuple[str, ...]:
+    outcomes: list[str] = []
+    for message in reversed(state.messages):
+        if message.get("role") not in {"assistant", "tool"}:
+            continue
+        content = str(message.get("content") or "").strip()
+        if content:
+            outcomes.append(content)
+        if len(outcomes) >= 5:
+            break
+    return tuple(reversed(outcomes))
+
+
+def _safe_state_digest(state: LightweightState) -> str:
+    try:
+        return state.digest()
+    except Exception:
+        return "unavailable"
+
+
+def _fallback_evidence(state: LightweightState, *, cause: str) -> GuardEvidence:
+    return GuardEvidence(
+        event=GuardEvent.RUNTIME_ERROR,
+        cause=cause,
+        goal=_last_user_goal(state),
+        iteration=state.metadata.iteration,
+        iteration_limit=state.metadata.iteration_limit,
+        phase=state.metadata.status.value,
+        node=state.metadata.phase.value,
+        state_digest=_safe_state_digest(state),
+        recent_outcomes=_recent_outcomes(state),
+    )
+
+
+def _is_bare_dsml_tool_envelope(content: str) -> bool:
+    """Reject a bare DeepSeek tool envelope from the text-only finalizer."""
+
+    text = unicodedata.normalize("NFKC", content).strip()
+    prefix = "<||DSML||tool_calls>"
+    return text.startswith(prefix)
+
+
 def agent_node_kind(node: AgentNode) -> NodeKind:
-    if node in {AgentNode.CONTROL, AgentNode.TEMPORARY_GUARD}:
+    if node in {AgentNode.CONTROL, AgentNode.GUARD}:
         return NodeKind.HARNESS
     return NodeKind.DOMAIN
 

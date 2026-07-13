@@ -32,8 +32,6 @@ CONFIG_SETTERS = {
     "model": ("agents", "defaults", "model"),
     "reasoning-effort": ("agents", "defaults", "reasoning_effort"),
     "max-iterations": ("agents", "defaults", "max_iterations"),
-    "max-auto-continue-iterations": ("agents", "defaults", "max_auto_continue_iterations"),
-    "max-finalization-iterations": ("agents", "defaults", "max_finalization_iterations"),
     "base-profile-id": ("agents", "defaults", "base_profile_id"),
     "profile-id": ("agents", "defaults", "profile_id"),
     "max-handoffs": ("agents", "defaults", "max_handoffs"),

@@ -12,13 +12,12 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from enum import Enum, StrEnum
 from typing import TYPE_CHECKING, Any
 
-from aeloon_core.loop_guard import LoopGuardDecision, LoopGuardState
+from aeloon_core.loop_guard import GuardEvidence, GuardRequest, GuardSource
 from aeloon_core.transitions import TokenLedger, TransitionRecord
 
 if TYPE_CHECKING:
     from aeloon_core.providers.base import LLMResponse, ToolCallRequest
     from aeloon_core.task_graph import TaskNode
-    from aeloon_core.temporary_guard import GuardEvidence
 
 Message = dict[str, Any]
 LazyLoader = Callable[[], Any]
@@ -33,7 +32,7 @@ class AgentNode(StrEnum):
     WORKER = "worker"
     CONTROL = "control"
     TOOL = "tool"
-    TEMPORARY_GUARD = "temporary_guard"
+    GUARD = "guard"
     DONE = "done"
 
 
@@ -43,7 +42,6 @@ class RunStatus(StrEnum):
     RUNNING = "running"
     FINALIZING = "finalizing"
     COMPLETED = "completed"
-    TERMINATED_BY_RULE = "terminated_by_rule"
     TERMINATED_BY_GUARD = "terminated_by_guard"
     FAILED = "failed"
 
@@ -51,7 +49,6 @@ class RunStatus(StrEnum):
     def terminal(self) -> bool:
         return self in {
             RunStatus.COMPLETED,
-            RunStatus.TERMINATED_BY_RULE,
             RunStatus.TERMINATED_BY_GUARD,
             RunStatus.FAILED,
         }
@@ -91,8 +88,10 @@ class StateMetadata:
     phase: AgentNode = AgentNode.MASTER
     status: RunStatus = RunStatus.RUNNING
     iteration: int = 0
-    finalization_iteration: int = 0
+    iteration_limit: int = 0
     finalization_prompt: Message | None = None
+    finalization_source: GuardSource | None = None
+    finalization_evidence: GuardEvidence | None = None
     final_content: str | None = None
     termination_reason: str | None = None
     session_id: str | None = None
@@ -103,7 +102,7 @@ class StateMetadata:
         self.phase = AgentNode(self.phase)
         self.status = RunStatus(self.status)
         self.iteration = max(0, int(self.iteration))
-        self.finalization_iteration = max(0, int(self.finalization_iteration))
+        self.iteration_limit = max(0, int(self.iteration_limit))
 
     @property
     def is_terminal(self) -> bool:
@@ -253,12 +252,10 @@ class LightweightState:
     permissions: dict[str, Any] = field(default_factory=dict)
     active_tools: list[str] = field(default_factory=list)
     metadata: StateMetadata = field(default_factory=StateMetadata)
-    guard_state: LoopGuardState = field(default_factory=LoopGuardState)
     pending_response: LLMResponse | None = None
     pending_tool_calls: list[ToolCallRequest] = field(default_factory=list)
     pending_tool_nodes: list[TaskNode] = field(default_factory=list)
-    pending_guard_evidence: GuardEvidence | None = None
-    pending_guard_fallback: LoopGuardDecision | None = None
+    pending_guard_request: GuardRequest | None = None
     final_emitted: bool = False
     tools_used: list[str] = field(default_factory=list)
     transitions: list[TransitionRecord] = field(default_factory=list)
@@ -271,7 +268,6 @@ class LightweightState:
     pending_handoff: PendingHandoff | None = None
     pending_control_call: ToolCallRequest | None = None
     pending_profile_correction: str | None = None
-    control_protocol_retries: int = 0
     delegation_count: int = 0
     last_delegation_fingerprint: str | None = None
     last_delegation_succeeded: bool = False
@@ -280,7 +276,6 @@ class LightweightState:
         if self.minimal_context is None:
             self.minimal_context = list(self.messages)
         self.handoff_count = max(0, int(self.handoff_count))
-        self.control_protocol_retries = max(0, int(self.control_protocol_retries))
         self.delegation_count = max(0, int(self.delegation_count))
 
     @classmethod
@@ -291,23 +286,19 @@ class LightweightState:
         active_tools: list[str] | None = None,
         permissions: dict[str, Any] | None = None,
         max_iterations: int = 0,
-        max_auto_continue_iterations: int = 0,
-        max_finalization_iterations: int = 0,
         metadata: StateMetadata | None = None,
     ) -> LightweightState:
-        """Build a state whose guard counters match the configured budgets."""
+        """Build a state whose iteration limit belongs to the agent loop."""
+
+        resolved_metadata = metadata or StateMetadata()
+        resolved_metadata.iteration_limit = max(1, int(max_iterations))
 
         return cls(
             messages=messages,
             minimal_context=list(messages),
             permissions=dict(permissions or {}),
             active_tools=list(active_tools or []),
-            metadata=metadata or StateMetadata(),
-            guard_state=LoopGuardState.from_limits(
-                max_iterations=max_iterations,
-                max_auto_continue_iterations=max_auto_continue_iterations,
-                max_finalization_iterations=max_finalization_iterations,
-            ),
+            metadata=resolved_metadata,
         )
 
     @property
@@ -352,15 +343,18 @@ class LightweightState:
                 "phase": self.metadata.phase.value,
                 "status": self.metadata.status.value,
                 "iteration": self.metadata.iteration,
-                "finalization_iteration": self.metadata.finalization_iteration,
+                "iteration_limit": self.metadata.iteration_limit,
                 "finalization_prompt": _value_summary(self.metadata.finalization_prompt),
+                "finalization_source": self.metadata.finalization_source,
+                "finalization_evidence": _value_summary(
+                    self.metadata.finalization_evidence
+                ),
                 "final_content": _value_summary(self.metadata.final_content),
                 "termination_reason": self.metadata.termination_reason,
                 "session_id": self.metadata.session_id,
                 "turn_id": self.metadata.turn_id,
                 "extras": _canonicalize(self.metadata.extras),
             },
-            "guard_state": self.guard_state.to_dict(),
             "pending_response": _value_summary(self.pending_response),
             "pending_tool_calls": [
                 _value_summary(tool_call) for tool_call in self.pending_tool_calls
@@ -368,8 +362,7 @@ class LightweightState:
             "pending_tool_nodes": [
                 _value_summary(tool_node) for tool_node in self.pending_tool_nodes
             ],
-            "pending_guard_evidence": _value_summary(self.pending_guard_evidence),
-            "pending_guard_fallback": _value_summary(self.pending_guard_fallback),
+            "pending_guard_request": _value_summary(self.pending_guard_request),
             "final_emitted": self.final_emitted,
             "tools_used": list(self.tools_used),
             "token_ledger": self.token_ledger.to_dict(),
@@ -389,7 +382,6 @@ class LightweightState:
                 "pending_profile_correction": _value_summary(
                     self.pending_profile_correction
                 ),
-                "control_protocol_retries": self.control_protocol_retries,
                 "delegation_count": self.delegation_count,
                 "last_delegation_fingerprint": self.last_delegation_fingerprint,
                 "last_delegation_succeeded": self.last_delegation_succeeded,

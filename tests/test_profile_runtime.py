@@ -12,7 +12,6 @@ from aeloon_core.state import RunStatus
 from aeloon_core.state_machine import run_agent_loop
 from aeloon_core.tools.base import Tool
 from aeloon_core.tools.registry import ToolRegistry
-from aeloon_core.transitions import NodeKind
 
 
 class ValueArgs(BaseModel):
@@ -532,6 +531,7 @@ async def test_mixed_control_batch_has_zero_external_side_effects() -> None:
                 ],
                 finish_reason="tool_calls",
             ),
+            LLMResponse(content='{"action":"retry"}'),
             control_call("complete-2", "complete_task", {"final_content": "recovered"}),
         ]
     )
@@ -546,7 +546,6 @@ async def test_mixed_control_batch_has_zero_external_side_effects() -> None:
 
     assert echo.calls == []
     assert state.tools_used == []
-    assert state.control_protocol_retries == 1
     assert state.metadata.final_content == "recovered"
     rejected_results = [
         message
@@ -557,11 +556,12 @@ async def test_mixed_control_batch_has_zero_external_side_effects() -> None:
 
 
 @pytest.mark.asyncio
-async def test_second_bare_text_violation_terminates_with_visible_text() -> None:
+async def test_bare_text_violation_is_guarded_and_finalized_visibly() -> None:
     provider = ScriptedProvider(
         [
             LLMResponse(content='{"agent_id":"planner"}'),
             LLMResponse(content="first bare answer"),
+            LLMResponse(content='{"action":"finalize"}'),
             LLMResponse(content="second visible answer"),
         ]
     )
@@ -576,14 +576,13 @@ async def test_second_bare_text_violation_terminates_with_visible_text() -> None
         on_progress=progress,
     )
 
-    assert state.metadata.status == RunStatus.TERMINATED_BY_RULE
+    assert state.metadata.status == RunStatus.TERMINATED_BY_GUARD
     assert state.metadata.final_content == "second visible answer"
-    assert state.control_protocol_retries == 2
-    assert len(provider.calls) == 3
+    assert len(provider.calls) == 4
     assert progress.finals == ["second visible answer"]
     assert any(
-        str(message.get("content") or "").startswith("PROFILE CONTROL PROTOCOL:")
-        for message in provider.calls[2]["messages"]
+        "AGENT LOOP WRAP-UP" in str(message.get("content") or "")
+        for message in provider.calls[3]["messages"]
     )
     assert not any(
         str(message.get("content") or "").startswith("PROFILE CONTROL PROTOCOL:")
@@ -599,6 +598,7 @@ async def test_hidden_unauthorized_tool_is_rejected_again_at_execution() -> None
         [
             LLMResponse(content='{"agent_id":"planner"}'),
             control_call("secret-1", "secret", {"value": "must-not-run"}),
+            LLMResponse(content='{"action":"retry"}'),
             control_call("complete-1", "complete_task", {"final_content": "denied safely"}),
         ]
     )
@@ -639,6 +639,8 @@ async def test_handoff_after_budget_instruction_terminates_visibly() -> None:
                 "handoff_agent",
                 {"summary": "send back", "recommended_agent": "planner"},
             ),
+            LLMResponse(content='{"action":"finalize"}'),
+            LLMResponse(content="handoff budget was exhausted; partial work preserved"),
         ]
     )
 
@@ -652,15 +654,9 @@ async def test_handoff_after_budget_instruction_terminates_visibly() -> None:
     )
 
     assert state.handoff_count == 1
-    assert state.control_protocol_retries == 0
-    assert state.metadata.status == RunStatus.TERMINATED_BY_RULE
+    assert state.metadata.status == RunStatus.TERMINATED_BY_GUARD
     assert "handoff budget was exhausted" in (state.metadata.final_content or "")
-    assert any(
-        "Do not call handoff_agent again" in str(message.get("content"))
-        for message in provider.calls[3]["messages"]
-        if message.get("role") == "system"
-    )
-    assert state.token_ledger.for_kind(NodeKind.HARNESS) == {}
+    assert provider.calls[-1]["tools"] == []
 
 
 @pytest.mark.asyncio
@@ -682,6 +678,7 @@ async def test_invalid_control_arguments_are_corrected_without_side_effects(
         [
             LLMResponse(content='{"agent_id":"planner"}'),
             invalid_call,
+            LLMResponse(content='{"action":"retry"}'),
             control_call("complete-1", "complete_task", {"final_content": "corrected"}),
         ]
     )
@@ -696,7 +693,6 @@ async def test_invalid_control_arguments_are_corrected_without_side_effects(
 
     assert state.metadata.status == RunStatus.COMPLETED
     assert state.metadata.final_content == "corrected"
-    assert state.control_protocol_retries == 1
     assert any(
         message.get("role") == "tool"
         and message["content"].startswith("Error: Invalid profile control call")
@@ -704,7 +700,7 @@ async def test_invalid_control_arguments_are_corrected_without_side_effects(
     )
     correction = next(
         str(message.get("content") or "")
-        for message in provider.calls[2]["messages"]
+        for message in provider.calls[3]["messages"]
         if str(message.get("content") or "").startswith(
             "PROFILE CONTROL PROTOCOL:"
         )
@@ -719,6 +715,7 @@ async def test_profile_finalization_is_text_only_and_does_not_require_complete_t
         [
             LLMResponse(content='{"agent_id":"planner"}'),
             control_call("echo-1", "echo", {"value": "one"}),
+            LLMResponse(content='{"action":"finalize"}'),
             LLMResponse(content="text-only wrap-up"),
         ]
     )
@@ -730,14 +727,11 @@ async def test_profile_finalization_is_text_only_and_does_not_require_complete_t
         messages=[{"role": "user", "content": "echo and finish"}],
         profile=profile(),
         max_iterations=1,
-        max_auto_continue_iterations=0,
-        max_finalization_iterations=1,
     )
 
     assert echo.calls == ["one"]
-    assert state.metadata.status == RunStatus.COMPLETED
+    assert state.metadata.status == RunStatus.TERMINATED_BY_GUARD
     assert state.metadata.final_content == "text-only wrap-up"
-    assert state.control_protocol_retries == 0
     assert provider.calls[-1]["tools"] == []
 
 
@@ -750,6 +744,8 @@ async def test_profile_provider_failure_keeps_host_termination_semantics() -> No
                 content="provider unavailable",
                 finish_reason="error",
             ),
+            LLMResponse(content='{"action":"finalize"}'),
+            LLMResponse(content="provider unavailable"),
         ]
     )
 
@@ -761,9 +757,8 @@ async def test_profile_provider_failure_keeps_host_termination_semantics() -> No
         profile=profile(),
     )
 
-    assert state.metadata.status == RunStatus.FAILED
+    assert state.metadata.status == RunStatus.TERMINATED_BY_GUARD
     assert state.metadata.final_content == "provider unavailable"
-    assert state.control_protocol_retries == 0
 
 
 @pytest.mark.asyncio

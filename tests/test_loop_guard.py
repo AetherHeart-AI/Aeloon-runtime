@@ -1,221 +1,232 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
+import asyncio
+import json
+from typing import Any
 
-from aeloon_core.loop_guard import AgentLoopGuard, LoopGuardAction, SimpleRuleEngine
-from aeloon_core.providers.base import ToolCallRequest
+import pytest
+
+from aeloon_core.loop_guard import (
+    GuardAction,
+    GuardEvent,
+    GuardEvidence,
+    GuardRequest,
+    GuardReviewer,
+    classify_malformed_tool_calls,
+    suppress_successful_side_effect_duplicates,
+)
+from aeloon_core.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
 
-def _answered_tool_call() -> list[dict]:
-    tool_call = ToolCallRequest(id="call-1", name="echo", arguments={"value": "one"})
-    return [
-        {"role": "assistant", "content": None, "tool_calls": [tool_call.to_openai_tool_call()]},
-        {"role": "tool", "tool_call_id": "call-1", "name": "echo", "content": "echo:one"},
+class Provider(LLMProvider):
+    def __init__(self, response: LLMResponse | Exception) -> None:
+        super().__init__()
+        self.response = response
+        self.calls: list[dict[str, Any]] = []
+
+    async def chat(self, messages, tools=None, **kwargs):
+        self.calls.append({"messages": messages, "tools": tools, **kwargs})
+        if isinstance(self.response, Exception):
+            raise self.response
+        return self.response
+
+
+def request(*actions: GuardAction) -> GuardRequest:
+    return GuardRequest(
+        evidence=GuardEvidence(
+            event=GuardEvent.TOOL_ERROR,
+            cause="tool failed",
+            goal="finish the task",
+        ),
+        allowed_actions=actions,
+    )
+
+
+@pytest.mark.asyncio
+async def test_reviewer_returns_only_an_allowed_control_action() -> None:
+    provider = Provider(
+        LLMResponse(content='{"action":"retry"}', usage={"total_tokens": 7})
+    )
+    reviewer = GuardReviewer(provider=provider, model="same-model")
+
+    resolution = await reviewer.decide(
+        request(GuardAction.RETRY, GuardAction.FINALIZE)
+    )
+
+    assert resolution.action == GuardAction.RETRY
+    assert resolution.source == "guard"
+    assert resolution.usage == {"total_tokens": 7}
+    assert provider.calls[0]["tools"] == []
+    assert provider.calls[0]["temperature"] == 0.0
+    assert provider.calls[0]["max_tokens"] == 512
+    assert provider.calls[0]["response_format"] == {"type": "json_object"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        LLMResponse(content='{"action":"retry","reason":"invented"}'),
+        LLMResponse(content='{"action":"continue"}'),
+        LLMResponse(content="not json"),
+        LLMResponse(content='{"action":"retry"}', finish_reason="length"),
+        LLMResponse(
+            content='{"action":"retry"}',
+            tool_calls=[ToolCallRequest(id="call", name="write", arguments={})],
+        ),
+        LLMResponse(
+            content=None,
+            reasoning_content='{"action":"retry"}',
+            finish_reason="length",
+        ),
+        RuntimeError("guard unavailable"),
+    ],
+)
+async def test_invalid_or_failed_review_falls_back_to_finalize(response) -> None:
+    resolution = await GuardReviewer(provider=Provider(response), model="m").decide(
+        request(GuardAction.RETRY, GuardAction.FINALIZE)
+    )
+
+    assert resolution.action == GuardAction.FINALIZE
+    assert resolution.source == "fallback"
+
+
+@pytest.mark.asyncio
+async def test_guard_timeout_falls_back_but_external_cancellation_propagates() -> None:
+    class SlowProvider(Provider):
+        async def chat(self, messages, tools=None, **kwargs):
+            del messages, tools, kwargs
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    resolution = await GuardReviewer(
+        provider=SlowProvider(LLMResponse(content="unused")),
+        model="m",
+        timeout_seconds=0.01,
+    ).decide(request(GuardAction.RETRY, GuardAction.FINALIZE))
+    assert resolution.source == "fallback"
+
+    task = asyncio.create_task(
+        GuardReviewer(
+            provider=SlowProvider(LLMResponse(content="unused")),
+            model="m",
+        ).decide(request(GuardAction.RETRY, GuardAction.FINALIZE))
+    )
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+def test_evidence_is_bounded_and_redacts_secrets() -> None:
+    evidence = GuardEvidence(
+        event=GuardEvent.RUNTIME_ERROR,
+        cause="x" * 10_000,
+        failures=({"arguments": {"api_key": "secret", "value": "ok"}},) * 20,
+        recent_outcomes=("y" * 2_000,) * 20,
+    ).to_payload()
+
+    encoded = json.dumps(evidence)
+    assert len(encoded) <= 12_000
+    assert "secret" not in encoded
+    assert "[REDACTED]" in encoded
+
+
+def test_local_validation_rejects_malformed_arguments() -> None:
+    call = ToolCallRequest(id="bad", name="write", arguments="not-an-object")
+
+    result = classify_malformed_tool_calls([call])
+
+    assert result.executable_calls == ()
+    assert result.rejected_calls == (call,)
+    assert result.tool_results[0].call_id == "bad"
+
+
+def test_only_successful_side_effect_duplicates_are_suppressed() -> None:
+    prior = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "old-read",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": '{"value":"x"}'},
+                },
+                {
+                    "id": "old-write",
+                    "type": "function",
+                    "function": {"name": "write", "arguments": '{"value":"x"}'},
+                },
+            ],
+        },
+        {"role": "tool", "tool_call_id": "old-read", "content": "done"},
+        {"role": "tool", "tool_call_id": "old-write", "content": "done"},
+    ]
+    calls = [
+        ToolCallRequest(id="read", name="read", arguments={"value": "x"}),
+        ToolCallRequest(id="write", name="write", arguments={"value": "x"}),
     ]
 
-
-def test_simple_rule_engine_exposes_the_compatible_deterministic_policy() -> None:
-    engine = SimpleRuleEngine(
-        max_iterations=1,
-        max_auto_continue_iterations=0,
-        max_finalization_iterations=1,
+    result = suppress_successful_side_effect_duplicates(
+        prior,
+        calls,
+        tool_modes={"read": "read_only", "write": "mutating"},
     )
 
-    assert isinstance(engine, AgentLoopGuard)
-    assert engine.handle_iteration_budget_reached().action == LoopGuardAction.FINALIZE
+    assert [call.id for call in result.executable_calls] == ["read"]
+    assert [call.id for call in result.rejected_calls] == ["write"]
 
 
-def test_duplicate_only_round_returns_to_model_then_stops() -> None:
-    guard = AgentLoopGuard(
-        max_iterations=1,
-        max_auto_continue_iterations=5,
-        max_finalization_iterations=1,
-    )
-    messages = _answered_tool_call()
+def test_failed_side_effect_can_be_retried_with_the_same_arguments() -> None:
+    prior = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "failed-write",
+                    "type": "function",
+                    "function": {"name": "write", "arguments": '{"value":"x"}'},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "failed-write",
+            "content": "Error: marker was not found",
+        },
+    ]
+    repeated = ToolCallRequest(id="retry", name="write", arguments={"value": "x"})
 
-    first = guard.handle_duplicate_tool_calls(
-        messages,
-        [ToolCallRequest(id="call-2", name="echo", arguments={"value": "one"})],
-    )
-
-    assert first.decision.action == LoopGuardAction.RETURN_TO_MODEL
-    assert first.executable_calls == []
-    assert first.duplicate_calls[0].id == "call-2"
-    assert first.tool_results[0].call_id == "call-2"
-    assert "Skipped duplicate call to echo" in first.tool_results[0].content
-
-    second = guard.handle_duplicate_tool_calls(
-        messages,
-        [ToolCallRequest(id="call-3", name="echo", arguments={"value": "one"})],
-    )
-
-    assert second.decision.action == LoopGuardAction.STOP_OFF_TRACK
-    assert "repeated tool calls" in second.decision.reason
-    assert "off track" in (second.decision.final_content or "")
-
-
-def test_malformed_only_round_returns_tool_error_and_counts_unproductive() -> None:
-    guard = AgentLoopGuard(
-        max_iterations=1,
-        max_auto_continue_iterations=5,
-        max_finalization_iterations=1,
+    result = suppress_successful_side_effect_duplicates(
+        prior,
+        [repeated],
+        tool_modes={"write": "mutating"},
     )
 
-    result = guard.handle_malformed_tool_calls(
-        [ToolCallRequest(id="bad-1", name="echo", arguments=["not-an-object"])]
+    assert result.executable_calls == (repeated,)
+    assert result.rejected_calls == ()
+
+
+def test_unknown_tool_mode_fails_closed_as_side_effecting() -> None:
+    prior = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "old",
+                    "type": "function",
+                    "function": {"name": "custom", "arguments": '{"value":"x"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "old", "content": "done"},
+    ]
+    repeated = ToolCallRequest(id="repeat", name="custom", arguments={"value": "x"})
+
+    result = suppress_successful_side_effect_duplicates(
+        prior,
+        [repeated],
+        tool_modes={"custom": "unknown"},
     )
 
-    assert result.decision.action == LoopGuardAction.RETURN_TO_MODEL
-    assert result.executable_calls == []
-    assert result.malformed_calls[0].id == "bad-1"
-    assert result.tool_results[0].call_id == "bad-1"
-    assert "must be a JSON object" in result.tool_results[0].content
-    assert guard.unproductive_tool_rounds == 1
-
-
-def test_productive_round_resets_unproductive_counter() -> None:
-    guard = AgentLoopGuard(
-        max_iterations=1,
-        max_auto_continue_iterations=5,
-        max_finalization_iterations=1,
-    )
-
-    first = guard.handle_unproductive_tool_round("first miss")
-    guard.record_productive_tool_round()
-    second = guard.handle_unproductive_tool_round("second miss")
-
-    assert first.action == LoopGuardAction.RETURN_TO_MODEL
-    assert second.action == LoopGuardAction.RETURN_TO_MODEL
-    assert guard.unproductive_tool_rounds == 1
-
-
-def test_failed_tool_rounds_return_recovery_system_prompt() -> None:
-    guard = AgentLoopGuard(
-        max_iterations=1,
-        max_auto_continue_iterations=5,
-        max_finalization_iterations=1,
-    )
-    failed_node = SimpleNamespace(
-        tool_name="write",
-        arguments={"path": "game.html"},
-        result="Error: File already exists",
-    )
-
-    first = guard.handle_tool_results([failed_node])
-    second = guard.handle_tool_results([failed_node])
-
-    assert first.action == LoopGuardAction.RETURN_TO_MODEL
-    assert first.prompt_message is not None
-    assert first.prompt_message["role"] == "system"
-    assert "TOOL ERROR RECOVERY" in first.prompt_message["content"]
-    assert "Error: File already exists" in first.prompt_message["content"]
-    assert "overwrite=true" in first.prompt_message["content"]
-    assert second.action == LoopGuardAction.RETURN_TO_MODEL
-    assert "failed or returned errors" in second.reason
-
-
-def test_exec_timeout_rounds_get_extra_recovery_before_stopping() -> None:
-    guard = AgentLoopGuard(
-        max_iterations=1,
-        max_auto_continue_iterations=5,
-        max_finalization_iterations=1,
-    )
-    timed_out_node = SimpleNamespace(
-        tool_name="exec",
-        result="Error: Command timed out after 3 seconds",
-    )
-
-    first = guard.handle_tool_results([timed_out_node])
-    second = guard.handle_tool_results([timed_out_node])
-    third = guard.handle_tool_results([timed_out_node])
-
-    assert first.action == LoopGuardAction.RETURN_TO_MODEL
-    assert first.prompt_message is not None
-    assert first.prompt_message["role"] == "system"
-    assert "Command timed out" in first.prompt_message["content"]
-    assert second.action == LoopGuardAction.RETURN_TO_MODEL
-    assert third.action == LoopGuardAction.STOP_OFF_TRACK
-    assert "repeatedly timed out" in third.reason
-
-
-def test_iteration_budget_decisions_auto_continue_then_finalize_then_exhaust() -> None:
-    guard = AgentLoopGuard(
-        max_iterations=2,
-        max_auto_continue_iterations=3,
-        max_finalization_iterations=1,
-    )
-
-    first = guard.handle_iteration_budget_reached()
-    second = guard.handle_iteration_budget_reached()
-    third = guard.handle_iteration_budget_reached()
-
-    assert first.action == LoopGuardAction.EXTEND_BUDGET
-    assert first.budget_grant == 2
-    assert second.action == LoopGuardAction.EXTEND_BUDGET
-    assert second.budget_grant == 1
-    assert third.action == LoopGuardAction.FINALIZE
-    assert third.prompt_message is not None
-    assert "MAXIMUM ITERATIONS REACHED" in third.prompt_message["content"]
-
-    exhausted = AgentLoopGuard(
-        max_iterations=1,
-        max_auto_continue_iterations=0,
-        max_finalization_iterations=0,
-    ).handle_iteration_budget_reached()
-
-    assert exhausted.action == LoopGuardAction.FINAL_RESPONSE
-    assert "maximum number of tool call iterations" in (exhausted.final_content or "")
-
-
-def test_empty_response_retries_once_then_returns_final_error() -> None:
-    guard = AgentLoopGuard(
-        max_iterations=1,
-        max_auto_continue_iterations=0,
-        max_finalization_iterations=1,
-    )
-
-    first = guard.handle_empty_or_exhausted_response(
-        finish_reason="stop",
-        finalizing=False,
-        finalization_iteration=0,
-    )
-    second = guard.handle_empty_or_exhausted_response(
-        finish_reason="stop",
-        finalizing=False,
-        finalization_iteration=0,
-    )
-
-    assert first.action == LoopGuardAction.CONTINUE
-    assert second.action == LoopGuardAction.FINAL_RESPONSE
-    assert "empty response" in (second.final_content or "")
-
-
-def test_output_budget_exhaustion_enters_and_limits_finalization() -> None:
-    guard = AgentLoopGuard(
-        max_iterations=5,
-        max_auto_continue_iterations=0,
-        max_finalization_iterations=2,
-    )
-
-    first = guard.handle_empty_or_exhausted_response(
-        finish_reason="length",
-        finalizing=False,
-        finalization_iteration=0,
-    )
-    retry = guard.handle_empty_or_exhausted_response(
-        finish_reason="length",
-        finalizing=True,
-        finalization_iteration=1,
-    )
-    exhausted = guard.handle_empty_or_exhausted_response(
-        finish_reason="length",
-        finalizing=True,
-        finalization_iteration=2,
-    )
-
-    assert first.action == LoopGuardAction.FINALIZE
-    assert first.prompt_message is not None
-    assert "VISIBLE ANSWER REQUIRED" in first.prompt_message["content"]
-    assert retry.action == LoopGuardAction.CONTINUE
-    assert exhausted.action == LoopGuardAction.FINAL_RESPONSE
-    assert "repeatedly exhausted its output budget" in (exhausted.final_content or "")
+    assert result.executable_calls == ()
+    assert result.rejected_calls == (repeated,)

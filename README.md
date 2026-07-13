@@ -28,7 +28,7 @@ tool and sub-agent lifecycles, flow-changing Guard decisions, errors, and compac
 token statistics. Raw reasoning, routine status updates, profile artifact
 metadata, turn UUID separators, and gateway logs are hidden by default. A Guard
 decision is rendered as a concise line such as
-`⚠ Guard [rule_engine] · 重试 · malformed tool call`.
+`⚠ Guard [guard] · 重试 · tool_error`.
 
 Useful interactive commands:
 
@@ -83,11 +83,9 @@ Inspect or update it later:
 uv run aeloon-core config path
 uv run aeloon-core config show
 uv run aeloon-core config set model gpt-4.1-mini
-uv run aeloon-core config set max-auto-continue-iterations 25
-uv run aeloon-core config set max-finalization-iterations 2
+uv run aeloon-core config set max-iterations 25
 uv run aeloon-core config set context-compaction-enabled true
 uv run aeloon-core config set context-compaction-trigger-ratio 0.9
-uv run aeloon-core config set uasm-guard-decision-mode full
 ```
 
 You can override the path with `AELOON_CORE_CONFIG` or `--config`.
@@ -128,8 +126,8 @@ table, falling back to `agents.defaults.context_window_tokens`. Tunables live un
 
 ## Unified Agentic State Machine
 
-The Unified Agentic State Machine (UASM) is the only agent-loop runtime. Rule
-handling, TemporaryGuard, and bounded minimal context are always enabled:
+The Unified Agentic State Machine (UASM) is the only agent-loop runtime. Its
+exception-only Guard and bounded minimal context are always enabled:
 
 ```bash
 uv run aeloon-core config set uasm-transition-trace-enabled true
@@ -137,17 +135,22 @@ uv run aeloon-core config set uasm-transition-trace-enabled true
 
 UASM makes the `MasterAgent -> WorkerAgent/ToolAgent` route explicit. Canonical
 conversation history lives in `LightweightState`; forward minimal context is a
-per-call view and does not replace persisted messages. Deterministic loop rules
-handle known failures. Only a repeated ambiguous failure that would otherwise
-stop the loop is escalated to a stateless `TemporaryGuard`, which sees a bounded
-evidence object rather than the transcript.
+per-call view and does not replace persisted messages. Normal execution never
+calls Guard. A tool failure, runtime exception, or iteration boundary invokes
+one stateless review over bounded evidence. Guard returns only `retry`,
+`continue`, or `finalize`; local code owns recovery prompts, budget increments,
+text-only finalization, and the hardcoded failure fallback. Guard responses are
+accepted only as complete, single-action JSON. If review itself fails, a tool
+error retries only within the existing iteration budget; every other case wraps
+up. Finalization is buffered with tools disabled so provider tool-protocol text
+cannot leak into the visible answer.
 
 Completed UASM turns persist transition records separately at
 `~/.aeloon-core/traces/<session-id>.jsonl`. Each record includes state digests,
 the node and decision, wall time, and token usage. Turn records aggregate tokens
 by `domain`, `harness`, and `context_processing` without mixing transition rows
 into session history. The additive `by_component` view distinguishes
-`profile_master`, `domain:<role>`, `tool`, `control`, `temporary_guard`, and
+`profile_master`, `domain:<role>`, `tool`, `control`, `guard`, and
 `minimal_context`; both views conserve the same aggregate counters.
 
 ## Agent Profiles (v1.5)
@@ -267,10 +270,11 @@ remain visible in the TUI. Joined reports are fairly trimmed to a 12,000-charact
 round budget. A turn may run at most two delegation rounds, and
 delegated branches cannot hand off, complete the parent task, or delegate again.
 
-A second protocol violation stops with visible output. Finalization,
-TemporaryGuard, and provider-failure termination remain host-controlled. Adding
-the fork/join operation advances the profile control protocol to version 2, so
-older custom artifacts must be recompiled, approved, and activated before use.
+Protocol violations enter the same exception-only Guard as the base loop.
+Finalization, local fallback, and provider-failure termination remain
+host-controlled. Adding the fork/join operation advances the profile control
+protocol to version 2, so older custom artifacts must be recompiled, approved,
+and activated before use.
 
 Rollback selects a prior approved compatible artifact for future turns; it
 cannot undo tool side effects from completed turns:

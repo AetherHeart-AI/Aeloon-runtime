@@ -87,8 +87,16 @@ class WorkerProgress:
     ) -> None:
         del usage, node_kind, component
 
-    async def on_guard_decision(self, resolution: Any) -> None:
-        del resolution
+    async def on_guard_resolution(self, resolution: Any) -> None:
+        await self._call_parent(
+            "on_worker_guard_resolution",
+            worker_id=self.worker_id,
+            run_id=self.run_id,
+            profile_id=self.profile_id,
+            label=self.label,
+            resolution=resolution,
+        )
+        await self._emit_activity("planning", label=self.label)
 
     async def on_final(self, content: str, **kwargs: Any) -> None:
         del content, kwargs
@@ -268,29 +276,6 @@ class WorkerProgress:
                 return
         if label not in self._active_tools:
             await self._emit_activity("processing", label=label)
-
-    async def on_loop_guard_decision(
-        self,
-        decision: Any,
-        *,
-        event: str,
-        source: str,
-        fallback_used: bool = False,
-        budget_grant: int | None = None,
-    ) -> None:
-        await self._call_parent(
-            "on_worker_guard_decision",
-            worker_id=self.worker_id,
-            run_id=self.run_id,
-            profile_id=self.profile_id,
-            label=self.label,
-            decision=decision,
-            event=event,
-            source=source,
-            fallback_used=fallback_used,
-            budget_grant=budget_grant,
-        )
-        await self._emit_activity("planning", label=self.label)
 
     def _scope_label(self, subagent_label: str | None) -> str:
         safe = _safe_identifier(subagent_label)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from aeloon_core.loop_guard import LoopGuardAction, LoopGuardDecision
+from aeloon_core.loop_guard import GuardAction, GuardEvent, GuardResolution
 from aeloon_core.state import AgentNode
 from aeloon_core.transitions import (
     NodeKind,
@@ -63,9 +63,11 @@ def test_transition_recorder_sequences_serializes_and_persists() -> None:
         profile={"profile_id": "coding-team", "artifact_id": "artifact-1"},
         before_digest="before",
         after_digest="after",
-        decision=LoopGuardDecision(
-            LoopGuardAction.RETURN_TO_MODEL,
-            reason="recover",
+        decision=GuardResolution(
+            event=GuardEvent.TOOL_ERROR,
+            action=GuardAction.RETRY,
+            source="guard",
+            evidence={"event": "tool_error"},
         ),
         token_usage={"input_tokens": 8, "output_tokens": 2},
         wall_time_ms=12.5,
@@ -81,7 +83,7 @@ def test_transition_recorder_sequences_serializes_and_persists() -> None:
     assert [record.sequence for record in recorder.records] == [1, 2]
     assert persisted == [first, second]
     payload = recorder.to_dicts()[0]
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
     assert payload["session_id"] == "session-1"
     assert payload["turn_id"] == "turn-1"
     assert payload["node"] == "worker"
@@ -92,12 +94,11 @@ def test_transition_recorder_sequences_serializes_and_persists() -> None:
         "artifact_id": "artifact-1",
     }
     assert payload["decision"] == {
-        "action": "return_to_model",
-        "reason": "recover",
-        "final_content": None,
-        "prompt_message": None,
-        "progress_message": None,
-        "budget_grant": 0,
+        "event": "tool_error",
+        "action": "retry",
+        "source": "guard",
+        "usage": {},
+        "evidence": {"event": "tool_error"},
     }
     assert payload["token_usage"] == {
         "input_tokens": 8,

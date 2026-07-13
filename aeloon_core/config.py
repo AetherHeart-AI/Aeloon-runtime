@@ -52,8 +52,6 @@ class AgentDefaultsConfig(BaseModel):
     chat_timeout: int = 3600
     context_window_tokens: int = 128_000
     max_iterations: int = 25
-    max_auto_continue_iterations: int = 25
-    max_finalization_iterations: int = 2
     base_profile_id: str = Field(default="base", pattern=r"^base$")
     profile_id: str | None = Field(
         default=None,

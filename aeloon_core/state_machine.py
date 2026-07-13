@@ -12,7 +12,12 @@ from aeloon_core.agents import (
     MasterAgent,
     WorkerAgent,
 )
-from aeloon_core.loop_guard import SimpleRuleEngine
+from aeloon_core.loop_guard import (
+    GuardEvent,
+    GuardEvidence,
+    GuardReviewer,
+    local_failure_message,
+)
 from aeloon_core.minimal_context import MinimalContextProcessor
 from aeloon_core.model_input import PrepareModelInput
 from aeloon_core.profile_agents import ControlAgent, ProfileDomainAgent
@@ -24,8 +29,7 @@ from aeloon_core.state import (
     RunStatus,
     StateMetadata,
 )
-from aeloon_core.temporary_guard import TemporaryGuard
-from aeloon_core.tool_agents import TemporaryGuardAgent, ToolAgent
+from aeloon_core.tool_agents import GuardAgent, ToolAgent
 from aeloon_core.transitions import TransitionRecord, TransitionRecorder
 
 if TYPE_CHECKING:
@@ -41,8 +45,6 @@ async def run_agent_loop(
     tools: ToolRegistry,
     messages: list[dict[str, Any]],
     max_iterations: int = 25,
-    max_auto_continue_iterations: int = 25,
-    max_finalization_iterations: int = 2,
     transition_trace_enabled: bool = True,
     minimal_context_recent_turns: int = 2,
     minimal_context_tool_result_chars: int = 1_200,
@@ -61,6 +63,9 @@ async def run_agent_loop(
 ) -> LightweightState:
     """Run the explicit Master -> Worker/Tool/Guard state machine."""
 
+    if max_iterations < 1:
+        raise ValueError("max_iterations must be at least 1")
+
     metadata = StateMetadata(
         session_id=session_id,
         turn_id=turn_id,
@@ -70,8 +75,6 @@ async def run_agent_loop(
         active_tools=_active_tool_names(tools.get_definitions()),
         permissions={"model": True, "tools": True},
         max_iterations=max_iterations,
-        max_auto_continue_iterations=max_auto_continue_iterations,
-        max_finalization_iterations=max_finalization_iterations,
         metadata=metadata,
     )
     if profile is not None:
@@ -85,12 +88,6 @@ async def run_agent_loop(
             generation=profile.generation,
         )
         state.active_tools = []
-    rule_engine = SimpleRuleEngine(
-        max_iterations=max_iterations,
-        max_auto_continue_iterations=max_auto_continue_iterations,
-        max_finalization_iterations=max_finalization_iterations,
-        state=state.guard_state,
-    )
     context_processor = MinimalContextProcessor(
         preserve_recent_turns=minimal_context_recent_turns,
         max_tool_result_chars=minimal_context_tool_result_chars,
@@ -99,11 +96,6 @@ async def run_agent_loop(
         session_id=session_id,
         turn_id=turn_id,
         persist=on_transition if transition_trace_enabled else None,
-    )
-    temporary_guard = TemporaryGuard(
-        provider=provider,
-        model=model,
-        action_space="full",
     )
     runtime_kwargs: dict[str, Any] = {}
     if add_assistant_message is not None:
@@ -118,10 +110,10 @@ async def run_agent_loop(
         provider=provider,
         model=model,
         tools=tools,
-        rule_engine=rule_engine,
+        guard=GuardReviewer(provider=provider, model=model),
+        base_iteration_budget=max_iterations,
         context_processor=context_processor,
         recorder=recorder,
-        temporary_guard=temporary_guard,
         profile=profile,
         profile_master=LLMProfileMaster(provider=provider, model=model)
         if profile is not None
@@ -137,7 +129,7 @@ async def run_agent_loop(
         AgentNode.WORKER: WorkerAgent(runtime),
         AgentNode.CONTROL: ControlAgent(runtime),
         AgentNode.TOOL: ToolAgent(runtime),
-        AgentNode.TEMPORARY_GUARD: TemporaryGuardAgent(runtime),
+        AgentNode.GUARD: GuardAgent(runtime),
     }
     profile_agents = (
         {agent.id: ProfileDomainAgent(runtime, agent.id) for agent in profile.agents}
@@ -177,7 +169,35 @@ async def run_agent_loop(
             before_digest = ""
             started_at = 0.0
             runtime.begin_step()
-        state = await agent.run(state)
+        try:
+            state = await agent.run(state)
+        except Exception as exc:
+            if node == AgentNode.GUARD or state.metadata.status == RunStatus.FINALIZING:
+                evidence = state.metadata.finalization_evidence or GuardEvidence(
+                    event=GuardEvent.RUNTIME_ERROR,
+                    cause=f"{type(exc).__name__}: {exc}",
+                    iteration=state.metadata.iteration,
+                    iteration_limit=state.metadata.iteration_limit,
+                    node=node.value,
+                )
+                await _finish_with_local_fallback(
+                    runtime,
+                    state,
+                    content=local_failure_message(evidence),
+                    reason="guard or finalization failed",
+                )
+            else:
+                failures, outcomes, side_effects = _pair_interrupted_tool_calls(
+                    state, runtime, exc
+                )
+                state = await runtime.queue_guard(
+                    state,
+                    event=GuardEvent.RUNTIME_ERROR,
+                    cause=f"{type(exc).__name__}: {exc}",
+                    failures=failures,
+                    recent_outcomes=outcomes,
+                    successful_side_effects=side_effects,
+                )
         if transition_trace_enabled:
             node_kind = agent.node_kind_for(state)
             component = agent.component_for(state)
@@ -218,3 +238,94 @@ def _active_tool_names(tool_defs: list[dict[str, Any]]) -> list[str]:
         if isinstance(name, str):
             names.append(name)
     return names
+
+
+def _pair_interrupted_tool_calls(
+    state: LightweightState,
+    runtime: AgentRuntime,
+    exc: Exception,
+) -> tuple[
+    tuple[dict[str, Any], ...],
+    tuple[str, ...],
+    tuple[dict[str, Any], ...],
+]:
+    """Close any pending protocol calls without replaying uncertain side effects."""
+
+    answered = {
+        str(message.get("tool_call_id"))
+        for message in state.messages
+        if message.get("role") == "tool" and message.get("tool_call_id")
+    }
+    declared = {
+        str(call.get("id"))
+        for message in state.messages
+        if message.get("role") == "assistant"
+        for call in (message.get("tool_calls") or [])
+        if isinstance(call, dict) and call.get("id")
+    }
+    for call in state.pending_tool_calls:
+        if call.id in answered or call.id not in declared:
+            continue
+        state.messages = runtime.add_tool_result(
+            state.messages,
+            call.id,
+            call.name,
+            "Error: The call outcome is uncertain because execution was interrupted; "
+            "do not replay it automatically.",
+        )
+    state.pending_response = None
+    state.pending_tool_calls = []
+    state.pending_control_call = None
+    failures: list[dict[str, Any]] = []
+    outcomes: list[str] = []
+    side_effects: list[dict[str, Any]] = []
+    for node in state.pending_tool_nodes:
+        result = node.result or node.error or "unknown tool outcome"
+        outcomes.append(result)
+        item = {
+            "tool_name": node.tool_name,
+            "arguments": node.arguments,
+            "result": result,
+        }
+        if str(result).lstrip().lower().startswith("error"):
+            failures.append({**item, "kind": "tool_result"})
+        elif node.mode != "read_only":
+            side_effects.append(item)
+    state.pending_tool_nodes = []
+    failures.append(
+        {
+            "kind": "runtime_exception",
+            "result": f"{type(exc).__name__}: {exc}",
+        }
+    )
+    return tuple(failures), tuple(outcomes), tuple(side_effects)
+
+
+async def _finish_with_local_fallback(
+    runtime: AgentRuntime,
+    state: LightweightState,
+    *,
+    content: str,
+    reason: str,
+) -> None:
+    """Make the terminal fallback independent of adapters and model output."""
+
+    try:
+        await runtime.finish(
+            state,
+            content=content,
+            status=RunStatus.FAILED,
+            reason=reason,
+            add_message=True,
+        )
+        return
+    except Exception:
+        state.messages.append({"role": "assistant", "content": content})
+        state.metadata.finish(
+            status=RunStatus.FAILED,
+            final_content=content,
+            reason=reason,
+        )
+        if not state.final_emitted:
+            state.final_emitted = True
+            await runtime.emit_hook("on_final", content, messages=state.messages)

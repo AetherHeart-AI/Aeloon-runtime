@@ -5,7 +5,7 @@ from __future__ import annotations
 from time import perf_counter
 
 from aeloon_core.agents import BaseAgent, WorkerAgent
-from aeloon_core.loop_guard import LoopGuardAction, LoopGuardDecision
+from aeloon_core.loop_guard import GuardAction, GuardEvent
 from aeloon_core.profile_delegation import (
     joined_tool_result,
     prepare_delegation,
@@ -128,10 +128,6 @@ class ControlAgent(BaseAgent):
 
         limit = self.runtime.profile_handoff_limit()
         if state.handoff_count >= limit:
-            content = (
-                f"The profile handoff budget was exhausted at {state.handoff_count}/{limit}; "
-                "the active role attempted another handoff instead of completing the task."
-            )
             state.messages = self.runtime.add_tool_result(
                 state.messages,
                 tool_call.id,
@@ -139,20 +135,18 @@ class ControlAgent(BaseAgent):
                 f"Error: Handoff budget exhausted ({state.handoff_count}/{limit}).",
             )
             self._clear_pending(state)
-            self.runtime.describe_step(
-                {
-                    "action": "terminate",
-                    "source": "handoff_budget",
-                    "handoff_count": state.handoff_count,
-                    "handoff_limit": limit,
-                }
+            state.pending_profile_correction = (
+                "The handoff budget is exhausted. Complete the task using the current "
+                "evidence instead of requesting another handoff."
             )
-            return await self.runtime.finish(
+            return await self.runtime.queue_guard(
                 state,
-                content=content,
-                status=RunStatus.TERMINATED_BY_RULE,
-                reason="profile handoff budget exhausted",
-                add_message=False,
+                event=GuardEvent.BUDGET_EXHAUSTED,
+                cause=(
+                    "profile handoff budget exhausted at "
+                    f"{state.handoff_count}/{limit}"
+                ),
+                allowed_actions=(GuardAction.RETRY, GuardAction.FINALIZE),
             )
 
         source_agent = state.active_agent_id or profile.default_agent_id
@@ -205,9 +199,15 @@ class ControlAgent(BaseAgent):
                 f"({state.delegation_count}/{MAX_DELEGATION_ROUNDS}).",
             )
             self._clear_pending(state)
-            return await self.runtime.profile_protocol_error(
+            state.pending_profile_correction = (
+                "The parallel delegation budget is exhausted. Synthesize existing "
+                "reports or complete the task without another delegation."
+            )
+            return await self.runtime.queue_guard(
                 state,
-                reason="parallel delegation budget exhausted",
+                event=GuardEvent.BUDGET_EXHAUSTED,
+                cause="parallel delegation budget exhausted",
+                allowed_actions=(GuardAction.RETRY, GuardAction.FINALIZE),
             )
 
         round_number = state.delegation_count + 1
@@ -225,22 +225,15 @@ class ControlAgent(BaseAgent):
             )
             self._clear_pending(state)
             state.resume_agent_id = state.active_agent_id
-            decision = LoopGuardDecision(
-                LoopGuardAction.RETURN_TO_MODEL,
-                reason="duplicate successful parallel delegation was rejected",
-                prompt_message={
-                    "role": "system",
-                    "content": (
-                        "Do not repeat the completed delegation. Use its existing reports, "
-                        "change the task set for a material evidence gap, or complete the task."
-                    ),
-                },
+            state.pending_profile_correction = (
+                "Do not repeat the completed delegation. Use its existing reports, "
+                "change the task set for a material evidence gap, or complete the task."
             )
-            await self.runtime.emit_guard_decision(
-                decision,
-                event="duplicate_delegation",
+            return await self.runtime.queue_guard(
+                state,
+                event=GuardEvent.TOOL_ERROR,
+                cause="duplicate successful parallel delegation was rejected",
             )
-            return await self.runtime.return_to_model(state, decision)
         try:
             branches = prepare_delegation(
                 self.runtime,
@@ -328,6 +321,6 @@ class ControlAgent(BaseAgent):
 def _subagent_component_node_kind(component: str) -> NodeKind:
     if component == "minimal_context":
         return NodeKind.CONTEXT_PROCESSING
-    if component in {"profile_master", "temporary_guard", "control"}:
+    if component in {"profile_master", "guard", "control"}:
         return NodeKind.HARNESS
     return NodeKind.DOMAIN

@@ -15,13 +15,17 @@ def tool_call_fingerprint(name: str, arguments: Any) -> str:
     return digest
 
 
-def collect_tool_call_fingerprints(messages: list[dict[str, Any]]) -> set[str]:
-    """Collect fingerprints for assistant tool calls already answered by tools."""
+def collect_successful_tool_call_fingerprints(
+    messages: list[dict[str, Any]],
+) -> set[str]:
+    """Collect fingerprints only for calls with successful tool results."""
 
     answered = {
         message["tool_call_id"]
         for message in messages
-        if message.get("role") == "tool" and isinstance(message.get("tool_call_id"), str)
+        if message.get("role") == "tool"
+        and isinstance(message.get("tool_call_id"), str)
+        and not _tool_result_failed(message.get("content"))
     }
     seen: set[str] = set()
     for message in messages:
@@ -43,10 +47,6 @@ def collect_tool_call_fingerprints(messages: list[dict[str, Any]]) -> set[str]:
     return seen
 
 
-def duplicate_tool_result(name: str) -> str:
-    """Return the standard duplicate-call tool result."""
-
-    return (
-        f"Skipped duplicate call to {name}: the same tool with identical arguments "
-        "already ran in this conversation. Use the existing result or change the arguments."
-    )
+def _tool_result_failed(content: Any) -> bool:
+    text = str(content or "").lstrip().lower()
+    return text.startswith("error") or text.startswith("skipped duplicate call")

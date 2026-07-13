@@ -39,7 +39,7 @@ RESERVED_ROLE_IDS = frozenset(
         "harness",
         "master",
         "profile_master",
-        "temporary_guard",
+        "guard",
         "tool",
         "worker",
     }

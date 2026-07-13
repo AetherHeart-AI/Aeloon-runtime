@@ -263,8 +263,13 @@ class UnsafeDelegateProvider(LLMProvider):
         response_format: dict[str, str] | None = None,
     ) -> LLMResponse:
         del tools, model, max_tokens, temperature, reasoning_effort, tool_choice
-        if response_format is not None:
+        if response_format is not None and any(
+            "profile master" in str(message.get("content") or "").lower()
+            for message in messages
+        ):
             return LLMResponse(content='{"agent_id":"lead"}')
+        if response_format is not None:
+            return LLMResponse(content='{"action":"retry"}')
         if any(
             "DELEGATED BRANCH PROTOCOL" in str(message.get("content") or "") for message in messages
         ):
@@ -307,7 +312,6 @@ async def test_delegate_tasks_rejects_non_read_only_roles_before_fork() -> None:
 
     assert provider.branch_calls == 0
     assert state.delegation_count == 0
-    assert state.control_protocol_retries == 1
     assert state.metadata.final_content == "unsafe delegation rejected"
     rejected = next(
         message["content"]
@@ -516,23 +520,24 @@ class FailingCompletionProgress:
 
 
 @pytest.mark.asyncio
-async def test_branch_callback_failure_cancels_and_awaits_running_siblings() -> None:
-    provider = CleanupProvider()
+async def test_branch_callback_failure_does_not_change_control_flow() -> None:
+    provider = UnsafeDelegateProvider()
 
-    with pytest.raises(RuntimeError, match="progress callback failed"):
-        await asyncio.wait_for(
-            run_agent_loop(
+    state = await asyncio.wait_for(
+        run_agent_loop(
                 provider=provider,
                 model="test-model",
                 tools=ToolRegistry(),
                 messages=[{"role": "user", "content": "research"}],
                 profile=_profile(),
                 on_progress=FailingCompletionProgress(),
-            ),
-            timeout=1,
-        )
+        ),
+        timeout=1,
+    )
 
-    assert provider.sibling_cancelled.is_set()
+    assert provider.branch_calls == 2
+    assert state.metadata.status == RunStatus.COMPLETED
+    assert state.metadata.final_content == "unsafe delegation rejected"
 
 
 class HangingLifecycleProgress:
@@ -552,20 +557,21 @@ async def test_branch_lifecycle_callback_has_its_own_deadline(monkeypatch) -> No
     )
     provider = UnsafeDelegateProvider()
 
-    with pytest.raises(TimeoutError):
-        await asyncio.wait_for(
-            run_agent_loop(
+    state = await asyncio.wait_for(
+        run_agent_loop(
                 provider=provider,
                 model="test-model",
                 tools=ToolRegistry(),
                 messages=[{"role": "user", "content": "research"}],
                 profile=_profile(),
                 on_progress=HangingLifecycleProgress(),
-            ),
-            timeout=1,
-        )
+        ),
+        timeout=1,
+    )
 
-    assert provider.branch_calls == 0
+    assert provider.branch_calls == 2
+    assert state.metadata.status == RunStatus.COMPLETED
+    assert state.metadata.final_content == "unsafe delegation rejected"
 
 
 def test_joined_reports_bypass_generic_tool_preview_for_coordinator() -> None:
@@ -892,8 +898,13 @@ class RepeatingDelegateProvider(LLMProvider):
         response_format: dict[str, str] | None = None,
     ) -> LLMResponse:
         del tools, model, max_tokens, temperature, reasoning_effort, tool_choice
-        if response_format is not None:
+        if response_format is not None and any(
+            "profile master" in str(message.get("content") or "").lower()
+            for message in messages
+        ):
             return LLMResponse(content='{"agent_id":"lead"}')
+        if response_format is not None:
+            return LLMResponse(content='{"action":"retry"}')
         if any(
             "DELEGATED BRANCH PROTOCOL" in str(message.get("content") or "")
             for message in messages
@@ -944,9 +955,9 @@ async def test_identical_successful_delegation_is_guarded_without_reforking() ->
     guard = next(
         payload
         for event, payload in events
-        if event == "chat.guard.decision" and payload["event"] == "duplicate_delegation"
+        if event == "chat.guard.decision" and payload["event"] == "tool_error"
     )
-    assert guard["action"] == "return_to_model"
+    assert guard["action"] == "retry"
     duplicate_result = [
         message["content"]
         for message in state.messages

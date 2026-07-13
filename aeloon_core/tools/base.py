@@ -50,11 +50,15 @@ class FunctionTool(Tool):
         description: str,
         args_model: type[BaseModel],
         handler: Callable[..., Awaitable[str]],
+        concurrency_mode: Literal["read_only", "mutating", "exclusive"] = "exclusive",
     ) -> None:
+        if concurrency_mode not in {"read_only", "mutating", "exclusive"}:
+            raise ValueError(f"invalid concurrency mode: {concurrency_mode}")
         self.name = name
         self.description = description
         self.args_model = args_model
         self._handler = handler
+        self.concurrency_mode = concurrency_mode
 
     async def execute(self, **kwargs: Any) -> str:
         return await self._handler(**kwargs)

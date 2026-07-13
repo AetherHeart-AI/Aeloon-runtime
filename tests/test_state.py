@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from aeloon_core.loop_guard import AgentLoopGuard, LoopGuardAction, LoopGuardState
 from aeloon_core.state import (
     AgentNode,
     LazyValue,
@@ -9,7 +8,7 @@ from aeloon_core.state import (
     RunStatus,
     StateMetadata,
 )
-from aeloon_core.transitions import NodeKind, TokenLedger, TransitionRecord
+from aeloon_core.transitions import NodeKind, TransitionRecord
 
 
 def test_lightweight_state_defaults_to_a_detached_model_context() -> None:
@@ -27,7 +26,7 @@ def test_state_metadata_requires_visible_content_for_terminal_status() -> None:
     metadata = StateMetadata()
 
     metadata.finish(
-        status=RunStatus.TERMINATED_BY_RULE,
+        status=RunStatus.TERMINATED_BY_GUARD,
         final_content="Iteration budget exhausted.",
         reason="budget",
     )
@@ -93,28 +92,6 @@ def test_state_digest_is_stable_and_excludes_transition_history() -> None:
     assert left.stable_digest() != right.stable_digest()
 
 
-def test_agent_loop_guard_mutates_an_injected_state() -> None:
-    guard_state = LoopGuardState.from_limits(
-        max_iterations=2,
-        max_auto_continue_iterations=3,
-        max_finalization_iterations=1,
-    )
-    state = LightweightState(messages=[], guard_state=guard_state)
-    guard = AgentLoopGuard(
-        max_iterations=2,
-        max_auto_continue_iterations=3,
-        max_finalization_iterations=1,
-        state=state.guard_state,
-    )
-
-    decision = guard.handle_iteration_budget_reached()
-
-    assert decision.action == LoopGuardAction.EXTEND_BUDGET
-    assert guard.state is state.guard_state
-    assert state.guard_state.iteration_limit == 4
-    assert state.guard_state.auto_continue_remaining == 1
-
-
 def test_profile_state_is_omitted_until_a_turn_pins_an_artifact() -> None:
     state = LightweightState(messages=[{"role": "user", "content": "work"}])
     no_profile_digest = state.digest()
@@ -132,30 +109,11 @@ def test_profile_state_is_omitted_until_a_turn_pins_an_artifact() -> None:
     assert state.digest() != pinned_digest
 
 
-def test_profile_fields_do_not_change_v1_positional_constructor_abi() -> None:
-    metadata = StateMetadata()
-    guard = LoopGuardState()
-    ledger = TokenLedger()
-    state = LightweightState(
-        [{"role": "user", "content": "legacy"}],
-        [{"role": "user", "content": "minimal"}],
-        {"read": True},
-        ["read"],
-        metadata,
-        guard,
-        None,
-        [],
-        [],
-        None,
-        None,
-        True,
-        ["read"],
-        [],
-        ledger,
-        {},
+def test_from_messages_sets_the_single_iteration_limit() -> None:
+    state = LightweightState.from_messages(
+        [{"role": "user", "content": "work"}],
+        max_iterations=7,
     )
 
-    assert state.final_emitted is True
-    assert state.tools_used == ["read"]
-    assert state.token_ledger is ledger
-    assert state.profile_ref is None
+    assert state.metadata.iteration_limit == 7
+    assert not hasattr(state, "guard_state")

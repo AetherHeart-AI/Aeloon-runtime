@@ -18,11 +18,10 @@ from aeloon_core.__main__ import (
 )
 from aeloon_core.config import Config
 from aeloon_core.context import SYSTEM_PROMPT
-from aeloon_core.loop_guard import LoopGuardAction, LoopGuardDecision
+from aeloon_core.loop_guard import GuardAction, GuardEvent, GuardResolution
 from aeloon_core.orchestrator import TurnResult
 from aeloon_core.providers.base import LLMResponse, ToolCallRequest
 from aeloon_core.task_graph import TaskNode
-from aeloon_core.temporary_guard import GuardResolution
 from aeloon_core.terminal_cli import TerminalEventRenderer
 from aeloon_core.turn_events import TurnEventProgress
 
@@ -68,6 +67,8 @@ def test_uasm_config_setters_keep_runtime_trace_and_context_controls() -> None:
     assert args.key == "uasm-minimal-context-recent-turns"
     assert _coerce_config_value("uasm-minimal-context-recent-turns", "3") == 3
     assert "uasm-rule-engine-enabled" not in CONFIG_SETTERS
+    assert "max-auto-continue-iterations" not in CONFIG_SETTERS
+    assert "max-finalization-iterations" not in CONFIG_SETTERS
 
 
 def test_implicit_chat_invocations() -> None:
@@ -355,26 +356,14 @@ async def test_turn_progress_emits_sanitized_guard_decision_and_usage() -> None:
         events.append((event, payload))
 
     progress = TurnEventProgress(session_id="session-1", emit=emit)
-    decision = LoopGuardDecision(
-        LoopGuardAction.STOP_OFF_TRACK,
-        reason="repeated tool failures",
-        final_content="private final content",
-        prompt_message={"role": "system", "content": "private recovery prompt"},
-    )
-
     resolution = GuardResolution(
-        decision=decision,
-        source="rule_fallback",
+        event=GuardEvent.TOOL_ERROR,
+        action=GuardAction.FINALIZE,
+        source="fallback",
         usage={"total_tokens": 3},
-        fallback_used=True,
+        evidence={"event": "tool_error", "cause": "bounded failure"},
     )
-    await progress.on_guard_decision(resolution)
-    await progress.on_loop_guard_decision(
-        decision,
-        event="tool_result_failed",
-        source="rule_fallback",
-        fallback_used=True,
-    )
+    await progress.on_guard_resolution(resolution)
 
     assert [event for event, _payload in events] == [
         "chat.usage",
@@ -388,15 +377,12 @@ async def test_turn_progress_emits_sanitized_guard_decision_and_usage() -> None:
         "source",
         "event",
         "action",
-        "reason",
-        "budget_grant",
-        "fallback_used",
+        "usage",
+        "evidence",
     }
-    assert payload["source"] == "rule_fallback"
-    assert payload["event"] == "tool_result_failed"
-    assert payload["action"] == "stop_off_track"
-    assert payload["fallback_used"] is True
-    assert "private" not in json.dumps(payload)
+    assert payload["source"] == "fallback"
+    assert payload["event"] == "tool_error"
+    assert payload["action"] == "finalize"
     assert progress.usage == {"total_tokens": 3}
 
 
@@ -408,25 +394,22 @@ async def test_delegated_guard_uses_separate_branch_correlated_event() -> None:
         events.append((event, payload))
 
     progress = TurnEventProgress(session_id="session-1", emit=emit)
-    await progress.on_profile_delegate_guard_decision(
+    await progress.on_profile_delegate_guard_resolution(
         "delegate-2-3",
         "fact_checker#1",
-        LoopGuardDecision(
-            LoopGuardAction.RETURN_TO_MODEL,
-            reason="retry one branch",
-            final_content="private final",
-            prompt_message={"role": "system", "content": "private prompt"},
+        GuardResolution(
+            event=GuardEvent.TOOL_ERROR,
+            action=GuardAction.RETRY,
+            source="guard",
+            evidence={"event": "tool_error"},
         ),
-        event="tool_result_failed",
-        source="rule_engine",
     )
 
     assert [event for event, _payload in events] == ["chat.profile.delegate.guard"]
     payload = events[0][1]
     assert payload["branch_id"] == "delegate-2-3"
     assert payload["subagent_label"] == "fact_checker#1"
-    assert payload["reason"] == "retry one branch"
-    assert "private" not in json.dumps(payload)
+    assert payload["action"] == "retry"
 
 
 @pytest.mark.asyncio
@@ -559,15 +542,15 @@ async def test_parallel_subagent_events_and_tools_are_labeled() -> None:
         succeeded=1,
         duration_ms=125,
     )
-    await progress.on_profile_delegate_guard_decision(
+    await progress.on_profile_delegate_guard_resolution(
         "delegate-1-1",
         "source_scout#1",
-        LoopGuardDecision(
-            LoopGuardAction.RETURN_TO_MODEL,
-            reason="retry failed source",
+        GuardResolution(
+            event=GuardEvent.TOOL_ERROR,
+            action=GuardAction.RETRY,
+            source="guard",
+            evidence={"event": "tool_error"},
         ),
-        event="tool_result_failed",
-        source="rule_engine",
     )
 
     output = console.export_text()
@@ -576,7 +559,7 @@ async def test_parallel_subagent_events_and_tools_are_labeled() -> None:
     assert "✓ 工具 websearch [source_scout#1]" in output
     assert "✓ 子agent source_scout#1 · 完成 · 123 ms" in output
     assert "↳ 并行子agent · 汇总 1/1 · 125 ms" in output
-    assert "Guard [rule_engine/source_scout#1] · 重试 · retry failed source" in output
+    assert "Guard [guard/source_scout#1] · 重试 · tool_error" in output
 
 
 @pytest.mark.asyncio
@@ -602,22 +585,18 @@ async def test_subagent_task_update_is_single_line_and_bounded() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("event", "action", "source", "fallback_used", "expected"),
+    ("event", "action", "source", "expected"),
     [
-        ("empty_response", "continue", "rule_engine", False, "· 重试"),
-        ("duplicate_tool_calls", "continue", "temporary_guard", False, "· 继续"),
-        ("tool_result_failed", "return_to_model", "rule_engine", False, "· 重试"),
-        ("iteration_budget", "extend_budget", "temporary_guard", False, "· 扩容 +2"),
-        ("output_exhausted", "finalize", "rule_engine", False, "· 收尾"),
-        ("output_exhausted", "final_response", "rule_engine", False, "· 停止"),
-        ("tool_result_failed", "stop_off_track", "rule_fallback", True, "· 停止 · 回退"),
+        ("budget_exhausted", "continue", "guard", "· 继续"),
+        ("tool_error", "retry", "guard", "· 重试"),
+        ("runtime_error", "finalize", "guard", "· 收尾"),
+        ("tool_error", "finalize", "fallback", "· 收尾 · 回退"),
     ],
 )
 async def test_terminal_renderer_shows_key_guard_decisions(
     event: str,
     action: str,
     source: str,
-    fallback_used: bool,
     expected: str,
 ) -> None:
     console = Console(record=True, width=80)
@@ -629,9 +608,6 @@ async def test_terminal_renderer_shows_key_guard_decisions(
             "source": source,
             "event": event,
             "action": action,
-            "reason": "bounded guard reason " * 20,
-            "budget_grant": 2,
-            "fallback_used": fallback_used,
             "evidence": "private evidence must not render",
         },
     )

@@ -483,7 +483,7 @@ def _master_payload(
         ),
         "budget": {
             "iteration_remaining": max(
-                0, state.guard_state.iteration_limit - state.metadata.iteration
+                0, state.metadata.iteration_limit - state.metadata.iteration
             ),
             "handoffs_used": state.handoff_count,
         },

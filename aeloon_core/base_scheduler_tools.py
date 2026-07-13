@@ -104,44 +104,79 @@ def build_base_scheduler_tools(
     async def archive_worker(worker_id: str) -> str:
         return _json(control.archive_worker(worker_id))
 
-    for name, description, model, handler in (
+    for name, description, model, handler, concurrency_mode in (
         (
             "discover_profiles",
             "List active Worker Profile capabilities.",
             _NoArgs,
             discover_profiles,
+            "read_only",
         ),
         (
             "list_workers",
             "List this Base session's Workers and whether each is safe to reuse.",
             _NoArgs,
             list_workers,
+            "read_only",
         ),
         (
             "inspect_worker",
             "Read one Worker's bounded lifecycle and results.",
             _WorkerId,
             inspect_worker,
+            "read_only",
         ),
         (
             "spawn_worker",
             "Create a clean Worker only when no compatible reusable Worker exists.",
             _SpawnArgs,
             spawn_worker,
+            "mutating",
         ),
         (
             "send_worker",
             "Reuse one idle Worker's private context for a related follow-up task.",
             _SendArgs,
             send_worker,
+            "mutating",
         ),
-        ("await_workers", "Wait for one or more Worker runs.", _AwaitArgs, await_workers),
-        ("resume_worker", "Resume one recoverable Worker run.", _RunId, resume_worker),
-        ("cancel_worker", "Cancel one Worker run.", _RunId, cancel_worker),
-        ("archive_worker", "Archive one inactive Worker.", _WorkerId, archive_worker),
+        (
+            "await_workers",
+            "Wait for one or more Worker runs.",
+            _AwaitArgs,
+            await_workers,
+            "read_only",
+        ),
+        (
+            "resume_worker",
+            "Resume one recoverable Worker run.",
+            _RunId,
+            resume_worker,
+            "mutating",
+        ),
+        (
+            "cancel_worker",
+            "Cancel one Worker run.",
+            _RunId,
+            cancel_worker,
+            "mutating",
+        ),
+        (
+            "archive_worker",
+            "Archive one inactive Worker.",
+            _WorkerId,
+            archive_worker,
+            "mutating",
+        ),
     ):
         registry.register(
-            FunctionTool(name=name, description=description, args_model=model, handler=handler)
+            FunctionTool(
+                name=name,
+                description=description,
+                args_model=model,
+                handler=handler,
+                concurrency_mode=concurrency_mode,
+            )
         )
     return registry
 
