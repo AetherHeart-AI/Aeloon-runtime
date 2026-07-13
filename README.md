@@ -2,19 +2,21 @@
 
 A minimal, independent Aeloon agent-loop playground. It provides an explicit
 state-machine runtime, an OpenAI-compatible provider, a small set of local tools,
-JSONL session persistence, and a terminal debugging CLI.
+JSONL session persistence, and an OpenTUI command deck.
 
 ## Quick Start
 
 ```bash
 uv sync
+bun install --cwd aeloon_core/tui
 export AELOON_CORE_API_KEY="..."
 export AELOON_CORE_API_BASE="https://api.openai.com/v1"
 export AELOON_CORE_MODEL="gpt-4.1-mini"
 uv run python -m aeloon_core "List the current directory and read README.md"
 ```
 
-Run the opencode-style terminal CLI:
+Interactive chat uses [OpenTUI](https://opentui.com/) and requires Bun 1.3 or
+newer. Run it with:
 
 ```bash
 uv run aeloon-core
@@ -22,48 +24,79 @@ uv run aeloon-core
 uv run aeloon-core chat
 ```
 
-Inside the CLI, type prompts directly. The default terminal view is deliberately
-quiet: it keeps the workspace, model, session id, streamed assistant output,
-tool and sub-agent lifecycles, flow-changing Guard decisions, errors, and compact
-token statistics. Raw reasoning, routine status updates, profile artifact
-metadata, turn UUID separators, and gateway logs are hidden by default. A Guard
-decision is rendered as a concise line such as
-`⚠ Guard [guard] · 重试 · tool_error`.
+The default Master view is deliberately compressed: it keeps the conversation,
+high-signal file and command actions, Worker lifecycle, flow-changing Guard
+decisions, errors, and compact turn statistics. Routine reads, raw tool payloads,
+and gateway logs are available in verbose or Logs views. Reasoning dumps,
+heartbeats, and internal UUIDs are never part of the default transcript.
+
+The composer remains live while a turn runs. New prompts enter a FIFO queue
+instead of waiting for the current turn to end. `Tab` moves between the composer,
+Master transcript, and Worker tabs; unread Worker activity does not steal focus
+or move a manually pinned scroll position.
 
 Useful interactive commands:
 
 ```text
 /help
+/workers
+/worker <label>
+/verbosity compact|verbose
+/logs
 /sessions
 /resume <session-id>
 /new
-/logs debug
-/logs off
+/spawn <profile> <task>
+/cancel-turn
+/cancel [worker]
+/resume-worker [instruction…]
 /quit
 ```
 
-You can also run one rich-rendered turn and exit:
+From Worker Detail, `r` focuses the composer with `/resume-worker ` ready for
+an explicit continuation or retry instruction. Terminal runs are never
+silently replayed, which avoids repeating file writes or external side effects.
+
+An explicit initial prompt keeps the line-oriented renderer and exits after one
+turn. This is also the fallback for non-interactive stdin/stdout, so scripts and
+pipes do not enter the alternate-screen UI:
 
 ```bash
 uv run aeloon-core chat "List the current directory"
 uv run aeloon-core tui "Read README.md"
 ```
 
-Enable gateway diagnostics explicitly when needed:
+Open the Logs view initially when gateway diagnostics are needed:
 
 ```bash
 # Compact gateway logs at the default INFO level
 uv run aeloon-core chat --show-gateway-logs
 
 # Setting a level or requesting detail also enables gateway logs
-uv run aeloon-core tui --gateway-log-level DEBUG --gateway-log-detail "Read README.md"
+uv run aeloon-core tui --gateway-log-level DEBUG --gateway-log-detail
 
 # The compatibility flag always wins when options are composed by scripts
 uv run aeloon-core chat --gateway-log-level DEBUG --hide-gateway-logs
 ```
 
+These flags seed the OpenTUI Logs view and log detail settings; `/logs` and
+`/verbosity` can change them while the application is running.
+
 Runtime commands use the directory where you invoke `aeloon-core` as the
 workspace. To target a different folder for one command, pass `--workspace`.
+
+For frontend development, run its checks independently:
+
+```bash
+bun --cwd aeloon_core/tui run check
+```
+
+If interactive launch reports missing OpenTUI dependencies, rerun
+`bun install --cwd aeloon_core/tui`. The Python launcher passes the active
+workspace and session as non-sensitive environment values. Full runtime
+configuration stays in the Python launcher; Bun receives only an inherited
+NDJSON socket plus non-sensitive UI context. Provider credentials and the
+operator's tool environment therefore never enter the frontend process.
 
 ## Config
 

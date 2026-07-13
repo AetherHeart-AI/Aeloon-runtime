@@ -390,15 +390,13 @@ class AeloonCoreOrchestrator:
             run.context.permissions.tool_names,
         )
         parent_progress = self.worker_manager.progress_for(run.run_id)
-        worker_progress = (
-            WorkerProgress(
-                parent=parent_progress,
-                worker_id=worker.worker_id,
-                run_id=run.run_id,
-                profile_id=worker.profile.profile_id,
-            )
-            if parent_progress is not None
-            else None
+        worker_progress = WorkerProgress(
+            parent=parent_progress,
+            worker_id=worker.worker_id,
+            run_id=run.run_id,
+            run_sequence=run.run_sequence,
+            profile_id=worker.profile.profile_id,
+            journal=self.worker_manager.ui_journal,
         )
         defaults = self.config.agents.defaults
         state = await run_agent_loop(

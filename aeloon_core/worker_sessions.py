@@ -62,6 +62,7 @@ class RunnerAttemptStatus(StrEnum):
 class WorkerOperation(StrEnum):
     SPAWN = "spawn"
     SEND = "send"
+    RECOVERY = "recovery"
 
 
 class IdempotencyConflictError(ValueError):
@@ -144,6 +145,7 @@ class WorkerRunRecord:
     idempotency_key: str
     created_at: str
     result: ResultEnvelope | None = None
+    run_sequence: int = 1
 
 
 class WorkerStore:
@@ -153,8 +155,11 @@ class WorkerStore:
         self.data_dir = Path(data_dir)
         self.path = self.data_dir / "worker-control.sqlite3"
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as connection:
-            connection.executescript(
+        # Schema discovery and migration must share one write lock. Otherwise
+        # two processes opening the same legacy database can both observe a
+        # missing column before either ALTER TABLE commits.
+        with self._transaction() as connection:
+            connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS worker_sessions (
                   worker_id TEXT PRIMARY KEY,
@@ -162,10 +167,15 @@ class WorkerStore:
                   profile_json TEXT NOT NULL,
                   status TEXT NOT NULL,
                   created_at TEXT NOT NULL
-                );
+                )
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS worker_runs (
                   run_id TEXT PRIMARY KEY,
                   worker_id TEXT NOT NULL REFERENCES worker_sessions(worker_id),
+                  run_sequence INTEGER NOT NULL,
                   base_turn_id TEXT,
                   status TEXT NOT NULL,
                   context_json TEXT NOT NULL,
@@ -175,17 +185,20 @@ class WorkerStore:
                   created_at TEXT NOT NULL,
                   updated_at TEXT NOT NULL,
                   UNIQUE(worker_id, idempotency_key)
-                );
-                CREATE INDEX IF NOT EXISTS worker_runs_worker_idx
-                  ON worker_runs(worker_id, created_at DESC);
+                )
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS worker_checkpoints (
                   run_id TEXT PRIMARY KEY REFERENCES worker_runs(run_id),
                   checkpoint_json TEXT NOT NULL,
                   created_at TEXT NOT NULL
-                );
+                )
                 """
             )
             self._migrate_worker_run_operation_type(connection)
+            self._migrate_worker_run_sequence(connection)
 
     def create_worker(
         self,
@@ -224,12 +237,14 @@ class WorkerStore:
             )
             connection.execute(
                 "INSERT INTO worker_runs("
-                "run_id, worker_id, base_turn_id, status, context_json, result_json, "
+                "run_id, worker_id, run_sequence, base_turn_id, status, "
+                "context_json, result_json, "
                 "operation_type, idempotency_key, created_at, updated_at"
-                ") VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
+                ") VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
                 (
                     run_id,
                     worker_id,
+                    self._next_run_sequence(connection, worker_id),
                     base_turn_id,
                     WorkerRunStatus.QUEUED,
                     _dump(context),
@@ -248,7 +263,7 @@ class WorkerStore:
                     now,
                 ),
                 WorkerRunRecord(run_id, worker_id, base_turn_id, WorkerRunStatus.QUEUED,
-                                context, idempotency_key, now),
+                                context, idempotency_key, now, run_sequence=1),
                 True,
             )
 
@@ -281,7 +296,8 @@ class WorkerStore:
     def list_runs(self, worker_id: str) -> list[WorkerRunRecord]:
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM worker_runs WHERE worker_id = ? ORDER BY created_at", (worker_id,)
+                "SELECT * FROM worker_runs WHERE worker_id = ? ORDER BY run_sequence",
+                (worker_id,),
             ).fetchall()
         return [self._run_from_row(row) for row in rows]
 
@@ -311,14 +327,17 @@ class WorkerStore:
                     context=context,
                 )
                 return self._run_from_row(existing), False
+            run_sequence = self._next_run_sequence(connection, worker_id)
             connection.execute(
                 "INSERT INTO worker_runs("
-                "run_id, worker_id, base_turn_id, status, context_json, result_json, "
+                "run_id, worker_id, run_sequence, base_turn_id, status, "
+                "context_json, result_json, "
                 "operation_type, idempotency_key, created_at, updated_at"
-                ") VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
+                ") VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
                 (
                     run_id,
                     worker_id,
+                    run_sequence,
                     base_turn_id,
                     WorkerRunStatus.QUEUED,
                     _dump(context),
@@ -337,6 +356,101 @@ class WorkerStore:
                     context,
                     idempotency_key,
                     now,
+                    run_sequence=run_sequence,
+                ),
+                True,
+            )
+
+    def create_recovery_run(
+        self,
+        *,
+        source_run_id: str,
+        context: ContextEnvelope,
+        idempotency_key: str,
+        base_turn_id: str | None = None,
+    ) -> tuple[WorkerRunRecord, bool]:
+        """Atomically continue the latest terminal Run, or replay that recovery."""
+
+        now = _now()
+        run_id = uuid.uuid4().hex
+        with self._transaction() as connection:
+            source_row = connection.execute(
+                "SELECT * FROM worker_runs WHERE run_id = ?",
+                (source_run_id,),
+            ).fetchone()
+            if source_row is None:
+                raise KeyError(f"unknown worker run: {source_run_id}")
+            source = self._run_from_row(source_row)
+            session = self._session_row(connection, source.worker_id)
+            if session.status is WorkerSessionStatus.ARCHIVED:
+                raise ValueError("archived Workers cannot be recovered")
+            if source.status not in {
+                WorkerRunStatus.COMPLETED,
+                WorkerRunStatus.PARTIAL,
+                WorkerRunStatus.FAILED,
+                WorkerRunStatus.CANCELLED,
+            }:
+                raise ValueError(
+                    f"Worker run status {source.status.value!r} is not recoverable"
+                )
+
+            existing = connection.execute(
+                "SELECT * FROM worker_runs WHERE worker_id = ? AND idempotency_key = ?",
+                (source.worker_id, idempotency_key),
+            ).fetchone()
+            if existing is not None:
+                self._validate_idempotent_replay(
+                    existing,
+                    operation=WorkerOperation.RECOVERY,
+                    base_turn_id=base_turn_id,
+                    context=context,
+                )
+                if int(existing["run_sequence"]) != source.run_sequence + 1:
+                    raise IdempotencyConflictError(
+                        f"idempotency conflict for key {idempotency_key!r}: "
+                        "request differs in source run"
+                    )
+                return self._run_from_row(existing), False
+
+            latest = connection.execute(
+                "SELECT * FROM worker_runs WHERE worker_id = ? "
+                "ORDER BY run_sequence DESC LIMIT 1",
+                (source.worker_id,),
+            ).fetchone()
+            assert latest is not None
+            if latest["run_id"] != source.run_id:
+                raise ValueError("the Worker already moved to a newer run; inspect it again")
+
+            run_sequence = source.run_sequence + 1
+            connection.execute(
+                "INSERT INTO worker_runs("
+                "run_id, worker_id, run_sequence, base_turn_id, status, "
+                "context_json, result_json, "
+                "operation_type, idempotency_key, created_at, updated_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
+                (
+                    run_id,
+                    source.worker_id,
+                    run_sequence,
+                    base_turn_id,
+                    WorkerRunStatus.QUEUED,
+                    _dump(context),
+                    WorkerOperation.RECOVERY,
+                    idempotency_key,
+                    now,
+                    now,
+                ),
+            )
+            return (
+                WorkerRunRecord(
+                    run_id,
+                    source.worker_id,
+                    base_turn_id,
+                    WorkerRunStatus.QUEUED,
+                    context,
+                    idempotency_key,
+                    now,
+                    run_sequence=run_sequence,
                 ),
                 True,
             )
@@ -627,6 +741,71 @@ class WorkerStore:
         )
 
     @staticmethod
+    def _migrate_worker_run_sequence(connection: sqlite3.Connection) -> None:
+        """Add a durable per-Worker order to databases created before run sequences."""
+
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(worker_runs)").fetchall()
+        }
+        if "run_sequence" not in columns:
+            # SQLite cannot add a non-null column without a default. Zero is a
+            # migration-only sentinel; every row is backfilled before the unique
+            # index is installed, and application writes always allocate >= 1.
+            connection.execute(
+                "ALTER TABLE worker_runs ADD COLUMN run_sequence "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+
+        invalid = connection.execute(
+            "SELECT 1 FROM worker_runs WHERE run_sequence < 1 LIMIT 1"
+        ).fetchone()
+        duplicates = connection.execute(
+            "SELECT 1 FROM worker_runs GROUP BY worker_id, run_sequence "
+            "HAVING COUNT(*) > 1 LIMIT 1"
+        ).fetchone()
+        if invalid is not None or duplicates is not None:
+            rows = connection.execute(
+                "SELECT rowid, worker_id FROM worker_runs "
+                "ORDER BY worker_id, created_at, rowid"
+            ).fetchall()
+            worker_id: str | None = None
+            run_sequence = 0
+            for row in rows:
+                if row["worker_id"] != worker_id:
+                    worker_id = str(row["worker_id"])
+                    run_sequence = 0
+                run_sequence += 1
+                connection.execute(
+                    "UPDATE worker_runs SET run_sequence = ? WHERE rowid = ?",
+                    (run_sequence, row["rowid"]),
+                )
+
+        # Replace the old timestamp index only after backfill. The named unique
+        # index enforces allocation correctness for every future writer.
+        connection.execute("DROP INDEX IF EXISTS worker_runs_worker_idx")
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS worker_runs_worker_idx "
+            "ON worker_runs(worker_id, run_sequence DESC)"
+        )
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS worker_runs_sequence_unique_idx "
+            "ON worker_runs(worker_id, run_sequence)"
+        )
+
+    @staticmethod
+    def _next_run_sequence(connection: sqlite3.Connection, worker_id: str) -> int:
+        """Allocate the next sequence inside the caller's immediate transaction."""
+
+        row = connection.execute(
+            "SELECT COALESCE(MAX(run_sequence), 0) + 1 AS next_sequence "
+            "FROM worker_runs WHERE worker_id = ?",
+            (worker_id,),
+        ).fetchone()
+        assert row is not None
+        return int(row["next_sequence"])
+
+    @staticmethod
     def _validate_idempotent_replay(
         row: sqlite3.Row,
         *,
@@ -676,7 +855,7 @@ class WorkerStore:
             row["run_id"], row["worker_id"], row["base_turn_id"], WorkerRunStatus(row["status"]),
             ContextEnvelope.model_validate_json(row["context_json"]), row["idempotency_key"],
             row["created_at"], ResultEnvelope.model_validate_json(row["result_json"])
-            if row["result_json"] else None,
+            if row["result_json"] else None, int(row["run_sequence"]),
         )
 
     def _connect(self) -> sqlite3.Connection:

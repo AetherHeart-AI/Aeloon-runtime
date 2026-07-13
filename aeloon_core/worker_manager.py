@@ -26,6 +26,7 @@ from aeloon_core.worker_sessions import (
     WorkerSessionRecord,
     WorkerStore,
 )
+from aeloon_core.worker_ui import WorkerUiJournal
 
 ToolOutcome = Literal["known", "unknown", "none"]
 
@@ -67,10 +68,14 @@ class WorkerSessionManager:
         on_lifecycle: LifecycleHook | None = None,
         max_concurrency: int = 4,
         heartbeat_interval_seconds: float = 10.0,
+        ui_journal: WorkerUiJournal | None = None,
     ) -> None:
         self.store = store
         self.executor = executor
         self.on_lifecycle = on_lifecycle
+        # This journal is an operator projection only. It is deliberately not
+        # surfaced by WorkerControlService, which is also callable by Base.
+        self.ui_journal = ui_journal or WorkerUiJournal(store)
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._progress: dict[str, Any] = {}
         # Hot Worker context belongs to the WorkerSession, never to Base history.
@@ -143,15 +148,27 @@ class WorkerSessionManager:
         context: ContextEnvelope,
         idempotency_key: str,
         base_turn_id: str | None = None,
+        source_run_id: str | None = None,
         start: bool = True,
         progress: Any | None = None,
     ) -> tuple[WorkerRunRecord, bool]:
-        run, created = self.store.create_run(
-            worker_id=worker_id,
-            context=context,
-            idempotency_key=idempotency_key,
-            base_turn_id=base_turn_id,
-        )
+        if source_run_id is None:
+            run, created = self.store.create_run(
+                worker_id=worker_id,
+                context=context,
+                idempotency_key=idempotency_key,
+                base_turn_id=base_turn_id,
+            )
+        else:
+            source = self.store.get_run(source_run_id)
+            if source.worker_id != worker_id:
+                raise ValueError("recovery source belongs to a different Worker")
+            run, created = self.store.create_recovery_run(
+                source_run_id=source_run_id,
+                context=context,
+                idempotency_key=idempotency_key,
+                base_turn_id=base_turn_id,
+            )
         self._bind_progress(run, progress, created=created)
         if created:
             await self._emit("created", run)
@@ -382,6 +399,11 @@ class WorkerSessionManager:
             )
 
     async def _emit(self, event: str, run: WorkerRunRecord) -> None:
+        try:
+            await asyncio.to_thread(self.ui_journal.record_lifecycle, event, run)
+        except Exception as exc:
+            # UI observability must never change a Worker's execution outcome.
+            logger.warning("Ignoring Worker UI journal failure: {}", exc)
         if self.on_lifecycle is not None:
             await self._invoke_observer(self.on_lifecycle, event, run)
         progress = self._progress.get(run.run_id)
@@ -394,6 +416,7 @@ class WorkerSessionManager:
                     event=event,
                     worker_id=run.worker_id,
                     run_id=run.run_id,
+                    run_sequence=run.run_sequence,
                     profile_id=worker.profile.profile_id,
                     status=run.status.value,
                     duration_ms=run.result.duration_ms if run.result is not None else None,
@@ -411,6 +434,7 @@ class WorkerSessionManager:
             hook,
             worker_id=run.worker_id,
             run_id=run.run_id,
+            run_sequence=run.run_sequence,
             profile_id=worker.profile.profile_id,
             status=run.status.value,
             elapsed_ms=elapsed_ms,

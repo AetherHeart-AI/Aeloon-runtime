@@ -232,6 +232,7 @@ class TurnEventProgress:
         run_id: str,
         profile_id: str,
         status: str,
+        run_sequence: int = 1,
         duration_ms: int | None = None,
         summary: str | None = None,
     ) -> None:
@@ -244,6 +245,7 @@ class TurnEventProgress:
                 phase=event,
                 worker_id=worker_id,
                 run_id=run_id,
+                run_sequence=max(1, int(run_sequence)),
                 profile_id=profile_id,
                 status=status,
                 duration_ms=duration_ms,
@@ -259,12 +261,14 @@ class TurnEventProgress:
         profile_id: str,
         status: str,
         elapsed_ms: int,
+        run_sequence: int = 1,
     ) -> None:
         await self.emit(
             "chat.worker.heartbeat",
             self._payload(
                 worker_id=worker_id,
                 run_id=run_id,
+                run_sequence=max(1, int(run_sequence)),
                 profile_id=profile_id,
                 status=status,
                 elapsed_ms=max(0, elapsed_ms),
@@ -281,6 +285,7 @@ class TurnEventProgress:
         label: str,
         revision: int,
         phase: str,
+        run_sequence: int = 1,
         role_id: str | None = None,
         tool_names: tuple[str, ...] = (),
         current_step: str | None = None,
@@ -308,6 +313,7 @@ class TurnEventProgress:
             self._payload(
                 worker_id=worker_id,
                 run_id=run_id,
+                run_sequence=max(1, int(run_sequence)),
                 profile_id=profile_id,
                 label=label,
                 revision=max(1, int(revision)),
@@ -337,6 +343,7 @@ class TurnEventProgress:
         status: str,
         metrics: dict[str, Any],
         duration_ms: int | None,
+        run_sequence: int = 1,
     ) -> None:
         """Emit a typed safe projection, not Worker arguments or result text."""
 
@@ -345,6 +352,7 @@ class TurnEventProgress:
             self._payload(
                 worker_id=worker_id,
                 run_id=run_id,
+                run_sequence=max(1, int(run_sequence)),
                 profile_id=profile_id,
                 label=label,
                 tool_name=tool_name,
@@ -363,6 +371,7 @@ class TurnEventProgress:
         profile_id: str,
         label: str,
         resolution: Any,
+        run_sequence: int = 1,
     ) -> None:
         record = resolution.to_record()
         await self.emit(
@@ -370,6 +379,7 @@ class TurnEventProgress:
             self._payload(
                 worker_id=worker_id,
                 run_id=run_id,
+                run_sequence=max(1, int(run_sequence)),
                 profile_id=profile_id,
                 subagent_label=label,
                 **record,

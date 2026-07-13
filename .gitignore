@@ -7,6 +7,8 @@ __pycache__/
 web/node_modules/
 web/dist/
 web/tsconfig.tsbuildinfo
+aeloon_core/tui/node_modules/
+aeloon_core/tui/build/
 
 .DS_Store
 .env

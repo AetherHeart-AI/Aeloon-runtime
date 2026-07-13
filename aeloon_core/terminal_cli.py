@@ -22,6 +22,7 @@ from rich.text import Text
 
 from aeloon_core.config import Config
 from aeloon_core.loop_guard import tool_result_failed
+from aeloon_core.opentui_launcher import OpenTuiLaunchError, run_opentui
 from aeloon_core.orchestrator import AeloonCoreOrchestrator, TurnResult
 from aeloon_core.turn_events import TurnEventProgress
 
@@ -969,7 +970,20 @@ async def run_terminal_cli(
     gateway_log_level: str = "INFO",
     gateway_log_detail: bool = False,
 ) -> None:
-    """Run the terminal chat CLI."""
+    """Run OpenTUI for interactive chat and retain legacy stream rendering elsewhere."""
+
+    if prompt is None and _is_tty():
+        try:
+            await run_opentui(
+                config,
+                session_id=session_id,
+                show_gateway_logs=show_gateway_logs,
+                gateway_log_level=gateway_log_level,
+                gateway_log_detail=gateway_log_detail,
+            )
+        except OpenTuiLaunchError as exc:
+            raise SystemExit(str(exc)) from None
+        return
 
     cli = TerminalChatCli(
         config,

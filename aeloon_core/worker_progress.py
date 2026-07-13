@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import re
 import unicodedata
+from collections import deque
+from dataclasses import dataclass
 from time import perf_counter
 from typing import Any
 
@@ -36,6 +39,14 @@ _ACTIVITY_PHASES = {
     "branch_done",
     "synthesizing",
 }
+_MAX_PENDING_JOURNAL_CALLS = 64
+
+
+@dataclass(frozen=True, slots=True)
+class _BufferedJournalCall:
+    name: str
+    kwargs: dict[str, Any]
+    priority: int
 
 
 class WorkerProgress:
@@ -48,10 +59,14 @@ class WorkerProgress:
         worker_id: str,
         run_id: str,
         profile_id: str,
+        run_sequence: int = 1,
+        journal: Any | None = None,
     ) -> None:
         self.parent = parent
+        self.journal = journal
         self.worker_id = worker_id
         self.run_id = run_id
+        self.run_sequence = max(1, int(run_sequence))
         self.profile_id = profile_id
         self.label = f"{profile_id}#{worker_id[:8]}"
         self._tool_started: dict[str, float] = {}
@@ -60,6 +75,9 @@ class WorkerProgress:
         self._role_ids: dict[str, str] = {}
         self._last_activity: dict[str, tuple[Any, ...]] = {}
         self._activity_revisions: dict[str, int] = {}
+        self._journal_calls: deque[_BufferedJournalCall] = deque()
+        self._journal_task: asyncio.Task[None] | None = None
+        self._journal_dropped_calls = 0
 
     async def __call__(self, text: str, *, tool_hint: bool = False) -> None:
         del text, tool_hint
@@ -88,10 +106,16 @@ class WorkerProgress:
         del usage, node_kind, component
 
     async def on_guard_resolution(self, resolution: Any) -> None:
+        self._call_journal(
+            "record_guard",
+            run_id=self.run_id,
+            resolution=resolution,
+        )
         await self._call_parent(
             "on_worker_guard_resolution",
             worker_id=self.worker_id,
             run_id=self.run_id,
+            run_sequence=self.run_sequence,
             profile_id=self.profile_id,
             label=self.label,
             resolution=resolution,
@@ -246,10 +270,19 @@ class WorkerProgress:
             else None
         )
         tool_name, status, metrics = _safe_tool_projection(node)
+        self._call_journal(
+            "record_tool",
+            run_id=self.run_id,
+            tool_name=tool_name,
+            status=status,
+            metrics=metrics,
+            duration_ms=duration_ms,
+        )
         await self._call_parent(
             "on_worker_tool_result",
             worker_id=self.worker_id,
             run_id=self.run_id,
+            run_sequence=self.run_sequence,
             profile_id=self.profile_id,
             label=label,
             tool_name=tool_name,
@@ -321,10 +354,22 @@ class WorkerProgress:
         self._last_activity[label] = fingerprint
         revision = self._activity_revisions.get(label, 0) + 1
         self._activity_revisions[label] = revision
+        self._call_journal(
+            "record_activity",
+            run_id=self.run_id,
+            phase=phase,
+            role_id=resolved_role,
+            tool_names=tool_names,
+            current_step=step_text,
+            todo_completed=completed,
+            todo_total=total,
+            detail_source=detail_source,
+        )
         await self._call_parent(
             "on_worker_activity",
             worker_id=self.worker_id,
             run_id=self.run_id,
+            run_sequence=self.run_sequence,
             profile_id=self.profile_id,
             label=label,
             revision=revision,
@@ -342,11 +387,123 @@ class WorkerProgress:
         if hook is None:
             return
         try:
-            result = hook(**kwargs)
+            if inspect.iscoroutinefunction(hook):
+                result = hook(**kwargs)
+            else:
+                result = await asyncio.to_thread(hook, **kwargs)
             if inspect.isawaitable(result):
                 await result
         except Exception as exc:
             logger.warning("Ignoring Worker progress observer failure: {}", exc)
+
+    @property
+    def pending_journal_calls(self) -> int:
+        return len(self._journal_calls)
+
+    @property
+    def dropped_journal_calls(self) -> int:
+        return self._journal_dropped_calls
+
+    async def flush_journal(self) -> None:
+        """Drain optional observability work outside the Worker execution path."""
+
+        while self._journal_task is not None:
+            await asyncio.shield(self._journal_task)
+        flush = getattr(self.journal, "flush", None)
+        if flush is None:
+            return
+        try:
+            if inspect.iscoroutinefunction(flush):
+                result = flush()
+            else:
+                result = await asyncio.to_thread(flush)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:
+            logger.warning("Ignoring Worker UI journal flush failure: {}", exc)
+
+    def _call_journal(self, name: str, **kwargs: Any) -> None:
+        hook = getattr(self.journal, name, None)
+        if hook is None:
+            return
+        if getattr(self.journal, "writes_are_buffered", False):
+            try:
+                hook(**kwargs)
+            except Exception as exc:
+                logger.warning("Ignoring Worker UI journal failure: {}", exc)
+            return
+
+        call = _BufferedJournalCall(
+            name=name,
+            kwargs=kwargs,
+            priority=_journal_call_priority(name, kwargs),
+        )
+        if len(self._journal_calls) >= _MAX_PENDING_JOURNAL_CALLS:
+            if name == "record_activity":
+                self._remove_latest_activity_call()
+            if len(self._journal_calls) >= _MAX_PENDING_JOURNAL_CALLS:
+                victim = next(
+                    (
+                        index
+                        for index, pending in enumerate(self._journal_calls)
+                        if pending.priority < call.priority
+                    ),
+                    None,
+                )
+                if victim is None:
+                    victim = next(
+                        (
+                            index
+                            for index, pending in enumerate(self._journal_calls)
+                            if pending.priority == call.priority and call.priority > 0
+                        ),
+                        None,
+                    )
+                    if victim is None:
+                        self._journal_dropped_calls += 1
+                        return
+                del self._journal_calls[victim]
+                self._journal_dropped_calls += 1
+        self._journal_calls.append(call)
+        if self._journal_task is None:
+            self._journal_task = asyncio.create_task(self._drain_journal_calls())
+
+    def _remove_latest_activity_call(self) -> None:
+        for index in range(len(self._journal_calls) - 1, -1, -1):
+            if self._journal_calls[index].name == "record_activity":
+                del self._journal_calls[index]
+                self._journal_dropped_calls += 1
+                return
+
+    async def _drain_journal_calls(self) -> None:
+        try:
+            while self._journal_calls:
+                call = self._journal_calls.popleft()
+                hook = getattr(self.journal, call.name, None)
+                if hook is None:
+                    continue
+                try:
+                    if inspect.iscoroutinefunction(hook):
+                        result = hook(**call.kwargs)
+                    else:
+                        result = await asyncio.to_thread(hook, **call.kwargs)
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception as exc:
+                    # UI observability cannot become part of Worker correctness.
+                    logger.warning("Ignoring Worker UI journal failure: {}", exc)
+        finally:
+            self._journal_task = None
+
+
+def _journal_call_priority(name: str, kwargs: dict[str, Any]) -> int:
+    if name == "record_activity":
+        return 0
+    if name == "record_guard":
+        return 2
+    if name == "record_tool" and kwargs.get("status") != "done":
+        return 2
+    return 1
 
 
 def _safe_tool_projection(node: TaskNode) -> tuple[str, str, dict[str, Any]]:
