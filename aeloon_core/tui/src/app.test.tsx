@@ -186,7 +186,7 @@ test("compact Master renders the command deck without implementation noise", asy
   expect(frame).toContain("coding#ab12")
   expect(frame).toContain("2/5")
   expect(frame).toContain("GUARD")
-  expect(frame).toContain("write")
+  expect(frame).toContain("WROTE")
   expect(frame).toContain("running")
   expect(frame).toContain("compact")
   expect(frame).toContain("Ask Aeloon to work in this workspace")
@@ -197,6 +197,61 @@ test("compact Master renders the command deck without implementation noise", asy
   expect(frame).not.toContain("private file contents")
   expect(frame).not.toContain("safe change")
 
+  setup.renderer.destroy()
+})
+
+test("completed turns collapse process rows and t restores the live timeline", async () => {
+  const completedEvents: BridgeEnvelope[] = [
+    { type: "event", event: "chat.turn.start", payload: {} },
+    {
+      type: "event",
+      event: "chat.block.add",
+      payload: { block: { content: "plan the check", id: "think-before", type: "reasoning" } },
+    },
+    {
+      type: "event",
+      event: "chat.block.add",
+      payload: { block: { arguments: { command: "bun test" }, id: "exec-fold", name: "exec", type: "tool_call" } },
+    },
+    {
+      type: "event",
+      event: "chat.block.update",
+      payload: { block_id: "exec-fold", patch: { duration_ms: 34, result: "ok\nExit code: 0", status: "done" } },
+    },
+    {
+      type: "event",
+      event: "chat.block.add",
+      payload: { block: { content: "inspect the result", id: "think-after", type: "reasoning" } },
+    },
+    {
+      type: "event",
+      event: "chat.block.add",
+      payload: { block: { content: "The focused tests pass.", id: "answer-fold", type: "text" } },
+    },
+    { type: "event", event: "chat.turn.end", payload: { duration_ms: 81 } },
+  ]
+  const setup = await testRender(
+    () => <App connect={false} initialEnvelopes={completedEvents} initialSnapshot={{ ...snapshot, history: [] }} />,
+    { height: 30, width: 100 },
+  )
+  await setup.flush()
+  let frame = setup.captureCharFrame()
+  expect(frame).toContain("▸ PROCESS · 1 tool · 81ms")
+  expect(frame).toContain("The focused tests pass.")
+  expect(frame).not.toContain("RAN bun test")
+
+  setup.mockInput.pressEscape()
+  await setup.flush()
+  setup.mockInput.pressTab()
+  setup.mockInput.pressTab()
+  await setup.flush()
+  setup.mockInput.pressKey("t")
+  await setup.flush()
+  frame = setup.captureCharFrame()
+  expect(frame).toContain("▾ PROCESS · 1 tool · 81ms")
+  expect(frame).toContain("RAN bun test · exit 0 · 15 chars / 2 lines · 34ms")
+  expect(frame.indexOf("thinking")).toBeLessThan(frame.indexOf("RAN bun test"))
+  expect(frame.indexOf("RAN bun test")).toBeLessThan(frame.lastIndexOf("thinking"))
   setup.renderer.destroy()
 })
 

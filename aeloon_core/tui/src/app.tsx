@@ -38,6 +38,8 @@ import {
   setVerbosity,
   setView,
   toggleVerbosity,
+  toggleTimelineItem,
+  toggleTurnProcess,
 } from "./model"
 import { PromptQueue } from "./prompt-queue"
 import type { BridgeEnvelope, JsonObject, ReadySnapshot } from "./protocol"
@@ -550,6 +552,11 @@ export function App(props: AppProps) {
       togglePin()
       return
     }
+    if (key.name === "t" && state.view.kind === "master") {
+      key.preventDefault()
+      mutate((draft) => toggleTurnProcess(draft))
+      return
+    }
     if (key.name === "m") {
       key.preventDefault()
       chooseView({ kind: "master" })
@@ -636,6 +643,8 @@ export function App(props: AppProps) {
         onPinChange={(pinned) => mutate((draft) => setPinned(draft, pinned))}
         onScrollRef={(value) => (scrollbox = value)}
         onToggleReport={() => setExpandedReport((value) => !value)}
+        onToggleTimelineItem={(itemId) => mutate((draft) => toggleTimelineItem(draft, itemId))}
+        onToggleTurnProcess={(turnId) => mutate((draft) => toggleTurnProcess(draft, turnId))}
         palette={palette()}
         state={state}
       />

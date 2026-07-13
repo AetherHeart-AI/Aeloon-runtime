@@ -2,12 +2,14 @@ import { describe, expect, test } from "bun:test"
 import {
   applyCommandResult,
   applyEnvelope,
+  appendUserPrompt,
   createAppState,
   hydrateReady,
   markTurnCancelled,
   setVerbosity,
   setView,
   visibleMasterItems,
+  visibleMasterTurns,
   visibleWorkerItems,
   waitingSummary,
 } from "./model"
@@ -67,17 +69,17 @@ describe("TUI event projection", () => {
     )
 
     const rendered = visibleMasterItems(state)
-    expect(rendered.map((item) => item.kind)).toEqual(["aggregate", "tool"])
-    expect(rendered[0]?.body).toBe("read ×2 · grep ×1")
-    expect(rendered[1]?.body).toBe("src/app.ts · 24 chars")
-    expect(JSON.stringify(rendered)).not.toContain("secret chain")
+    expect(rendered.map((item) => item.kind)).toEqual(["thinking", "aggregate", "tool"])
+    expect(rendered[0]?.collapsed).toBeTrue()
+    expect(rendered[1]?.body).toBe("read ×2 · grep ×1")
+    expect(rendered[2]?.primary).toBe("src/app.ts · 24 chars")
     expect(JSON.stringify(rendered)).not.toContain("gateway request")
     expect(JSON.stringify(rendered)).not.toContain("never-show-this")
     expect(JSON.stringify(rendered)).not.toContain("private file contents")
     expect(JSON.stringify(rendered)).not.toContain("sensitive implementation")
   })
 
-  test("verbose reveals low-signal rows, arguments, and logs but never reasoning", () => {
+  test("verbose reveals low-signal rows, arguments, logs, and folded reasoning", () => {
     const state = createAppState()
     applyEnvelope(
       state,
@@ -103,10 +105,11 @@ describe("TUI event projection", () => {
 
     setVerbosity(state, "verbose")
     const rendered = visibleMasterItems(state)
-    expect(rendered.map((item) => item.kind)).toEqual(["tool", "log"])
+    expect(rendered.map((item) => item.kind)).toEqual(["tool", "thinking", "log"])
     expect(rendered[0]?.rawDetail).toContain('"offset": 20')
-    expect(rendered[1]?.body).toBe("HTTP 200")
-    expect(JSON.stringify(state)).not.toContain("raw thought")
+    expect(rendered[1]?.body).toBe("raw thought")
+    expect(rendered[1]?.collapsed).toBeTrue()
+    expect(rendered[2]?.body).toBe("HTTP 200")
   })
 
   test("promotes a low-signal failure out of its aggregate", () => {
@@ -130,6 +133,60 @@ describe("TUI event projection", () => {
     expect(rendered[0]?.body).toBe("Routine checks completed")
     expect(rendered[1]?.status).toBe("failed")
     expect(rendered[1]?.body).toContain("permission denied")
+    applyEnvelope(state, event("chat.turn.end", { duration_ms: 12 }))
+    expect(visibleMasterTurns(state)[0]?.collapsed).toBeFalse()
+  })
+
+  test("preserves thinking and tool insertion order while extracting only the final answer", () => {
+    const state = createAppState()
+    appendUserPrompt(state, "ship the TUI")
+    applyEnvelope(state, event("chat.turn.start", {}))
+    applyEnvelope(state, event("chat.block.add", {
+      block: { content: "checking before execution", id: "reasoning-1", type: "reasoning" },
+    }))
+    applyEnvelope(state, event("chat.block.add", {
+      block: { arguments: { command: "bun test" }, id: "exec-1", name: "exec", type: "tool_call" },
+    }))
+    applyEnvelope(state, event("chat.block.update", {
+      block_id: "exec-1",
+      patch: { duration_ms: 34, result: "ok\nExit code: 0", status: "done" },
+    }))
+    applyEnvelope(state, event("chat.block.add", {
+      block: { content: "checking the result", id: "reasoning-2", type: "reasoning" },
+    }))
+    applyEnvelope(state, event("chat.block.add", {
+      block: { content: "Done.", id: "answer-1", type: "text" },
+    }))
+    applyEnvelope(state, event("chat.turn.end", { duration_ms: 80 }))
+
+    const turn = visibleMasterTurns(state)[0]
+    expect(turn?.collapsed).toBeTrue()
+    expect(turn?.processSummary).toContain("1 tool · 80ms")
+    expect(turn?.process.map((item) => [item.kind, item.body])).toEqual([
+      ["thinking", "checking before execution"],
+      ["tool", "exit 0 · 15 chars / 2 lines · 34ms"],
+      ["thinking", "checking the result"],
+    ])
+    expect(turn?.answer?.body).toBe("Done.")
+    expect(turn?.process[1]).toMatchObject({ verb: "RAN", primary: "bun test", metrics: "exit 0 · 15 chars / 2 lines · 34ms" })
+  })
+
+  test("an empty later turn never promotes an earlier cancelled narration to final answer", () => {
+    const state = createAppState()
+    appendUserPrompt(state, "first")
+    applyEnvelope(state, event("chat.turn.start", {}))
+    applyEnvelope(state, event("chat.block.add", {
+      block: { content: "unfinished", id: "old-text", type: "text" },
+    }))
+    markTurnCancelled(state)
+    appendUserPrompt(state, "second")
+    applyEnvelope(state, event("chat.turn.start", {}))
+    applyEnvelope(state, event("chat.turn.end", {}))
+
+    const turns = visibleMasterTurns(state)
+    expect(turns[0]?.answer).toBeUndefined()
+    expect(turns[0]?.process.some((item) => item.body === "unfinished")).toBeTrue()
+    expect(turns.at(-1)?.answer).toBeUndefined()
   })
 
   test("Worker unread never changes view or focus and clears on inspection", () => {
@@ -218,7 +275,9 @@ describe("TUI event projection", () => {
         event("chat.worker.tool.result", {
           duration_ms: 20,
           label: "coding#abcd",
-          metrics: name === "exec" ? { exit_code: 1 } : { result_chars: 10, result_lines: 2 },
+          metrics: name === "exec"
+            ? { command: "bun test src/model.test.ts", exit_code: 1 }
+            : { result_chars: 10, result_lines: 2 },
           profile_id: "coding",
           status: name === "exec" ? "error" : "done",
           tool_name: name,
@@ -234,6 +293,11 @@ describe("TUI event projection", () => {
       "tool",
       "tool",
     ])
+    expect(compact.find((item) => item.toolName === "exec")).toMatchObject({
+      metrics: "exit 1 · 20ms",
+      primary: "bun test src/model.test.ts",
+      verb: "RAN",
+    })
     expect(compact[1]?.body).toBe("read ×2 · grep ×1")
     expect(compact.at(-1)?.status).toBe("failed")
 

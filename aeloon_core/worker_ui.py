@@ -33,6 +33,7 @@ _GLOBAL_PRUNE_BATCH = 1_000
 _FLUSH_TIMEOUT_SECONDS = 0.5
 _MAX_STEP_CHARS = 160
 _MAX_SUMMARY_CHARS = 600
+_MAX_TOOL_COMMAND_CHARS = 160
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
 _ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|[@-_])")
 _INTERNAL_ID = re.compile(
@@ -239,6 +240,9 @@ class WorkerUiJournal:
             for key, value in metrics.items()
             if key in _TOOL_METRICS and _bounded_int(value) is not None
         }
+        command = _safe_text(metrics.get("command"), limit=_MAX_TOOL_COMMAND_CHARS)
+        if command:
+            safe_metrics["command"] = command
         payload: dict[str, Any] = {
             "tool_name": name,
             "status": safe_status,

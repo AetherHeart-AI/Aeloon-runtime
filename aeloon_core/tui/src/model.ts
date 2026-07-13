@@ -22,9 +22,11 @@ export type TimelineKind =
   | "guard"
   | "lifecycle"
   | "log"
+  | "narration"
   | "step"
   | "summary"
   | "system"
+  | "thinking"
   | "tool"
   | "user"
 
@@ -35,16 +37,31 @@ export interface TimelineItem {
   aggregateCounts?: Record<string, number>
   aggregateId?: string
   body?: string
+  collapsed?: boolean
   detail?: string
   id: string
   kind: TimelineKind
+  metrics?: string
+  primary?: string
   rawDetail?: string
+  resultPreview?: string
   signal: SignalLevel
   status?: TimelineStatus
   title: string
   toolName?: string
   ts?: string
+  verb?: string
   workerLabel?: string
+}
+
+export interface TurnGroup {
+  answer?: TimelineItem
+  collapsed: boolean
+  id: string
+  process: TimelineItem[]
+  processSummary: string
+  summary?: TimelineItem
+  user?: TimelineItem
 }
 
 export interface GatewayLog {
@@ -107,6 +124,7 @@ export interface AppState {
   sessionId: string
   sessionSwitching: boolean
   turnStartedAt?: number
+  turnProcessCollapsed: Record<string, boolean>
   turnToolNames: string[]
   usage: JsonObject
   verbosity: Verbosity
@@ -156,6 +174,7 @@ export function createAppState(): AppState {
     sessionId: "",
     sessionSwitching: false,
     turnToolNames: [],
+    turnProcessCollapsed: {},
     usage: {},
     verbosity: "compact",
     view: { kind: "master" },
@@ -186,6 +205,7 @@ export function hydrateReady(state: AppState, snapshot: ReadySnapshot): void {
   state.running = false
   state.turnStartedAt = undefined
   state.turnToolNames = []
+  state.turnProcessCollapsed = {}
   state.usage = {}
   state.gatewayLogs = []
   state.workers = {}
@@ -389,12 +409,63 @@ export function setPinned(state: AppState, pinned: boolean): void {
 export function visibleMasterItems(state: AppState): TimelineItem[] {
   const visible = state.masterTimeline.filter((item) => {
     if (state.verbosity === "compact") {
-      return item.kind === "aggregate" || (item.signal === "high" && item.kind !== "log")
+      return item.kind === "aggregate" || item.kind === "thinking" || (item.signal === "high" && item.kind !== "log")
     }
     return item.kind !== "aggregate"
   })
   if (state.verbosity === "verbose") return visible
   return visible.map((item) => (item.rawDetail ? { ...item, rawDetail: undefined } : item))
+}
+
+export function visibleMasterTurns(state: AppState): TurnGroup[] {
+  const groups: TurnGroup[] = []
+  let current: TurnGroup | undefined
+  for (const item of visibleMasterItems(state)) {
+    if (item.kind === "user") {
+      current = emptyTurn(item.id, item)
+      groups.push(current)
+      continue
+    }
+    if (!current || current.summary) {
+      current = emptyTurn(item.id)
+      groups.push(current)
+    }
+    if (item.kind === "summary") {
+      current.summary = item
+    } else {
+      current.process.push(item)
+    }
+  }
+  for (const group of groups) {
+    for (let index = group.process.length - 1; index >= 0; index -= 1) {
+      if (group.process[index]?.kind !== "assistant") continue
+      group.answer = group.process[index]
+      group.process = group.process
+        .filter((_, candidateIndex) => candidateIndex !== index)
+        .map((candidate) => candidate.kind === "assistant"
+          ? { ...candidate, kind: "narration", title: "NARRATION" }
+          : candidate)
+      break
+    }
+    const failed = group.process.filter((item) => item.status === "failed").length
+    const defaultCollapsed = Boolean(group.summary) && failed === 0
+    group.collapsed = state.turnProcessCollapsed[group.id] ?? defaultCollapsed
+    group.processSummary = formatProcessSummary(group.process, group.summary)
+  }
+  return groups
+}
+
+export function toggleTurnProcess(state: AppState, turnId?: string): void {
+  const groups = visibleMasterTurns(state).filter((group) => group.process.length)
+  const group = turnId ? groups.find((candidate) => candidate.id === turnId) : groups.at(-1)
+  if (!group) return
+  state.turnProcessCollapsed[group.id] = !group.collapsed
+}
+
+export function toggleTimelineItem(state: AppState, itemId: string): void {
+  const item = state.masterTimeline.find((candidate) => candidate.id === itemId)
+    ?? Object.values(state.workers).flatMap((worker) => worker.timeline).find((candidate) => candidate.id === itemId)
+  if (item) item.collapsed = !item.collapsed
 }
 
 export function visibleWorkerItems(state: AppState, workerId: string): TimelineItem[] {
@@ -553,15 +624,31 @@ function onBlockAdd(state: AppState, payload: JsonObject): void {
   const id = stringValue(block.id)
   const type = stringValue(block.type)
   if (!id || !type) return
-  if (type === "reasoning") return
+  if (type === "reasoning") {
+    const item = addMasterItem(state, {
+      body: stringValue(block.content),
+      collapsed: true,
+      kind: "thinking",
+      signal: "high",
+      status: "running",
+      title: "THINKING",
+      ts: stringValue(block.created_at),
+    })
+    state.pendingBlocks[id] = {
+      itemId: item.id,
+      startedAt: stringValue(block.created_at),
+      type,
+    }
+    return
+  }
 
   if (type === "text") {
     const item = addMasterItem(state, {
       body: stringValue(block.content),
-      kind: "assistant",
+      kind: "narration",
       signal: "high",
       status: "running",
-      title: "AELOON",
+      title: "NARRATION",
       ts: stringValue(block.created_at),
     })
     state.pendingBlocks[id] = { itemId: item.id, type }
@@ -577,13 +664,16 @@ function onBlockAdd(state: AppState, payload: JsonObject): void {
   const item = addMasterItem(state, {
     aggregateId,
     body: summarizeToolArguments(name, block.arguments),
+    collapsed: true,
     kind: "tool",
+    primary: summarizeToolArguments(name, block.arguments),
     rawDetail: safeJson(block.arguments),
     signal,
     status: "running",
     title: name === "todowrite" ? "TODO" : "TOOL",
     toolName: name,
     ts: stringValue(block.created_at),
+    verb: toolVerb(name),
     workerLabel: workerLabel || undefined,
   })
   state.pendingBlocks[id] = {
@@ -601,7 +691,7 @@ function onBlockAdd(state: AppState, payload: JsonObject): void {
 function onBlockDelta(state: AppState, payload: JsonObject): void {
   const id = stringValue(payload.block_id)
   const block = state.pendingBlocks[id]
-  if (!block || block.type !== "text" || !block.itemId) return
+  if (!block || (block.type !== "text" && block.type !== "reasoning") || !block.itemId) return
   const item = findMasterItem(state, block.itemId)
   if (item) item.body = `${item.body ?? ""}${stringValue(payload.delta)}`
 }
@@ -614,9 +704,16 @@ function onBlockUpdate(state: AppState, payload: JsonObject): void {
   if (!patch) return
 
   const item = block.itemId ? findMasterItem(state, block.itemId) : undefined
-  if (block.type === "text") {
+  if (block.type === "text" || block.type === "reasoning") {
     if (item && "content" in patch) item.body = stringValue(patch.content)
-    if (item && stringValue(patch.status) === "done") item.status = "done"
+    if (item && stringValue(patch.status) === "done") {
+      item.status = "done"
+      if (block.type === "text") {
+        item.kind = "assistant"
+        item.title = "AELOON"
+      }
+      if (block.type === "reasoning") item.metrics = formatDuration(numberValue(patch.duration_ms))
+    }
     return
   }
   if (block.type !== "tool_call") return
@@ -624,13 +721,16 @@ function onBlockUpdate(state: AppState, payload: JsonObject): void {
   const name = block.name ?? "tool"
   const failed = isFailedStatus(patch.status) || toolResultFailed(patch.result)
   if (item) {
-    item.body = summarizeToolResult(
+    item.metrics = summarizeToolResult(
       name,
       patch.result,
       block.arguments,
       failed,
       numberValue(patch.duration_ms),
     )
+    item.body = item.metrics
+    item.resultPreview = truncateText(stringValue(patch.result), RAW_DETAIL_LIMIT)
+    item.collapsed = !failed
     item.status = failed ? "failed" : "done"
     if (failed && item.signal === "low") {
       item.signal = "high"
@@ -753,28 +853,37 @@ function onWorkerToolResult(state: AppState, payload: JsonObject): void {
   const name = stringValue(payload.tool_name) || "tool"
   const failed = stringValue(payload.status) !== "done"
   const signal: SignalLevel = failed || !LOW_SIGNAL_TOOLS.has(name) ? "high" : "low"
-  const body = summarizeWorkerTool(name, objectValue(payload.metrics) ?? {}, numberValue(payload.duration_ms))
+  const display = workerToolDisplay(name, objectValue(payload.metrics) ?? {}, numberValue(payload.duration_ms))
+  const body = [display.primary, display.metrics].filter(Boolean).join(" · ")
   let aggregateId: string | undefined
   if (signal === "low") aggregateId = bumpWorkerAggregate(state, worker, name)
   appendWorkerItem(state, worker, {
     aggregateId,
     body,
+    collapsed: !failed,
     kind: "tool",
+    metrics: display.metrics,
+    primary: display.primary,
     signal,
     status: failed ? "failed" : "done",
     title: "TOOL",
     toolName: name,
     ts: stringValue(payload.ts),
+    verb: toolVerb(name),
   })
   if (signal === "high") {
     addMasterItem(state, {
       body,
+      collapsed: !failed,
       kind: "tool",
+      metrics: display.metrics,
+      primary: display.primary,
       signal: "high",
       status: failed ? "failed" : "done",
       title: "TOOL",
       toolName: name,
       ts: stringValue(payload.ts),
+      verb: toolVerb(name),
       workerLabel: worker.label,
     })
   }
@@ -814,11 +923,22 @@ function onTurnEnd(state: AppState, payload: JsonObject): void {
   state.running = false
   state.turnStartedAt = undefined
   state.lastTurnDurationMs = numberValue(payload.duration_ms)
-  for (const block of Object.values(state.pendingBlocks)) {
+  const pending = Object.values(state.pendingBlocks)
+  for (const block of pending) {
     if (block.type === "text" && block.itemId) {
       const item = findMasterItem(state, block.itemId)
       if (item) item.status = "done"
     }
+    if (block.type === "reasoning" && block.itemId) {
+      const item = findMasterItem(state, block.itemId)
+      if (item) item.status = "done"
+    }
+  }
+  const finalTextBlock = pending.filter((block) => block.type === "text" && block.itemId).at(-1)
+  const finalText = finalTextBlock?.itemId ? findMasterItem(state, finalTextBlock.itemId) : undefined
+  if (finalText) {
+    finalText.kind = "assistant"
+    finalText.title = "AELOON"
   }
   addMasterItem(state, {
     body: formatTurnSummary(state.lastTurnDurationMs, state.usage, state.turnToolNames),
@@ -996,19 +1116,25 @@ function projectWorkerJournalRow(state: AppState, row: JsonObject): TimelineItem
   if (kind === "tool") {
     const name = stringValue(row.tool_name) || "tool"
     const failed = stringValue(row.status) !== "done"
+    const display = workerToolDisplay(
+      name,
+      objectValue(row.metrics) ?? {},
+      numberValue(row.duration_ms),
+    )
+    const body = [display.primary, display.metrics].filter(Boolean).join(" · ")
     return {
-      body: summarizeWorkerTool(
-        name,
-        objectValue(row.metrics) ?? {},
-        numberValue(row.duration_ms),
-      ),
+      body,
+      collapsed: !failed,
       id: nextId(state, "worker-journal"),
       kind: "tool",
+      metrics: display.metrics,
+      primary: display.primary,
       signal: failed || stringValue(row.signal) !== "low" ? "high" : "low",
       status: failed ? "failed" : "done",
       title: "TOOL",
       toolName: name,
       ts,
+      verb: toolVerb(name),
     }
   }
   if (kind === "phase") {
@@ -1258,6 +1384,53 @@ function nextId(state: AppState, prefix: string): string {
   return `${prefix}-${state.sequence}`
 }
 
+function emptyTurn(id: string, user?: TimelineItem): TurnGroup {
+  return {
+    collapsed: false,
+    id,
+    process: [],
+    processSummary: "",
+    user,
+  }
+}
+
+function formatProcessSummary(items: TimelineItem[], summary?: TimelineItem): string {
+  let tools = 0
+  const workers = new Set<string>()
+  let failures = 0
+  for (const item of items) {
+    if (item.kind === "tool") tools += 1
+    if (item.kind === "aggregate") {
+      tools += Object.values(item.aggregateCounts ?? {}).reduce((total, count) => total + count, 0)
+    }
+    if (item.workerLabel) workers.add(item.workerLabel)
+    if (item.status === "failed") failures += 1
+  }
+  const parts = [`${tools} tool${tools === 1 ? "" : "s"}`]
+  if (workers.size) parts.push(`${workers.size} worker${workers.size === 1 ? "" : "s"}`)
+  const duration = summary?.body?.match(/(?:^| · )(\d+(?:\.\d+)?(?:ms|s)|\d+m\d+s)(?: · |$)/)?.[1]
+  if (duration) parts.push(duration)
+  if (failures) parts.push(`${failures} failed`)
+  return parts.join(" · ")
+}
+
+function toolVerb(name: string): string {
+  return ({
+    await: "AWAIT",
+    edit: "EDIT",
+    exec: "RAN",
+    glob: "INSPECT",
+    grep: "INSPECT",
+    inspect_worker: "INSPECT",
+    read: "READ",
+    spawn: "SPAWN",
+    spawn_worker: "SPAWN",
+    webfetch: "FETCHED",
+    websearch: "SEARCHED",
+    write: "WROTE",
+  } as Record<string, string>)[name] ?? name.replaceAll("_", " ").toUpperCase()
+}
+
 function formatAggregate(counts: Record<string, number>): string {
   const entries = Object.entries(counts).filter(([, count]) => count > 0)
   if (!entries.length) return "Routine checks completed"
@@ -1315,10 +1488,15 @@ function summarizeToolResult(
   return [`${text.length} chars / ${lineCount(text)} lines`, duration].filter(Boolean).join(" · ")
 }
 
-function summarizeWorkerTool(name: string, metrics: JsonObject, durationMs?: number): string {
+function workerToolDisplay(
+  name: string,
+  metrics: JsonObject,
+  durationMs?: number,
+): { metrics: string; primary: string } {
+  const primary = name === "exec"
+    ? oneLine(stringValue(metrics.command), 160) || "exec"
+    : stringValue(metrics.resource) || name
   const parts: string[] = []
-  const resource = stringValue(metrics.resource)
-  if (resource) parts.push(resource)
   if (name === "write" && numberValue(metrics.input_chars) !== undefined) {
     parts.push(`${numberValue(metrics.input_chars)} chars written`)
   } else if (name === "edit") {
@@ -1334,7 +1512,7 @@ function summarizeWorkerTool(name: string, metrics: JsonObject, durationMs?: num
   }
   const duration = formatDuration(durationMs)
   if (duration) parts.push(duration)
-  return parts.join(" · ") || "Completed"
+  return { metrics: parts.join(" · ") || "Completed", primary }
 }
 
 function formatTurnSummary(durationMs: number | undefined, usage: JsonObject, tools: string[]): string {
@@ -1479,6 +1657,10 @@ function safeJson(value: unknown): string {
   }
   if (rendered.length <= RAW_DETAIL_LIMIT) return rendered
   return `${rendered.slice(0, RAW_DETAIL_LIMIT)}… [${rendered.length - RAW_DETAIL_LIMIT} chars hidden]`
+}
+
+function truncateText(value: string, limit: number): string {
+  return value.length <= limit ? value : `${value.slice(0, limit)}… [${value.length - limit} chars hidden]`
 }
 
 function oneLine(value: string, limit: number): string {

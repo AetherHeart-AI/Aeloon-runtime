@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import re
+import shlex
 import unicodedata
 from collections import deque
 from dataclasses import dataclass
@@ -40,6 +41,22 @@ _ACTIVITY_PHASES = {
     "synthesizing",
 }
 _MAX_PENDING_JOURNAL_CALLS = 64
+_DISPLAYABLE_COMMANDS = {
+    "bun",
+    "find",
+    "git",
+    "ls",
+    "npm",
+    "pnpm",
+    "pytest",
+    "python",
+    "python3",
+    "ruff",
+    "tsc",
+    "uv",
+    "yarn",
+}
+_SHELL_OPERATORS = {"&", "&&", ";", "|", "||"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -527,6 +544,9 @@ def _safe_tool_projection(node: TaskNode) -> tuple[str, str, dict[str, Any]]:
         metrics["old_chars"] = len(str(arguments.get("old_text") or ""))
         metrics["new_chars"] = len(str(arguments.get("new_text") or ""))
     elif node.tool_name == "exec":
+        command = _safe_command_summary(arguments.get("command"))
+        if command:
+            metrics["command"] = command
         match = re.search(r"(?:Exit code|exit code|exit)\D*(-?\d+)", result)
         if match is not None:
             metrics["exit_code"] = int(match.group(1))
@@ -541,6 +561,49 @@ def _safe_tool_projection(node: TaskNode) -> tuple[str, str, dict[str, Any]]:
     elif node.tool_name in {"glob", "grep", "websearch"}:
         metrics["item_count"] = len([line for line in result.splitlines() if line.strip()])
     return node.tool_name, status, metrics
+
+
+def _safe_command_summary(value: Any, *, limit: int = 160) -> str:
+    """Return a bounded allowlisted operator hint without shell payloads."""
+
+    text = " ".join(str(value or "").splitlines()[0].split()) if value else ""
+    if not text:
+        return ""
+    try:
+        tokens = shlex.split(text)
+    except ValueError:
+        tokens = text.split()
+    while tokens and "=" in tokens[0] and not tokens[0].startswith(("./", "/")):
+        tokens.pop(0)
+    if not tokens:
+        return ""
+    executable = tokens[0].rsplit("/", 1)[-1]
+    if executable not in _DISPLAYABLE_COMMANDS:
+        return executable[:limit]
+    visible = [executable]
+    redact_next = False
+    for token in tokens[1:]:
+        if redact_next:
+            redact_next = False
+            continue
+        if token in _SHELL_OPERATORS:
+            visible.append("…")
+            break
+        if token in {"-c", "-e", "--eval"}:
+            visible.extend((token, "…"))
+            break
+        if re.search(r"(?i)(token|password|passwd|secret|api[-_]?key)", token):
+            visible.append("[redacted]")
+            redact_next = "=" not in token
+            continue
+        if re.match(r"(?i)https?://", token):
+            visible.append("[url]")
+            continue
+        visible.append(token[:80])
+        if len(" ".join(visible)) >= limit:
+            break
+    summary = " ".join(visible)
+    return summary if len(summary) <= limit else f"{summary[: limit - 1]}…"
 
 
 def _safe_current_todo(node: TaskNode) -> tuple[str, int, int] | None:

@@ -5,12 +5,13 @@ import type {
   AppState,
   GatewayLog,
   TimelineItem,
+  TurnGroup,
   View,
   WorkerInfo,
 } from "./model"
 import {
   usageCounters,
-  visibleMasterItems,
+  visibleMasterTurns,
   visibleWorkerItems,
   waitingSummary,
 } from "./model"
@@ -64,12 +65,14 @@ interface TranscriptPaneProps {
   onPinChange: (pinned: boolean) => void
   onScrollRef: (renderable: ScrollBoxRenderable) => void
   onToggleReport: () => void
+  onToggleTimelineItem: (itemId: string) => void
+  onToggleTurnProcess: (turnId: string) => void
   palette: Palette
   state: AppState
 }
 
 export function TranscriptPane(props: TranscriptPaneProps) {
-  const masterItems = createMemo(() => visibleMasterItems(props.state))
+  const masterTurns = createMemo(() => visibleMasterTurns(props.state))
   const selectedWorker = createMemo(() => {
     const view = props.state.view
     return view.kind === "worker" ? props.state.workers[view.workerId] : undefined
@@ -100,12 +103,14 @@ export function TranscriptPane(props: TranscriptPaneProps) {
       }}
     >
       <Show when={props.state.view.kind === "master"} fallback={<EmptySlot />}>
-        <For each={masterItems()} fallback={<EmptySlot />}>
-          {(item) => (
-            <TimelineRow
-              item={item}
+        <For each={masterTurns()} fallback={<EmptySlot />}>
+          {(turn) => (
+            <TurnView
+              onToggleItem={props.onToggleTimelineItem}
+              onToggleProcess={props.onToggleTurnProcess}
               palette={props.palette}
               showRaw={props.state.verbosity === "verbose"}
+              turn={turn}
             />
           )}
         </For>
@@ -124,6 +129,7 @@ export function TranscriptPane(props: TranscriptPaneProps) {
           <WorkerDetail
             expandedReport={props.expandedReport}
             onToggleReport={props.onToggleReport}
+            onToggleTimelineItem={props.onToggleTimelineItem}
             palette={props.palette}
             state={props.state}
             worker={worker()}
@@ -139,6 +145,7 @@ export function TranscriptPane(props: TranscriptPaneProps) {
 
 interface TimelineRowProps {
   item: TimelineItem
+  onToggle?: (itemId: string) => void
   palette: Palette
   showRaw?: boolean
 }
@@ -152,6 +159,63 @@ export function TimelineRow(props: TimelineRowProps) {
     if (props.item.workerLabel) parts.push(props.item.workerLabel)
     return parts.join(" · ")
   })
+  const expanded = createMemo(() => props.showRaw || props.item.collapsed === false)
+  const canExpand = createMemo(() => Boolean(props.item.resultPreview || props.item.rawDetail || props.item.kind === "thinking"))
+  if (props.item.kind === "tool") {
+    return (
+      <box width="100%" flexDirection="column" marginBottom={expanded() ? 1 : 0} flexShrink={0}>
+        <text
+          fg={color()}
+          selectable
+          selectionBg={props.palette.selection}
+          selectionFg={props.palette.foreground}
+          wrapMode="word"
+          onMouseDown={() => canExpand() && props.onToggle?.(props.item.id)}
+        >
+          {icon()} <strong>{props.item.verb ?? props.item.toolName?.toUpperCase() ?? "TOOL"}</strong>
+          {props.item.primary || props.item.body ? ` ${props.item.primary ?? props.item.body}` : ""}
+          {props.item.metrics ? ` · ${props.item.metrics}` : ""}
+          {props.item.workerLabel ? ` · ${props.item.workerLabel}` : ""}
+          {canExpand() ? ` ${expanded() ? "▾" : "▸"}` : ""}
+        </text>
+        <Show when={expanded() && props.item.resultPreview} fallback={<EmptySlot />}>
+          {(detail) => (
+            <text fg={props.palette.foreground} selectable selectionBg={props.palette.selection} wrapMode="word">
+              {detail()}
+            </text>
+          )}
+        </Show>
+        <Show when={expanded() && props.item.rawDetail} fallback={<EmptySlot />}>
+          {(detail) => (
+            <text fg={props.palette.muted} selectable selectionBg={props.palette.selection} wrapMode="word">
+              {detail()}
+            </text>
+          )}
+        </Show>
+      </box>
+    )
+  }
+  if (props.item.kind === "thinking") {
+    return (
+      <box width="100%" flexDirection="column" marginBottom={expanded() ? 1 : 0} flexShrink={0}>
+        <text
+          fg={props.palette.muted}
+          selectable
+          selectionBg={props.palette.selection}
+          onMouseDown={() => props.onToggle?.(props.item.id)}
+        >
+          {expanded() ? "▾" : "▸"} thinking{props.item.metrics ? ` · ${props.item.metrics}` : ""}
+        </text>
+        <Show when={expanded() && props.item.body} fallback={<EmptySlot />}>
+          {(body) => (
+            <text fg={props.palette.muted} selectable selectionBg={props.palette.selection} wrapMode="word">
+              {body()}
+            </text>
+          )}
+        </Show>
+      </box>
+    )
+  }
   return (
     <box width="100%" flexDirection="column" marginBottom={1} flexShrink={0}>
       <text
@@ -194,9 +258,57 @@ export function TimelineRow(props: TimelineRowProps) {
   )
 }
 
+interface TurnViewProps {
+  onToggleItem: (itemId: string) => void
+  onToggleProcess: (turnId: string) => void
+  palette: Palette
+  showRaw: boolean
+  turn: TurnGroup
+}
+
+function TurnView(props: TurnViewProps) {
+  return (
+    <box width="100%" flexDirection="column" marginBottom={1} flexShrink={0}>
+      <Show when={props.turn.user} fallback={<EmptySlot />}>
+        {(item) => <TimelineRow item={item()} palette={props.palette} showRaw={props.showRaw} />}
+      </Show>
+      <Show when={props.turn.process.length} fallback={<EmptySlot />}>
+        <box width="100%" flexDirection="column" flexShrink={0}>
+          <text
+            fg={props.turn.process.some((item) => item.status === "failed") ? props.palette.error : props.palette.muted}
+            selectable={false}
+            onMouseDown={() => props.onToggleProcess(props.turn.id)}
+          >
+            {props.turn.collapsed ? "▸" : "▾"} PROCESS · {props.turn.processSummary}
+          </text>
+          <Show when={!props.turn.collapsed} fallback={<EmptySlot />}>
+            <For each={props.turn.process} fallback={<EmptySlot />}>
+              {(item) => (
+                <TimelineRow
+                  item={item}
+                  onToggle={props.onToggleItem}
+                  palette={props.palette}
+                  showRaw={props.showRaw}
+                />
+              )}
+            </For>
+          </Show>
+        </box>
+      </Show>
+      <Show when={props.turn.answer} fallback={<EmptySlot />}>
+        {(item) => <TimelineRow item={item()} palette={props.palette} showRaw={props.showRaw} />}
+      </Show>
+      <Show when={props.turn.summary} fallback={<EmptySlot />}>
+        {(item) => <TimelineRow item={item()} palette={props.palette} showRaw={props.showRaw} />}
+      </Show>
+    </box>
+  )
+}
+
 interface WorkerDetailProps {
   expandedReport: boolean
   onToggleReport: () => void
+  onToggleTimelineItem: (itemId: string) => void
   palette: Palette
   state: AppState
   worker: WorkerInfo
@@ -266,6 +378,7 @@ export function WorkerDetail(props: WorkerDetailProps) {
         {(item) => (
           <TimelineRow
             item={item}
+            onToggle={props.onToggleTimelineItem}
             palette={props.palette}
             showRaw={props.state.verbosity === "verbose"}
           />
