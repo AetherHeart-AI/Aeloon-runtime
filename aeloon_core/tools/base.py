@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 
@@ -38,6 +38,26 @@ class Tool(ABC):
                 "parameters": _strip_titles(self.args_model.model_json_schema()),
             },
         }
+
+
+class FunctionTool(Tool):
+    """Small adapter for runtime-scoped atomic control-plane capabilities."""
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        description: str,
+        args_model: type[BaseModel],
+        handler: Callable[..., Awaitable[str]],
+    ) -> None:
+        self.name = name
+        self.description = description
+        self.args_model = args_model
+        self._handler = handler
+
+    async def execute(self, **kwargs: Any) -> str:
+        return await self._handler(**kwargs)
 
 
 def _strip_titles(node: Any) -> Any:

@@ -553,6 +553,11 @@ class WorkerAgent(BaseAgent):
                 )
             state.metadata.finalization_iteration += 1
             tool_defs: list[dict[str, Any]] = []
+            await self.runtime.emit_hook(
+                "on_agent_activity",
+                phase="finalizing",
+                role_id=state.active_agent_id,
+            )
             await self.runtime.emit_progress(
                 "Wrapping up..."
                 if state.metadata.finalization_iteration == 1
@@ -581,6 +586,11 @@ class WorkerAgent(BaseAgent):
                 tool_defs = [*tool_defs, *control_definitions]
             else:
                 tool_defs = self.runtime.tools.get_definitions()
+            await self.runtime.emit_hook(
+                "on_agent_activity",
+                phase="analyzing" if state.metadata.iteration == 1 else "planning",
+                role_id=state.active_agent_id,
+            )
             await self.runtime.emit_progress(
                 "Thinking..."
                 if state.metadata.iteration == 1

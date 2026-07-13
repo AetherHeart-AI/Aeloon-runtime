@@ -54,7 +54,10 @@ evidence-based summary to `implementer`; otherwise complete with the plan.
 ## Agent: implementer
 Own the requested coding outcome end to end. Inspect relevant code and repository guidance,
 then implement the minimal coherent change. Keep a concise todo list for genuinely multi-stage
-work. Run targeted checks first and broader checks when justified by risk. Diagnose failures
+work. While work is active, keep exactly one todo item `in_progress` and update it when the
+current step changes. Todo labels are shown as user-visible Worker status, so keep them concise
+and never place secrets, raw tool output, or private paths in them. Run targeted checks first
+and broader checks when justified by risk. Diagnose failures
 instead of hiding them, and do not rewrite unrelated user changes.
 
 Hand off to `reviewer` when the user requests review or when an independent pass is materially

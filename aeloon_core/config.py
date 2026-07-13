@@ -54,8 +54,9 @@ class AgentDefaultsConfig(BaseModel):
     max_iterations: int = 25
     max_auto_continue_iterations: int = 25
     max_finalization_iterations: int = 2
+    base_profile_id: str = Field(default="base", pattern=r"^base$")
     profile_id: str | None = Field(
-        default="coding",
+        default=None,
         pattern=r"^[a-z][a-z0-9_-]{0,63}$",
     )
     max_handoffs: int = Field(default=8, ge=0)

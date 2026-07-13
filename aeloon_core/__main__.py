@@ -12,10 +12,11 @@ from typing import Any
 from aeloon_core.config import Config, load_config, resolve_config_path, save_config
 from aeloon_core.orchestrator import AeloonCoreOrchestrator
 from aeloon_core.profile_cli import run_profile
+from aeloon_core.runner import run_worker_runner
 from aeloon_core.terminal_cli import LOG_LEVELS, run_terminal_cli
 from aeloon_core.turn_events import TurnEventProgress
 
-COMMANDS = {"run", "chat", "tui", "config", "profile"}
+COMMANDS = {"run", "chat", "tui", "config", "profile", "runner"}
 REMOVED_COMMANDS = {"webui"}
 CHAT_ONLY_OPTIONS = {
     "--show-gateway-logs",
@@ -33,6 +34,7 @@ CONFIG_SETTERS = {
     "max-iterations": ("agents", "defaults", "max_iterations"),
     "max-auto-continue-iterations": ("agents", "defaults", "max_auto_continue_iterations"),
     "max-finalization-iterations": ("agents", "defaults", "max_finalization_iterations"),
+    "base-profile-id": ("agents", "defaults", "base_profile_id"),
     "profile-id": ("agents", "defaults", "profile_id"),
     "max-handoffs": ("agents", "defaults", "max_handoffs"),
     "context-compaction-enabled": ("agents", "defaults", "context_compaction", "enabled"),
@@ -204,6 +206,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     profile_rollback.add_argument("artifact_id")
     _add_profile_store_args(profile_rollback)
+
+    runner_parser = subparsers.add_parser("runner", help="Run queued Worker sessions.")
+    runner_parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Drain the current queue and exit.",
+    )
+    runner_parser.add_argument("--poll-seconds", type=float, default=0.5)
+    _add_path_args(runner_parser)
 
     return parser
 
@@ -590,6 +601,16 @@ def main(argv: list[str] | None = None) -> None:
             run_profile(
                 args,
                 path_overrides=_load_with_path_overrides,
+            )
+        )
+        return
+    if args.command == "runner":
+        config = _load_with_path_overrides(args)
+        asyncio.run(
+            run_worker_runner(
+                AeloonCoreOrchestrator(config),
+                once=args.once,
+                poll_seconds=args.poll_seconds,
             )
         )
         return

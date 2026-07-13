@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -16,6 +17,22 @@ from aeloon_core.transitions import accumulate_usage
 
 Emit = Callable[[str, dict[str, Any]], Awaitable[None]]
 LOG_TEXT_PREVIEW_CHARS = 240
+_WORKER_ACTIVITY_PHASES = {
+    "analyzing",
+    "planning",
+    "drafting",
+    "using_tool",
+    "processing",
+    "working_step",
+    "finalizing",
+    "delegating",
+    "handoff",
+    "branch_running",
+    "branch_done",
+    "synthesizing",
+}
+_WORKER_ACTIVITY_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
+_WORKER_ACTIVITY_ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|[@-_])")
 
 
 class TurnEventProgress:
@@ -231,6 +248,169 @@ class TurnEventProgress:
                 reason=str(getattr(decision, "reason", "") or ""),
                 budget_grant=max(0, int(resolved_budget_grant or 0)),
                 fallback_used=bool(fallback_used),
+            ),
+        )
+
+    async def on_worker_lifecycle(
+        self,
+        *,
+        event: str,
+        worker_id: str,
+        run_id: str,
+        profile_id: str,
+        status: str,
+        duration_ms: int | None = None,
+        summary: str | None = None,
+    ) -> None:
+        """Publish host-owned lifecycle only; never publish a Worker report."""
+
+        del summary
+        await self.emit(
+            "chat.worker.lifecycle",
+            self._payload(
+                phase=event,
+                worker_id=worker_id,
+                run_id=run_id,
+                profile_id=profile_id,
+                status=status,
+                duration_ms=duration_ms,
+                ts=_now(),
+            ),
+        )
+
+    async def on_worker_heartbeat(
+        self,
+        *,
+        worker_id: str,
+        run_id: str,
+        profile_id: str,
+        status: str,
+        elapsed_ms: int,
+    ) -> None:
+        await self.emit(
+            "chat.worker.heartbeat",
+            self._payload(
+                worker_id=worker_id,
+                run_id=run_id,
+                profile_id=profile_id,
+                status=status,
+                elapsed_ms=max(0, elapsed_ms),
+                ts=_now(),
+            ),
+        )
+
+    async def on_worker_activity(
+        self,
+        *,
+        worker_id: str,
+        run_id: str,
+        profile_id: str,
+        label: str,
+        revision: int,
+        phase: str,
+        role_id: str | None = None,
+        tool_names: tuple[str, ...] = (),
+        current_step: str | None = None,
+        todo_completed: int | None = None,
+        todo_total: int | None = None,
+        detail_source: str = "host",
+    ) -> None:
+        """Publish one display-only Worker activity snapshot outside Base history."""
+
+        if phase not in _WORKER_ACTIVITY_PHASES:
+            return
+        safe_role = (
+            role_id
+            if role_id is not None and _WORKER_ACTIVITY_IDENTIFIER.fullmatch(role_id)
+            else None
+        )
+        safe_tools = tuple(
+            name
+            for name in tool_names[:4]
+            if _WORKER_ACTIVITY_IDENTIFIER.fullmatch(name)
+        )
+        safe_step = _safe_worker_activity_text(current_step)
+        await self.emit(
+            "chat.worker.activity",
+            self._payload(
+                worker_id=worker_id,
+                run_id=run_id,
+                profile_id=profile_id,
+                label=label,
+                revision=max(1, int(revision)),
+                phase=phase,
+                role_id=safe_role,
+                tool_names=safe_tools,
+                current_step=safe_step or None,
+                todo_completed=(
+                    max(0, int(todo_completed)) if todo_completed is not None else None
+                ),
+                todo_total=max(0, int(todo_total)) if todo_total is not None else None,
+                detail_source=(
+                    "worker_declared" if detail_source == "worker_declared" else "host"
+                ),
+                ts=_now(),
+            ),
+        )
+
+    async def on_worker_tool_result(
+        self,
+        *,
+        worker_id: str,
+        run_id: str,
+        profile_id: str,
+        label: str,
+        tool_name: str,
+        status: str,
+        metrics: dict[str, Any],
+        duration_ms: int | None,
+    ) -> None:
+        """Emit a typed safe projection, not Worker arguments or result text."""
+
+        await self.emit(
+            "chat.worker.tool.result",
+            self._payload(
+                worker_id=worker_id,
+                run_id=run_id,
+                profile_id=profile_id,
+                label=label,
+                tool_name=tool_name,
+                status=status,
+                duration_ms=duration_ms,
+                metrics=metrics,
+                ts=_now(),
+            ),
+        )
+
+    async def on_worker_guard_decision(
+        self,
+        *,
+        worker_id: str,
+        run_id: str,
+        profile_id: str,
+        label: str,
+        decision: Any,
+        event: str,
+        source: str,
+        fallback_used: bool = False,
+        budget_grant: int | None = None,
+    ) -> None:
+        action = getattr(decision, "action", "")
+        action_value = getattr(action, "value", action)
+        await self.emit(
+            "chat.worker.guard",
+            self._payload(
+                worker_id=worker_id,
+                run_id=run_id,
+                profile_id=profile_id,
+                subagent_label=label,
+                source=source,
+                event=event,
+                action=str(action_value),
+                reason=event,
+                budget_grant=max(0, int(budget_grant or 0)),
+                fallback_used=fallback_used,
+                ts=_now(),
             ),
         )
 
@@ -712,6 +892,19 @@ def _tool_call_detail(tool_call: ToolCallRequest) -> dict[str, Any]:
         "arguments": tool_call.arguments,
         "openai_tool_call": tool_call.to_openai_tool_call(),
     }
+
+
+def _safe_worker_activity_text(value: Any, *, limit: int = 100) -> str:
+    text = _WORKER_ACTIVITY_ANSI.sub("", str(value or ""))
+    text = "".join(
+        " "
+        if char.isspace()
+        else ""
+        if unicodedata.category(char).startswith("C")
+        else char
+        for char in text
+    )
+    return " ".join(text.split())[:limit]
 
 
 def _task_node_detail(node: TaskNode) -> dict[str, Any]:

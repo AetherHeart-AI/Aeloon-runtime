@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import uuid
 from datetime import UTC, datetime
 from typing import Any
 
 from loguru import logger
 from prompt_toolkit import PromptSession
+from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style
 from rich import box
 from rich.console import Console
@@ -88,6 +90,9 @@ class TerminalEventRenderer:
         self.block_contents: dict[str, str] = {}
         self.last_usage: dict[str, Any] = {}
         self.last_turn_duration_ms: int | None = None
+        self.worker_activity_fingerprints: dict[tuple[str, str], tuple[Any, ...]] = {}
+        self.worker_activity_revisions: dict[tuple[str, str], int] = {}
+        self.terminal_worker_runs: set[str] = set()
         self._assistant_streaming = False
         self._lock = asyncio.Lock()
 
@@ -131,6 +136,12 @@ class TerminalEventRenderer:
         table.add_row("/sessions", "list saved sessions")
         table.add_row("/resume <id>", "continue a saved session")
         table.add_row("/history", "show the current session history")
+        table.add_row("/profiles", "list active Worker profiles")
+        table.add_row("/workers", "list Workers for this session")
+        table.add_row("/worker <id>", "inspect a Worker and its runs")
+        table.add_row("/cancel <run-id>", "cancel one Worker run")
+        table.add_row("/resume-worker <run-id>", "resume one recoverable Worker run")
+        table.add_row("/spawn <profile> <task>", "create a Worker for an explicit task")
         table.add_row("/logs [on|off|info|debug|warning|error|detail]", "control gateway logs")
         table.add_row("/clear", "clear the terminal")
         table.add_row("/quit", "exit")
@@ -232,6 +243,23 @@ class TerminalEventRenderer:
         if event == "chat.profile.delegate.guard":
             self._render_guard_decision(payload)
             return
+        if event == "chat.worker.guard":
+            self._render_guard_decision(payload)
+            return
+        if event == "chat.worker.lifecycle":
+            self._render_worker_lifecycle(payload)
+            return
+        if event == "chat.worker.heartbeat":
+            # Heartbeats are an internal liveness signal. Activity changes are
+            # the user-facing progress channel; periodic ticks do not belong in
+            # the transcript.
+            return
+        if event == "chat.worker.activity":
+            self._render_worker_activity(payload)
+            return
+        if event == "chat.worker.tool.result":
+            self._render_worker_tool_result(payload)
+            return
         if event == "chat.block.add":
             self._render_block_add(payload)
             return
@@ -258,6 +286,134 @@ class TerminalEventRenderer:
             self.last_turn_duration_ms = duration if isinstance(duration, int) else None
             self._flush_text_blocks()
             self._finish_stream_line()
+
+    def _render_worker_lifecycle(self, payload: dict[str, Any]) -> None:
+        phase = str(payload.get("phase") or "")
+        run_id = str(payload.get("run_id") or "")
+        if phase == "created":
+            return
+        terminal_phases = {"completed", "partial", "failed", "timed_out", "cancelled"}
+        if run_id in self.terminal_worker_runs and phase in {"running", *terminal_phases}:
+            return
+        if phase == "running":
+            self._clear_worker_activity(run_id)
+        self._finish_stream_line()
+        label = _worker_label(payload)
+        text = Text(no_wrap=True, overflow="ellipsis")
+        if phase == "running":
+            text.append("◆ ", style=SEMANTIC_STYLES["agent"])
+            text.append("Worker ", style=SEMANTIC_STYLES["muted"])
+            text.append(label, style=SEMANTIC_STYLES["agent"])
+            text.append(" · 启动", style=SEMANTIC_STYLES["muted"])
+        else:
+            partial = phase == "partial"
+            failed = phase in {"failed", "timed_out", "cancelled"}
+            style = (
+                SEMANTIC_STYLES["error"]
+                if failed
+                else SEMANTIC_STYLES["guard"]
+                if partial
+                else SEMANTIC_STYLES["success"]
+            )
+            icon = "✕ " if failed else "⚠ " if partial else "✓ "
+            text.append(icon, style=style)
+            text.append("Worker ", style=SEMANTIC_STYLES["muted"])
+            text.append(label, style=style)
+            phase_label = {
+                "completed": "完成",
+                "partial": "部分完成",
+                "failed": "失败",
+                "timed_out": "超时",
+                "cancelled": "取消",
+            }.get(phase, phase)
+            text.append(f" · {phase_label}", style=SEMANTIC_STYLES["muted"])
+            duration = _compact_duration(payload.get("duration_ms"))
+            if duration:
+                text.append(f" · {duration}", style=SEMANTIC_STYLES["muted"])
+            if run_id:
+                self.terminal_worker_runs.add(run_id)
+                self._clear_worker_activity(run_id)
+        self._print_transcript_line(text)
+
+    def _render_worker_activity(self, payload: dict[str, Any]) -> None:
+        run_id = str(payload.get("run_id") or "")
+        if not run_id or run_id in self.terminal_worker_runs:
+            return
+        label = str(payload.get("label") or _worker_label(payload))
+        key = (run_id, label)
+        revision = payload.get("revision")
+        if isinstance(revision, int):
+            previous_revision = self.worker_activity_revisions.get(key, 0)
+            if revision <= previous_revision:
+                return
+        phase = str(payload.get("phase") or "")
+        tools = tuple(
+            str(name)
+            for name in payload.get("tool_names", ())
+            if isinstance(name, str)
+        )
+        current_step = _one_line(str(payload.get("current_step") or ""), limit=100)
+        role_id = str(payload.get("role_id") or "")
+        completed = payload.get("todo_completed")
+        total = payload.get("todo_total")
+        fingerprint = (
+            phase,
+            None if payload.get("detail_source") == "worker_declared" else role_id,
+            tools,
+            current_step,
+            completed,
+            total,
+        )
+        if self.worker_activity_fingerprints.get(key) == fingerprint:
+            if isinstance(revision, int):
+                self.worker_activity_revisions[key] = revision
+            return
+        self.worker_activity_fingerprints[key] = fingerprint
+        if isinstance(revision, int):
+            self.worker_activity_revisions[key] = revision
+
+        self._finish_stream_line()
+        text = Text(no_wrap=True, overflow="ellipsis")
+        declared_step = bool(current_step and payload.get("detail_source") == "worker_declared")
+        text.append("↳ " if declared_step else "◇ ", style=SEMANTIC_STYLES["guard"])
+        text.append("Worker ", style=SEMANTIC_STYLES["muted"])
+        text.append(label, style=SEMANTIC_STYLES["agent"])
+        if declared_step:
+            text.append(" · 当前：", style=SEMANTIC_STYLES["muted"])
+            text.append(current_step)
+            if isinstance(completed, int) and isinstance(total, int) and total > 0:
+                text.append(f" · {completed}/{total}", style=SEMANTIC_STYLES["muted"])
+        else:
+            if role_id and phase in {"analyzing", "handoff", "branch_running"}:
+                text.append(f" · {role_id}", style=SEMANTIC_STYLES["muted"])
+            summary = _worker_activity_summary(phase, tools)
+            if summary:
+                text.append(f" · {summary}", style=SEMANTIC_STYLES["muted"])
+        self._print_transcript_line(text)
+
+    def _clear_worker_activity(self, run_id: str) -> None:
+        for key in [key for key in self.worker_activity_fingerprints if key[0] == run_id]:
+            self.worker_activity_fingerprints.pop(key, None)
+            self.worker_activity_revisions.pop(key, None)
+
+    def _render_worker_tool_result(self, payload: dict[str, Any]) -> None:
+        run_id = str(payload.get("run_id") or "")
+        if run_id and run_id in self.terminal_worker_runs:
+            return
+        self._finish_stream_line()
+        status = str(payload.get("status") or "done")
+        rendered_status = "done" if status == "done" else "error"
+        name = str(payload.get("tool_name") or "tool")
+        metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
+        detail = _worker_tool_metric_summary(name, metrics, payload.get("duration_ms"))
+        self._print_transcript_line(
+            _tool_line(
+                name=name,
+                status=rendered_status,
+                detail=detail,
+                subagent_label=str(payload.get("label") or _worker_label(payload)),
+            )
+        )
 
     def _render_profile_event(self, event: str, payload: dict[str, Any]) -> None:
         if event == "chat.profile.pinned":
@@ -396,15 +552,6 @@ class TerminalEventRenderer:
         if block_type == "tool_call":
             self._consume_pending_text_blocks()
             self._finish_stream_line()
-            name = str(block.get("name") or "tool")
-            self._print_transcript_line(
-                _tool_line(
-                    name=name,
-                    status="running",
-                    detail=_tool_call_detail_text(name, block.get("arguments")),
-                    subagent_label=self.block_agents.get(block_id),
-                )
-            )
 
     def _render_block_delta(self, payload: dict[str, Any]) -> None:
         block_id = str(payload.get("block_id") or "")
@@ -466,6 +613,23 @@ class TerminalEventRenderer:
                 subagent_label=self.block_agents.get(block_id),
             )
         )
+        if name == "todowrite" and not failed:
+            self._render_todo_items(self.block_arguments.get(block_id))
+
+    def _render_todo_items(self, arguments: Any) -> None:
+        """Render persisted task progress rather than raw tool payload."""
+
+        todos = _todo_items(arguments)
+        for item in todos:
+            status = str(item.get("status") or "pending")
+            content = _one_line(str(item.get("content") or ""), limit=110)
+            completed = status == "completed"
+            line = Text()
+            line.append("[x] " if completed else "[] ", style=(
+                SEMANTIC_STYLES["success"] if completed else SEMANTIC_STYLES["muted"]
+            ))
+            line.append(content, style="dim" if completed else "white")
+            self._print_transcript_line(line)
 
     def _render_log(self, payload: dict[str, Any]) -> None:
         self.gateway_logs.append(payload)
@@ -601,7 +765,7 @@ class TerminalChatCli:
                 if not prompt:
                     continue
                 if prompt.startswith("/"):
-                    keep_running = self._handle_command(prompt)
+                    keep_running = await self._handle_command(prompt)
                     if not keep_running:
                         return
                     continue
@@ -631,10 +795,11 @@ class TerminalChatCli:
 
     async def _read_prompt(self) -> str:
         if self.prompt_session is not None:
-            return await self.prompt_session.prompt_async(
-                [("class:prompt", "aeloon: ")],
-                enable_suspend=True,
-            )
+            with patch_stdout(raw=True):
+                return await self.prompt_session.prompt_async(
+                    [("class:prompt", "aeloon: ")],
+                    enable_suspend=True,
+                )
 
         self.console.print(Text("aeloon: ", style="bold cyan"), end="")
         line = await asyncio.to_thread(sys.stdin.readline)
@@ -642,7 +807,7 @@ class TerminalChatCli:
             raise EOFError
         return line.rstrip("\n")
 
-    def _handle_command(self, command: str) -> bool:
+    async def _handle_command(self, command: str) -> bool:
         parts = command.split()
         name = parts[0].lower()
         args = parts[1:]
@@ -676,6 +841,72 @@ class TerminalChatCli:
             return True
         if name == "/logs":
             self._configure_logs(args)
+            return True
+        if name == "/profiles":
+            self.console.print_json(
+                json.dumps(self.orchestrator.worker_control.discover_profiles(), ensure_ascii=False)
+            )
+            return True
+        if name == "/workers":
+            self.console.print_json(
+                json.dumps(
+                    self.orchestrator.worker_control.list_workers(self.session_id),
+                    ensure_ascii=False,
+                )
+            )
+            return True
+        if name == "/worker":
+            if not args:
+                self.console.print("[red]Usage:[/] /worker <id>")
+            else:
+                self.console.print_json(
+                    json.dumps(
+                        self.orchestrator.worker_control.inspect_worker(args[0]),
+                        ensure_ascii=False,
+                    )
+                )
+            return True
+        if name == "/cancel":
+            if not args:
+                self.console.print("[red]Usage:[/] /cancel <run-id>")
+            else:
+                self.console.print_json(
+                    json.dumps(
+                        await self.orchestrator.worker_control.cancel_worker(args[0]),
+                        ensure_ascii=False,
+                    )
+                )
+            return True
+        if name == "/resume-worker":
+            if not args:
+                self.console.print("[red]Usage:[/] /resume-worker <run-id>")
+            else:
+                self.console.print_json(
+                    json.dumps(
+                        await self.orchestrator.worker_control.resume_worker(args[0]),
+                        ensure_ascii=False,
+                    )
+                )
+            return True
+        if name == "/spawn":
+            if len(args) < 2:
+                self.console.print("[red]Usage:[/] /spawn <profile> <task>")
+            else:
+                self.console.print_json(
+                    json.dumps(
+                        await self.orchestrator.worker_control.spawn_worker(
+                            base_session_id=self.session_id,
+                            profile_id=args[0],
+                            task=" ".join(args[1:]),
+                            idempotency_key=f"tui:{uuid.uuid4().hex}",
+                            progress=TurnEventProgress(
+                                session_id=self.session_id,
+                                emit=self.renderer.emit,
+                            ),
+                        ),
+                        ensure_ascii=False,
+                    )
+                )
             return True
 
         self.console.print(f"[red]Unknown command:[/] {command}")
@@ -807,8 +1038,10 @@ def _tool_line(
     )
     text = Text(no_wrap=True, overflow="ellipsis")
     text.append(f"{icon} ", style=icon_style)
-    text.append("工具 ", style=SEMANTIC_STYLES["muted"])
-    text.append(name, style=SEMANTIC_STYLES["tool"])
+    label = "TODO" if name == "todowrite" else name
+    if name != "todowrite":
+        text.append("工具 ", style=SEMANTIC_STYLES["muted"])
+    text.append(label, style=SEMANTIC_STYLES["tool"])
     if subagent_label:
         text.append(f" [{subagent_label}]", style=SEMANTIC_STYLES["agent"])
     if detail:
@@ -817,12 +1050,90 @@ def _tool_line(
     return text
 
 
+def _worker_label(payload: dict[str, Any]) -> str:
+    profile_id = str(payload.get("profile_id") or "worker")
+    worker_id = str(payload.get("worker_id") or "")[:8]
+    return f"{profile_id}#{worker_id}" if worker_id else profile_id
+
+
+def _worker_activity_summary(phase: str, tools: tuple[str, ...]) -> str:
+    if phase == "using_tool":
+        tool_set = set(tools)
+        if tool_set and tool_set <= {"read", "glob", "grep"}:
+            return "检查现有项目"
+        if tool_set and tool_set <= {"websearch", "webfetch"}:
+            return "检索和核对资料"
+        if tool_set & {"write", "edit"}:
+            return "编写和修改实现"
+        if "exec" in tool_set:
+            return "运行验证"
+        if "todowrite" in tool_set:
+            return "整理任务计划"
+        if tools:
+            return "执行工具：" + "、".join(tools)
+        return "执行工具"
+    return {
+        "analyzing": "分析任务与上下文",
+        "planning": "规划下一步",
+        "drafting": "生成阶段结果",
+        "processing": "分析工具结果",
+        "working_step": "执行当前步骤",
+        "finalizing": "整理并提交结果",
+        "delegating": "协调并行子任务",
+        "handoff": "切换执行角色",
+        "branch_running": "执行子任务",
+        "branch_done": "子任务已结束",
+        "synthesizing": "汇总子任务结果",
+    }.get(phase, "")
+
+
+def _worker_tool_metric_summary(
+    name: str,
+    metrics: dict[str, Any],
+    duration_ms: Any,
+) -> str:
+    parts: list[str] = []
+    resource = metrics.get("resource")
+    if isinstance(resource, str) and resource:
+        parts.append(resource)
+    if name == "write" and isinstance(metrics.get("input_chars"), int):
+        parts.append(f"wrote {metrics['input_chars']} chars")
+    elif name == "edit":
+        old_chars = metrics.get("old_chars")
+        new_chars = metrics.get("new_chars")
+        if isinstance(old_chars, int) and isinstance(new_chars, int):
+            parts.append(f"edited {old_chars} -> {new_chars} chars")
+    elif name == "exec" and isinstance(metrics.get("exit_code"), int):
+        parts.append(f"exit {metrics['exit_code']}")
+    elif name == "todowrite" and isinstance(metrics.get("item_count"), int):
+        completed = metrics.get("todo_completed")
+        if isinstance(completed, int):
+            parts.append(f"{completed}/{metrics['item_count']} 完成")
+        else:
+            parts.append(f"{metrics['item_count']} items")
+    elif isinstance(metrics.get("item_count"), int):
+        parts.append(f"{metrics['item_count']} items")
+    else:
+        chars = metrics.get("result_chars")
+        lines = metrics.get("result_lines")
+        if isinstance(chars, int) and isinstance(lines, int):
+            parts.append(f"returned {chars} chars/{lines} lines")
+    duration = _compact_duration(duration_ms)
+    if duration:
+        parts.append(duration)
+    return " · ".join(parts)
+
+
 def _compact_duration(value: Any) -> str:
     if isinstance(value, bool) or not isinstance(value, int | float):
         return ""
     milliseconds = max(0, int(value))
     if milliseconds < 1_000:
         return f"{milliseconds} ms"
+    if milliseconds >= 60_000:
+        total_seconds = milliseconds // 1_000
+        minutes, seconds = divmod(total_seconds, 60)
+        return f"{minutes}m{seconds:02d}s"
     return f"{milliseconds / 1_000:.1f}s"
 
 
@@ -867,9 +1178,7 @@ def _tool_call_detail_text(name: str, arguments: Any) -> str:
     if name == "websearch":
         return _join_parts(_preview_arg(args, "query", limit=120), _number_arg(args, "max_results"))
     if name == "todowrite":
-        todos = args.get("todos")
-        if isinstance(todos, list):
-            return f"{len(todos)} todos"
+        return _todo_progress_summary(args)
     return _generic_arg_summary(arguments)
 
 
@@ -916,6 +1225,20 @@ def _tool_result_detail_text(
         return _join_parts(_exit_code_summary(text), _text_size_summary(text), duration)
     if name == "webfetch":
         return _join_parts(_web_status_summary(text), _text_size_summary(text), duration)
+    if name == "todowrite":
+        return _join_parts(_todo_progress_summary(args), duration)
+    if name in {
+        "discover_profiles",
+        "list_workers",
+        "inspect_worker",
+        "spawn_worker",
+        "send_worker",
+        "await_workers",
+        "resume_worker",
+        "cancel_worker",
+        "archive_worker",
+    }:
+        return _join_parts(_scheduler_result_summary(name, text), duration)
     return _join_parts(_text_size_summary(text), duration)
 
 
@@ -937,6 +1260,93 @@ def _generic_arg_summary(arguments: Any) -> str:
         else:
             parts.append(f"{key}={value}")
     return _join_parts(*parts)
+
+
+def _scheduler_result_summary(name: str, text: str) -> str:
+    try:
+        payload = json.loads(text)
+    except (TypeError, json.JSONDecodeError):
+        return _one_line(text, limit=120)
+
+    if name == "discover_profiles" and isinstance(payload, list):
+        profile_ids = [
+            str(item.get("profile", {}).get("profile_id"))
+            for item in payload
+            if isinstance(item, dict) and item.get("profile", {}).get("profile_id")
+        ]
+        return _join_parts(
+            f"{len(profile_ids)} profiles",
+            ", ".join(profile_ids),
+        )
+    if name == "list_workers" and isinstance(payload, list):
+        labels = [
+            (
+                f"{item.get('profile', {}).get('profile_id')}#"
+                f"{str(item.get('worker_id') or '')[:6]}"
+                f"{' [reusable]' if item.get('reusable') else ''}"
+            )
+            for item in payload[:4]
+            if isinstance(item, dict)
+        ]
+        return _join_parts(f"{len(payload)} workers", ", ".join(labels))
+    if name in {"spawn_worker", "send_worker"} and isinstance(payload, dict):
+        profile_id = payload.get("profile", {}).get("profile_id")
+        worker_id = str(payload.get("worker_id") or "")[:8]
+        run_id = str(payload.get("run_id") or "")[:8]
+        if name == "send_worker":
+            action = "worker reused"
+            run_action = "run created" if payload.get("created") else "existing run"
+        else:
+            action = "worker created" if payload.get("created") else "existing worker"
+            run_action = ""
+        return _join_parts(
+            f"{profile_id}#{worker_id}" if profile_id else f"worker {worker_id}",
+            f"run {run_id}",
+            action,
+            run_action,
+            "detached" if payload.get("detached") else "",
+        )
+    if name == "await_workers" and isinstance(payload, list):
+        statuses: dict[str, int] = {}
+        for item in payload:
+            if isinstance(item, dict):
+                status = str(item.get("status") or "unknown")
+                statuses[status] = statuses.get(status, 0) + 1
+        return _join_parts(
+            f"{len(payload)} runs",
+            ", ".join(f"{count} {status}" for status, count in statuses.items()),
+        )
+    if isinstance(payload, dict):
+        status = str(payload.get("status") or "")
+        worker_id = str(payload.get("worker_id") or "")[:8]
+        run_id = str(payload.get("run_id") or "")[:8]
+        return _join_parts(
+            f"worker {worker_id}" if worker_id else "",
+            f"run {run_id}" if run_id else "",
+            status,
+        )
+    return _text_size_summary(text)
+
+
+def _todo_items(arguments: Any) -> list[dict[str, Any]]:
+    args = arguments if isinstance(arguments, dict) else {}
+    todos = args.get("todos")
+    return [item for item in todos if isinstance(item, dict)] if isinstance(todos, list) else []
+
+
+def _todo_progress_summary(arguments: Any) -> str:
+    todos = _todo_items(arguments)
+    if not todos:
+        return "更新任务列表"
+    completed = sum(item.get("status") == "completed" for item in todos)
+    active = sum(item.get("status") == "in_progress" for item in todos)
+    pending = sum(item.get("status") == "pending" for item in todos)
+    parts = [f"{completed}/{len(todos)} 完成"]
+    if active:
+        parts.append(f"{active} 进行中")
+    if pending:
+        parts.append(f"{pending} 待办")
+    return " · ".join(parts)
 
 
 def _path_detail(args: dict[str, Any]) -> str:

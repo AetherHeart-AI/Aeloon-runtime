@@ -229,24 +229,68 @@ class ProfileArtifactStore:
     def load_active(self, profile_id: str) -> RuntimeProfileSpec:
         with _file_lock(self.activation_lock_path, exclusive=False):
             pointer, manifest = self._validated_active(profile_id)
-            compatible, reasons = self._compatibility(manifest)
-            if not compatible:
-                raise ArtifactCompatibilityError("; ".join(reasons))
-            source = (self._artifact_dir(pointer["artifact_id"]) / COMPILED_FILENAME).read_text()
-            runtime = parse_compiled_profile(
-                source,
-                artifact_id=pointer["artifact_id"],
-                generation=pointer["generation"],
+            return self._load_pinned_locked(pointer, manifest)
+
+    def load_pinned(
+        self,
+        *,
+        profile_id: str,
+        artifact_id: str,
+        generation: int,
+        audit_id: str,
+    ) -> RuntimeProfileSpec:
+        """Load a historical Worker pin without consulting the current pointer."""
+
+        _validate_identifier(profile_id)
+        with _file_lock(self.activation_lock_path, exclusive=False):
+            audit = self._read_audit(audit_id)
+            if (
+                audit.get("profile_id") != profile_id
+                or audit.get("artifact_id") != artifact_id
+                or audit.get("generation") != generation
+            ):
+                raise ArtifactIntegrityError("pinned artifact does not match activation audit")
+            manifest = self._verify_integrity(artifact_id)
+            if manifest["identity"]["profile"]["id"] != profile_id:
+                raise ArtifactIntegrityError("pinned artifact belongs to a different profile")
+            self._read_approval(artifact_id)
+            return self._load_pinned_locked(
+                {"artifact_id": artifact_id, "generation": generation}, manifest
             )
-            return runtime.model_copy(
-                update={
-                    "control_protocol_version": int(
-                        manifest["identity"]["compatibility"][
-                            "control_protocol_version"
-                        ]
-                    )
-                }
-            )
+
+    def list_active(self) -> list[dict[str, Any]]:
+        """Return active profiles through a public API rather than store layout."""
+
+        with _file_lock(self.activation_lock_path, exclusive=False):
+            result: list[dict[str, Any]] = []
+            for pointer_path in sorted(self.active_dir.glob("*.json")):
+                pointer = self._read_pointer(pointer_path.stem)
+                if pointer is None:
+                    continue
+                result.append(self.status(str(pointer["profile_id"])))
+            return result
+
+    def _load_pinned_locked(
+        self,
+        pointer: Mapping[str, Any],
+        manifest: Mapping[str, Any],
+    ) -> RuntimeProfileSpec:
+        compatible, reasons = self._compatibility(manifest)
+        if not compatible:
+            raise ArtifactCompatibilityError("; ".join(reasons))
+        source = (self._artifact_dir(str(pointer["artifact_id"])) / COMPILED_FILENAME).read_text()
+        runtime = parse_compiled_profile(
+            source,
+            artifact_id=str(pointer["artifact_id"]),
+            generation=int(pointer["generation"]),
+        )
+        return runtime.model_copy(
+            update={
+                "control_protocol_version": int(
+                    manifest["identity"]["compatibility"]["control_protocol_version"]
+                )
+            }
+        )
 
     def inspect(self, artifact_id: str) -> dict[str, Any]:
         with _file_lock(self.activation_lock_path, exclusive=False):

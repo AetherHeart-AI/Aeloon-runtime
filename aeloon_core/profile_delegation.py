@@ -400,6 +400,20 @@ class _DelegatedProgress:
     async def __call__(self, text: str, *, tool_hint: bool = False) -> None:
         del text, tool_hint
 
+    async def on_agent_activity(
+        self,
+        *,
+        phase: str,
+        role_id: str | None = None,
+    ) -> None:
+        del role_id
+        await self.runtime.emit_hook(
+            "on_agent_activity",
+            phase=phase,
+            role_id=self.branch.agent.id,
+            subagent_label=self.branch.label,
+        )
+
     async def on_llm_response(
         self,
         response: Any,

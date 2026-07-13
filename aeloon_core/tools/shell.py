@@ -85,8 +85,11 @@ class ExecTool(WorkspaceTool):
                     timeout=effective_timeout,
                 )
             except TimeoutError:
-                self._kill_process_group(process)
+                await self._terminate_process_group(process)
                 return f"Error: Command timed out after {effective_timeout} seconds"
+            except asyncio.CancelledError:
+                await self._terminate_process_group(process)
+                raise
 
             parts: list[str] = []
             if stdout:
@@ -139,16 +142,33 @@ class ExecTool(WorkspaceTool):
         return [*argv, "/bin/sh", "-c", command]
 
     @staticmethod
-    def _kill_process_group(process: asyncio.subprocess.Process) -> None:
+    async def _terminate_process_group(process: asyncio.subprocess.Process) -> None:
+        if process.returncode is not None:
+            return
+        ExecTool._signal_process_group(process, signal.SIGTERM)
+        try:
+            await asyncio.wait_for(process.wait(), timeout=1.0)
+        except TimeoutError:
+            ExecTool._signal_process_group(process, signal.SIGKILL)
+            await process.wait()
+
+    @staticmethod
+    def _signal_process_group(
+        process: asyncio.subprocess.Process,
+        requested_signal: signal.Signals,
+    ) -> None:
         pid = process.pid
         if pid is None:
             return
         try:
-            os.killpg(pid, signal.SIGTERM)
+            os.killpg(pid, requested_signal)
         except ProcessLookupError:
             return
         except Exception:
-            process.kill()
+            if requested_signal is signal.SIGTERM:
+                process.terminate()
+            else:
+                process.kill()
 
     def _truncate(self, result: str) -> str:
         if len(result) <= self._MAX_OUTPUT:
