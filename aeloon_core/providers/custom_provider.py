@@ -11,6 +11,7 @@ import json_repair
 from openai import AsyncOpenAI
 
 from aeloon_core.providers.base import (
+    ContentStreamSink,
     GenerationSettings,
     LLMProvider,
     LLMResponse,
@@ -152,6 +153,7 @@ class CustomProvider(LLMProvider):
         tool_choice: str | dict[str, Any] | None = None,
         on_delta: Callable[[str], Awaitable[None]] | None = None,
         on_reasoning_delta: Callable[[str], Awaitable[None]] | None = None,
+        content_sink: ContentStreamSink | None = None,
     ) -> LLMResponse:
         resolved_model = model or self.default_model
         kwargs = self._build_kwargs(
@@ -174,6 +176,7 @@ class CustomProvider(LLMProvider):
                 stream,
                 on_delta=on_delta,
                 on_reasoning_delta=on_reasoning_delta,
+                content_sink=content_sink,
             )
 
         return await self._create_with_tool_fallback(kwargs, _run)
@@ -184,6 +187,7 @@ class CustomProvider(LLMProvider):
         *,
         on_delta: Callable[[str], Awaitable[None]] | None = None,
         on_reasoning_delta: Callable[[str], Awaitable[None]] | None = None,
+        content_sink: ContentStreamSink | None = None,
     ) -> LLMResponse:
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
@@ -205,9 +209,13 @@ class CustomProvider(LLMProvider):
 
                 content = getattr(delta, "content", None)
                 if isinstance(content, str) and content:
-                    content_parts.append(content)
-                    if on_delta is not None:
-                        await on_delta(content)
+                    visible = (
+                        await content_sink.feed(content) if content_sink is not None else content
+                    )
+                    if visible:
+                        content_parts.append(visible)
+                        if on_delta is not None:
+                            await on_delta(visible)
 
                 reasoning = getattr(delta, "reasoning_content", None)
                 if isinstance(reasoning, str) and reasoning:

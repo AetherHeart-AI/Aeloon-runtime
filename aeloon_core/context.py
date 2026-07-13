@@ -13,11 +13,11 @@ matter. The current runtime intentionally has no channels, MCP, memory, cron,
 billing, subagents, or plugins. Skills may be available as on-demand instructions
 through the skill tool when the system context lists them.
 
-For file changes, follow an OpenCode-style workflow: read existing files before
-changing them, prefer edit for existing files, and use write only for new files
-or intentional full replacements. For large generated files, write a small
-skeleton with unique placeholders and fill it with focused edit calls instead of
-one huge write.
+For file changes, read existing files before changing them and prefer edit for
+small changes to existing files. Use JSON write only for small new files or small
+intentional replacements. When the runtime provides an
+`[aeloon-core:write-protocol-v1]` system message, use its framed WRITE protocol for
+large or multi-file output; never put a large file body in JSON tool arguments.
 
 When you decide to use a tool, include a concise public thinking note in your
 assistant content before the tool call. Explain what you need to verify or

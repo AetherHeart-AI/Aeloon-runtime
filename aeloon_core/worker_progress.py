@@ -282,9 +282,7 @@ class WorkerProgress:
         label = self._scope_label(subagent_label)
         started = self._tool_started.pop(node.call_id, None)
         duration_ms = (
-            max(0, int((perf_counter() - started) * 1_000))
-            if started is not None
-            else None
+            max(0, int((perf_counter() - started) * 1_000)) if started is not None else None
         )
         tool_name, status, metrics = _safe_tool_projection(node)
         self._call_journal(
@@ -539,7 +537,14 @@ def _safe_tool_projection(node: TaskNode) -> tuple[str, str, dict[str, Any]]:
         "result_lines": len(result.splitlines()),
     }
     if node.tool_name == "write":
-        metrics["input_chars"] = len(str(arguments.get("content") or ""))
+        files = arguments.get("files")
+        if isinstance(files, list):
+            metrics["file_count"] = len(files)
+            metrics["input_bytes"] = sum(
+                int(item.get("bytes") or 0) for item in files if isinstance(item, dict)
+            )
+        else:
+            metrics["input_chars"] = len(str(arguments.get("content") or ""))
     elif node.tool_name == "edit":
         metrics["old_chars"] = len(str(arguments.get("old_text") or ""))
         metrics["new_chars"] = len(str(arguments.get("new_text") or ""))
@@ -555,8 +560,7 @@ def _safe_tool_projection(node: TaskNode) -> tuple[str, str, dict[str, Any]]:
         if isinstance(todos, list):
             metrics["item_count"] = len(todos)
             metrics["todo_completed"] = sum(
-                isinstance(item, dict) and item.get("status") == "completed"
-                for item in todos
+                isinstance(item, dict) and item.get("status") == "completed" for item in todos
             )
     elif node.tool_name in {"glob", "grep", "websearch"}:
         metrics["item_count"] = len([line for line in result.splitlines() if line.strip()])
@@ -612,29 +616,21 @@ def _safe_current_todo(node: TaskNode) -> tuple[str, int, int] | None:
     if not isinstance(todos, list):
         return None
     active = [
-        item
-        for item in todos
-        if isinstance(item, dict) and item.get("status") == "in_progress"
+        item for item in todos if isinstance(item, dict) and item.get("status") == "in_progress"
     ]
     if len(active) != 1:
         return None
     content = _safe_display_text(active[0].get("content"))
     if not content:
         return None
-    completed = sum(
-        isinstance(item, dict) and item.get("status") == "completed" for item in todos
-    )
+    completed = sum(isinstance(item, dict) and item.get("status") == "completed" for item in todos)
     return content, completed, len(todos)
 
 
 def _safe_display_text(value: Any, *, limit: int = 100) -> str:
     text = _ANSI_ESCAPE.sub("", str(value or ""))
     text = "".join(
-        " "
-        if char.isspace()
-        else ""
-        if unicodedata.category(char).startswith("C")
-        else char
+        " " if char.isspace() else "" if unicodedata.category(char).startswith("C") else char
         for char in text
     )
     return " ".join(text.split())[:limit]

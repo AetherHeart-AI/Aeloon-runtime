@@ -51,6 +51,7 @@ from aeloon_core.worker_sessions import (
     WorkerRunStatus,
     WorkerStore,
 )
+from aeloon_core.write_runtime import WriteCoordinator
 
 
 @dataclass
@@ -96,6 +97,11 @@ class AeloonCoreOrchestrator:
         self.profile_registry = self.worker_tool_registry
         self.skills = SkillRegistry.discover(config)
         workspace = config.workspace
+        self.write_coordinator = WriteCoordinator(
+            workspace=workspace,
+            data_dir=config.data_dir,
+            denied_paths=(config.data_dir,),
+        )
         self.todo_tool = TodoWriteTool(data_dir=config.data_dir)
         for registry, protected_paths in (
             (self.registry, ()),
@@ -208,9 +214,7 @@ class AeloonCoreOrchestrator:
                     goal=prompt,
                     permissions=PermissionSnapshot(
                         tool_names=tuple(
-                            sorted(
-                                {tool for agent in profile.agents for tool in agent.tools}
-                            )
+                            sorted({tool for agent in profile.agents for tool in agent.tools})
                         )
                     ),
                     budget=BudgetGrant(
@@ -295,13 +299,12 @@ class AeloonCoreOrchestrator:
                 minimal_context_tool_result_chars=policy.minimal_context_tool_result_chars,
                 session_id=actual_session_id,
                 turn_id=turn_id,
-                on_transition=(
-                    persist_transition if policy.transition_trace_enabled else None
-                ),
+                on_transition=(persist_transition if policy.transition_trace_enabled else None),
                 on_progress=on_progress,
                 prepare_model_input=prepare_model_input,
                 profile=profile,
                 max_handoffs=defaults.max_handoffs,
+                write_coordinator=self.write_coordinator,
             )
         except BaseException:
             if trace_write_tail is not None:
@@ -413,6 +416,7 @@ class AeloonCoreOrchestrator:
             on_progress=worker_progress,
             profile=profile,
             max_handoffs=defaults.max_handoffs,
+            write_coordinator=self.write_coordinator,
         )
         self.workers.append_transcript(
             run.run_id,

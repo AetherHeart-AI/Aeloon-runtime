@@ -8,13 +8,21 @@ import re
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Protocol
 
 from loguru import logger
 
 from aeloon_core.transitions import accumulate_usage
 
 ResponseFormat = dict[str, str]
+
+
+class ContentStreamSink(Protocol):
+    """Consume raw content deltas while returning only provider-visible text."""
+
+    async def feed(self, delta: str) -> str: ...
+
+    async def abort(self) -> None: ...
 
 
 @dataclass
@@ -64,6 +72,9 @@ class LLMResponse:
     usage: dict[str, int] = field(default_factory=dict)
     reasoning_content: str | None = None
     thinking_blocks: list[dict] | None = None
+    write_batch: Any = None
+    write_error: str | None = None
+    stream_sink: ContentStreamSink | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -242,10 +253,11 @@ class LLMProvider(ABC):
         tool_choice: str | dict[str, Any] | None = None,
         on_delta: Callable[[str], Awaitable[None]] | None = None,
         on_reasoning_delta: Callable[[str], Awaitable[None]] | None = None,
+        content_sink: ContentStreamSink | None = None,
     ) -> LLMResponse:
         """Stream a chat completion when a provider supports it."""
 
-        del on_delta, on_reasoning_delta
+        del on_delta, on_reasoning_delta, content_sink
         return await self.chat(
             messages=messages,
             tools=tools,
@@ -294,6 +306,7 @@ class LLMProvider(ABC):
         tool_choice: str | dict[str, Any] | None = None,
         on_delta: Callable[[str], Awaitable[None]] | None = None,
         on_reasoning_delta: Callable[[str], Awaitable[None]] | None = None,
+        content_sink_factory: Callable[[int], ContentStreamSink] | None = None,
     ) -> LLMResponse:
         """Call chat_stream() with retry on transient provider failures."""
 
@@ -307,14 +320,27 @@ class LLMProvider(ABC):
             tool_choice=tool_choice,
         )
 
-        def _attempt(attempt: int) -> Awaitable[LLMResponse]:
+        async def _attempt(attempt: int) -> LLMResponse:
             # Only stream deltas on the first try; retries collect silently.
-            return self._safe_call(
-                self.chat_stream(
-                    **kw,
-                    on_delta=on_delta if attempt == 1 else None,
-                    on_reasoning_delta=on_reasoning_delta if attempt == 1 else None,
+            sink = content_sink_factory(attempt) if content_sink_factory is not None else None
+            try:
+                response = await self._safe_call(
+                    self.chat_stream(
+                        **kw,
+                        on_delta=on_delta if attempt == 1 else None,
+                        on_reasoning_delta=on_reasoning_delta if attempt == 1 else None,
+                        content_sink=sink,
+                    )
                 )
-            )
+            except BaseException:
+                if sink is not None:
+                    await sink.abort()
+                raise
+            if response.finish_reason == "error":
+                if sink is not None:
+                    await sink.abort()
+            else:
+                response.stream_sink = sink
+            return response
 
         return await self._retry(_attempt, label="Streaming LLM")

@@ -344,6 +344,20 @@ File writes follow an OpenCode-style safety pattern:
   the marker is stripped before the file is saved. If the marker is missing,
   Aeloon treats the write as possibly truncated and refuses to touch the file.
 
+When a model call has `write` permission, the runtime also advertises framed WRITE
+protocol v1. This is the preferred path for large or multi-file output: short JSON
+metadata stays in the frame header while raw UTF-8 file bodies stream into private
+staging. A nonce-scoped END marker closes each file and one batch END marker closes
+the transaction. The runtime commits only after the provider finishes normally and
+every frame, path, limit, and overwrite precondition validates. Incomplete, mixed,
+cancelled, or unauthorized batches are discarded without changing target files.
+
+Framed batches are restricted to workspace-relative paths. Each target replacement
+uses a same-directory temporary file and `os.replace`; multi-file batches add a
+rollback journal and startup recovery. This guarantees that truncated model output
+never reaches a target and that an interrupted batch is recovered, but it does not
+claim simultaneous cross-path visibility from an ordinary filesystem.
+
 ## Skills
 
 Aeloon Core discovers OpenCode-style `SKILL.md` files at startup. The model sees

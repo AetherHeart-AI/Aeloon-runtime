@@ -18,6 +18,7 @@ from aeloon_core.transitions import TokenLedger, TransitionRecord
 if TYPE_CHECKING:
     from aeloon_core.providers.base import LLMResponse, ToolCallRequest
     from aeloon_core.task_graph import TaskNode
+    from aeloon_core.write_runtime import StagedWriteBatch
 
 Message = dict[str, Any]
 LazyLoader = Callable[[], Any]
@@ -255,6 +256,7 @@ class LightweightState:
     pending_response: LLMResponse | None = None
     pending_tool_calls: list[ToolCallRequest] = field(default_factory=list)
     pending_tool_nodes: list[TaskNode] = field(default_factory=list)
+    pending_write_batch: StagedWriteBatch | None = field(default=None, repr=False)
     pending_guard_request: GuardRequest | None = None
     final_emitted: bool = False
     tools_used: list[str] = field(default_factory=list)
@@ -346,9 +348,7 @@ class LightweightState:
                 "iteration_limit": self.metadata.iteration_limit,
                 "finalization_prompt": _value_summary(self.metadata.finalization_prompt),
                 "finalization_source": self.metadata.finalization_source,
-                "finalization_evidence": _value_summary(
-                    self.metadata.finalization_evidence
-                ),
+                "finalization_evidence": _value_summary(self.metadata.finalization_evidence),
                 "final_content": _value_summary(self.metadata.final_content),
                 "termination_reason": self.metadata.termination_reason,
                 "session_id": self.metadata.session_id,
@@ -362,13 +362,17 @@ class LightweightState:
             "pending_tool_nodes": [
                 _value_summary(tool_node) for tool_node in self.pending_tool_nodes
             ],
+            "pending_write_batch": (
+                _value_summary(self.pending_write_batch.manifest())
+                if self.pending_write_batch is not None
+                else None
+            ),
             "pending_guard_request": _value_summary(self.pending_guard_request),
             "final_emitted": self.final_emitted,
             "tools_used": list(self.tools_used),
             "token_ledger": self.token_ledger.to_dict(),
             "lazy_values": {
-                ref: lazy.to_digest_value()
-                for ref, lazy in sorted(self.lazy_values.items())
+                ref: lazy.to_digest_value() for ref, lazy in sorted(self.lazy_values.items())
             },
         }
         if self.profile_ref is not None:
@@ -379,9 +383,7 @@ class LightweightState:
                 "handoff_count": self.handoff_count,
                 "pending_handoff": _value_summary(self.pending_handoff),
                 "pending_control_call": _value_summary(self.pending_control_call),
-                "pending_profile_correction": _value_summary(
-                    self.pending_profile_correction
-                ),
+                "pending_profile_correction": _value_summary(self.pending_profile_correction),
                 "delegation_count": self.delegation_count,
                 "last_delegation_fingerprint": self.last_delegation_fingerprint,
                 "last_delegation_succeeded": self.last_delegation_succeeded,

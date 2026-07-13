@@ -1441,6 +1441,19 @@ function summarizeToolArguments(name: string, value: unknown): string {
   const args = objectValue(value) ?? {}
   if (name === "read") return stringValue(args.path) || "Reading file"
   if (name === "write") {
+    const files = Array.isArray(args.files) ? args.files : []
+    if (files.length) {
+      const first = objectValue(files[0]) ?? {}
+      const bytes = files.reduce((total, item) => {
+        const file = objectValue(item) ?? {}
+        return total + (numberValue(file.bytes) ?? 0)
+      }, 0)
+      return [
+        stringValue(first.path),
+        `${files.length} file${files.length === 1 ? "" : "s"}`,
+        `${bytes} bytes`,
+      ].filter(Boolean).join(" · ")
+    }
     const content = stringValue(args.content)
     return [stringValue(args.path), content ? `${content.length} chars` : ""].filter(Boolean).join(" · ")
   }
@@ -1470,6 +1483,16 @@ function summarizeToolResult(
   const duration = formatDuration(durationMs)
   if (failed) return ["Failed", oneLine(text, 160), duration].filter(Boolean).join(" · ")
   if (name === "write") {
+    const files = Array.isArray(args.files) ? args.files : []
+    if (files.length) {
+      const bytes = files.reduce((total, item) => {
+        const file = objectValue(item) ?? {}
+        return total + (numberValue(file.bytes) ?? 0)
+      }, 0)
+      return [`${files.length} files`, `${bytes} bytes written`, duration]
+        .filter(Boolean)
+        .join(" · ")
+    }
     return [stringValue(args.path), `${stringValue(args.content).length} chars written`, duration]
       .filter(Boolean)
       .join(" · ")
@@ -1499,6 +1522,8 @@ function workerToolDisplay(
   const parts: string[] = []
   if (name === "write" && numberValue(metrics.input_chars) !== undefined) {
     parts.push(`${numberValue(metrics.input_chars)} chars written`)
+  } else if (name === "write" && numberValue(metrics.input_bytes) !== undefined) {
+    parts.push(`${numberValue(metrics.file_count) ?? 0} files · ${numberValue(metrics.input_bytes)} bytes`)
   } else if (name === "edit") {
     const oldChars = numberValue(metrics.old_chars)
     const newChars = numberValue(metrics.new_chars)
