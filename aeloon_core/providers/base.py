@@ -8,7 +8,7 @@ import re
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Protocol
+from typing import Any, ClassVar
 
 from loguru import logger
 
@@ -16,13 +16,46 @@ from aeloon_core.transitions import accumulate_usage
 
 ResponseFormat = dict[str, str]
 
+_TOOL_ARGUMENTS_ERROR_CODE_MAX_CHARS = 64
+_TOOL_ARGUMENTS_ERROR_MESSAGE_MAX_CHARS = 240
 
-class ContentStreamSink(Protocol):
-    """Consume raw content deltas while returning only provider-visible text."""
 
-    async def feed(self, delta: str) -> str: ...
+@dataclass(frozen=True)
+class ToolArgumentsError:
+    """Bounded metadata describing why tool arguments cannot be executed."""
 
-    async def abort(self) -> None: ...
+    code: str
+    message: str
+    position: int | None
+    raw_chars: int
+
+    def __post_init__(self) -> None:
+        raw_chars = max(0, self.raw_chars)
+        position = self.position
+        if position is not None:
+            position = min(max(0, position), raw_chars)
+        object.__setattr__(
+            self,
+            "code",
+            self.code[:_TOOL_ARGUMENTS_ERROR_CODE_MAX_CHARS],
+        )
+        object.__setattr__(
+            self,
+            "message",
+            self.message[:_TOOL_ARGUMENTS_ERROR_MESSAGE_MAX_CHARS],
+        )
+        object.__setattr__(self, "position", position)
+        object.__setattr__(self, "raw_chars", raw_chars)
+
+    def to_dict(self) -> dict[str, str | int | None]:
+        """Return JSON-compatible error metadata without raw arguments."""
+
+        return {
+            "code": self.code,
+            "message": self.message,
+            "position": self.position,
+            "raw_chars": self.raw_chars,
+        }
 
 
 @dataclass
@@ -31,23 +64,12 @@ class ToolCallRequest:
 
     id: str
     name: str
-    arguments: dict[str, Any] | list[Any] | None
+    arguments: dict[str, Any]
+    arguments_error: ToolArgumentsError | None = None
 
     def __post_init__(self) -> None:
-        if isinstance(self.arguments, dict):
-            return
-        if self.arguments is None:
+        if self.arguments_error is not None:
             self.arguments = {}
-            return
-        if isinstance(self.arguments, list):
-            if len(self.arguments) == 1 and isinstance(self.arguments[0], dict):
-                self.arguments = self.arguments[0]
-                return
-            if self.arguments and all(isinstance(item, dict) for item in self.arguments):
-                merged: dict[str, Any] = {}
-                for item in self.arguments:
-                    merged.update(item)
-                self.arguments = merged
 
     def to_openai_tool_call(self) -> dict[str, Any]:
         """Serialize to an OpenAI-style tool_call payload."""
@@ -72,9 +94,6 @@ class LLMResponse:
     usage: dict[str, int] = field(default_factory=dict)
     reasoning_content: str | None = None
     thinking_blocks: list[dict] | None = None
-    write_batch: Any = None
-    write_error: str | None = None
-    stream_sink: ContentStreamSink | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -253,11 +272,10 @@ class LLMProvider(ABC):
         tool_choice: str | dict[str, Any] | None = None,
         on_delta: Callable[[str], Awaitable[None]] | None = None,
         on_reasoning_delta: Callable[[str], Awaitable[None]] | None = None,
-        content_sink: ContentStreamSink | None = None,
     ) -> LLMResponse:
         """Stream a chat completion when a provider supports it."""
 
-        del on_delta, on_reasoning_delta, content_sink
+        del on_delta, on_reasoning_delta
         return await self.chat(
             messages=messages,
             tools=tools,
@@ -306,7 +324,6 @@ class LLMProvider(ABC):
         tool_choice: str | dict[str, Any] | None = None,
         on_delta: Callable[[str], Awaitable[None]] | None = None,
         on_reasoning_delta: Callable[[str], Awaitable[None]] | None = None,
-        content_sink_factory: Callable[[int], ContentStreamSink] | None = None,
     ) -> LLMResponse:
         """Call chat_stream() with retry on transient provider failures."""
 
@@ -322,25 +339,12 @@ class LLMProvider(ABC):
 
         async def _attempt(attempt: int) -> LLMResponse:
             # Only stream deltas on the first try; retries collect silently.
-            sink = content_sink_factory(attempt) if content_sink_factory is not None else None
-            try:
-                response = await self._safe_call(
-                    self.chat_stream(
-                        **kw,
-                        on_delta=on_delta if attempt == 1 else None,
-                        on_reasoning_delta=on_reasoning_delta if attempt == 1 else None,
-                        content_sink=sink,
-                    )
+            return await self._safe_call(
+                self.chat_stream(
+                    **kw,
+                    on_delta=on_delta if attempt == 1 else None,
+                    on_reasoning_delta=on_reasoning_delta if attempt == 1 else None,
                 )
-            except BaseException:
-                if sink is not None:
-                    await sink.abort()
-                raise
-            if response.finish_reason == "error":
-                if sink is not None:
-                    await sink.abort()
-            else:
-                response.stream_sink = sink
-            return response
+            )
 
         return await self._retry(_attempt, label="Streaming LLM")

@@ -15,6 +15,7 @@ from typing import Any
 from loguru import logger
 
 from aeloon_core.loop_guard import tool_result_failed
+from aeloon_core.operator_output import sanitize_operator_output
 from aeloon_core.providers.base import ToolCallRequest
 from aeloon_core.task_graph import TaskNode
 
@@ -41,6 +42,19 @@ _ACTIVITY_PHASES = {
     "synthesizing",
 }
 _MAX_PENDING_JOURNAL_CALLS = 64
+_MAX_TOOL_RESULT_PREVIEW_CHARS = 4_000
+_MAX_TOOL_FAILURE_PREVIEW_CHARS = 400
+_SAFE_FAILURE_PREVIEW_TOOLS = {
+    "glob",
+    "grep",
+    "read",
+    "skill",
+    "str_replace",
+    "todowrite",
+    "webfetch",
+    "websearch",
+    "write",
+}
 _DISPLAYABLE_COMMANDS = {
     "bun",
     "find",
@@ -67,7 +81,7 @@ class _BufferedJournalCall:
 
 
 class WorkerProgress:
-    """Forward sanitized activity while swallowing all Worker-authored text."""
+    """Hide model-authored text and project bounded activity for operators."""
 
     def __init__(
         self,
@@ -81,6 +95,9 @@ class WorkerProgress:
     ) -> None:
         self.parent = parent
         self.journal = journal
+        self.allow_tool_output = bool(
+            getattr(parent, "allow_worker_tool_output", False)
+        )
         self.worker_id = worker_id
         self.run_id = run_id
         self.run_sequence = max(1, int(run_sequence))
@@ -284,7 +301,10 @@ class WorkerProgress:
         duration_ms = (
             max(0, int((perf_counter() - started) * 1_000)) if started is not None else None
         )
-        tool_name, status, metrics = _safe_tool_projection(node)
+        tool_name, status, metrics = _safe_tool_projection(
+            node,
+            include_result_preview=self.allow_tool_output,
+        )
         self._call_journal(
             "record_tool",
             run_id=self.run_id,
@@ -521,8 +541,12 @@ def _journal_call_priority(name: str, kwargs: dict[str, Any]) -> int:
     return 1
 
 
-def _safe_tool_projection(node: TaskNode) -> tuple[str, str, dict[str, Any]]:
-    """Cross the Worker/Base boundary with only a strict display allowlist."""
+def _safe_tool_projection(
+    node: TaskNode,
+    *,
+    include_result_preview: bool = False,
+) -> tuple[str, str, dict[str, Any]]:
+    """Project Worker activity through a strict observer allowlist."""
 
     arguments = node.arguments if isinstance(node.arguments, dict) else {}
     result = str(node.result or "")
@@ -536,18 +560,38 @@ def _safe_tool_projection(node: TaskNode) -> tuple[str, str, dict[str, Any]]:
         "result_chars": len(result),
         "result_lines": len(result.splitlines()),
     }
+    if include_result_preview and node.tool_name == "exec":
+        result_preview = _safe_tool_result_preview(result)
+        if result_preview:
+            metrics["result_preview"] = result_preview
+    elif (
+        include_result_preview
+        and status != "done"
+        and node.tool_name in _SAFE_FAILURE_PREVIEW_TOOLS
+    ):
+        first_line = next((line for line in result.splitlines() if line.strip()), "")
+        result_preview = _safe_tool_result_preview(
+            first_line,
+            limit=_MAX_TOOL_FAILURE_PREVIEW_CHARS,
+        )
+        if result_preview:
+            metrics["result_preview"] = result_preview
     if node.tool_name == "write":
-        files = arguments.get("files")
-        if isinstance(files, list):
-            metrics["file_count"] = len(files)
-            metrics["input_bytes"] = sum(
-                int(item.get("bytes") or 0) for item in files if isinstance(item, dict)
-            )
-        else:
-            metrics["input_chars"] = len(str(arguments.get("content") or ""))
-    elif node.tool_name == "edit":
-        metrics["old_chars"] = len(str(arguments.get("old_text") or ""))
-        metrics["new_chars"] = len(str(arguments.get("new_text") or ""))
+        content = arguments.get("content")
+        content_text = content if isinstance(content, str) else ""
+        metrics["input_chars"] = len(content_text)
+        try:
+            metrics["input_bytes"] = len(content_text.encode("utf-8"))
+        except UnicodeEncodeError:
+            pass
+        expected_offset = arguments.get("expected_offset")
+        if isinstance(expected_offset, int) and not isinstance(expected_offset, bool):
+            metrics["expected_offset"] = expected_offset
+    elif node.tool_name == "str_replace":
+        metrics["old_chars"] = len(str(arguments.get("old_str") or ""))
+        metrics["new_chars"] = len(str(arguments.get("new_str") or ""))
+        if arguments.get("replace_all") is True:
+            metrics["replace_all"] = True
     elif node.tool_name == "exec":
         command = _safe_command_summary(arguments.get("command"))
         if command:
@@ -608,6 +652,16 @@ def _safe_command_summary(value: Any, *, limit: int = 160) -> str:
             break
     summary = " ".join(visible)
     return summary if len(summary) <= limit else f"{summary[: limit - 1]}…"
+
+
+def _safe_tool_result_preview(
+    value: Any,
+    *,
+    limit: int = _MAX_TOOL_RESULT_PREVIEW_CHARS,
+) -> str:
+    """Sanitize and bound tool output for privileged local operator display."""
+
+    return sanitize_operator_output(value, limit=limit)
 
 
 def _safe_current_todo(node: TaskNode) -> tuple[str, int, int] | None:

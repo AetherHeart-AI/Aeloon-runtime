@@ -463,6 +463,7 @@ class _DelegatedProgress:
                 id=self._call_id(tool_call.id),
                 name=tool_call.name,
                 arguments=tool_call.arguments,
+                arguments_error=tool_call.arguments_error,
             )
             for tool_call in tool_calls
         ]

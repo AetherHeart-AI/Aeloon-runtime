@@ -14,9 +14,17 @@ from pydantic import BaseModel, Field
 
 from aeloon_core.tools.base import WorkspaceTool
 
+MAX_EXEC_COMMAND_CHARS = 8_192
+
 
 class ExecArgs(BaseModel):
-    command: str = Field(description="Shell command to execute.")
+    command: str = Field(
+        description=(
+            "Shell command to execute, at most 8192 characters. Do not put generated file or "
+            "long script bodies here; use write for new files and str_replace for edits."
+        ),
+        json_schema_extra={"maxLength": MAX_EXEC_COMMAND_CHARS},
+    )
     working_dir: str | None = Field(
         default=None,
         description="Optional working directory. Relative paths resolve from workspace.",
@@ -30,7 +38,8 @@ class ExecTool(WorkspaceTool):
     name = "exec"
     description = (
         "Execute a shell command in the workspace and return stdout, stderr, "
-        "and exit code. Quote paths because they may contain spaces."
+        "and exit code. Quote paths because they may contain spaces. Use write or str_replace "
+        "instead of inline Python, heredocs, or redirection for generated file contents."
     )
     args_model = ExecArgs
 
@@ -52,6 +61,8 @@ class ExecTool(WorkspaceTool):
         working_dir: str | None = None,
         timeout: int | None = None,
     ) -> str:
+        if len(command) > MAX_EXEC_COMMAND_CHARS:
+            return _payload_violation_error(len(command))
         cwd = self._resolve(working_dir)
         effective_timeout = min(timeout or self.timeout, 600)
         try:
@@ -180,3 +191,11 @@ class ExecTool(WorkspaceTool):
 
 def _sandbox_literal(path: Path) -> str:
     return str(path).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _payload_violation_error(actual_chars: int) -> str:
+    return (
+        f"Error [EXEC_COMMAND_TOO_LARGE]: field=command; actual={actual_chars}; "
+        f"limit={MAX_EXEC_COMMAND_CHARS}; next_action=run a short command by path, or use write "
+        "for a new file and str_replace for an existing file."
+    )

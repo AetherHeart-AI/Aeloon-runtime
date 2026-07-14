@@ -58,6 +58,11 @@ ToolName: TypeAlias = Annotated[
     StringConstraints(strip_whitespace=True, min_length=1, max_length=256),
 ]
 
+LEGACY_EDIT_MIGRATION = (
+    "legacy profile tool 'edit' is incompatible; replace it with 'str_replace', "
+    "increment the profile revision, then compile, approve, and activate a new artifact"
+)
+
 _FRONTMATTER_RE = re.compile(
     r"\A---[ \t]*\n(?P<yaml>.*?)\n---[ \t]*(?:\n|\Z)(?P<body>.*)\Z",
     re.DOTALL,
@@ -93,6 +98,8 @@ class _FrozenStrictModel(BaseModel):
 def _validate_tools(tools: tuple[str, ...]) -> tuple[str, ...]:
     if len(set(tools)) != len(tools):
         raise ValueError("tool names must be unique within an agent")
+    if "edit" in tools:
+        raise ValueError(LEGACY_EDIT_MIGRATION)
     return tools
 
 
@@ -590,6 +597,7 @@ __all__ = [
     "COMPILED_API_VERSION",
     "MAX_COMPILED_SOURCE_CHARS",
     "MAX_PROFILE_SOURCE_CHARS",
+    "LEGACY_EDIT_MIGRATION",
     "PROFILE_ID_PATTERN",
     "PROFILE_SCHEMA_VERSION",
     "RESERVED_ROLE_IDS",

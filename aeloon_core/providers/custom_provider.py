@@ -2,20 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
-import json_repair
 from openai import AsyncOpenAI
 
 from aeloon_core.providers.base import (
-    ContentStreamSink,
     GenerationSettings,
     LLMProvider,
     LLMResponse,
     ResponseFormat,
+    ToolArgumentsError,
     ToolCallRequest,
 )
 
@@ -24,6 +25,150 @@ _UNSUPPORTED_TOOL_MARKERS = (
     "enable-auto-tool-choice",
     "tool-call-parser",
 )
+_COMPLETE_FINISH_REASONS = frozenset({"stop", "tool_calls"})
+_MISSING_FINISH_REASON = "unknown"
+
+
+def _raw_argument_chars(raw_arguments: Any) -> int:
+    return len(raw_arguments) if isinstance(raw_arguments, str) else 0
+
+
+def _reject_non_json_constant(value: str) -> None:
+    raise ValueError(f"non-standard numeric constant {value}")
+
+
+def _decode_tool_arguments(
+    raw_arguments: Any,
+) -> tuple[dict[str, Any], ToolArgumentsError | None]:
+    """Strictly decode one JSON-object argument payload without retaining invalid input."""
+
+    raw_chars = _raw_argument_chars(raw_arguments)
+    if not isinstance(raw_arguments, str):
+        return {}, ToolArgumentsError(
+            code="TOOL_ARGUMENTS_INVALID_JSON",
+            message="Tool arguments must be a JSON string encoding an object.",
+            position=None,
+            raw_chars=raw_chars,
+        )
+    try:
+        decoded = json.loads(raw_arguments, parse_constant=_reject_non_json_constant)
+    except json.JSONDecodeError as exc:
+        return {}, ToolArgumentsError(
+            code="TOOL_ARGUMENTS_INVALID_JSON",
+            message=f"Tool arguments are not valid JSON: {exc.msg}.",
+            position=exc.pos,
+            raw_chars=raw_chars,
+        )
+    except ValueError as exc:
+        return {}, ToolArgumentsError(
+            code="TOOL_ARGUMENTS_INVALID_JSON",
+            message=f"Tool arguments are not valid JSON: {exc}.",
+            position=None,
+            raw_chars=raw_chars,
+        )
+    if not isinstance(decoded, dict):
+        return {}, ToolArgumentsError(
+            code="TOOL_ARGUMENTS_NOT_OBJECT",
+            message=(
+                "Tool arguments must decode to a JSON object, "
+                f"not {type(decoded).__name__}."
+            ),
+            position=None,
+            raw_chars=raw_chars,
+        )
+    return decoded, None
+
+
+def _generation_incomplete_error(
+    finish_reason: str,
+    raw_arguments: Any,
+) -> ToolArgumentsError:
+    return ToolArgumentsError(
+        code="GENERATION_INCOMPLETE",
+        message=(
+            f"Tool-call generation ended with finish_reason={finish_reason!r}; "
+            "the call was not executed."
+        ),
+        position=None,
+        raw_chars=_raw_argument_chars(raw_arguments),
+    )
+
+
+def _tool_call_request(
+    *,
+    call_id: Any,
+    name: Any,
+    raw_arguments: Any,
+    finish_reason: str,
+) -> ToolCallRequest:
+    valid_call_id = (
+        isinstance(call_id, str) and bool(call_id) and call_id == call_id.strip()
+    )
+    valid_name = isinstance(name, str) and bool(name) and name == name.strip()
+    resolved_call_id = call_id if valid_call_id else f"invalid-{uuid.uuid4().hex[:9]}"
+    resolved_name = name if valid_name else "invalid_tool_call"
+    if finish_reason not in _COMPLETE_FINISH_REASONS:
+        arguments = {}
+        arguments_error = _generation_incomplete_error(finish_reason, raw_arguments)
+    elif not valid_call_id or not valid_name:
+        missing = ", ".join(
+            field
+            for field, valid in (("id", valid_call_id), ("function name", valid_name))
+            if not valid
+        )
+        arguments = {}
+        arguments_error = ToolArgumentsError(
+            code="TOOL_CALL_INCOMPLETE",
+            message=f"Tool call is missing a non-empty {missing}.",
+            position=None,
+            raw_chars=_raw_argument_chars(raw_arguments),
+        )
+    else:
+        arguments, arguments_error = _decode_tool_arguments(raw_arguments)
+    return ToolCallRequest(
+        id=resolved_call_id,
+        name=resolved_name,
+        arguments=arguments,
+        arguments_error=arguments_error,
+    )
+
+
+def _reject_invalid_tool_batch(
+    tool_calls: list[ToolCallRequest],
+    raw_char_counts: list[int],
+) -> list[ToolCallRequest]:
+    """Reject otherwise-valid calls when any call in a complete batch is malformed."""
+
+    first_error = next(
+        (
+            call.arguments_error
+            for call in tool_calls
+            if call.arguments_error is not None
+            and call.arguments_error.code
+            in {
+                "TOOL_ARGUMENTS_INVALID_JSON",
+                "TOOL_ARGUMENTS_NOT_OBJECT",
+                "TOOL_CALL_INCOMPLETE",
+            }
+        ),
+        None,
+    )
+    if first_error is None:
+        return tool_calls
+    for call, raw_chars in zip(tool_calls, raw_char_counts, strict=True):
+        if call.arguments_error is not None:
+            continue
+        call.arguments = {}
+        call.arguments_error = ToolArgumentsError(
+            code="TOOL_BATCH_REJECTED",
+            message=(
+                "Tool batch was rejected because another call failed with "
+                f"{first_error.code}."
+            ),
+            position=None,
+            raw_chars=raw_chars,
+        )
+    return tool_calls
 
 
 def _is_tooling_unsupported_error(exc: Exception) -> bool:
@@ -153,7 +298,6 @@ class CustomProvider(LLMProvider):
         tool_choice: str | dict[str, Any] | None = None,
         on_delta: Callable[[str], Awaitable[None]] | None = None,
         on_reasoning_delta: Callable[[str], Awaitable[None]] | None = None,
-        content_sink: ContentStreamSink | None = None,
     ) -> LLMResponse:
         resolved_model = model or self.default_model
         kwargs = self._build_kwargs(
@@ -176,7 +320,6 @@ class CustomProvider(LLMProvider):
                 stream,
                 on_delta=on_delta,
                 on_reasoning_delta=on_reasoning_delta,
-                content_sink=content_sink,
             )
 
         return await self._create_with_tool_fallback(kwargs, _run)
@@ -187,14 +330,14 @@ class CustomProvider(LLMProvider):
         *,
         on_delta: Callable[[str], Awaitable[None]] | None = None,
         on_reasoning_delta: Callable[[str], Awaitable[None]] | None = None,
-        content_sink: ContentStreamSink | None = None,
     ) -> LLMResponse:
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
         tool_call_parts: dict[int, dict[str, str]] = {}
-        finish_reason = "stop"
+        finish_reason: str | None = None
         usage: dict[str, int] = {}
 
+        stream_error: Exception | None = None
         try:
             async for chunk in stream:
                 usage = self._usage_dict(getattr(chunk, "usage", None)) or usage
@@ -209,13 +352,9 @@ class CustomProvider(LLMProvider):
 
                 content = getattr(delta, "content", None)
                 if isinstance(content, str) and content:
-                    visible = (
-                        await content_sink.feed(content) if content_sink is not None else content
-                    )
-                    if visible:
-                        content_parts.append(visible)
-                        if on_delta is not None:
-                            await on_delta(visible)
+                    content_parts.append(content)
+                    if on_delta is not None:
+                        await on_delta(content)
 
                 reasoning = getattr(delta, "reasoning_content", None)
                 if isinstance(reasoning, str) and reasoning:
@@ -225,15 +364,35 @@ class CustomProvider(LLMProvider):
 
                 for tool_call_delta in getattr(delta, "tool_calls", None) or []:
                     self._accumulate_tool_call_delta(tool_call_parts, tool_call_delta)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            stream_error = exc
         finally:
             close = getattr(stream, "aclose", None)
             if close is not None:
-                await close()
+                try:
+                    await close()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    if stream_error is None:
+                        stream_error = exc
 
+        if stream_error is not None:
+            detail = f"{type(stream_error).__name__}: {stream_error}"
+            return LLMResponse(
+                content=f"Error calling LLM: stream ended before completion ({detail})",
+                tool_calls=self._stream_tool_calls(tool_call_parts, "error"),
+                finish_reason="error",
+                usage=usage,
+            )
+
+        resolved_finish_reason = finish_reason or _MISSING_FINISH_REASON
         return LLMResponse(
             content="".join(content_parts) or None,
-            tool_calls=self._stream_tool_calls(tool_call_parts),
-            finish_reason=finish_reason,
+            tool_calls=self._stream_tool_calls(tool_call_parts, resolved_finish_reason),
+            finish_reason=resolved_finish_reason,
             usage=usage,
             reasoning_content="".join(reasoning_parts) or None,
         )
@@ -264,26 +423,26 @@ class CustomProvider(LLMProvider):
             entry["arguments"] += arguments
 
     @staticmethod
-    def _stream_tool_calls(parts: dict[int, dict[str, str]]) -> list[ToolCallRequest]:
+    def _stream_tool_calls(
+        parts: dict[int, dict[str, str]],
+        finish_reason: str = "tool_calls",
+    ) -> list[ToolCallRequest]:
         tool_calls: list[ToolCallRequest] = []
+        raw_char_counts: list[int] = []
         for index in sorted(parts):
             entry = parts[index]
             name = entry.get("name") or ""
-            if not name:
-                continue
-            raw_args = (entry.get("arguments") or "").strip()
-            try:
-                arguments = json_repair.loads(raw_args) if raw_args else {}
-            except Exception:
-                arguments = {"_raw": raw_args}
+            raw_arguments = entry.get("arguments") or ""
             tool_calls.append(
-                ToolCallRequest(
-                    id=entry.get("id") or uuid.uuid4().hex[:9],
+                _tool_call_request(
+                    call_id=entry.get("id"),
                     name=name,
-                    arguments=arguments,
+                    raw_arguments=raw_arguments,
+                    finish_reason=finish_reason,
                 )
             )
-        return tool_calls
+            raw_char_counts.append(_raw_argument_chars(raw_arguments))
+        return _reject_invalid_tool_batch(tool_calls, raw_char_counts)
 
     @staticmethod
     def _usage_dict(usage: Any) -> dict[str, int]:
@@ -306,29 +465,27 @@ class CustomProvider(LLMProvider):
             )
         choice = response.choices[0]
         msg = choice.message
+        finish_reason = choice.finish_reason or _MISSING_FINISH_REASON
         tool_calls: list[ToolCallRequest] = []
+        raw_char_counts: list[int] = []
         for tc in msg.tool_calls or []:
-            raw_arguments = tc.function.arguments
-            arguments: dict[str, Any] | list[Any] | None
-            if isinstance(raw_arguments, str):
-                loaded_arguments = json_repair.loads(raw_arguments)
-                arguments = loaded_arguments if isinstance(loaded_arguments, dict | list) else None
-            elif isinstance(raw_arguments, dict | list):
-                arguments = raw_arguments
-            else:
-                arguments = None
+            function = getattr(tc, "function", None)
+            raw_arguments = getattr(function, "arguments", None)
             tool_calls.append(
-                ToolCallRequest(
-                    id=tc.id,
-                    name=tc.function.name,
-                    arguments=arguments,
+                _tool_call_request(
+                    call_id=getattr(tc, "id", None),
+                    name=getattr(function, "name", None),
+                    raw_arguments=raw_arguments,
+                    finish_reason=finish_reason,
                 )
             )
+            raw_char_counts.append(_raw_argument_chars(raw_arguments))
+        _reject_invalid_tool_batch(tool_calls, raw_char_counts)
         usage = response.usage
         return LLMResponse(
             content=msg.content,
             tool_calls=tool_calls,
-            finish_reason=choice.finish_reason or "stop",
+            finish_reason=finish_reason,
             usage={
                 "prompt_tokens": usage.prompt_tokens,
                 "completion_tokens": usage.completion_tokens,

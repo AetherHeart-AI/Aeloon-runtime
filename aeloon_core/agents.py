@@ -5,7 +5,6 @@ from __future__ import annotations
 import inspect
 import json
 import unicodedata
-import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -56,27 +55,14 @@ from aeloon_core.runtime_support import (
     shrink_answered_tool_args_for_provider,
 )
 from aeloon_core.state import AgentNode, LightweightState, RunStatus
-from aeloon_core.task_graph import TaskNode, TaskState
+from aeloon_core.task_graph import TaskNode
 from aeloon_core.tools.registry import ScopedToolRegistry
 from aeloon_core.transitions import NodeKind, TransitionRecorder, normalize_usage
-from aeloon_core.write_protocol import WriteFrameDecoder, WriteProtocolError, protocol_guidance
-from aeloon_core.write_runtime import WriteCoordinator
 
 if TYPE_CHECKING:
     from aeloon_core.profiles import RuntimeAgentSpec, RuntimeProfileSpec
     from aeloon_core.providers.base import LLMProvider, LLMResponse
     from aeloon_core.tools.registry import ToolRegistry
-
-
-class _WriteContentSink:
-    def __init__(self, decoder: WriteFrameDecoder) -> None:
-        self.decoder = decoder
-
-    async def feed(self, delta: str) -> str:
-        return self.decoder.feed(delta)
-
-    async def abort(self) -> None:
-        self.decoder.abort()
 
 
 @dataclass
@@ -96,7 +82,6 @@ class AgentRuntime:
     trace_enabled: bool = True
     on_progress: Callable[..., Awaitable[None]] | None = None
     prepare_model_input: PrepareModelInput | None = None
-    write_coordinator: WriteCoordinator | None = None
     add_assistant_message: Callable[..., list[dict[str, Any]]] = default_add_assistant_message
     add_tool_result: Callable[[list[dict[str, Any]], str, str, str], list[dict[str, Any]]] = (
         default_add_tool_result
@@ -198,15 +183,6 @@ class AgentRuntime:
         allow_streaming: bool = True,
     ) -> LLMResponse:
         provider_messages = shrink_answered_tool_args_for_provider(messages)
-        write_enabled = self.write_coordinator is not None and "write" in _active_tool_names(
-            tool_defs
-        )
-        write_transaction_id = uuid.uuid4().hex if write_enabled else None
-        if write_transaction_id is not None:
-            provider_messages = [
-                *provider_messages,
-                {"role": "system", "content": protocol_guidance(write_transaction_id)},
-            ]
         delta_hook = (
             getattr(self.on_progress, "on_llm_delta", None)
             if self.on_progress and allow_streaming
@@ -218,7 +194,7 @@ class AgentRuntime:
             else None
         )
         if (
-            delta_hook is not None or reasoning_delta_hook is not None or write_enabled
+            delta_hook is not None or reasoning_delta_hook is not None
         ) and provider_supports_streaming(self.provider):
             think_filter = ThinkTagDeltaFilter()
 
@@ -247,88 +223,19 @@ class AgentRuntime:
                 on_reasoning_delta=(
                     _on_reasoning_delta if reasoning_delta_hook is not None else None
                 ),
-                content_sink_factory=(
-                    (
-                        lambda _attempt: _WriteContentSink(
-                            WriteFrameDecoder(
-                                transaction_id=write_transaction_id,
-                                attempt=self.write_coordinator.start_attempt(write_transaction_id),
-                            )
-                        )
-                    )
-                    if write_enabled
-                    and write_transaction_id is not None
-                    and self.write_coordinator is not None
-                    else None
-                ),
             )
             tail = think_filter.flush() if delta_hook is not None else ""
             if tail and delta_hook is not None:
                 result = delta_hook(tail)
                 if inspect.isawaitable(result):
                     await result
-            if write_enabled and isinstance(response.stream_sink, _WriteContentSink):
-                await self._finalize_write_sink(
-                    response,
-                    response.stream_sink,
-                    delta_hook=delta_hook,
-                )
             return response
 
-        response = await self.provider.chat_with_retry(
+        return await self.provider.chat_with_retry(
             messages=provider_messages,
             tools=tool_defs,
             model=self.model,
         )
-        if (
-            write_enabled
-            and write_transaction_id is not None
-            and self.write_coordinator is not None
-            and response.finish_reason != "error"
-        ):
-            sink = _WriteContentSink(
-                WriteFrameDecoder(
-                    transaction_id=write_transaction_id,
-                    attempt=self.write_coordinator.start_attempt(write_transaction_id),
-                )
-            )
-            if response.content:
-                await sink.feed(response.content)
-            await self._finalize_write_sink(response, sink, delta_hook=None)
-        return response
-
-    async def _finalize_write_sink(
-        self,
-        response: LLMResponse,
-        sink: _WriteContentSink,
-        *,
-        delta_hook: Callable[[str], Awaitable[None]] | None,
-    ) -> None:
-        streamed_content = response.content or ""
-        try:
-            result = sink.decoder.finalize(
-                finish_reason=response.finish_reason,
-                has_tool_calls=bool(response.tool_calls),
-            )
-        except WriteProtocolError as exc:
-            response.content = sink.decoder.visible_content
-            response.write_batch = None
-            response.write_error = str(exc)
-        else:
-            response.content = result.visible_content
-            response.write_batch = result.batch
-        finally:
-            response.stream_sink = None
-        final_content = response.content or ""
-        if (
-            delta_hook is not None
-            and final_content.startswith(streamed_content)
-            and len(final_content) > len(streamed_content)
-        ):
-            tail = final_content[len(streamed_content) :]
-            result = delta_hook(tail)
-            if inspect.isawaitable(result):
-                await result
 
     async def finish(
         self,
@@ -546,7 +453,7 @@ class MasterAgent(BaseAgent):
             next_node = AgentNode.WORKER
         elif state.pending_control_call is not None:
             next_node = AgentNode.CONTROL
-        elif state.pending_tool_calls or state.pending_write_batch is not None:
+        elif state.pending_tool_calls:
             next_node = AgentNode.TOOL
         elif state.profile_ref is not None and state.resume_agent_id is not None:
             state.active_agent_id = state.resume_agent_id
@@ -657,6 +564,7 @@ class WorkerAgent(BaseAgent):
                 tool_defs = [*tool_defs, *control_definitions]
             else:
                 tool_defs = self.runtime.tools.get_definitions()
+                state.active_tools = _active_tool_names(tool_defs)
             await self.runtime.emit_hook(
                 "on_agent_activity",
                 phase="analyzing" if state.metadata.iteration == 1 else "planning",
@@ -782,37 +690,14 @@ class WorkerAgent(BaseAgent):
             component=component,
         )
 
-        if response.write_error is not None:
-            state.messages = self.runtime.add_assistant_message(
-                state.messages,
-                response.content,
-                reasoning_content=response.reasoning_content,
-                thinking_blocks=response.thinking_blocks,
-            )
-            return await self.runtime.queue_guard(
-                state,
-                event=GuardEvent.RUNTIME_ERROR,
-                cause=(
-                    "streamed WRITE protocol rejected; no files were changed: "
-                    f"{response.write_error}. Resend the complete batch or use edit "
-                    "for a small change."
-                ),
-            )
-
-        if response.write_batch is not None:
-            batch = response.write_batch
-            response.write_batch = None
-            state.pending_response = response
-            state.pending_write_batch = batch
-            state.pending_tool_calls = []
-            if self.runtime.profile is not None:
-                state.resume_agent_id = state.active_agent_id
-            state.metadata.phase = AgentNode.MASTER
-            return state
-
         if response.tool_calls:
             if state.metadata.status == RunStatus.FINALIZING:
                 return await self._handle_finalization_tool_calls(state, response)
+            if any(call.arguments_error is not None for call in response.tool_calls):
+                state.pending_response = response
+                state.pending_tool_calls = list(response.tool_calls)
+                state.metadata.phase = AgentNode.MASTER
+                return state
             if self.runtime.profile is not None:
                 control_names = self.runtime.profile_control_tool_names()
                 control_calls = [
@@ -995,8 +880,6 @@ class ToolAgent(BaseAgent):
 
     async def run(self, state: LightweightState) -> LightweightState:
         response = state.pending_response
-        if response is not None and state.pending_write_batch is not None:
-            return await self._run_write_batch(state, response)
         if response is None or not state.pending_tool_calls:
             self._clear_pending(state)
             state.metadata.phase = AgentNode.MASTER
@@ -1102,95 +985,10 @@ class ToolAgent(BaseAgent):
             )
         return await self.runtime.grant_more_or_finalize(state)
 
-    async def _run_write_batch(
-        self,
-        state: LightweightState,
-        response: LLMResponse,
-    ) -> LightweightState:
-        batch = state.pending_write_batch
-        coordinator = self.runtime.write_coordinator
-        if batch is None or coordinator is None:
-            self._clear_pending(state)
-            return await self.runtime.queue_guard(
-                state,
-                event=GuardEvent.RUNTIME_ERROR,
-                cause="streamed WRITE batch reached ToolAgent without a coordinator",
-            )
-
-        call_id = f"stream-write-{batch.transaction_id[:16]}"
-        tool_call = ToolCallRequest(
-            id=call_id,
-            name="write",
-            arguments=batch.manifest(),
-        )
-        state.messages = self.runtime.add_assistant_message(
-            state.messages,
-            response.content,
-            tool_calls=[tool_call.to_openai_tool_call()],
-            reasoning_content=response.reasoning_content,
-            thinking_blocks=response.thinking_blocks,
-        )
-        await self.runtime.emit_hook("on_tool_calls", [tool_call])
-        node = TaskNode(
-            index=0,
-            call_id=call_id,
-            tool_name="write",
-            arguments=tool_call.arguments if isinstance(tool_call.arguments, dict) else {},
-            mode="mutating",
-            state=TaskState.RUNNING,
-        )
-        failure: Mapping[str, Any] | None = None
-        try:
-            manifest = await coordinator.commit_batch(batch)
-            node.result = "Successfully committed streamed WRITE batch: " + json.dumps(
-                manifest, ensure_ascii=False, sort_keys=True
-            )
-            node.state = TaskState.DONE
-            state.tools_used.append("write")
-        except Exception as exc:
-            node.error = str(exc)
-            node.result = (
-                "Error: Streamed WRITE batch was rejected; no partial generated file was "
-                f"accepted: {exc}"
-            )
-            node.state = TaskState.FAILED
-            failure = {
-                "tool_name": "write",
-                "call_id": call_id,
-                "error": str(exc),
-            }
-        state.pending_tool_nodes = [node]
-        await self.runtime.emit_hook("on_tool_result", node)
-        state.messages = self.runtime.add_tool_result(
-            state.messages,
-            call_id,
-            "write",
-            node.result,
-        )
-        self._clear_pending(state)
-        self.runtime.describe_step(
-            {
-                "executed": 1,
-                "failed": 1 if failure is not None else 0,
-                "streamed_write": True,
-                "files": len(batch.files),
-            }
-        )
-        if failure is not None:
-            return await self.runtime.queue_guard(
-                state,
-                event=GuardEvent.TOOL_ERROR,
-                cause="streamed WRITE batch failed",
-                failures=(failure,),
-                recent_outcomes=(node.result,),
-            )
-        return await self.runtime.grant_more_or_finalize(state)
-
     @staticmethod
     def _clear_pending(state: LightweightState) -> None:
         state.pending_response = None
         state.pending_tool_calls = []
-        state.pending_write_batch = None
 
 
 class GuardAgent(BaseAgent):

@@ -18,7 +18,6 @@ from aeloon_core.transitions import TokenLedger, TransitionRecord
 if TYPE_CHECKING:
     from aeloon_core.providers.base import LLMResponse, ToolCallRequest
     from aeloon_core.task_graph import TaskNode
-    from aeloon_core.write_runtime import StagedWriteBatch
 
 Message = dict[str, Any]
 LazyLoader = Callable[[], Any]
@@ -256,7 +255,6 @@ class LightweightState:
     pending_response: LLMResponse | None = None
     pending_tool_calls: list[ToolCallRequest] = field(default_factory=list)
     pending_tool_nodes: list[TaskNode] = field(default_factory=list)
-    pending_write_batch: StagedWriteBatch | None = field(default=None, repr=False)
     pending_guard_request: GuardRequest | None = None
     final_emitted: bool = False
     tools_used: list[str] = field(default_factory=list)
@@ -362,11 +360,6 @@ class LightweightState:
             "pending_tool_nodes": [
                 _value_summary(tool_node) for tool_node in self.pending_tool_nodes
             ],
-            "pending_write_batch": (
-                _value_summary(self.pending_write_batch.manifest())
-                if self.pending_write_batch is not None
-                else None
-            ),
             "pending_guard_request": _value_summary(self.pending_guard_request),
             "final_emitted": self.final_emitted,
             "tools_used": list(self.tools_used),

@@ -160,10 +160,37 @@ export function TimelineRow(props: TimelineRowProps) {
     return parts.join(" · ")
   })
   const expanded = createMemo(() => props.showRaw || props.item.collapsed === false)
-  const canExpand = createMemo(() => Boolean(props.item.resultPreview || props.item.rawDetail || props.item.kind === "thinking"))
+  const result = createMemo(() =>
+    expanded()
+      ? props.item.resultDetail ?? props.item.resultPreview
+      : props.item.resultPreview,
+  )
+  const canExpand = createMemo(() => Boolean(
+    props.item.rawDetail
+      || props.item.kind === "thinking"
+      || (props.item.resultDetail && props.item.resultDetail !== props.item.resultPreview),
+  ))
+  if (props.item.kind === "aggregate") {
+    return (
+      <text
+        fg={props.palette.muted}
+        selectable
+        selectionBg={props.palette.selection}
+        wrapMode="word"
+        flexShrink={0}
+      >
+        ⋯ {props.item.body}
+      </text>
+    )
+  }
   if (props.item.kind === "tool") {
     return (
-      <box width="100%" flexDirection="column" marginBottom={expanded() ? 1 : 0} flexShrink={0}>
+      <box
+        width="100%"
+        flexDirection="column"
+        marginBottom={expanded() || result() ? 1 : 0}
+        flexShrink={0}
+      >
         <text
           fg={color()}
           selectable
@@ -178,7 +205,7 @@ export function TimelineRow(props: TimelineRowProps) {
           {props.item.workerLabel ? ` · ${props.item.workerLabel}` : ""}
           {canExpand() ? ` ${expanded() ? "▾" : "▸"}` : ""}
         </text>
-        <Show when={expanded() && props.item.resultPreview} fallback={<EmptySlot />}>
+        <Show when={result()} fallback={<EmptySlot />}>
           {(detail) => (
             <text fg={props.palette.foreground} selectable selectionBg={props.palette.selection} wrapMode="word">
               {detail()}

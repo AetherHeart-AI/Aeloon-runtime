@@ -31,7 +31,7 @@ from aeloon_core.providers.custom_provider import CustomProvider
 from aeloon_core.session import SessionStore
 from aeloon_core.skills import SkillRegistry
 from aeloon_core.state_machine import run_agent_loop
-from aeloon_core.tools.filesystem import EditTool, ReadTool, WriteTool
+from aeloon_core.tools.filesystem import ReadTool, StrReplaceTool, WriteTool
 from aeloon_core.tools.registry import ScopedToolRegistry, ToolRegistry
 from aeloon_core.tools.search_grep import GlobTool, GrepTool
 from aeloon_core.tools.shell import ExecTool
@@ -51,7 +51,6 @@ from aeloon_core.worker_sessions import (
     WorkerRunStatus,
     WorkerStore,
 )
-from aeloon_core.write_runtime import WriteCoordinator
 
 
 @dataclass
@@ -97,11 +96,6 @@ class AeloonCoreOrchestrator:
         self.profile_registry = self.worker_tool_registry
         self.skills = SkillRegistry.discover(config)
         workspace = config.workspace
-        self.write_coordinator = WriteCoordinator(
-            workspace=workspace,
-            data_dir=config.data_dir,
-            denied_paths=(config.data_dir,),
-        )
         self.todo_tool = TodoWriteTool(data_dir=config.data_dir)
         for registry, protected_paths in (
             (self.registry, ()),
@@ -115,7 +109,7 @@ class AeloonCoreOrchestrator:
                 ),
                 ReadTool(workspace=workspace, denied_paths=protected_paths),
                 WriteTool(workspace=workspace, denied_paths=protected_paths),
-                EditTool(workspace=workspace, denied_paths=protected_paths),
+                StrReplaceTool(workspace=workspace, denied_paths=protected_paths),
                 GlobTool(workspace=workspace, denied_paths=protected_paths),
                 GrepTool(workspace=workspace, denied_paths=protected_paths),
                 WebFetchTool(config=config.tools.web),
@@ -304,7 +298,6 @@ class AeloonCoreOrchestrator:
                 prepare_model_input=prepare_model_input,
                 profile=profile,
                 max_handoffs=defaults.max_handoffs,
-                write_coordinator=self.write_coordinator,
             )
         except BaseException:
             if trace_write_tail is not None:
@@ -416,7 +409,6 @@ class AeloonCoreOrchestrator:
             on_progress=worker_progress,
             profile=profile,
             max_handoffs=defaults.max_handoffs,
-            write_coordinator=self.write_coordinator,
         )
         self.workers.append_transcript(
             run.run_id,

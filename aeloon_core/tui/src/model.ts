@@ -44,6 +44,7 @@ export interface TimelineItem {
   metrics?: string
   primary?: string
   rawDetail?: string
+  resultDetail?: string
   resultPreview?: string
   signal: SignalLevel
   status?: TimelineStatus
@@ -74,7 +75,6 @@ export interface GatewayLog {
 }
 
 export interface WorkerInfo {
-  aggregateId?: string
   currentStep?: string
   durationMs?: number
   goal?: string
@@ -157,6 +157,9 @@ const TERMINAL_WORKER_STATES = new Set([
 
 const LOG_LIMIT = 1_000
 const RAW_DETAIL_LIMIT = 1_200
+const TOOL_RESULT_DETAIL_LIMIT = 16_000
+const TOOL_RESULT_PREVIEW_CHARS = 360
+const TOOL_RESULT_PREVIEW_LINES = 4
 
 export function createAppState(): AppState {
   return {
@@ -473,9 +476,9 @@ export function visibleWorkerItems(state: AppState, workerId: string): TimelineI
   if (!worker) return []
   const visible = worker.timeline.filter((item) => {
     if (state.verbosity === "compact") {
-      return item.kind === "aggregate" || item.signal === "high"
+      return item.kind !== "aggregate" && item.signal === "high"
     }
-    return item.kind !== "aggregate"
+    return true
   })
   if (state.verbosity === "verbose") return visible
   return visible.map((item) => (item.rawDetail ? { ...item, rawDetail: undefined } : item))
@@ -721,6 +724,7 @@ function onBlockUpdate(state: AppState, payload: JsonObject): void {
   const name = block.name ?? "tool"
   const failed = isFailedStatus(patch.status) || toolResultFailed(patch.result)
   if (item) {
+    const result = displayToolResult(name, stringValue(patch.result))
     item.metrics = summarizeToolResult(
       name,
       patch.result,
@@ -729,8 +733,11 @@ function onBlockUpdate(state: AppState, payload: JsonObject): void {
       numberValue(patch.duration_ms),
     )
     item.body = item.metrics
-    item.resultPreview = truncateText(stringValue(patch.result), RAW_DETAIL_LIMIT)
-    item.collapsed = !failed
+    item.resultDetail = boundToolResult(result, TOOL_RESULT_DETAIL_LIMIT) || undefined
+    item.resultPreview = name === "exec" || failed
+      ? previewToolResult(result) || undefined
+      : undefined
+    item.collapsed = true
     item.status = failed ? "failed" : "done"
     if (failed && item.signal === "low") {
       item.signal = "high"
@@ -788,7 +795,6 @@ function onWorkerLifecycle(state: AppState, payload: JsonObject): void {
   worker.durationMs = numberValue(payload.duration_ms) ?? worker.durationMs
   if (worker.status === "running" && !worker.startedAt) worker.startedAt = Date.now()
   if (TERMINAL_WORKER_STATES.has(worker.status)) {
-    worker.aggregateId = undefined
     worker.currentStep = undefined
     worker.phase = friendlyPhase(worker.status, [])
     if (worker.phases.at(-1) !== worker.phase) worker.phases.push(worker.phase)
@@ -853,17 +859,18 @@ function onWorkerToolResult(state: AppState, payload: JsonObject): void {
   const name = stringValue(payload.tool_name) || "tool"
   const failed = stringValue(payload.status) !== "done"
   const signal: SignalLevel = failed || !LOW_SIGNAL_TOOLS.has(name) ? "high" : "low"
-  const display = workerToolDisplay(name, objectValue(payload.metrics) ?? {}, numberValue(payload.duration_ms))
+  const metrics = objectValue(payload.metrics) ?? {}
+  const display = workerToolDisplay(name, metrics, numberValue(payload.duration_ms))
+  const result = workerResultDisplay(name, metrics)
   const body = [display.primary, display.metrics].filter(Boolean).join(" · ")
-  let aggregateId: string | undefined
-  if (signal === "low") aggregateId = bumpWorkerAggregate(state, worker, name)
   appendWorkerItem(state, worker, {
-    aggregateId,
     body,
-    collapsed: !failed,
+    collapsed: true,
     kind: "tool",
     metrics: display.metrics,
     primary: display.primary,
+    resultDetail: result.detail,
+    resultPreview: result.preview,
     signal,
     status: failed ? "failed" : "done",
     title: "TOOL",
@@ -874,10 +881,12 @@ function onWorkerToolResult(state: AppState, payload: JsonObject): void {
   if (signal === "high") {
     addMasterItem(state, {
       body,
-      collapsed: !failed,
+      collapsed: true,
       kind: "tool",
       metrics: display.metrics,
       primary: display.primary,
+      resultDetail: result.detail,
+      resultPreview: result.preview,
       signal: "high",
       status: failed ? "failed" : "done",
       title: "TOOL",
@@ -887,7 +896,7 @@ function onWorkerToolResult(state: AppState, payload: JsonObject): void {
       workerLabel: worker.label,
     })
   }
-  markWorkerUnread(state, worker)
+  if (signal === "high") markWorkerUnread(state, worker)
 }
 
 function updateWorkerHeartbeat(state: AppState, payload: JsonObject): void {
@@ -1102,14 +1111,15 @@ function projectWorkerJournalRow(state: AppState, row: JsonObject): TimelineItem
       const count = numberValue(value)
       if (count !== undefined && count > 0) counts[name] = count
     }
+    if (!Object.keys(counts).length) return undefined
     return {
       aggregateCounts: counts,
       body: formatAggregate(counts),
       id: nextId(state, "worker-journal"),
       kind: "aggregate",
-      signal: "high",
+      signal: "low",
       status: "done",
-      title: "ROUTINE ACTIVITY",
+      title: "ROUTINE",
       ts,
     }
   }
@@ -1121,14 +1131,17 @@ function projectWorkerJournalRow(state: AppState, row: JsonObject): TimelineItem
       objectValue(row.metrics) ?? {},
       numberValue(row.duration_ms),
     )
+    const result = workerResultDisplay(name, objectValue(row.metrics) ?? {})
     const body = [display.primary, display.metrics].filter(Boolean).join(" · ")
     return {
       body,
-      collapsed: !failed,
+      collapsed: true,
       id: nextId(state, "worker-journal"),
       kind: "tool",
       metrics: display.metrics,
       primary: display.primary,
+      resultDetail: result.detail,
+      resultPreview: result.preview,
       signal: failed || stringValue(row.signal) !== "low" ? "high" : "low",
       status: failed ? "failed" : "done",
       title: "TOOL",
@@ -1237,7 +1250,6 @@ function beginWorkerRun(
 
   worker.runId = runId
   worker.runSequence = runSequence
-  worker.aggregateId = undefined
   worker.currentStep = undefined
   worker.durationMs = undefined
   worker.goal = undefined
@@ -1311,7 +1323,6 @@ function appendWorkerItem(
 ): TimelineItem {
   const complete: TimelineItem = { ...item, id: nextId(state, `worker-${worker.id.slice(0, 4)}`) }
   worker.timeline.push(complete)
-  if (item.signal === "high" && item.kind !== "aggregate") worker.aggregateId = undefined
   return worker.timeline.at(-1) ?? complete
 }
 
@@ -1332,25 +1343,6 @@ function bumpMasterAggregate(state: AppState, toolName: string): string {
   return item.id
 }
 
-function bumpWorkerAggregate(state: AppState, worker: WorkerInfo, toolName: string): string {
-  let item = worker.aggregateId
-    ? worker.timeline.find((candidate) => candidate.id === worker.aggregateId)
-    : undefined
-  if (!item || item.kind !== "aggregate") {
-    item = appendWorkerItem(state, worker, {
-      aggregateCounts: {},
-      kind: "aggregate",
-      signal: "high",
-      title: "ROUTINE ACTIVITY",
-    })
-    worker.aggregateId = item.id
-  }
-  item.aggregateCounts ??= {}
-  item.aggregateCounts[toolName] = (item.aggregateCounts[toolName] ?? 0) + 1
-  item.body = formatAggregate(item.aggregateCounts)
-  return item.id
-}
-
 function removeFromAggregate(
   timeline: TimelineItem[],
   aggregateId: string | undefined,
@@ -1361,6 +1353,11 @@ function removeFromAggregate(
   if (!item?.aggregateCounts) return
   item.aggregateCounts[toolName] = Math.max(0, (item.aggregateCounts[toolName] ?? 0) - 1)
   if (!item.aggregateCounts[toolName]) delete item.aggregateCounts[toolName]
+  if (!Object.keys(item.aggregateCounts).length) {
+    const index = timeline.findIndex((candidate) => candidate.id === aggregateId)
+    if (index >= 0) timeline.splice(index, 1)
+    return
+  }
   item.body = formatAggregate(item.aggregateCounts)
 }
 
@@ -1417,7 +1414,6 @@ function formatProcessSummary(items: TimelineItem[], summary?: TimelineItem): st
 function toolVerb(name: string): string {
   return ({
     await: "AWAIT",
-    edit: "EDIT",
     exec: "RAN",
     glob: "INSPECT",
     grep: "INSPECT",
@@ -1425,6 +1421,7 @@ function toolVerb(name: string): string {
     read: "READ",
     spawn: "SPAWN",
     spawn_worker: "SPAWN",
+    str_replace: "REPLACED",
     webfetch: "FETCHED",
     websearch: "SEARCHED",
     write: "WROTE",
@@ -1433,7 +1430,7 @@ function toolVerb(name: string): string {
 
 function formatAggregate(counts: Record<string, number>): string {
   const entries = Object.entries(counts).filter(([, count]) => count > 0)
-  if (!entries.length) return "Routine checks completed"
+  if (!entries.length) return ""
   return entries.map(([name, count]) => `${name} ×${count}`).join(" · ")
 }
 
@@ -1441,23 +1438,24 @@ function summarizeToolArguments(name: string, value: unknown): string {
   const args = objectValue(value) ?? {}
   if (name === "read") return stringValue(args.path) || "Reading file"
   if (name === "write") {
-    const files = Array.isArray(args.files) ? args.files : []
-    if (files.length) {
-      const first = objectValue(files[0]) ?? {}
-      const bytes = files.reduce((total, item) => {
-        const file = objectValue(item) ?? {}
-        return total + (numberValue(file.bytes) ?? 0)
-      }, 0)
-      return [
-        stringValue(first.path),
-        `${files.length} file${files.length === 1 ? "" : "s"}`,
-        `${bytes} bytes`,
-      ].filter(Boolean).join(" · ")
-    }
     const content = stringValue(args.content)
-    return [stringValue(args.path), content ? `${content.length} chars` : ""].filter(Boolean).join(" · ")
+    const expectedOffset = numberValue(args.expected_offset)
+    return [
+      stringValue(args.path),
+      `${content.length} chars`,
+      expectedOffset !== undefined ? `offset ${expectedOffset}` : "",
+    ].filter(Boolean).join(" · ")
   }
-  if (name === "edit") return stringValue(args.path) || "Editing file"
+  if (name === "str_replace") {
+    const oldStr = stringValue(args.old_str)
+    const newStr = stringValue(args.new_str)
+    return [
+      stringValue(args.path) || "Replacing file text",
+      `${oldStr.length} → ${newStr.length} chars`,
+      args.replace_all === true ? "all matches" : "",
+    ].filter(Boolean).join(" · ")
+  }
+  if (name === "edit") return stringValue(args.path) || "Legacy file change"
   if (name === "exec") return oneLine(stringValue(args.command), 140) || "Running command"
   if (name === "todowrite") {
     const todos = Array.isArray(args.todos) ? args.todos : []
@@ -1483,21 +1481,19 @@ function summarizeToolResult(
   const duration = formatDuration(durationMs)
   if (failed) return ["Failed", oneLine(text, 160), duration].filter(Boolean).join(" · ")
   if (name === "write") {
-    const files = Array.isArray(args.files) ? args.files : []
-    if (files.length) {
-      const bytes = files.reduce((total, item) => {
-        const file = objectValue(item) ?? {}
-        return total + (numberValue(file.bytes) ?? 0)
-      }, 0)
-      return [`${files.length} files`, `${bytes} bytes written`, duration]
-        .filter(Boolean)
-        .join(" · ")
-    }
-    return [stringValue(args.path), `${stringValue(args.content).length} chars written`, duration]
+    const expectedOffset = numberValue(args.expected_offset)
+    return [
+      stringValue(args.path),
+      `${stringValue(args.content).length} chars written`,
+      expectedOffset !== undefined ? `offset ${expectedOffset}` : "",
+      duration,
+    ]
       .filter(Boolean)
       .join(" · ")
   }
-  if (name === "edit") return [stringValue(args.path), "Updated", duration].filter(Boolean).join(" · ")
+  if (name === "str_replace") {
+    return [stringValue(args.path), "Replaced", duration].filter(Boolean).join(" · ")
+  }
   if (name === "exec") {
     return [exitCode(text), `${text.length} chars / ${lineCount(text)} lines`, duration]
       .filter(Boolean)
@@ -1520,11 +1516,14 @@ function workerToolDisplay(
     ? oneLine(stringValue(metrics.command), 160) || "exec"
     : stringValue(metrics.resource) || name
   const parts: string[] = []
-  if (name === "write" && numberValue(metrics.input_chars) !== undefined) {
-    parts.push(`${numberValue(metrics.input_chars)} chars written`)
-  } else if (name === "write" && numberValue(metrics.input_bytes) !== undefined) {
-    parts.push(`${numberValue(metrics.file_count) ?? 0} files · ${numberValue(metrics.input_bytes)} bytes`)
-  } else if (name === "edit") {
+  if (name === "write") {
+    const inputChars = numberValue(metrics.input_chars)
+    const inputBytes = numberValue(metrics.input_bytes)
+    const expectedOffset = numberValue(metrics.expected_offset)
+    if (inputChars !== undefined) parts.push(`${inputChars} chars written`)
+    else if (inputBytes !== undefined) parts.push(`${inputBytes} bytes written`)
+    if (expectedOffset !== undefined) parts.push(`offset ${expectedOffset}`)
+  } else if (name === "str_replace") {
     const oldChars = numberValue(metrics.old_chars)
     const newChars = numberValue(metrics.new_chars)
     if (oldChars !== undefined && newChars !== undefined) parts.push(`${oldChars} → ${newChars} chars`)
@@ -1538,6 +1537,18 @@ function workerToolDisplay(
   const duration = formatDuration(durationMs)
   if (duration) parts.push(duration)
   return { metrics: parts.join(" · ") || "Completed", primary }
+}
+
+function workerResultDisplay(name: string, metrics: JsonObject): {
+  detail?: string
+  preview?: string
+} {
+  const value = displayToolResult(name, stringValue(metrics.result_preview))
+  if (!value) return {}
+  return {
+    detail: boundToolResult(value, TOOL_RESULT_DETAIL_LIMIT) || undefined,
+    preview: previewToolResult(value) || undefined,
+  }
 }
 
 function formatTurnSummary(durationMs: number | undefined, usage: JsonObject, tools: string[]): string {
@@ -1581,7 +1592,7 @@ function formatProgress(step: string, completed?: number, total?: number): strin
 
 function friendlyPhase(phase: string, tools: string[]): string {
   if (phase === "using_tool") {
-    if (tools.some((name) => name === "write" || name === "edit")) return "editing"
+    if (tools.some((name) => name === "write" || name === "str_replace")) return "editing"
     if (tools.includes("exec")) return "testing"
     if (tools.some((name) => LOW_SIGNAL_TOOLS.has(name))) return "analyzing"
     return "executing"
@@ -1684,8 +1695,51 @@ function safeJson(value: unknown): string {
   return `${rendered.slice(0, RAW_DETAIL_LIMIT)}… [${rendered.length - RAW_DETAIL_LIMIT} chars hidden]`
 }
 
-function truncateText(value: string, limit: number): string {
-  return value.length <= limit ? value : `${value.slice(0, limit)}… [${value.length - limit} chars hidden]`
+function boundToolResult(value: string, limit: number): string {
+  if (value.length <= limit) return value
+  if (limit < 32) return limit > 1 ? `${value.slice(0, limit - 1)}…` : "…".slice(0, limit)
+  let hidden = value.length - limit
+  for (let index = 0; index < 4; index += 1) {
+    const marker = `\n… [${hidden} chars hidden] …\n`
+    const visibleChars = limit - marker.length
+    const nextHidden = value.length - visibleChars
+    if (nextHidden === hidden) break
+    hidden = nextHidden
+  }
+  const marker = `\n… [${hidden} chars hidden] …\n`
+  const visibleChars = limit - marker.length
+  const headLength = Math.ceil(visibleChars * 0.65)
+  const tailLength = visibleChars - headLength
+  return `${value.slice(0, headLength)}${marker}${value.slice(-tailLength)}`
+}
+
+function displayToolResult(name: string, value: string): string {
+  if (name !== "exec") return value
+  const lines = value.replace(/\r\n?/g, "\n").split("\n")
+  while (lines.length && !lines[0]?.trim()) lines.shift()
+  while (lines.length && !lines.at(-1)?.trim()) lines.pop()
+  if (/^Exit code:\s*-?\d+$/i.test(lines.at(-1)?.trim() ?? "")) {
+    lines.pop()
+    while (lines.length && !lines.at(-1)?.trim()) lines.pop()
+  }
+  return lines.length === 1 && lines[0]?.trim() === "(no output)" ? "" : lines.join("\n")
+}
+
+function previewToolResult(value: string): string {
+  const lines = value
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((line) => line.trimEnd())
+  while (lines.length && !lines[0]?.trim()) lines.shift()
+  while (lines.length && !lines.at(-1)?.trim()) lines.pop()
+  if (!lines.length || (lines.length === 1 && lines[0]?.trim() === "(no output)")) return ""
+  const selected = lines.slice(0, TOOL_RESULT_PREVIEW_LINES)
+  let preview = selected.join("\n")
+  const truncated = lines.length > selected.length || preview.length > TOOL_RESULT_PREVIEW_CHARS
+  if (!truncated) return preview
+  const suffix = "\n…"
+  preview = preview.slice(0, TOOL_RESULT_PREVIEW_CHARS - suffix.length).trimEnd()
+  return `${preview}${suffix}`
 }
 
 function oneLine(value: string, limit: number): string {

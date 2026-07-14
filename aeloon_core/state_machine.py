@@ -37,7 +37,6 @@ if TYPE_CHECKING:
     from aeloon_core.profiles import RuntimeProfileSpec
     from aeloon_core.providers.base import LLMProvider, ToolCallRequest
     from aeloon_core.tools.registry import ToolRegistry
-    from aeloon_core.write_runtime import WriteCoordinator
 
 
 async def run_agent_loop(
@@ -62,7 +61,6 @@ async def run_agent_loop(
     tool_hint: Callable[[list[ToolCallRequest]], str] | None = None,
     profile: RuntimeProfileSpec | None = None,
     max_handoffs: int = 8,
-    write_coordinator: WriteCoordinator | None = None,
 ) -> LightweightState:
     """Run the explicit Master -> Worker/Tool/Guard state machine."""
 
@@ -125,7 +123,6 @@ async def run_agent_loop(
         trace_enabled=transition_trace_enabled,
         on_progress=on_progress,
         prepare_model_input=prepare_model_input,
-        write_coordinator=write_coordinator,
         **runtime_kwargs,
     )
     agents: dict[AgentNode, BaseAgent] = {
@@ -176,9 +173,6 @@ async def run_agent_loop(
         try:
             state = await agent.run(state)
         except asyncio.CancelledError:
-            if state.pending_write_batch is not None and write_coordinator is not None:
-                write_coordinator.discard_batch(state.pending_write_batch)
-                state.pending_write_batch = None
             raise
         except Exception as exc:
             if node == AgentNode.GUARD or state.metadata.status == RunStatus.FINALIZING:
@@ -231,9 +225,6 @@ async def run_agent_loop(
             reason="missing final response",
             add_message=True,
         )
-    if state.pending_write_batch is not None and write_coordinator is not None:
-        write_coordinator.discard_batch(state.pending_write_batch)
-        state.pending_write_batch = None
     return state
 
 
@@ -283,9 +274,6 @@ def _pair_interrupted_tool_calls(
     state.pending_response = None
     state.pending_tool_calls = []
     state.pending_control_call = None
-    if state.pending_write_batch is not None and runtime.write_coordinator is not None:
-        runtime.write_coordinator.discard_batch(state.pending_write_batch)
-    state.pending_write_batch = None
     failures: list[dict[str, Any]] = []
     outcomes: list[str] = []
     side_effects: list[dict[str, Any]] = []

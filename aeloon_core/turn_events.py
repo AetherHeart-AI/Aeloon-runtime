@@ -38,10 +38,18 @@ _WORKER_ACTIVITY_ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|[@-_])")
 class TurnEventProgress:
     """Accumulate a turn and emit structured progress events."""
 
-    def __init__(self, *, session_id: str, emit: Emit) -> None:
+    def __init__(
+        self,
+        *,
+        session_id: str,
+        emit: Emit,
+        allow_worker_tool_output: bool = False,
+    ) -> None:
         self.session_id = session_id
         self.turn_id = uuid.uuid4().hex[:12]
         self.emit = emit
+        # Only the local OpenTUI bridge enables this operator capability.
+        self.allow_worker_tool_output = allow_worker_tool_output
         self.blocks: list[dict[str, Any]] = []
         self._text_block_id: str | None = None
         self._reasoning_block_id: str | None = None
@@ -345,8 +353,11 @@ class TurnEventProgress:
         duration_ms: int | None,
         run_sequence: int = 1,
     ) -> None:
-        """Emit a typed safe projection, not Worker arguments or result text."""
+        """Emit metrics plus bounded exec output or a failure preview for operators."""
 
+        safe_metrics = dict(metrics)
+        if not self.allow_worker_tool_output:
+            safe_metrics.pop("result_preview", None)
         await self.emit(
             "chat.worker.tool.result",
             self._payload(
@@ -358,7 +369,7 @@ class TurnEventProgress:
                 tool_name=tool_name,
                 status=status,
                 duration_ms=duration_ms,
-                metrics=metrics,
+                metrics=safe_metrics,
                 ts=_now(),
             ),
         )

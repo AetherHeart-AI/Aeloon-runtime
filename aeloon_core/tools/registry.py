@@ -42,14 +42,24 @@ class ToolRegistry:
             args = tool.args_model.model_validate(params)
         except ValidationError as exc:
             errors = "; ".join(_format_error(error) for error in exc.errors())
-            return f"Error: Invalid parameters for tool '{name}': {errors}{hint}"
+            return (
+                f"Error [TOOL_ARGUMENTS_INVALID]: tool={name!r}; errors={errors!r}; "
+                "next_action='retry with one JSON object matching the advertised tool schema'"
+                f"{hint}"
+            )
         try:
             result = await tool.execute(**args.model_dump(exclude_unset=True))
             if isinstance(result, str) and result.startswith("Error"):
                 return result + hint
             return result
         except Exception as exc:
-            return f"Error executing {name}: {exc}" + hint
+            detail = f"{type(exc).__name__}: {exc}"
+            return (
+                f"Error [TOOL_EXECUTION_ERROR]: tool={name!r}; "
+                f"actual={detail!r}; "
+                "next_action='inspect the error and retry with a corrected call'"
+                f"{hint}"
+            )
 
 
 class ScopedToolRegistry:
@@ -100,7 +110,10 @@ def _definition_name(definition: dict[str, Any]) -> str | None:
 
 
 def _tool_not_found(name: str, available: Iterable[str]) -> str:
-    return f"Error: Tool '{name}' not found. Available: {', '.join(available)}"
+    return (
+        f"Error [TOOL_NOT_FOUND]: tool={name!r}; available={list(available)!r}; "
+        "next_action='choose one of the advertised tools'"
+    )
 
 
 def _format_error(error: dict[str, Any]) -> str:

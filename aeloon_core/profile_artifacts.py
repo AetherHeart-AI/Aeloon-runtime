@@ -29,6 +29,7 @@ from aeloon_core.profile_compiler import (
     compiler_descriptor,
 )
 from aeloon_core.profiles import (
+    LEGACY_EDIT_MIGRATION,
     PROFILE_ID_PATTERN,
     ProfileSource,
     RuntimeProfileSpec,
@@ -201,6 +202,9 @@ class ProfileArtifactStore:
             manifest = self._verify_integrity(artifact_id)
             if not manifest["identity"]["valid"]:
                 raise ArtifactLifecycleError("quarantined artifacts cannot be approved")
+            compatible, reasons = self._compatibility(manifest)
+            if not compatible:
+                raise ArtifactCompatibilityError("; ".join(reasons))
             approval = {
                 "artifact_id": artifact_id,
                 "artifact_digest": artifact_id,
@@ -519,10 +523,19 @@ class ProfileArtifactStore:
             )
         for name, fingerprint in requested_fingerprints.items():
             current = host.get(name) if host is not None else None
+            if name == "edit":
+                errors.append(LEGACY_EDIT_MIGRATION)
+                continue
             if fingerprint is None or current is None:
                 errors.append(f"requested tool is missing: {name}")
             elif current != fingerprint:
-                errors.append(f"tool schema fingerprint changed: {name}")
+                if name == "write":
+                    errors.append(
+                        "write tool schema is incompatible; increment the profile revision, "
+                        "then compile, approve, and activate a new artifact"
+                    )
+                else:
+                    errors.append(f"tool schema fingerprint changed: {name}")
         return not errors, errors
 
     def _cache_key(self, text: str, source: ProfileSource, compiler: Mapping[str, Any]) -> str:

@@ -1,9 +1,9 @@
 """Operator-only, privacy-preserving Worker timeline storage and queries.
 
-This module is intentionally not part of :class:`WorkerControlService`.  Base
+This module is intentionally not part of :class:`WorkerControlService`. Base
 agents keep their existing bounded control surface, while the local operator UI
 can inspect a durable projection of Worker activity without reading private
-transcripts.
+transcripts. Tool output is limited to bounded exec output and failure previews.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ from typing import Any
 
 from loguru import logger
 
+from aeloon_core.operator_output import sanitize_operator_output
 from aeloon_core.worker_sessions import WorkerRunRecord, WorkerStore
 
 _MAX_EVENTS_PER_RUN = 500
@@ -34,6 +35,7 @@ _FLUSH_TIMEOUT_SECONDS = 0.5
 _MAX_STEP_CHARS = 160
 _MAX_SUMMARY_CHARS = 600
 _MAX_TOOL_COMMAND_CHARS = 160
+_MAX_TOOL_RESULT_PREVIEW_CHARS = 4_000
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
 _ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|[@-_])")
 _INTERNAL_ID = re.compile(
@@ -235,7 +237,7 @@ class WorkerUiJournal:
     ) -> None:
         name = _safe_identifier(tool_name) or "tool"
         safe_status = status if status in _TOOL_STATUSES else "error"
-        safe_metrics = {
+        safe_metrics: dict[str, Any] = {
             key: _bounded_int(value)
             for key, value in metrics.items()
             if key in _TOOL_METRICS and _bounded_int(value) is not None
@@ -243,6 +245,12 @@ class WorkerUiJournal:
         command = _safe_text(metrics.get("command"), limit=_MAX_TOOL_COMMAND_CHARS)
         if command:
             safe_metrics["command"] = command
+        result_preview = _safe_multiline_text(
+            metrics.get("result_preview"),
+            limit=_MAX_TOOL_RESULT_PREVIEW_CHARS,
+        )
+        if result_preview and (name == "exec" or safe_status != "done"):
+            safe_metrics["result_preview"] = result_preview
         payload: dict[str, Any] = {
             "tool_name": name,
             "status": safe_status,
@@ -695,6 +703,10 @@ def _safe_text(value: Any, *, limit: int) -> str:
         for char in text
     )
     return " ".join(text.split())[:limit]
+
+
+def _safe_multiline_text(value: Any, *, limit: int) -> str:
+    return sanitize_operator_output(value, limit=limit)
 
 
 def _now() -> str:

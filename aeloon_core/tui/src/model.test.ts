@@ -112,6 +112,65 @@ describe("TUI event projection", () => {
     expect(rendered[2]?.body).toBe("HTTP 200")
   })
 
+  test("summarizes native write offsets and str_replace arguments", () => {
+    const state = createAppState()
+    applyEnvelope(state, event("chat.block.add", {
+      block: {
+        arguments: { content: "你好", expected_offset: 6, path: "notes.txt" },
+        id: "write-chunk",
+        name: "write",
+        type: "tool_call",
+      },
+    }))
+    applyEnvelope(state, event("chat.block.add", {
+      block: {
+        arguments: {
+          new_str: "after\n",
+          old_str: "before\n",
+          path: "notes.txt",
+          replace_all: true,
+        },
+        id: "replace-one",
+        name: "str_replace",
+        type: "tool_call",
+      },
+    }))
+
+    const rendered = visibleMasterItems(state).filter((item) => item.kind === "tool")
+    expect(rendered[0]).toMatchObject({
+      primary: "notes.txt · 2 chars · offset 6",
+      verb: "WROTE",
+    })
+    expect(rendered[1]).toMatchObject({
+      primary: "notes.txt · 7 → 6 chars · all matches",
+      verb: "REPLACED",
+    })
+    expect(JSON.stringify(rendered)).not.toContain("你好")
+    expect(JSON.stringify(rendered)).not.toContain("before")
+    expect(JSON.stringify(rendered)).not.toContain("after")
+  })
+
+  test("keeps legacy edit history readable without exposing its file body", () => {
+    const state = createAppState()
+    applyEnvelope(state, event("chat.block.add", {
+      block: {
+        arguments: {
+          new_text: "private replacement body",
+          old_text: "private original body",
+          path: "legacy.txt",
+        },
+        id: "legacy-edit",
+        name: "edit",
+        type: "tool_call",
+      },
+    }))
+
+    const rendered = visibleMasterItems(state).filter((item) => item.kind === "tool")
+    expect(rendered[0]?.primary).toBe("legacy.txt")
+    expect(JSON.stringify(rendered)).not.toContain("private original body")
+    expect(JSON.stringify(rendered)).not.toContain("private replacement body")
+  })
+
   test("promotes a low-signal failure out of its aggregate", () => {
     const state = createAppState()
     applyEnvelope(
@@ -129,10 +188,10 @@ describe("TUI event projection", () => {
     )
 
     const rendered = visibleMasterItems(state)
-    expect(rendered.map((item) => item.kind)).toEqual(["aggregate", "tool"])
-    expect(rendered[0]?.body).toBe("Routine checks completed")
-    expect(rendered[1]?.status).toBe("failed")
-    expect(rendered[1]?.body).toContain("permission denied")
+    expect(rendered.map((item) => item.kind)).toEqual(["tool"])
+    expect(rendered[0]?.status).toBe("failed")
+    expect(rendered[0]?.collapsed).toBeTrue()
+    expect(rendered[0]?.body).toContain("permission denied")
     applyEnvelope(state, event("chat.turn.end", { duration_ms: 12 }))
     expect(visibleMasterTurns(state)[0]?.collapsed).toBeFalse()
   })
@@ -168,7 +227,64 @@ describe("TUI event projection", () => {
       ["thinking", "checking the result"],
     ])
     expect(turn?.answer?.body).toBe("Done.")
-    expect(turn?.process[1]).toMatchObject({ verb: "RAN", primary: "bun test", metrics: "exit 0 · 15 chars / 2 lines · 34ms" })
+    expect(turn?.process[1]).toMatchObject({
+      metrics: "exit 0 · 15 chars / 2 lines · 34ms",
+      primary: "bun test",
+      resultDetail: "ok",
+      resultPreview: "ok",
+      verb: "RAN",
+    })
+  })
+
+  test("keeps command output through the detail bound and exposes a short preview", () => {
+    const state = createAppState()
+    const output = `first line\n${"x".repeat(17_000)}\nlast line\nExit code: 0`
+    applyEnvelope(state, event("chat.block.add", {
+      block: {
+        arguments: { command: "python generate.py" },
+        id: "exec-long",
+        name: "exec",
+        type: "tool_call",
+      },
+    }))
+    applyEnvelope(state, event("chat.block.update", {
+      block_id: "exec-long",
+      patch: { result: output, status: "done" },
+    }))
+
+    const tool = visibleMasterItems(state).find((item) => item.toolName === "exec")
+    expect(tool?.resultPreview).toStartWith("first line\n")
+    expect(tool?.resultPreview).toEndWith("\n…")
+    expect(tool?.resultDetail).toStartWith("first line\n")
+    expect(tool?.resultDetail).toContain("chars hidden")
+    expect(tool?.resultDetail).toEndWith("last line")
+    expect((tool?.resultDetail?.length ?? 0) > 1_200).toBeTrue()
+    expect(tool?.resultDetail?.length).toBeLessThanOrEqual(16_000)
+    expect(tool?.resultPreview?.length).toBeLessThanOrEqual(360)
+  })
+
+  test("keeps long failures folded behind their visible preview", () => {
+    const state = createAppState()
+    const output = `Error: focused tests failed\n${"x".repeat(17_000)}\nfinal failure context`
+    applyEnvelope(state, event("chat.block.add", {
+      block: {
+        arguments: { command: "pytest -q" },
+        id: "exec-failure",
+        name: "exec",
+        type: "tool_call",
+      },
+    }))
+    applyEnvelope(state, event("chat.block.update", {
+      block_id: "exec-failure",
+      patch: { result: output, status: "error" },
+    }))
+
+    const tool = visibleMasterItems(state).find((item) => item.toolName === "exec")
+    expect(tool?.collapsed).toBeTrue()
+    expect(tool?.resultPreview).toStartWith("Error: focused tests failed")
+    expect(tool?.resultPreview).toEndWith("\n…")
+    expect(tool?.resultDetail).toContain("chars hidden")
+    expect(tool?.resultDetail).toEndWith("final failure context")
   })
 
   test("an empty later turn never promotes an earlier cancelled narration to final answer", () => {
@@ -259,7 +375,7 @@ describe("TUI event projection", () => {
     expect(JSON.stringify(visibleMasterItems(state))).not.toContain("run-private-control-id")
   })
 
-  test("Worker detail aggregates routine tools and surfaces mutations and failures", () => {
+  test("Worker compact hides routine tools and surfaces mutations, output, and failures", () => {
     const state = createAppState()
     applyEnvelope(
       state,
@@ -276,8 +392,14 @@ describe("TUI event projection", () => {
           duration_ms: 20,
           label: "coding#abcd",
           metrics: name === "exec"
-            ? { command: "bun test src/model.test.ts", exit_code: 1 }
-            : { result_chars: 10, result_lines: 2 },
+            ? {
+                command: "bun test src/model.test.ts",
+                exit_code: 1,
+                result_preview: "one regression failed\nExit code: 1",
+              }
+            : name === "write"
+              ? { expected_offset: 128, input_bytes: 10, input_chars: 10 }
+              : { result_chars: 10, result_lines: 2 },
           profile_id: "coding",
           status: name === "exec" ? "error" : "done",
           tool_name: name,
@@ -289,20 +411,54 @@ describe("TUI event projection", () => {
     const compact = visibleWorkerItems(state, "abcd1234")
     expect(compact.map((item) => item.kind)).toEqual([
       "lifecycle",
-      "aggregate",
       "tool",
       "tool",
     ])
     expect(compact.find((item) => item.toolName === "exec")).toMatchObject({
       metrics: "exit 1 · 20ms",
       primary: "bun test src/model.test.ts",
+      resultDetail: "one regression failed",
+      resultPreview: "one regression failed",
+      collapsed: true,
       verb: "RAN",
     })
-    expect(compact[1]?.body).toBe("read ×2 · grep ×1")
+    expect(compact.find((item) => item.toolName === "write")?.metrics)
+      .toBe("10 chars written · offset 128 · 20ms")
     expect(compact.at(-1)?.status).toBe("failed")
+    expect(state.workers.abcd1234?.unread).toBe(3)
 
     setVerbosity(state, "verbose")
     expect(visibleWorkerItems(state, "abcd1234").filter((item) => item.kind === "tool")).toHaveLength(5)
+  })
+
+  test("hidden routine tools stay unread-silent while their failures remain visible", () => {
+    const state = createAppState()
+    applyEnvelope(state, event("chat.worker.lifecycle", {
+      phase: "running",
+      profile_id: "coding",
+      worker_id: "abcd1234",
+    }))
+    const lifecycleUnread = state.workers.abcd1234?.unread
+    applyEnvelope(state, event("chat.worker.tool.result", {
+      metrics: { result_chars: 12, result_lines: 1 },
+      profile_id: "coding",
+      status: "done",
+      tool_name: "read",
+      worker_id: "abcd1234",
+    }))
+    expect(state.workers.abcd1234?.unread).toBe(lifecycleUnread)
+    expect(visibleWorkerItems(state, "abcd1234").some((item) => item.toolName === "read")).toBeFalse()
+
+    applyEnvelope(state, event("chat.worker.tool.result", {
+      metrics: { result_preview: "Error: permission denied" },
+      profile_id: "coding",
+      status: "error",
+      tool_name: "read",
+      worker_id: "abcd1234",
+    }))
+    expect(state.workers.abcd1234?.unread).toBe((lifecycleUnread ?? 0) + 1)
+    expect(visibleWorkerItems(state, "abcd1234").find((item) => item.toolName === "read"))
+      .toMatchObject({ resultPreview: "Error: permission denied", status: "failed" })
   })
 
   test("profile delegates stay in Master and do not masquerade as durable Workers", () => {
@@ -355,7 +511,7 @@ describe("TUI event projection", () => {
           metrics: { new_chars: 420, old_chars: 300, resource: "worker_ui.py" },
           signal: "high",
           status: "done",
-          tool_name: "edit",
+          tool_name: "str_replace",
         },
         { action: "retry", event: "tests need one repair", kind: "guard", source: "guard" },
       ],
@@ -374,14 +530,22 @@ describe("TUI event projection", () => {
     expect(visibleWorkerItems(state, "ab12ffff").map((item) => item.kind)).toEqual([
       "lifecycle",
       "step",
+      "tool",
+      "guard",
+    ])
+    expect(JSON.stringify(visibleWorkerItems(state, "ab12ffff"))).not.toContain(
+      "run-private-control-id",
+    )
+    setVerbosity(state, "verbose")
+    const verbose = visibleWorkerItems(state, "ab12ffff")
+    expect(verbose.map((item) => item.kind)).toEqual([
+      "lifecycle",
+      "step",
       "aggregate",
       "tool",
       "guard",
     ])
-    expect(visibleWorkerItems(state, "ab12ffff")[2]?.body).toBe("read ×4 · grep ×2")
-    expect(JSON.stringify(visibleWorkerItems(state, "ab12ffff"))).not.toContain(
-      "run-private-control-id",
-    )
+    expect(verbose[2]?.body).toBe("read ×4 · grep ×2")
   })
 
   test("ignores late events from an inactive session", () => {

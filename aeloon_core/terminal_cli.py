@@ -1067,7 +1067,7 @@ def _worker_activity_summary(phase: str, tools: tuple[str, ...]) -> str:
             return "检查现有项目"
         if tool_set and tool_set <= {"websearch", "webfetch"}:
             return "检索和核对资料"
-        if tool_set & {"write", "edit"}:
+        if tool_set & {"write", "str_replace"}:
             return "编写和修改实现"
         if "exec" in tool_set:
             return "运行验证"
@@ -1102,11 +1102,14 @@ def _worker_tool_metric_summary(
         parts.append(resource)
     if name == "write" and isinstance(metrics.get("input_chars"), int):
         parts.append(f"wrote {metrics['input_chars']} chars")
-    elif name == "edit":
+        expected_offset = metrics.get("expected_offset")
+        if isinstance(expected_offset, int):
+            parts.append(f"offset {expected_offset}")
+    elif name == "str_replace":
         old_chars = metrics.get("old_chars")
         new_chars = metrics.get("new_chars")
         if isinstance(old_chars, int) and isinstance(new_chars, int):
-            parts.append(f"edited {old_chars} -> {new_chars} chars")
+            parts.append(f"replaced {old_chars} -> {new_chars} chars")
     elif name == "exec" and isinstance(metrics.get("exit_code"), int):
         parts.append(f"exit {metrics['exit_code']}")
     elif name == "todowrite" and isinstance(metrics.get("item_count"), int):
@@ -1150,12 +1153,16 @@ def _tool_call_detail_text(name: str, arguments: Any) -> str:
             _number_arg(args, "limit"),
         )
     if name == "write":
-        return _join_parts(_path_detail(args), f"{_string_arg_len(args, 'content')} chars")
-    if name == "edit":
         return _join_parts(
             _path_detail(args),
-            f"old {_string_arg_len(args, 'old_text')} chars",
-            f"new {_string_arg_len(args, 'new_text')} chars",
+            f"{_string_arg_len(args, 'content')} chars",
+            _number_arg(args, "expected_offset"),
+        )
+    if name == "str_replace":
+        return _join_parts(
+            _path_detail(args),
+            f"old {_string_arg_len(args, 'old_str')} chars",
+            f"new {_string_arg_len(args, 'new_str')} chars",
             "replace_all" if args.get("replace_all") else "",
         )
     if name == "exec":
@@ -1216,13 +1223,18 @@ def _tool_result_detail_text(
         return _join_parts(_path_detail(args), f"read {chars} chars/{lines} lines", duration)
     if name == "write":
         wrote = f"wrote {_string_arg_len(args, 'content')} chars"
-        return _join_parts(_path_detail(args), wrote, duration)
-    if name == "edit":
-        old_len = _string_arg_len(args, "old_text")
-        new_len = _string_arg_len(args, "new_text")
         return _join_parts(
             _path_detail(args),
-            f"edited {old_len} -> {new_len} chars",
+            wrote,
+            _number_arg(args, "expected_offset"),
+            duration,
+        )
+    if name == "str_replace":
+        old_len = _string_arg_len(args, "old_str")
+        new_len = _string_arg_len(args, "new_str")
+        return _join_parts(
+            _path_detail(args),
+            f"replaced {old_len} -> {new_len} chars",
             duration,
         )
     if name == "exec":
@@ -1250,7 +1262,17 @@ def _generic_arg_summary(arguments: Any) -> str:
     if not isinstance(arguments, dict):
         return _text_size_summary("" if arguments is None else str(arguments))
     parts: list[str] = []
-    hidden_keys = {"content", "old_text", "new_text", "text", "body", "input", "prompt"}
+    hidden_keys = {
+        "content",
+        "old_str",
+        "new_str",
+        "old_text",
+        "new_text",
+        "text",
+        "body",
+        "input",
+        "prompt",
+    }
     for key, value in arguments.items():
         if isinstance(value, str):
             if key in hidden_keys:

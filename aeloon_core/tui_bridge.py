@@ -27,6 +27,7 @@ from loguru import logger
 from pydantic import BaseModel, ValidationError
 
 from aeloon_core.config import Config, load_config
+from aeloon_core.operator_output import redact_sensitive_text as _redact_sensitive_text
 from aeloon_core.orchestrator import AeloonCoreOrchestrator
 from aeloon_core.turn_events import TurnEventProgress
 from aeloon_core.worker_ui import WorkerUiQueryService
@@ -39,56 +40,6 @@ _MAX_ERROR_CHARS = 1_000
 _MAX_PENDING_LOG_EVENTS = 256
 _TRACEBACK_LINE = re.compile(r"^Traceback \(most recent call last\):")
 _ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|[@-_])")
-_AUTHORIZATION_SECRET = re.compile(
-    r"(?im)(\b(?:proxy-)?authorization\s*[:=]\s*)[^\r\n]*"
-)
-_ASSIGNMENT_SECRET = re.compile(
-    r"""(?ix)
-    (
-        (?<![A-Za-z0-9_])
-        ["']?
-        (?:
-            AWS_ACCESS_KEY_ID
-            |
-            API[_-]?KEY
-            |
-            CLIENT[_-]?SECRET
-            |
-            TOKEN
-            |
-            PASSWORD
-            |
-            SECRET
-            |
-            COOKIE
-            |
-            [A-Za-z_][A-Za-z0-9_.-]*
-            (?:API[_-]?KEY|CLIENT[_-]?SECRET|TOKEN|PASSWORD|SECRET|COOKIE)
-            [A-Za-z0-9_.-]*
-        )
-        ["']?
-        \s*[:=]\s*
-    )
-    (?:
-        "(?:\\.|[^"\\\r\n])*"
-        |
-        '(?:\\.|[^'\\\r\n])*'
-        |
-        [^\r\n]*
-    )
-    """
-)
-_NAMED_SECRET = re.compile(
-    r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|x[_-]?auth[_-]?token|"
-    r"password|secret|cookie)"
-    r"(\s*[:=]\s*)[^\s,;]+"
-)
-_URL_CREDENTIAL = re.compile(r"(://[^:/@\s]+:)[^@\s]+(@)")
-_KEY_LIKE_SECRET = re.compile(
-    r"(?i)\b(?:(?:sk|rk|pk)-[A-Za-z0-9_-]{8,}|"
-    r"(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{8,})\b"
-)
-
 RecordSink = Callable[[dict[str, Any]], Awaitable[None]]
 
 
@@ -323,6 +274,7 @@ class TUIBridge:
             progress = TurnEventProgress(
                 session_id=queued.session_id,
                 emit=self.emit_event,
+                allow_worker_tool_output=True,
             )
             await self.emit_event(
                 "bridge.prompt.started",
@@ -419,7 +371,11 @@ class TUIBridge:
                 idempotency_key=idempotency_key or f"tui:{uuid.uuid4().hex}",
                 base_turn_id=_optional_text(payload, "base_turn_id"),
                 detached=detached,
-                progress=TurnEventProgress(session_id=session_id, emit=self.emit_event),
+                progress=TurnEventProgress(
+                    session_id=session_id,
+                    emit=self.emit_event,
+                    allow_worker_tool_output=True,
+                ),
             )
             return _spawn_worker_view(result)
         if command == "cancel_worker":
@@ -443,6 +399,7 @@ class TUIBridge:
                 progress=TurnEventProgress(
                     session_id=self.session_id,
                     emit=self.emit_event,
+                    allow_worker_tool_output=True,
                 ),
             )
             return _resume_worker_view(result)
@@ -977,21 +934,6 @@ def _safe_error_message(exc: BaseException) -> str:
     if len(message) > _MAX_ERROR_CHARS:
         return message[: _MAX_ERROR_CHARS - 1] + "…"
     return message
-
-
-def _redact_sensitive_text(value: Any) -> str:
-    message = str(value)
-    # Authorization schemes can carry structured, comma-delimited credentials
-    # (for example Digest), so redact the full header value rather than trying
-    # to enumerate schemes or token shapes. Header values end at a line break.
-    message = _AUTHORIZATION_SECRET.sub(r"\1[redacted]", message)
-    # Quoted assignments stop at their closing quote so adjacent JSON fields
-    # remain readable. Unquoted values consume the rest of their line because
-    # secrets such as passphrases may contain spaces.
-    message = _ASSIGNMENT_SECRET.sub(r"\1[redacted]", message)
-    message = _NAMED_SECRET.sub(r"\1\2[redacted]", message)
-    message = _URL_CREDENTIAL.sub(r"\1[redacted]\2", message)
-    return _KEY_LIKE_SECRET.sub("[redacted]", message)
 
 
 def _error_code(exc: BaseException) -> str:

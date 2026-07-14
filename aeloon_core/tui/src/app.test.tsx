@@ -129,11 +129,27 @@ const events: BridgeEnvelope[] = [
     type: "event",
     event: "chat.worker.tool.result",
     payload: {
+      duration_ms: 41,
+      metrics: {
+        command: "bun test src/model.test.ts",
+        exit_code: 0,
+        result_preview: "worker tests passed\nExit code: 0",
+      },
+      profile_id: "coding",
+      status: "done",
+      tool_name: "exec",
+      worker_id: "ab12-worker-internal-uuid",
+    },
+  },
+  {
+    type: "event",
+    event: "chat.worker.tool.result",
+    payload: {
       duration_ms: 33,
       metrics: { new_chars: 310, old_chars: 240, resource: "worker_ui_journal.py" },
       profile_id: "coding",
       status: "done",
-      tool_name: "edit",
+      tool_name: "str_replace",
       worker_id: "ab12-worker-internal-uuid",
     },
   },
@@ -187,6 +203,7 @@ test("compact Master renders the command deck without implementation noise", asy
   expect(frame).toContain("2/5")
   expect(frame).toContain("GUARD")
   expect(frame).toContain("WROTE")
+  expect(frame).toContain("REPLACED")
   expect(frame).toContain("running")
   expect(frame).toContain("compact")
   expect(frame).toContain("Ask Aeloon to work in this workspace")
@@ -250,6 +267,7 @@ test("completed turns collapse process rows and t restores the live timeline", a
   frame = setup.captureCharFrame()
   expect(frame).toContain("▾ PROCESS · 1 tool · 81ms")
   expect(frame).toContain("RAN bun test · exit 0 · 15 chars / 2 lines · 34ms")
+  expect(frame).toContain("ok")
   expect(frame.indexOf("thinking")).toBeLessThan(frame.indexOf("RAN bun test"))
   expect(frame.indexOf("RAN bun test")).toBeLessThan(frame.lastIndexOf("thinking"))
   setup.renderer.destroy()
@@ -296,8 +314,9 @@ test("Tab opens the Worker workbench without stealing composer focus on updates"
   expect(frame).toContain("PHASE")
   expect(frame).toContain("TODO")
   expect(frame).toContain("Wire the operator-safe journal")
-  expect(frame).toContain("ROUTINE ACTIVITY")
+  expect(frame).not.toContain("ROUTINE ACTIVITY")
   expect(frame).toContain("worker_ui_journal.py")
+  expect(frame).toContain("worker tests passed")
   expect(frame).not.toContain("run-internal-uuid")
 
   setup.renderer.destroy()

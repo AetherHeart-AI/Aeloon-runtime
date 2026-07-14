@@ -27,8 +27,13 @@ uv run aeloon-core chat
 The default Master view is deliberately compressed: it keeps the conversation,
 high-signal file and command actions, Worker lifecycle, flow-changing Guard
 decisions, errors, and compact turn statistics. Routine reads, raw tool payloads,
-and gateway logs are available in verbose or Logs views. Reasoning dumps,
-heartbeats, and internal UUIDs are never part of the default transcript.
+and gateway logs are available in verbose or Logs views. Successful commands
+show a short output preview; clicking the row or pressing `v` reveals the bounded
+head and tail. Worker compact views omit successful routine tools, while restored
+verbose history keeps a muted aggregate. OpenTUI's operator-only Worker command
+previews are bounded and scrub common credential patterns; Base and plain CLI
+progress keep structured metrics only. Reasoning dumps, heartbeats, and internal
+UUIDs are never part of the default transcript.
 
 The composer remains live while a turn runs. New prompts enter a FIFO queue
 instead of waiting for the current turn to end. `Tab` moves between the composer,
@@ -227,7 +232,7 @@ agents:
     tools: [read, glob, grep]
   - id: implementer
     description: Implement and verify changes
-    tools: [read, write, edit, exec]
+    tools: [read, write, str_replace, exec]
 ---
 
 ## Shared
@@ -274,10 +279,10 @@ Compiled Python is an inert review format: only one constant-only
 and generated source is never imported, executed, or passed to `compile`.
 Artifacts must move through `validated -> approved -> active`; activation is an
 audited, cross-process-serialized commit whose active pointer is published last.
-During Profile turns, filesystem tools cannot access the operator data directory,
-and exec is sandboxed away from it (or disabled when that isolation is
-unavailable). A turn pins the active artifact once, so activation during a turn
-affects only the next turn.
+During Profile turns, filesystem tools cannot access the operator data directory.
+`exec` remains a filesystem-capable shell, not a file-write security boundary;
+omit it from roles that must not write through shell commands. A turn pins the
+active artifact once, so activation during a turn affects only the next turn.
 
 At runtime, the profile master can select only a declared role. Roles see the
 intersection of their requested tools and the host registry plus three internal
@@ -327,7 +332,7 @@ The runtime registers these tools:
 - `exec`
 - `read`
 - `write`
-- `edit`
+- `str_replace`
 - `glob`
 - `grep`
 - `skill` when skills are enabled
@@ -335,28 +340,37 @@ The runtime registers these tools:
 - `websearch`
 - `todowrite`
 
-File writes follow an OpenCode-style safety pattern:
+File changes use two native, atomic tools:
 
 - Use `read` with `offset`/`limit` to inspect files in chunks.
-- Use `edit` for existing files whenever possible.
-- `write` refuses to overwrite an existing file unless `overwrite=true`.
-- Large `write` calls require an `end_marker` appended to the end of `content`;
-  the marker is stripped before the file is saved. If the marker is missing,
-  Aeloon treats the write as possibly truncated and refuses to touch the file.
+- Use `write(path, content)` for a new workspace-relative file. `content` is limited
+  to 16,000 characters per call, and an existing target is rejected.
+- Continue one large file with `write(path, content, expected_offset)`, where
+  `expected_offset` must equal the file's current UTF-8 byte length. Use the returned
+  `next_offset` for the next chunk. A completed file may not exceed 16 MiB.
+- Prefer splitting large output into logical files. If one file must be chunked, send
+  complete chunks of at most 16,000 characters in separate calls.
+- Use `str_replace(path, old_str, new_str, replace_all=false)` for an existing file.
+  `old_str` must be non-empty and uniquely match unless `replace_all=true`; `old_str`
+  and `new_str` are each limited to 16,000 characters. Matching is exact except that
+  LF and CRLF are equivalent, and the file's newline style is preserved.
 
-When a model call has `write` permission, the runtime also advertises framed WRITE
-protocol v1. This is the preferred path for large or multi-file output: short JSON
-metadata stays in the frame header while raw UTF-8 file bodies stream into private
-staging. A nonce-scoped END marker closes each file and one batch END marker closes
-the transaction. The runtime commits only after the provider finishes normally and
-every frame, path, limit, and overwrite precondition validates. Incomplete, mixed,
-cancelled, or unauthorized batches are discarded without changing target files.
+Write paths must be workspace-relative regular files and cannot traverse protected or
+symlink paths. Each successful `write` or `str_replace` call stages a same-directory
+temporary file, flushes and fsyncs it, rechecks the target baseline, and commits with
+`os.replace`.
+Completed chunks are committed independently; there is no cross-file transaction.
 
-Framed batches are restricted to workspace-relative paths. Each target replacement
-uses a same-directory temporary file and `os.replace`; multi-file batches add a
-rollback journal and startup recovery. This guarantees that truncated model output
-never reaches a target and that an interrupted batch is recovered, but it does not
-claim simultaneous cross-path visibility from an ordinary filesystem.
+Invalid JSON, truncated tool arguments, and tool batches that do not finish with
+`stop` or `tool_calls` are rejected without executing the batch. Use the file tools
+for generated content rather than carrying file bodies through `python -c`, heredocs,
+or shell redirection. `exec` commands are capped at 8,192 characters, but `exec`
+remains a filesystem-capable shell; the cap and prompt guidance are not a security
+boundary.
+
+The old `edit` tool and framed WRITE schema are not compatibility aliases. Custom
+profiles that declare them, or depend on `overwrite`/`end_marker`, must be compiled,
+approved, and activated again with `str_replace` and the native `write` schema.
 
 ## Skills
 

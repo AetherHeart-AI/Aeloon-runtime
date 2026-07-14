@@ -101,7 +101,7 @@ class ToolResultPatch:
 
 @dataclass(frozen=True)
 class ToolCallClassification:
-    """Local validation results; no policy or retry counters live here."""
+    """Local validation results; no retry counters live here."""
 
     executable_calls: tuple[ToolCallRequest, ...] = ()
     rejected_calls: tuple[ToolCallRequest, ...] = ()
@@ -293,6 +293,20 @@ def classify_malformed_tool_calls(
     patches: list[ToolResultPatch] = []
     failures: list[Mapping[str, Any]] = []
     for tool_call in tool_calls:
+        if tool_call.arguments_error is not None:
+            rejected.append(tool_call)
+            content = _format_arguments_error(tool_call)
+            summary = _rejected_arguments_metadata(tool_call)
+            patches.append(ToolResultPatch(tool_call.id, tool_call.name, content))
+            failures.append(
+                {
+                    "tool_name": tool_call.name,
+                    "arguments": summary,
+                    "result": content,
+                    "kind": tool_call.arguments_error.code.lower(),
+                }
+            )
+            continue
         if isinstance(tool_call.arguments, dict):
             executable.append(tool_call)
             continue
@@ -331,7 +345,11 @@ def suppress_successful_side_effect_duplicates(
         fingerprint = tool_call_fingerprint(tool_call.name, tool_call.arguments)
         mode = tool_modes.get(tool_call.name, "exclusive")
         side_effecting = mode != "read_only"
-        duplicate = side_effecting and (fingerprint in seen or fingerprint in batch_seen)
+        duplicate = (
+            side_effecting
+            and tool_call.name != "write"
+            and (fingerprint in seen or fingerprint in batch_seen)
+        )
         if not duplicate:
             executable.append(tool_call)
             if side_effecting:
@@ -339,9 +357,9 @@ def suppress_successful_side_effect_duplicates(
             continue
         rejected.append(tool_call)
         content = (
-            f"Error: Skipped duplicate side-effecting call to '{tool_call.name}' because "
-            "the same successful call already ran. Reuse its result or choose a "
-            "different, explicitly justified action."
+            f"Error [DUPLICATE_SIDE_EFFECT]: tool={tool_call.name!r}; the same successful "
+            "side-effecting call already ran; next_action='reuse its result or make a "
+            "materially different call'."
         )
         patches.append(ToolResultPatch(tool_call.id, tool_call.name, content))
         failures.append(
@@ -361,13 +379,10 @@ def suppress_successful_side_effect_duplicates(
 
 
 def rejected_arguments_summary(tool_call: ToolCallRequest) -> str:
-    """Serialize rejected non-object arguments without echoing large payloads."""
+    """Serialize rejected arguments without echoing malformed or large payloads."""
 
     return json.dumps(
-        {
-            "_rejected_malformed_arguments": True,
-            "original_type": type(tool_call.arguments).__name__,
-        },
+        _rejected_arguments_metadata(tool_call),
         ensure_ascii=False,
     )
 
@@ -442,9 +457,42 @@ def _parse_action(content: str | None, allowed: tuple[str, ...]) -> str | None:
 def _format_malformed_arguments_error(tool_call: ToolCallRequest) -> str:
     raw = _safe_json(tool_call.arguments)
     return (
-        f"Error: arguments for tool '{tool_call.name}' must be a JSON object, "
-        f"but received {type(tool_call.arguments).__name__}: {_truncate(raw, 500)}."
+        f"Error [TOOL_ARGUMENTS_NOT_OBJECT]: arguments for tool '{tool_call.name}' must be "
+        f"a JSON object; actual={type(tool_call.arguments).__name__}; "
+        f"value={_truncate(raw, 500)}; next_action=retry with an object keyed by the tool schema."
     )
+
+
+def _format_arguments_error(tool_call: ToolCallRequest) -> str:
+    error = tool_call.arguments_error
+    assert error is not None
+    position = f"; position={error.position}" if error.position is not None else ""
+    next_action = (
+        "retry with a smaller complete tool call"
+        if error.code == "GENERATION_INCOMPLETE"
+        else "retry with one complete JSON object matching the tool schema"
+    )
+    return (
+        f"Error [{error.code}]: tool={tool_call.name}; {_truncate(error.message, 300)}"
+        f"{position}; raw_chars={error.raw_chars}; next_action={next_action}."
+    )
+
+
+def _rejected_arguments_metadata(
+    tool_call: ToolCallRequest,
+) -> dict[str, Any]:
+    if tool_call.arguments_error is not None:
+        error = tool_call.arguments_error
+        return {
+            "_rejected_tool_arguments": True,
+            "code": error.code,
+            "position": error.position,
+            "raw_chars": error.raw_chars,
+        }
+    return {
+        "_rejected_malformed_arguments": True,
+        "original_type": type(tool_call.arguments).__name__,
+    }
 
 
 def _bounded_failure(failure: Mapping[str, Any]) -> dict[str, Any]:
