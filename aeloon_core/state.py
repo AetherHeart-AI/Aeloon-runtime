@@ -89,6 +89,10 @@ class StateMetadata:
     status: RunStatus = RunStatus.RUNNING
     iteration: int = 0
     iteration_limit: int = 0
+    # Consecutive tool rounds that returned Error* results (reset on a clean round).
+    consecutive_tool_failure_rounds: int = 0
+    # How many times the host auto-extended the iteration budget without Guard.
+    budget_auto_continues_used: int = 0
     finalization_prompt: Message | None = None
     finalization_source: GuardSource | None = None
     finalization_evidence: GuardEvidence | None = None
@@ -103,6 +107,8 @@ class StateMetadata:
         self.status = RunStatus(self.status)
         self.iteration = max(0, int(self.iteration))
         self.iteration_limit = max(0, int(self.iteration_limit))
+        self.consecutive_tool_failure_rounds = max(0, int(self.consecutive_tool_failure_rounds))
+        self.budget_auto_continues_used = max(0, int(self.budget_auto_continues_used))
 
     @property
     def is_terminal(self) -> bool:
@@ -344,6 +350,8 @@ class LightweightState:
                 "status": self.metadata.status.value,
                 "iteration": self.metadata.iteration,
                 "iteration_limit": self.metadata.iteration_limit,
+                "consecutive_tool_failure_rounds": self.metadata.consecutive_tool_failure_rounds,
+                "budget_auto_continues_used": self.metadata.budget_auto_continues_used,
                 "finalization_prompt": _value_summary(self.metadata.finalization_prompt),
                 "finalization_source": self.metadata.finalization_source,
                 "finalization_evidence": _value_summary(self.metadata.finalization_evidence),

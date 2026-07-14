@@ -49,6 +49,8 @@ async def run_agent_loop(
     transition_trace_enabled: bool = True,
     minimal_context_recent_turns: int = 2,
     minimal_context_tool_result_chars: int = 1_200,
+    tool_error_guard_threshold: int = 3,
+    budget_auto_continues: int = 2,
     session_id: str | None = None,
     turn_id: str | None = None,
     on_transition: Callable[[TransitionRecord], None] | None = None,
@@ -66,6 +68,10 @@ async def run_agent_loop(
 
     if max_iterations < 1:
         raise ValueError("max_iterations must be at least 1")
+    if tool_error_guard_threshold < 1:
+        raise ValueError("tool_error_guard_threshold must be at least 1")
+    if budget_auto_continues < 0:
+        raise ValueError("budget_auto_continues must be non-negative")
 
     metadata = StateMetadata(
         session_id=session_id,
@@ -120,6 +126,8 @@ async def run_agent_loop(
         if profile is not None
         else None,
         max_handoffs=max_handoffs,
+        tool_error_guard_threshold=tool_error_guard_threshold,
+        budget_auto_continues=budget_auto_continues,
         trace_enabled=transition_trace_enabled,
         on_progress=on_progress,
         prepare_model_input=prepare_model_input,

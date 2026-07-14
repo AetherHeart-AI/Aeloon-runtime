@@ -263,6 +263,8 @@ async def _run_branch(
                 max_iterations=DELEGATE_MAX_ITERATIONS,
                 transition_trace_enabled=False,
                 minimal_context_recent_turns=2,
+                tool_error_guard_threshold=runtime.tool_error_guard_threshold,
+                budget_auto_continues=runtime.budget_auto_continues,
                 session_id=parent_state.metadata.session_id,
                 turn_id=f"{parent_state.metadata.turn_id or 'turn'}.{branch.branch_id}",
                 on_progress=progress,

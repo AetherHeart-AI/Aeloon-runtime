@@ -31,9 +31,40 @@ async def resolve_context_window(
     return litellm_context_window_from_table(table, model)
 
 
+async def resolve_max_output_tokens(
+    model: str,
+    *,
+    http_client: httpx.AsyncClient | None = None,
+) -> int | None:
+    """Resolve a model max completion size from the LiteLLM metadata table."""
+
+    try:
+        table = await _litellm_table(http_client=http_client)
+    except Exception as exc:
+        logger.debug("Model max-output lookup failed via litellm: {}", exc)
+        return None
+    return litellm_max_output_tokens_from_table(table, model)
+
+
 def litellm_context_window_from_table(table: Any, model: str) -> int | None:
     """Extract one context window from the LiteLLM model table."""
 
+    return _litellm_int_field(table, model, ("max_input_tokens",))
+
+
+def litellm_max_output_tokens_from_table(table: Any, model: str) -> int | None:
+    """Extract one max-output length from the LiteLLM model table."""
+
+    # Prefer the dedicated completion ceiling; fall back to max_tokens which
+    # LiteLLM often uses as the same value for chat models.
+    return _litellm_int_field(table, model, ("max_output_tokens", "max_tokens"))
+
+
+def _litellm_int_field(
+    table: Any,
+    model: str,
+    fields: tuple[str, ...],
+) -> int | None:
     if not isinstance(table, dict):
         return None
 
@@ -43,9 +74,10 @@ def litellm_context_window_from_table(table: Any, model: str) -> int | None:
             matcher = _matches_model_id_exact if exact else _matches_model_id_suffix
             if not matcher(key, candidates) or not isinstance(value, dict):
                 continue
-            context = _positive_int(value.get("max_input_tokens"))
-            if context is not None:
-                return context
+            for field in fields:
+                parsed = _positive_int(value.get(field))
+                if parsed is not None:
+                    return parsed
     return None
 
 

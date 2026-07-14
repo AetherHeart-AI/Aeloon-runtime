@@ -79,6 +79,10 @@ class AgentRuntime:
     profile: RuntimeProfileSpec | None = None
     profile_master: LLMProfileMaster | None = None
     max_handoffs: int = 8
+    # Soft-feed Error* tool results this many consecutive rounds before Guard.
+    tool_error_guard_threshold: int = 3
+    # Automatic budget extensions before a Guard budget review is required.
+    budget_auto_continues: int = 2
     trace_enabled: bool = True
     on_progress: Callable[..., Awaitable[None]] | None = None
     prepare_model_input: PrepareModelInput | None = None
@@ -330,17 +334,18 @@ class AgentRuntime:
                 "minimal_context_count": len(state.minimal_context or []),
                 "lazy_reference_count": len(state.lazy_values),
                 "active_agent_id": state.active_agent_id or "",
+                "consecutive_tool_failure_rounds": state.metadata.consecutive_tool_failure_rounds,
+                "budget_auto_continues_used": state.metadata.budget_auto_continues_used,
             },
         )
         state.pending_guard_request = GuardRequest(
             evidence=evidence,
             allowed_actions=allowed_actions,
-            fallback_action=(
-                GuardAction.RETRY
-                if event == GuardEvent.TOOL_ERROR
-                and GuardAction.RETRY in allowed_actions
-                and state.metadata.iteration < state.metadata.iteration_limit
-                else GuardAction.FINALIZE
+            fallback_action=_guard_fallback_action(
+                event=event,
+                allowed_actions=allowed_actions,
+                iteration=state.metadata.iteration,
+                iteration_limit=state.metadata.iteration_limit,
             ),
         )
         state.metadata.phase = AgentNode.MASTER
@@ -366,6 +371,23 @@ class AgentRuntime:
         if state.metadata.iteration < state.metadata.iteration_limit:
             state.metadata.phase = AgentNode.MASTER
             return state
+        # Prefer local budget extensions over an immediate Guard finalize.
+        if state.metadata.budget_auto_continues_used < max(0, int(self.budget_auto_continues)):
+            state.metadata.budget_auto_continues_used += 1
+            state.metadata.iteration_limit += max(1, int(self.base_iteration_budget))
+            state.metadata.phase = AgentNode.MASTER
+            self.describe_step(
+                {
+                    "action": "auto_continue",
+                    "budget_auto_continues_used": state.metadata.budget_auto_continues_used,
+                    "iteration_limit": state.metadata.iteration_limit,
+                }
+            )
+            await self.emit_progress(
+                f"Extending budget ({state.metadata.budget_auto_continues_used}/"
+                f"{self.budget_auto_continues})..."
+            )
+            return state
         return await self.queue_guard(
             state,
             event=GuardEvent.BUDGET_EXHAUSTED,
@@ -382,6 +404,46 @@ class AgentRuntime:
             state.metadata.iteration_limit += 1
         state.metadata.phase = AgentNode.MASTER
         return state
+
+    async def return_after_tool_errors(
+        self,
+        state: LightweightState,
+        *,
+        failures: tuple[Mapping[str, Any], ...],
+        recent_outcomes: tuple[Any, ...] = (),
+        successful_side_effects: tuple[Mapping[str, Any], ...] = (),
+    ) -> LightweightState:
+        """Feed Error* tool results back to the model; escalate only after N rounds."""
+
+        state.metadata.consecutive_tool_failure_rounds += 1
+        threshold = max(1, int(self.tool_error_guard_threshold))
+        if state.metadata.consecutive_tool_failure_rounds < threshold:
+            self.describe_step(
+                {
+                    "action": "soft_tool_feedback",
+                    "failed": len(failures),
+                    "consecutive_tool_failure_rounds": (
+                        state.metadata.consecutive_tool_failure_rounds
+                    ),
+                    "threshold": threshold,
+                }
+            )
+            await self.emit_progress(
+                "Tool error returned to the model "
+                f"({state.metadata.consecutive_tool_failure_rounds}/{threshold})..."
+            )
+            return await self.grant_more_or_finalize(state)
+        return await self.queue_guard(
+            state,
+            event=GuardEvent.TOOL_ERROR,
+            cause=(
+                "one or more calls failed in "
+                f"{state.metadata.consecutive_tool_failure_rounds} consecutive tool rounds"
+            ),
+            failures=failures,
+            recent_outcomes=recent_outcomes,
+            successful_side_effects=successful_side_effects,
+        )
 
     def record_context_transition(
         self,
@@ -808,15 +870,13 @@ class WorkerAgent(BaseAgent):
                 reasoning_content=response.reasoning_content,
                 thinking_blocks=response.thinking_blocks,
             )
-            status = (
-                RunStatus.TERMINATED_BY_GUARD
-                if state.metadata.finalization_source == "guard"
-                else RunStatus.FAILED
-            )
+            # A successful text-only wrap-up is partial success, whether Guard or
+            # the local fallback produced the decision. Hard FAILED is reserved for
+            # paths that cannot emit a usable answer (see local_failure_message).
             return await self.runtime.finish(
                 state,
                 content=clean,
-                status=status,
+                status=RunStatus.TERMINATED_BY_GUARD,
                 reason="guard requested an honest wrap-up",
                 add_message=False,
             )
@@ -975,14 +1035,15 @@ class ToolAgent(BaseAgent):
             }
         )
         if failures:
-            return await self.runtime.queue_guard(
+            # Error strings are already in conversation history as tool results.
+            # Prefer model self-correction; only escalate after consecutive rounds.
+            return await self.runtime.return_after_tool_errors(
                 state,
-                event=GuardEvent.TOOL_ERROR,
-                cause="one or more calls in the latest tool round failed",
                 failures=tuple(failures),
                 recent_outcomes=outcomes,
                 successful_side_effects=side_effects,
             )
+        state.metadata.consecutive_tool_failure_rounds = 0
         return await self.runtime.grant_more_or_finalize(state)
 
     @staticmethod
@@ -1039,6 +1100,37 @@ def _append_tool_patches(
             patch.tool_name,
             patch.content,
         )
+
+
+def _guard_fallback_action(
+    *,
+    event: GuardEvent,
+    allowed_actions: tuple[GuardAction, ...],
+    iteration: int,
+    iteration_limit: int,
+) -> GuardAction:
+    """Host-owned fallback when Guard itself fails.
+
+    Budget reviews prefer CONTINUE so a flaky Guard response does not force
+    wrap-up. Tool errors prefer RETRY while budget remains; otherwise finalize.
+    """
+
+    allowed = set(allowed_actions)
+    if event == GuardEvent.BUDGET_EXHAUSTED and GuardAction.CONTINUE in allowed:
+        return GuardAction.CONTINUE
+    if (
+        event == GuardEvent.TOOL_ERROR
+        and GuardAction.RETRY in allowed
+        and iteration < iteration_limit
+    ):
+        return GuardAction.RETRY
+    if GuardAction.FINALIZE in allowed:
+        return GuardAction.FINALIZE
+    if GuardAction.CONTINUE in allowed:
+        return GuardAction.CONTINUE
+    if GuardAction.RETRY in allowed:
+        return GuardAction.RETRY
+    return next(iter(allowed_actions))
 
 
 def _node_failures(nodes: Sequence[TaskNode]) -> tuple[Mapping[str, Any], ...]:

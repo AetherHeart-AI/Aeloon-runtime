@@ -23,7 +23,7 @@ from aeloon_core.context import (
 )
 from aeloon_core.context_compaction import CompactionResult, maybe_compact_messages
 from aeloon_core.default_profile import BUILTIN_PROFILE_IDS, load_builtin_profile
-from aeloon_core.model_metadata import resolve_context_window
+from aeloon_core.model_metadata import resolve_context_window, resolve_max_output_tokens
 from aeloon_core.profile_artifacts import CompatibilityPolicy, ProfileArtifactStore
 from aeloon_core.profile_registry import ProfileRegistry
 from aeloon_core.providers.base import GenerationSettings
@@ -31,7 +31,12 @@ from aeloon_core.providers.custom_provider import CustomProvider
 from aeloon_core.session import SessionStore
 from aeloon_core.skills import SkillRegistry
 from aeloon_core.state_machine import run_agent_loop
-from aeloon_core.tools.filesystem import ReadTool, StrReplaceTool, WriteTool
+from aeloon_core.tools.filesystem import (
+    ReadTool,
+    StrReplaceTool,
+    WriteTool,
+    resolve_max_argument_chars,
+)
 from aeloon_core.tools.registry import ScopedToolRegistry, ToolRegistry
 from aeloon_core.tools.search_grep import GlobTool, GrepTool
 from aeloon_core.tools.shell import ExecTool
@@ -138,6 +143,31 @@ class AeloonCoreOrchestrator:
             manager=self.worker_manager,
             profiles=self.profiles,
         )
+        self._file_tool_limit_applied = False
+
+    async def _ensure_file_tool_limits(self) -> int:
+        """Cap write/str_replace chunks at min(32k, model max output) once per process."""
+
+        if self._file_tool_limit_applied:
+            write = self.registry.get("write")
+            return int(getattr(write, "max_content_chars", resolve_max_argument_chars()))
+
+        max_output = await resolve_max_output_tokens(self.config.agents.defaults.model)
+        limit = resolve_max_argument_chars(max_output)
+        for registry in (self.registry, self.worker_tool_registry):
+            for name in ("write", "str_replace"):
+                tool = registry.get(name)
+                configure = getattr(tool, "configure_max_content_chars", None)
+                if callable(configure):
+                    configure(limit)
+        self._file_tool_limit_applied = True
+        if max_output is not None:
+            logger.debug(
+                "File tool content limit set to {} chars (model max_output_tokens={})",
+                limit,
+                max_output,
+            )
+        return limit
 
     async def run_turn(
         self,
@@ -148,6 +178,7 @@ class AeloonCoreOrchestrator:
     ) -> TurnResult:
         """Run one prompt through the agent loop."""
 
+        await self._ensure_file_tool_limits()
         actual_session_id = session_id or self.sessions.new_session()
         self.todo_tool.set_session_id(actual_session_id)
         defaults = self.config.agents.defaults
@@ -291,6 +322,8 @@ class AeloonCoreOrchestrator:
                 transition_trace_enabled=policy.transition_trace_enabled,
                 minimal_context_recent_turns=policy.minimal_context_recent_turns,
                 minimal_context_tool_result_chars=policy.minimal_context_tool_result_chars,
+                tool_error_guard_threshold=policy.tool_error_guard_threshold,
+                budget_auto_continues=policy.budget_auto_continues,
                 session_id=actual_session_id,
                 turn_id=turn_id,
                 on_transition=(persist_transition if policy.transition_trace_enabled else None),
@@ -356,6 +389,7 @@ class AeloonCoreOrchestrator:
     async def _execute_worker_run(self, run: Any, worker: Any) -> WorkerExecutionOutcome:
         """Run one private Worker context through the existing UASM engine."""
 
+        await self._ensure_file_tool_limits()
         profile = self.profile_store.load_pinned(
             profile_id=worker.profile.profile_id,
             artifact_id=worker.profile.artifact_id,
@@ -404,6 +438,8 @@ class AeloonCoreOrchestrator:
             transition_trace_enabled=defaults.uasm.transition_trace_enabled,
             minimal_context_recent_turns=defaults.uasm.minimal_context_recent_turns,
             minimal_context_tool_result_chars=defaults.uasm.minimal_context_tool_result_chars,
+            tool_error_guard_threshold=defaults.uasm.tool_error_guard_threshold,
+            budget_auto_continues=defaults.uasm.budget_auto_continues,
             session_id=run.worker_id,
             turn_id=run.run_id,
             on_progress=worker_progress,
@@ -521,6 +557,13 @@ def _worker_profile_handle(
 
 
 def _worker_run_status(status: str) -> WorkerRunStatus:
+    """Map UASM terminal status to Worker lifecycle status.
+
+    Guard wrap-ups (including fallback-driven honest summaries) are PARTIAL so
+    the coordinator can reuse checkpoints and inspect completed work. Only true
+    hard failures remain FAILED.
+    """
+
     if status == "completed":
         return WorkerRunStatus.COMPLETED
     if status in {"terminated_by_rule", "terminated_by_guard"}:

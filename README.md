@@ -174,13 +174,18 @@ uv run aeloon-core config set uasm-transition-trace-enabled true
 UASM makes the `MasterAgent -> WorkerAgent/ToolAgent` route explicit. Canonical
 conversation history lives in `LightweightState`; forward minimal context is a
 per-call view and does not replace persisted messages. Normal execution never
-calls Guard. A tool failure, runtime exception, or iteration boundary invokes
-one stateless review over bounded evidence. Guard returns only `retry`,
-`continue`, or `finalize`; local code owns recovery prompts, budget increments,
-text-only finalization, and the hardcoded failure fallback. Guard responses are
-accepted only as complete, single-action JSON. If review itself fails, a tool
-error retries only within the existing iteration budget; every other case wraps
-up. Finalization is buffered with tools disabled so provider tool-protocol text
+calls Guard. Tool results that start with `Error` are first fed back to the
+model for self-correction; Guard is only invoked after
+`agents.defaults.uasm.tool_error_guard_threshold` consecutive failed tool rounds
+(default `3`). Iteration budget exhaustion first grants up to
+`agents.defaults.uasm.budget_auto_continues` automatic extensions (default `2`)
+before a Guard budget review. Guard returns only `retry`, `continue`, or
+`finalize`; local code owns recovery prompts, budget increments, text-only
+finalization, and the host fallback. On Guard failure, budget reviews fall back
+to `continue` and tool errors fall back to `retry` while budget remains.
+Successful text-only wrap-ups finish as `terminated_by_guard` (Worker status
+`partial`) rather than hard `failed`, so completed work remains reusable.
+Finalization is buffered with tools disabled so provider tool-protocol text
 cannot leak into the visible answer.
 
 Completed UASM turns persist transition records separately at
@@ -344,15 +349,18 @@ File changes use two native, atomic tools:
 
 - Use `read` with `offset`/`limit` to inspect files in chunks.
 - Use `write(path, content)` for a new workspace-relative file. `content` is limited
-  to 16,000 characters per call, and an existing target is rejected.
+  to 32,000 characters per call (or the model's max output length when smaller),
+  and an existing target is rejected.
 - Continue one large file with `write(path, content, expected_offset)`, where
   `expected_offset` must equal the file's current UTF-8 byte length. Use the returned
   `next_offset` for the next chunk. A completed file may not exceed 16 MiB.
 - Prefer splitting large output into logical files. If one file must be chunked, send
-  complete chunks of at most 16,000 characters in separate calls.
+  complete chunks of at most 32,000 characters (or the model's max output length
+  when smaller) in separate calls.
 - Use `str_replace(path, old_str, new_str, replace_all=false)` for an existing file.
   `old_str` must be non-empty and uniquely match unless `replace_all=true`; `old_str`
-  and `new_str` are each limited to 16,000 characters. Matching is exact except that
+  and `new_str` are each limited to the same per-call budget as `write` (default
+  32,000 characters). Matching is exact except that
   LF and CRLF are equivalent, and the file's newline style is preserved.
 
 Write paths must be workspace-relative regular files and cannot traverse protected or

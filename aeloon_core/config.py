@@ -41,6 +41,10 @@ class UASMConfig(BaseModel):
     transition_trace_enabled: bool = True
     minimal_context_recent_turns: int = Field(default=2, ge=1)
     minimal_context_tool_result_chars: int = Field(default=1_200, ge=128)
+    # Soft-feed tool errors back to the model this many consecutive rounds before Guard.
+    tool_error_guard_threshold: int = Field(default=3, ge=1)
+    # Grant this many automatic budget extensions before involving Guard.
+    budget_auto_continues: int = Field(default=2, ge=0)
 
 
 class AgentDefaultsConfig(BaseModel):

@@ -93,8 +93,31 @@ class ReadTool(WorkspaceTool):
             return f"Error reading file: {exc}"
 
 
-_MAX_ARGUMENT_CHARS = 16_000
+# Host default per-call write/edit chunk size. Effective limit is
+# min(DEFAULT_MAX_ARGUMENT_CHARS, model_max_output_tokens) when metadata is known.
+DEFAULT_MAX_ARGUMENT_CHARS = 32_000
+_MAX_ARGUMENT_CHARS = DEFAULT_MAX_ARGUMENT_CHARS  # backward-compatible alias
 _MAX_FILE_BYTES = 16 * 1024 * 1024
+
+
+def resolve_max_argument_chars(model_max_output_tokens: int | None = None) -> int:
+    """Return the effective per-call write/edit character budget.
+
+    Defaults to 32,000 characters and never exceeds that host ceiling. When the
+    model's advertised max output length is known and smaller, use that instead
+    so a single tool argument cannot exceed what the model can emit in one shot.
+    """
+
+    default = DEFAULT_MAX_ARGUMENT_CHARS
+    if model_max_output_tokens is None:
+        return default
+    try:
+        model_limit = int(model_max_output_tokens)
+    except (TypeError, ValueError):
+        return default
+    if model_limit <= 0:
+        return default
+    return min(default, model_limit)
 
 
 def _render_value(value: Any) -> str:
@@ -499,21 +522,32 @@ def _prepare_parent(tool: WorkspaceTool, path: str, target: Path) -> None:
         )
 
 
-class WriteArgs(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+def _build_write_args_model(max_chars: int) -> type[BaseModel]:
+    limit = max(1, int(max_chars))
 
-    path: str = Field(description="Workspace-relative path of the file to create or append.")
-    content: str = Field(
-        json_schema_extra={"maxLength": _MAX_ARGUMENT_CHARS},
-        description="UTF-8 text chunk to write, limited to 16,000 characters.",
-    )
-    expected_offset: int | None = Field(
-        default=None,
-        json_schema_extra={"minimum": 0},
-        description=(
-            "Current UTF-8 byte size required before appending. Omit to create a new file."
-        ),
-    )
+    class WriteArgs(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+
+        path: str = Field(description="Workspace-relative path of the file to create or append.")
+        content: str = Field(
+            json_schema_extra={"maxLength": limit},
+            description=f"UTF-8 text chunk to write, limited to {limit:,} characters.",
+        )
+        expected_offset: int | None = Field(
+            default=None,
+            json_schema_extra={"minimum": 0},
+            description=(
+                "Current UTF-8 byte size required before appending. Omit to create a new file."
+            ),
+        )
+
+    WriteArgs.__name__ = "WriteArgs"
+    WriteArgs.__qualname__ = "WriteArgs"
+    return WriteArgs
+
+
+# Default schema used when tools are constructed without an explicit budget.
+WriteArgs = _build_write_args_model(DEFAULT_MAX_ARGUMENT_CHARS)
 
 
 class WriteTool(WorkspaceTool):
@@ -523,11 +557,36 @@ class WriteTool(WorkspaceTool):
     concurrency_mode = "mutating"
     description = (
         "Atomically create a new UTF-8 file, or append one chunk when expected_offset equals "
-        "the file's current UTF-8 byte size. Each chunk is at most 16,000 characters and the "
-        "result is at most 16 MiB. Use the returned next_offset for the next chunk; use "
-        "str_replace to modify existing content."
+        f"the file's current UTF-8 byte size. Each chunk is at most {DEFAULT_MAX_ARGUMENT_CHARS:,} "
+        "characters and the result is at most 16 MiB. Use the returned next_offset for the next "
+        "chunk; use str_replace to modify existing content."
     )
     args_model = WriteArgs
+
+    def __init__(
+        self,
+        *,
+        workspace: Path,
+        denied_paths: Iterable[Path] = (),
+        max_content_chars: int | None = None,
+    ) -> None:
+        super().__init__(workspace=workspace, denied_paths=denied_paths)
+        self.configure_max_content_chars(
+            DEFAULT_MAX_ARGUMENT_CHARS if max_content_chars is None else max_content_chars
+        )
+
+    def configure_max_content_chars(self, max_content_chars: int) -> None:
+        """Update the per-call content budget and the advertised tool schema."""
+
+        limit = max(1, int(max_content_chars))
+        self.max_content_chars = limit
+        self.args_model = _build_write_args_model(limit)
+        self.description = (
+            "Atomically create a new UTF-8 file, or append one chunk when expected_offset equals "
+            f"the file's current UTF-8 byte size. Each chunk is at most {limit:,} characters and "
+            "the result is at most 16 MiB. Use the returned next_offset for the next chunk; use "
+            "str_replace to modify existing content."
+        )
 
     async def execute(
         self,
@@ -535,6 +594,7 @@ class WriteTool(WorkspaceTool):
         content: str,
         expected_offset: int | None = None,
     ) -> str:
+        limit = getattr(self, "max_content_chars", DEFAULT_MAX_ARGUMENT_CHARS)
         try:
             if expected_offset is not None and expected_offset < 0:
                 return _error(
@@ -546,14 +606,14 @@ class WriteTool(WorkspaceTool):
                     actual=expected_offset,
                     next_action="Use the non-negative next_offset returned by the previous write.",
                 )
-            if len(content) > _MAX_ARGUMENT_CHARS:
+            if len(content) > limit:
                 return _error(
                     "CONTENT_TOO_LARGE",
                     "write content exceeds the per-call character limit.",
                     path=path,
                     field="content",
                     actual=len(content),
-                    limit=_MAX_ARGUMENT_CHARS,
+                    limit=limit,
                     next_action="Split the content into smaller chunks or separate files.",
                 )
             try:
@@ -749,21 +809,31 @@ def _replacement_chunks(
     yield from _protect_literal_cr_boundaries(pieces())
 
 
-class StrReplaceArgs(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+def _build_str_replace_args_model(max_chars: int) -> type[BaseModel]:
+    limit = max(1, int(max_chars))
 
-    path: str = Field(description="Workspace-relative path of the UTF-8 file to edit.")
-    old_str: str = Field(
-        json_schema_extra={"minLength": 1, "maxLength": _MAX_ARGUMENT_CHARS},
-        description="Exact text to replace; CRLF and LF are treated as equivalent.",
-    )
-    new_str: str = Field(
-        json_schema_extra={"maxLength": _MAX_ARGUMENT_CHARS},
-        description="Replacement text, limited to 16,000 characters.",
-    )
-    replace_all: bool = Field(
-        default=False, description="Replace every occurrence instead of just one."
-    )
+    class StrReplaceArgs(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+
+        path: str = Field(description="Workspace-relative path of the UTF-8 file to edit.")
+        old_str: str = Field(
+            json_schema_extra={"minLength": 1, "maxLength": limit},
+            description="Exact text to replace; CRLF and LF are treated as equivalent.",
+        )
+        new_str: str = Field(
+            json_schema_extra={"maxLength": limit},
+            description=f"Replacement text, limited to {limit:,} characters.",
+        )
+        replace_all: bool = Field(
+            default=False, description="Replace every occurrence instead of just one."
+        )
+
+    StrReplaceArgs.__name__ = "StrReplaceArgs"
+    StrReplaceArgs.__qualname__ = "StrReplaceArgs"
+    return StrReplaceArgs
+
+
+StrReplaceArgs = _build_str_replace_args_model(DEFAULT_MAX_ARGUMENT_CHARS)
 
 
 class StrReplaceTool(WorkspaceTool):
@@ -778,6 +848,25 @@ class StrReplaceTool(WorkspaceTool):
     )
     args_model = StrReplaceArgs
 
+    def __init__(
+        self,
+        *,
+        workspace: Path,
+        denied_paths: Iterable[Path] = (),
+        max_content_chars: int | None = None,
+    ) -> None:
+        super().__init__(workspace=workspace, denied_paths=denied_paths)
+        self.configure_max_content_chars(
+            DEFAULT_MAX_ARGUMENT_CHARS if max_content_chars is None else max_content_chars
+        )
+
+    def configure_max_content_chars(self, max_content_chars: int) -> None:
+        """Update the per-call string budget and the advertised tool schema."""
+
+        limit = max(1, int(max_content_chars))
+        self.max_content_chars = limit
+        self.args_model = _build_str_replace_args_model(limit)
+
     async def execute(
         self,
         path: str,
@@ -785,6 +874,7 @@ class StrReplaceTool(WorkspaceTool):
         new_str: str,
         replace_all: bool = False,
     ) -> str:
+        limit = getattr(self, "max_content_chars", DEFAULT_MAX_ARGUMENT_CHARS)
         try:
             if not old_str:
                 return _error(
@@ -795,14 +885,14 @@ class StrReplaceTool(WorkspaceTool):
                     next_action="Provide a non-empty exact string from the target file.",
                 )
             for field_name, value in (("old_str", old_str), ("new_str", new_str)):
-                if len(value) > _MAX_ARGUMENT_CHARS:
+                if len(value) > limit:
                     return _error(
                         "CONTENT_TOO_LARGE",
                         f"{field_name} exceeds the per-call character limit.",
                         path=path,
                         field=field_name,
                         actual=len(value),
-                        limit=_MAX_ARGUMENT_CHARS,
+                        limit=limit,
                         next_action="Use a smaller exact replacement operation.",
                     )
                 try:
