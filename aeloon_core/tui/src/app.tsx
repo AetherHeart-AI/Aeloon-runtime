@@ -110,7 +110,13 @@ export function App(props: AppProps) {
         const workerId = envelope.payload.worker_id
         if (
           typeof workerId === "string" &&
-          ["cancelled", "completed", "failed", "partial", "timed_out"].includes(phase)
+          [
+            "cancelled",
+            "completed",
+            "failed",
+            "partial",
+            "waiting_for_context",
+          ].includes(phase)
         ) {
           void refreshFinishedWorker(
             workerId,
@@ -213,7 +219,7 @@ export function App(props: AppProps) {
       .map((id) => state.workers[id])
       .find((worker) => {
         if (!worker) return false
-        return [worker.id, worker.label, worker.profileId, worker.runId]
+        return [worker.id, worker.label, worker.workerTypeId, worker.runId]
           .filter(Boolean)
           .some(
             (candidate) =>
@@ -328,8 +334,8 @@ export function App(props: AppProps) {
         openWorker(worker)
         return
       }
-      case "profiles":
-        await requestControl("discover_profiles")
+      case "worker-types":
+        await requestControl("discover_worker_types")
         return
       case "sessions":
         await requestControl("list_sessions")
@@ -349,19 +355,23 @@ export function App(props: AppProps) {
         }
         return
       case "spawn": {
-        const [profileId, ...taskParts] = command.args
-        const task = taskParts.join(" ")
-        if (!profileId || !task) {
+        const [workerTypeId, ...objectiveParts] = command.args
+        const objective = objectiveParts.join(" ")
+        if (!workerTypeId || !objective) {
           mutate((draft) =>
-            appendSystemNotice(draft, "SPAWN", "Use /spawn <profile> <task>.", "error"),
+            appendSystemNotice(
+              draft,
+              "SPAWN",
+              "Use /spawn <worker-type> <objective>.",
+              "error",
+            ),
           )
           return
         }
         await requestControl("spawn_worker", {
-          detached: false,
-          profile_id: profileId,
+          objective,
           session_id: state.sessionId,
-          task,
+          worker_type_id: workerTypeId,
         })
         return
       }
@@ -379,39 +389,43 @@ export function App(props: AppProps) {
       }
       case "resume-worker": {
         const worker = selectedWorker()
-        const instruction = command.args.join(" ")
+        const response = command.args.join(" ")
         if (!worker?.runId) {
           mutate((draft) =>
             appendSystemNotice(
               draft,
               "RESUME WORKER",
-              "Open a Worker first, then provide a recovery instruction.",
+              "Open a waiting Worker first, then provide its requested context.",
               "error",
             ),
           )
           return
         }
-        if (
-          ["archived", "cancelled", "completed", "failed", "partial", "timed_out", "waiting_for_context"].includes(worker.status) &&
-          !instruction
-        ) {
+        if (worker.status !== "waiting_for_context") {
           mutate((draft) =>
             appendSystemNotice(
               draft,
               "RESUME WORKER",
-              "Add an instruction so recovery cannot repeat side effects by accident.",
+              "Only a Worker waiting for context can be resumed.",
+              "error",
+            ),
+          )
+          return
+        }
+        if (!response) {
+          mutate((draft) =>
+            appendSystemNotice(
+              draft,
+              "RESUME WORKER",
+              "Provide a response to the Worker's waiting question.",
               "error",
             ),
           )
           return
         }
         await requestControl("resume_worker", {
-          ...(worker.runSequence === undefined
-            ? {}
-            : { expected_run_sequence: worker.runSequence }),
-          instruction: instruction || undefined,
+          response,
           run_id: worker.runId,
-          worker_id: worker.id,
         })
         return
       }
@@ -574,6 +588,17 @@ export function App(props: AppProps) {
     }
     if (state.view.kind === "worker" && key.name === "r") {
       key.preventDefault()
+      if (selectedWorker()?.status !== "waiting_for_context") {
+        mutate((draft) =>
+          appendSystemNotice(
+            draft,
+            "RESUME WORKER",
+            "This Worker is not waiting for context.",
+            "error",
+          ),
+        )
+        return
+      }
       setComposerValue("/resume-worker ")
       mutate((draft) => setFocus(draft, "composer"))
       return

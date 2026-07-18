@@ -15,7 +15,7 @@ from aeloon_core.providers.base import LLMProvider
 COMPACTION_MARKER = "[aeloon-core:context-compaction]"
 SUMMARY_PROMPT = """You are performing a CONTEXT CHECKPOINT COMPACTION.
 
-Create a handoff summary for another LLM that will resume the task.
+Create a continuation summary for a later model call that will resume the task.
 
 Include:
 - Current progress and key decisions made

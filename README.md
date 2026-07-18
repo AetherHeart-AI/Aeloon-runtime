@@ -1,429 +1,248 @@
 # Aeloon Core
 
-A minimal, independent Aeloon agent-loop playground. It provides an explicit
-state-machine runtime, an OpenAI-compatible provider, a small set of local tools,
-JSONL session persistence, and an OpenTUI command deck.
+Aeloon Core is a small dynamic agent workflow runtime.
 
-## Quick Start
+> **Master 写 Flow、看结果、动态改图；Worker 自己找路、交付节点结果。**
+
+The Master owns the conversation and authors a durable dynamic Flow. It decides
+dependencies, parallel frontiers, review-driven revisions, and termination. A Worker
+receives one outcome-oriented node objective, chooses its own tools and Skills,
+completes the work, and returns a bounded report. Selecting a Worker type is only an
+executor-binding detail inside that larger Flow.
+
+There is one agent loop for both actors. Its nodes are always
+`router → model → tool/guard → done`; responsibility and tool configuration vary,
+not the execution engine.
+
+## Quick start
 
 ```bash
 uv sync
-bun install --cwd aeloon_core/tui
+cd aeloon_core/tui && bun install && cd ../..
+
 export AELOON_CORE_API_KEY="..."
 export AELOON_CORE_API_BASE="https://api.openai.com/v1"
 export AELOON_CORE_MODEL="gpt-4.1-mini"
-uv run python -m aeloon_core "List the current directory and read README.md"
+
+uv run aeloon-core
 ```
 
-Interactive chat uses [OpenTUI](https://opentui.com/) and requires Bun 1.3 or
-newer. Run it with:
+Run one non-interactive turn with:
 
 ```bash
-uv run aeloon-core
-# or explicitly:
-uv run aeloon-core chat
+uv run aeloon-core run "Inspect the repository and explain its entry points"
 ```
 
-The default Master view is deliberately compressed: it keeps the conversation,
-high-signal file and command actions, Worker lifecycle, flow-changing Guard
-decisions, errors, and compact turn statistics. Routine reads, raw tool payloads,
-and gateway logs are available in verbose or Logs views. Successful commands
-show a short output preview; clicking the row or pressing `v` reveals the bounded
-head and tail. Worker compact views omit successful routine tools, while restored
-verbose history keeps a muted aggregate. OpenTUI's operator-only Worker command
-previews are bounded and scrub common credential patterns; Base and plain CLI
-progress keep structured metrics only. Reasoning dumps, heartbeats, and internal
-UUIDs are never part of the default transcript.
-
-The composer remains live while a turn runs. New prompts enter a FIFO queue
-instead of waiting for the current turn to end. `Tab` moves between the composer,
-Master transcript, and Worker tabs; unread Worker activity does not steal focus
-or move a manually pinned scroll position.
-
-Useful interactive commands:
+Useful TUI commands include:
 
 ```text
-/help
+/worker-types
 /workers
 /worker <label>
-/verbosity compact|verbose
-/logs
+/spawn <worker-type> <objective>
+/resume-worker <response…>
+/cancel [run]
 /sessions
-/resume <session-id>
 /new
-/spawn <profile> <task>
-/cancel-turn
-/cancel [worker]
-/resume-worker [instruction…]
 /quit
 ```
 
-From Worker Detail, `r` focuses the composer with `/resume-worker ` ready for
-an explicit continuation or retry instruction. Terminal runs are never
-silently replayed, which avoids repeating file writes or external side effects.
+Independent Workers run concurrently. Runs in one WorkerSession retain a single
+private context lineage and are continued explicitly.
 
-An explicit initial prompt keeps the line-oriented renderer and exits after one
-turn. This is also the fallback for non-interactive stdin/stdout, so scripts and
-pipes do not enter the alternate-screen UI:
+## Master and Worker boundary
 
-```bash
-uv run aeloon-core chat "List the current directory"
-uv run aeloon-core tui "Read README.md"
+| Actor | Tools |
+|---|---|
+| Master | `list`, `read`, `glob`, `grep`; create/list/inspect/extend/advance/revise/pause/complete Flow; low-level Worker lifecycle escape hatches |
+| Worker | `list`, `read`, `write`, `str_replace`, `glob`, `grep`, `exec`, `webfetch`, `websearch`, `todowrite`, optional `skill` |
+| Worker terminal | `complete_work`, `request_master` |
+
+The Master handles tiny observations itself. It should not create a Worker just to
+perform an `ls -la`-sized action, and it should not send command lists or prescribed
+steps. A delegated request has one field: `objective`.
+
+## Dynamic Flows
+
+Multi-stage work is represented as a first-class, appendable DAG rather than an
+implicit sequence of Worker calls. For example:
+
+```text
+plan
+  ├─ build_1 ─┐
+  ├─ build_2 ─┼─ review
+  └─ build_3 ─┘
 ```
 
-Open the Logs view initially when gateway diagnostics are needed:
+The Master creates semantic nodes with `objective`, `worker_type_id`, and
+`depends_on`. A node may also set `worker_session_policy` to `auto` (the default) or
+`fresh`. Each `advance_flow` executes exactly one ready frontier: it launches all
+independent nodes as distinct WorkerSessions, joins their Runs, synchronizes bounded
+results, and returns control to Master. It deliberately does not start the next
+frontier in the same call, so Master can evaluate results and dynamically choose one
+of:
 
-```bash
-# Compact gateway logs at the default INFO level
-uv run aeloon-core chat --show-gateway-logs
+- `add_flow_nodes` to expand or replan the graph;
+- `revise_flow_node` to create a new generation and rerun only affected descendants;
+- `retry_flow_node` for a technical/non-successful Run outcome;
+- `resume_flow_node` for an exact `waiting_for_context` continuation;
+- `complete_flow` for an explicit completed, partial, or blocked outcome.
 
-# Setting a level or requesting detail also enables gateway logs
-uv run aeloon-core tui --gateway-log-level DEBUG --gateway-log-detail
+WorkerSession selection follows a durable, inspectable policy:
 
-# The compatibility flag always wins when options are composed by scripts
-uv run aeloon-core chat --gateway-log-level DEBUG --hide-gateway-logs
-```
+| Situation | WorkerSession action |
+|---|---|
+| New independent node or branch | Create a new WorkerSession |
+| Revision of the same node | Reuse its healthy WorkerSession by default |
+| Ordinary retry of the same node | Reuse its healthy WorkerSession by default |
+| `waiting_for_context` | Always resume the exact WorkerSession and source Run |
+| Worker missing, outcome unknown, or context polluted | Create a new WorkerSession |
+| Reviewer requiring an independent audit | Set `worker_session_policy: "fresh"` |
 
-These flags seed the OpenTUI Logs view and log detail settings; `/logs` and
-`/verbosity` can change them while the application is running.
+`fresh` applies to new non-resume executions; it never breaks the exact-continuation
+invariant for `waiting_for_context`. Lost or unknown Worker state automatically falls
+back to a new WorkerSession. When Master judges a context polluted, it passes
+`fresh_worker=true` and a concrete `fresh_reason` to `revise_flow_node` or
+`retry_flow_node`. Flow inspection exposes the requested policy, the resolved
+`new`/`reuse`/`resume` action, and its reason.
 
-Runtime commands use the directory where you invoke `aeloon-core` as the
-workspace. To target a different folder for one command, pass `--workspace`.
+Dependencies are scheduling edges, not implicit data pipes. Upstream reports remain
+untrusted task data and are never silently appended to a downstream authoritative
+objective. When build objectives depend on a planner's conclusions, Master advances
+the planner first and then dynamically authors the build nodes from its own synthesis.
+Static downstream nodes are appropriate when their inputs already live as durable
+shared-workspace artifacts or their objectives are known in advance.
 
-For frontend development, run its checks independently:
+Only `completed` and explicitly `skipped` dependencies unlock the default join.
+`partial`, `failed`, `cancelled`, `waiting_for_context`, `queued`, and `running` are
+never mistaken for success. A node may opt into `all_terminal` when its purpose is to
+diagnose failed branches.
 
-```bash
-bun --cwd aeloon_core/tui run check
-```
+Review approval is not inferred from words in a free-form Worker report. Master reads
+the report and explicitly completes or revises the Flow. Revision increments the
+target generation, marks only transitive descendants stale, and preserves unaffected
+parallel branches. Stable node/generation/attempt idempotency keys make frontier
+recovery safe after an interrupted dispatch.
 
-If interactive launch reports missing OpenTUI dependencies, rerun
-`bun install --cwd aeloon_core/tui`. The Python launcher passes the active
-workspace and session as non-sensitive environment values. Full runtime
-configuration stays in the Python launcher; Bun receives only an inherited
-NDJSON socket plus non-sensitive UI context. Provider credentials and the
-operator's tool environment therefore never enter the frontend process.
+An open or cancelling Flow prevents Master from ending the turn with bare text.
+`complete_flow`
+persists one Flow's explicit outcome without ending the turn; after every open Flow
+has been completed, paused, blocked, or cancelled, the terminal
+`finish_turn(final_content)` tool produces the user response. If user input is needed,
+Master pauses a quiescent Flow, asks the question, and resumes the same persisted Flow
+on a later turn. `max_rounds` provides an independent liveness bound for dynamic
+revision loops.
 
-## Config
+`cancel_flow` first enters a durable `cancelling` state. It becomes cleanly `cancelled`
+only after every Worker has settled without an uncertain in-flight tool outcome. If an
+owner disappears during tool execution, the Flow becomes `blocked` instead and exposes
+the unknown outcome for inspection. Tool boundaries re-check Run authority, so a stale
+owner is fenced from issuing new mutations after cancellation wins.
 
-By default Aeloon Core persists config at `~/.aeloon-core/config.json`. You can
-create it from the CLI:
+Worker types are soft responsibilities. `explorer`, `builder`, `researcher`, and `reviewer`
+receive the same domain capability set; their definitions only change the
+responsibility prompt. Workers never receive Worker scheduling tools or any nested
+agent capability. The Master never receives mutation, shell, web, or Skill tools.
 
-```bash
-uv run aeloon-core config init \
-  --api-key sk-... \
-  --api-base https://api.openai.com/v1 \
-  --model gpt-4.1-mini
-```
+## Worker definitions
 
-Inspect or update it later:
-
-```bash
-uv run aeloon-core config path
-uv run aeloon-core config show
-uv run aeloon-core config set model gpt-4.1-mini
-uv run aeloon-core config set max-iterations 25
-uv run aeloon-core config set context-compaction-enabled true
-uv run aeloon-core config set context-compaction-trigger-ratio 0.9
-```
-
-You can override the path with `AELOON_CORE_CONFIG` or `--config`.
-Environment variables override file values:
-
-- `AELOON_CORE_API_KEY`
-- `AELOON_CORE_API_BASE`
-- `AELOON_CORE_MODEL`
-- `AELOON_CORE_DATA_DIR`
-- `AELOON_CORE_PROFILE_ID`
-
-Minimal file example:
-
-```json
-{
-  "providers": {
-    "custom": {
-      "api_key": "sk-...",
-      "api_base": "https://api.openai.com/v1"
-    }
-  },
-  "agents": {
-    "defaults": {
-      "model": "gpt-4.1-mini"
-    }
-  }
-}
-```
-
-Normal model calls do not set `max_tokens`; the provider controls output length.
-
-Context compaction is enabled by default. Before every agent-loop model call, Aeloon
-estimates the complete model-visible request, including tool definitions. At 90% of
-the model context window, it summarizes older turns into a synthetic system checkpoint
-and keeps the recent tail intact. Context windows come from LiteLLM's public model
-table, falling back to `agents.defaults.context_window_tokens`. Tunables live under
-`agents.defaults.context_compaction`.
-
-## Unified Agentic State Machine
-
-The Unified Agentic State Machine (UASM) is the only agent-loop runtime. Its
-exception-only Guard and bounded minimal context are always enabled:
-
-```bash
-uv run aeloon-core config set uasm-transition-trace-enabled true
-```
-
-UASM makes the `MasterAgent -> WorkerAgent/ToolAgent` route explicit. Canonical
-conversation history lives in `LightweightState`; forward minimal context is a
-per-call view and does not replace persisted messages. Normal execution never
-calls Guard. Tool results that start with `Error` are first fed back to the
-model for self-correction; Guard is only invoked after
-`agents.defaults.uasm.tool_error_guard_threshold` consecutive failed tool rounds
-(default `3`). Iteration budget exhaustion first grants up to
-`agents.defaults.uasm.budget_auto_continues` automatic extensions (default `2`)
-before a Guard budget review. Guard returns only `retry`, `continue`, or
-`finalize`; local code owns recovery prompts, budget increments, text-only
-finalization, and the host fallback. On Guard failure, budget reviews fall back
-to `continue` and tool errors fall back to `retry` while budget remains.
-Successful text-only wrap-ups finish as `terminated_by_guard` (Worker status
-`partial`) rather than hard `failed`, so completed work remains reusable.
-Finalization is buffered with tools disabled so provider tool-protocol text
-cannot leak into the visible answer.
-
-Completed UASM turns persist transition records separately at
-`~/.aeloon-core/traces/<session-id>.jsonl`. Each record includes state digests,
-the node and decision, wall time, and token usage. Turn records aggregate tokens
-by `domain`, `harness`, and `context_processing` without mixing transition rows
-into session history. The additive `by_component` view distinguishes
-`profile_master`, `domain:<role>`, `tool`, `control`, `guard`, and
-`minimal_context`; both views conserve the same aggregate counters.
-
-## Agent Profiles (v1.5)
-
-Profiles provide explicitly declared agent teams while keeping the same
-`run_agent_loop`. Aeloon ships with two built-in profiles:
-
-- `coding` is the zero-config default with a `planner`, `implementer`, and
-  independent `reviewer`.
-- `research` coordinates two to four parallel read-only research branches and
-  independent fact checking before synthesis.
-
-Select research with `uv run aeloon-core config set profile-id research`. On the
-first turn with a selected built-in, the host deterministically compiles the
-package-owned source, records a system approval and activation audit, then pins
-the immutable artifact for the turn. It also best-effort copies the source in
-that bootstrap workspace to
-`.aeloon-core/profiles/<profile-id>/PROFILE.md` for inspection without
-overwriting an existing workspace file; runtime trust remains anchored to the
-packaged source and approved artifact, not that workspace copy.
-
-Disable profiles explicitly with `uv run aeloon-core config set profile-id none`.
-That preserves the v1.0 deterministic-master path: text completes the turn and
-neither compiler nor profile-master calls occur.
-
-A profile lives at `.aeloon-core/profiles/<profile-id>/PROFILE.md` and declares
-roles and requested tools in strict YAML, followed by shared, master, and role
-instructions in Markdown:
+Built-ins live in `aeloon_core/builtin_workers`. A project can add or override a type
+with `.aeloon-core/workers/*.md`:
 
 ```markdown
 ---
-schema_version: 1
-id: coding-team
-revision: 1
-description: Coding and review team
-default_agent: implementer
-max_handoffs: 8
-agents:
-  - id: planner
-    description: Analyze requirements
-    tools: [read, glob, grep]
-  - id: implementer
-    description: Implement and verify changes
-    tools: [read, write, str_replace, exec]
+id: reviewer
+description: Independently inspect changes and return evidence-backed risks
 ---
-
-## Shared
-Keep changes scoped and verified.
-
-## Master
-Select the role that owns the next step.
-
-## Agent: planner
-Inspect the repository and produce an implementation approach.
-
-## Agent: implementer
-Implement, verify, and report the result.
+Review the requested outcome in the shared workspace. Verify findings and report
+only actionable issues with concrete evidence.
 ```
 
-Custom profiles are built and activated explicitly:
+Frontmatter is strict: only `id` and `description` are accepted, duplicate keys and
+YAML aliases are rejected, and the Markdown body must be non-empty. Definitions are
+discovered once at process startup. A project definition overrides a built-in with
+the same `id`.
 
-```bash
-PROFILE=.aeloon-core/profiles/coding-team/PROFILE.md
+Creating a WorkerSession persists the complete immutable snapshot:
 
-uv run aeloon-core profile validate "$PROFILE"
-uv run aeloon-core profile compile "$PROFILE" --compiler deterministic
-uv run aeloon-core profile inspect <artifact-id>
-uv run aeloon-core profile approve <artifact-id> --approved-by operator
-uv run aeloon-core profile activate <artifact-id>
-uv run aeloon-core config set profile-id coding-team
-uv run aeloon-core profile status coding-team
+```text
+WorkerSnapshot(id, description, prompt, source, digest)
 ```
 
-The deterministic compiler is the reference backend. The optional `llm`
-backend is explicit and offline from turns:
+Changing a file affects new WorkerSessions after restart. Existing sessions continue
+with their stored snapshot and digest.
 
-```bash
-uv run aeloon-core profile compile "$PROFILE" --compiler llm --model gpt-4.1-mini
+## Completion and continuation
+
+A WorkerRun must end with exactly one terminal tool call:
+
+```text
+complete_work(summary, artifacts=[], evidence=[])
+request_master(summary, question)
 ```
 
-It has no tools, uses temperature zero, receives one repair attempt, and may
-rewrite prompts only. It cannot alter role ids, descriptions, tools, the
-default role, or handoff budget. Keep it experimental unless a golden-corpus
-evaluation shows measurable gains over the deterministic artifact.
+A terminal call mixed with any other tool call—or multiple terminal calls in one
+response—is rejected before any tool executes. Plain Worker text cannot complete a
+Run; it enters the normal correction and Guard path.
 
-Compiled Python is an inert review format: only one constant-only
-`CompiledProfile` class is allowed, values are decoded with `ast.literal_eval`,
-and generated source is never imported, executed, or passed to `compile`.
-Artifacts must move through `validated -> approved -> active`; activation is an
-audited, cross-process-serialized commit whose active pointer is published last.
-During Profile turns, filesystem tools cannot access the operator data directory.
-`exec` remains a filesystem-capable shell, not a file-write security boundary;
-omit it from roles that must not write through shell commands. A turn pins the
-active artifact once, so activation during a turn affects only the next turn.
+Run states are:
 
-At runtime, the profile master can select only a declared role. Roles see the
-intersection of their requested tools and the host registry plus three internal
-control operations:
-
-- `handoff_agent(summary, recommended_agent?)`
-- `delegate_tasks(tasks=[{agent_id, task}, ...])`
-- `complete_task(final_content)`
-
-Control calls must be the response's only tool call. External tools are hidden
-by role and checked again immediately before execution. Tool results always
-return to the calling role; only an accepted handoff invokes the profile master
-again.
-
-`delegate_tasks` is a bounded fork/join primitive for research and other
-independent read-only work. It accepts two to four tasks, starts each task in an
-isolated declared-role loop with the shared provider, and joins the bounded
-reports in input order before resuming the coordinator. Delegated roles may
-contain only `read_only` tools, and the provider must explicitly advertise
-concurrent-call support; branch model text is not streamed into the main
-answer, while branch lifecycle, labeled tool calls, failures, and Guard decisions
-remain visible in the TUI. Joined reports are fairly trimmed to a 12,000-character
-round budget. A turn may run at most two delegation rounds, and
-delegated branches cannot hand off, complete the parent task, or delegate again.
-
-Protocol violations enter the same exception-only Guard as the base loop.
-Finalization, local fallback, and provider-failure termination remain
-host-controlled. Adding the fork/join operation advances the profile control
-protocol to version 2, so older custom artifacts must be recompiled, approved,
-and activated before use.
-
-Rollback selects a prior approved compatible artifact for future turns; it
-cannot undo tool side effects from completed turns:
-
-```bash
-uv run aeloon-core profile rollback <prior-artifact-id>
-uv run aeloon-core config set profile-id none  # restore the v1.0 path
+```text
+queued → running → completed | partial | waiting_for_context | failed | cancelled
 ```
 
-See [UASM profile operations](docs/uasm-profiles.md) for the artifact layout,
-failure handling, compatibility rules, and operational checklist.
+`waiting_for_context` is settled, so `await_workers` returns immediately. The Master
+answers with `resume_worker(run_id, response, idempotency_key)`. Resume creates the
+next Run in the same WorkerSession, references the exact `source_run_id`, and restores
+that Run's checkpoint. The waiting Run is never reopened.
 
-## Core Tools
+Checkpoint, structured question, result, and waiting status are committed in one
+SQLite transaction. Reuse and resume inherit the prior permission domain; the host
+rejects permission expansion and idempotency conflicts. Each continuation receives
+the current Run budget instead of inheriting an obsolete cap.
 
-The runtime registers these tools:
+WorkerRuns have no cumulative token or tool-call cap by default. The model context
+window is a separate per-request concern: Workers use the same automatic context
+compaction as Master, followed by the bounded minimal-context view. A finite internal
+grant remains a hard Run bound when an embedding host explicitly supplies one, and
+the wall-clock timeout plus `cancel_worker` remain the liveness controls.
 
-- `exec`
-- `read`
-- `write`
-- `str_replace`
-- `glob`
-- `grep`
-- `skill` when skills are enabled
-- `webfetch`
-- `websearch`
-- `todowrite`
-
-File changes use two native, atomic tools:
-
-- Use `read` with `offset`/`limit` to inspect files in chunks.
-- Use `write(path, content)` for a new workspace-relative file. `content` is limited
-  to 32,000 characters per call (or the model's max output length when smaller),
-  and an existing target is rejected.
-- Continue one large file with `write(path, content, expected_offset)`, where
-  `expected_offset` must equal the file's current UTF-8 byte length. Use the returned
-  `next_offset` for the next chunk. A completed file may not exceed 16 MiB.
-- Prefer splitting large output into logical files. If one file must be chunked, send
-  complete chunks of at most 32,000 characters (or the model's max output length
-  when smaller) in separate calls.
-- Use `str_replace(path, old_str, new_str, replace_all=false)` for an existing file.
-  `old_str` must be non-empty and uniquely match unless `replace_all=true`; `old_str`
-  and `new_str` are each limited to the same per-call budget as `write` (default
-  32,000 characters). Matching is exact except that
-  LF and CRLF are equivalent, and the file's newline style is preserved.
-
-Write paths must be workspace-relative regular files and cannot traverse protected or
-symlink paths. Each successful `write` or `str_replace` call stages a same-directory
-temporary file, flushes and fsyncs it, rechecks the target baseline, and commits with
-`os.replace`.
-Completed chunks are committed independently; there is no cross-file transaction.
-
-Invalid JSON, truncated tool arguments, and tool batches that do not finish with
-`stop` or `tool_calls` are rejected without executing the batch. Use the file tools
-for generated content rather than carrying file bodies through `python -c`, heredocs,
-or shell redirection. `exec` commands are capped at 8,192 characters, but `exec`
-remains a filesystem-capable shell; the cap and prompt guidance are not a security
-boundary.
-
-The old `edit` tool and framed WRITE schema are not compatibility aliases. Custom
-profiles that declare them, or depend on `overwrite`/`end_marker`, must be compiled,
-approved, and activated again with `str_replace` and the native `write` schema.
+Cancellation of queued work settles immediately. For a detached running Worker, the
+control service first records a durable cancellation request; the owning runner cancels
+its model/tool coroutine and only then acknowledges the Run as `cancelled`. A Flow Run
+is reserved first, durably bound, and only then marked activated, allowing another runner
+to recover it without ever claiming an unbound reservation. Every executing tool holds a
+durable in-flight marker, and each Run claim records a unique process-owner epoch backed by
+an exclusive local file lock. While the owner is healthy or performing controlled teardown,
+the marker prevents lease expiry from exposing a terminal Flow result before the tool and
+its cleanup finish. A stale in-flight
+marker is recovered only after the kernel releases that exact owner's lock on process exit;
+heartbeat delay or an event-loop stall alone cannot clear it. Continuous runners keep polling
+for unrelated queued work while existing Workers are active. If an owner dies with a tool in
+flight, the Run is `failed` with `tool_outcome=unknown` even when cancellation was already
+requested: clearing the control-plane marker cannot prove that shell descendants or remote
+side effects stopped or rolled back. A cancelling Flow containing such a Run becomes `blocked`
+and instructs the Master to inspect side effects; only cancellation with no uncertain in-flight
+tool work becomes cleanly `cancelled`.
 
 ## Skills
 
-Aeloon Core discovers OpenCode-style `SKILL.md` files at startup. The model sees
-only names and descriptions in system context, then loads the full instructions
-on demand with the `skill` tool.
+Skills belong only to Workers. Each WorkerRun receives the current process's Skill
+summary and the `skill` tool when Skills are enabled. Loaded Skill content remains
+complete during the current Run; later Runs can load it again from the refreshed
+catalog instead of permanently injecting every Skill into the system prompt.
 
-Standard locations:
+Project-native locations are:
 
-- Project native: `.aeloon-core/skill/<name>/SKILL.md` and
-  `.aeloon-core/skills/<name>/SKILL.md`
-- Project OpenCode-compatible: `.opencode/skill/<name>/SKILL.md` and
-  `.opencode/skills/<name>/SKILL.md`
-- Project Claude-compatible: `.claude/skills/<name>/SKILL.md`
-- Project agent-compatible: `.agents/skills/<name>/SKILL.md`
-- Global native: `~/.aeloon-core/skill/<name>/SKILL.md` and
-  `~/.aeloon-core/skills/<name>/SKILL.md`
-- Global OpenCode-compatible: `~/.config/opencode/skill/<name>/SKILL.md` and
-  `~/.config/opencode/skills/<name>/SKILL.md`
-- Global Claude-compatible: `~/.claude/skills/<name>/SKILL.md`
-- Global agent-compatible: `~/.agents/skills/<name>/SKILL.md`
-
-For project-local external and config directories, Aeloon walks upward from the
-workspace to the git worktree root. Later discoveries override earlier duplicate
-skill names, so project-native skills can override global or compatibility
-skills.
-
-Minimal `SKILL.md`:
-
-```markdown
----
-name: git-release
-description: Prepare consistent releases and changelogs.
----
-
-## Workflow
-
-Draft release notes, check the versioning scheme, and produce the release
-command.
+```text
+.aeloon-core/skill/<name>/SKILL.md
+.aeloon-core/skills/<name>/SKILL.md
+.opencode/skill/<name>/SKILL.md
+.opencode/skills/<name>/SKILL.md
 ```
 
-Aeloon only reads simple scalar `name` and `description` fields from the
-frontmatter; other fields are ignored.
-
-Additional settings live under `skills`:
+Compatible `.claude/skills` and `.agents/skills` locations and their global variants
+are enabled by default. Configure discovery under `skills`:
 
 ```json
 {
@@ -436,9 +255,76 @@ Additional settings live under `skills`:
 }
 ```
 
-Environment overrides:
+Host-discovered Worker definitions and Skill contents are trusted workflow
+configuration. Workspace files, tool output, web content, and data referenced by a
+Skill remain untrusted task data.
 
+## Persistence and v2 migration
+
+Master turns are JSONL records. Flow state, idempotent graph decisions, turn leases, and
+terminal-response commits use the independent `flow-control.sqlite3` store with current
+schema version 4. A terminal response is committed there before JSONL projection or UI
+delivery; a crash can therefore recover and project it idempotently without rerunning the
+model.
+Worker control state uses `worker-control.sqlite3` at schema version 5; private
+Worker transcripts are stored below `worker-sessions/` and are never exposed to Master.
+
+The architecture-v2 upgrade is intentionally destructive only for legacy Worker schema
+v1. On first startup it locks the database, drops v1 Worker UI/checkpoint/run/session
+tables, creates the current schema, and deletes old `worker-sessions/` transcripts.
+Subsequent v2-to-v5 migrations preserve Worker data while adding activation, execution,
+and process-owner fences. A migrated v4 in-flight marker without an owner epoch fails
+closed and requires the old runner to finish or operator intervention; ownership is never
+fabricated from elapsed time. Existing Master sessions and ordinary transition traces
+remain. Old external definition/artifact directories are not read and are not deleted.
+
+Stop any old detached runner before upgrading. A migration or transcript-cleanup
+failure aborts startup instead of running against a half-migrated store.
+
+## Config
+
+Configuration defaults to `~/.aeloon-core/config.json`:
+
+```bash
+uv run aeloon-core config init \
+  --api-key sk-... \
+  --api-base https://api.openai.com/v1 \
+  --model gpt-4.1-mini
+
+uv run aeloon-core config show
+uv run aeloon-core config set max-iterations 25
+uv run aeloon-core config set context-compaction-enabled true
+```
+
+When loading a v1 config, v2 ignores the removed `base_profile_id`, `profile_id`,
+and `max_handoffs` settings. The next `config set` or `config init --force` writes
+the file back without them; unrelated unknown agent settings remain validation
+errors.
+
+Common environment overrides are:
+
+- `AELOON_CORE_API_KEY`
+- `AELOON_CORE_API_BASE`
+- `AELOON_CORE_MODEL`
+- `AELOON_CORE_WORKSPACE`
+- `AELOON_CORE_DATA_DIR`
 - `AELOON_CORE_SKILLS_ENABLED`
-- `AELOON_CORE_DISABLE_EXTERNAL_SKILLS`
-- `AELOON_CORE_DISABLE_CLAUDE_CODE_SKILLS`
-- `AELOON_CORE_SKILL_PATHS` using the OS path separator
+- `AELOON_CORE_SKILL_PATHS`
+
+## Atomic file tools
+
+`write` creates a new UTF-8 file or appends with the exact byte
+`expected_offset`; it never silently overwrites an existing file. `str_replace`
+requires an exact unique match unless `replace_all=true`. Both enforce the model-aware
+per-call character limit, reject symlink/protected paths, recheck the file baseline,
+and commit through an atomic same-directory replacement.
+
+## Development
+
+```bash
+uv run pytest -q
+uv run ruff check .
+uv build
+(cd aeloon_core/tui && bun run check)
+git diff --check
+```

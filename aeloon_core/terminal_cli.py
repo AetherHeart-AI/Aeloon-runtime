@@ -83,7 +83,6 @@ class TerminalEventRenderer:
         self.block_types: dict[str, str] = {}
         self.block_names: dict[str, str] = {}
         self.block_arguments: dict[str, Any] = {}
-        self.block_agents: dict[str, str] = {}
         self.block_content_lengths: dict[str, int] = {}
         self.block_contents: dict[str, str] = {}
         self.last_usage: dict[str, Any] = {}
@@ -134,12 +133,18 @@ class TerminalEventRenderer:
         table.add_row("/sessions", "list saved sessions")
         table.add_row("/resume <id>", "continue a saved session")
         table.add_row("/history", "show the current session history")
-        table.add_row("/profiles", "list active Worker profiles")
+        table.add_row("/worker-types", "list available Worker types")
         table.add_row("/workers", "list Workers for this session")
         table.add_row("/worker <id>", "inspect a Worker and its runs")
         table.add_row("/cancel <run-id>", "cancel one Worker run")
-        table.add_row("/resume-worker <run-id>", "resume one recoverable Worker run")
-        table.add_row("/spawn <profile> <task>", "create a Worker for an explicit task")
+        table.add_row(
+            "/resume-worker <run-id> <response>",
+            "answer a waiting Worker and continue it",
+        )
+        table.add_row(
+            "/spawn <worker-type> <objective>",
+            "create a Worker for an explicit objective",
+        )
         table.add_row("/logs [on|off|info|debug|warning|error|detail]", "control gateway logs")
         table.add_row("/clear", "clear the terminal")
         table.add_row("/quit", "exit")
@@ -238,9 +243,6 @@ class TerminalEventRenderer:
         if event == "chat.guard.decision":
             self._render_guard_decision(payload)
             return
-        if event == "chat.profile.delegate.guard":
-            self._render_guard_decision(payload)
-            return
         if event == "chat.worker.guard":
             self._render_guard_decision(payload)
             return
@@ -276,9 +278,6 @@ class TerminalEventRenderer:
             if isinstance(usage, dict):
                 self.last_usage = usage
             return
-        if event.startswith("chat.profile."):
-            self._render_profile_event(event, payload)
-            return
         if event == "chat.turn.end":
             duration = payload.get("duration_ms")
             self.last_turn_duration_ms = duration if isinstance(duration, int) else None
@@ -290,8 +289,14 @@ class TerminalEventRenderer:
         run_id = str(payload.get("run_id") or "")
         if phase == "created":
             return
-        terminal_phases = {"completed", "partial", "failed", "timed_out", "cancelled"}
-        if run_id in self.terminal_worker_runs and phase in {"running", *terminal_phases}:
+        settled_phases = {
+            "completed",
+            "partial",
+            "waiting_for_context",
+            "failed",
+            "cancelled",
+        }
+        if run_id in self.terminal_worker_runs and phase in {"running", *settled_phases}:
             return
         if phase == "running":
             self._clear_worker_activity(run_id)
@@ -304,8 +309,8 @@ class TerminalEventRenderer:
             text.append(label, style=SEMANTIC_STYLES["agent"])
             text.append(" · 启动", style=SEMANTIC_STYLES["muted"])
         else:
-            partial = phase == "partial"
-            failed = phase in {"failed", "timed_out", "cancelled"}
+            partial = phase in {"partial", "waiting_for_context"}
+            failed = phase in {"failed", "cancelled"}
             style = (
                 SEMANTIC_STYLES["error"]
                 if failed
@@ -320,8 +325,8 @@ class TerminalEventRenderer:
             phase_label = {
                 "completed": "完成",
                 "partial": "部分完成",
+                "waiting_for_context": "等待上下文",
                 "failed": "失败",
-                "timed_out": "超时",
                 "cancelled": "取消",
             }.get(phase, phase)
             text.append(f" · {phase_label}", style=SEMANTIC_STYLES["muted"])
@@ -351,12 +356,10 @@ class TerminalEventRenderer:
             if isinstance(name, str)
         )
         current_step = _one_line(str(payload.get("current_step") or ""), limit=100)
-        role_id = str(payload.get("role_id") or "")
         completed = payload.get("todo_completed")
         total = payload.get("todo_total")
         fingerprint = (
             phase,
-            None if payload.get("detail_source") == "worker_declared" else role_id,
             tools,
             current_step,
             completed,
@@ -382,8 +385,6 @@ class TerminalEventRenderer:
             if isinstance(completed, int) and isinstance(total, int) and total > 0:
                 text.append(f" · {completed}/{total}", style=SEMANTIC_STYLES["muted"])
         else:
-            if role_id and phase in {"analyzing", "handoff", "branch_running"}:
-                text.append(f" · {role_id}", style=SEMANTIC_STYLES["muted"])
             summary = _worker_activity_summary(phase, tools)
             if summary:
                 text.append(f" · {summary}", style=SEMANTIC_STYLES["muted"])
@@ -409,96 +410,9 @@ class TerminalEventRenderer:
                 name=name,
                 status=rendered_status,
                 detail=detail,
-                subagent_label=str(payload.get("label") or _worker_label(payload)),
+                worker_label=str(payload.get("label") or _worker_label(payload)),
             )
         )
-
-    def _render_profile_event(self, event: str, payload: dict[str, Any]) -> None:
-        if event == "chat.profile.pinned":
-            return
-        self._finish_stream_line()
-        text = Text(no_wrap=True, overflow="ellipsis")
-        if event == "chat.profile.route":
-            text.append("◆ ", style=SEMANTIC_STYLES["agent"])
-            text.append("子agent ", style=SEMANTIC_STYLES["muted"])
-            text.append(
-                str(payload.get("agent_id") or "unknown"),
-                style=SEMANTIC_STYLES["agent"],
-            )
-            text.append(" · 启动", style=SEMANTIC_STYLES["muted"])
-            if payload.get("fallback_used"):
-                text.append(" · 回退选择", style=SEMANTIC_STYLES["guard"])
-        elif event == "chat.profile.delegate.start":
-            label = str(payload.get("label") or payload.get("agent_id") or "unknown")
-            task = _one_line(
-                str(payload.get("task") or "并行任务"),
-                limit=TRANSCRIPT_DETAIL_CHARS,
-            )
-            text.append("◆ ", style=SEMANTIC_STYLES["agent"])
-            text.append("子agent ", style=SEMANTIC_STYLES["muted"])
-            text.append(label, style=SEMANTIC_STYLES["agent"])
-            text.append(" · 并行启动", style=SEMANTIC_STYLES["muted"])
-            if task:
-                text.append(" · ", style=SEMANTIC_STYLES["muted"])
-                text.append(task)
-        elif event == "chat.profile.delegate.complete":
-            label = str(payload.get("label") or payload.get("agent_id") or "unknown")
-            status = str(payload.get("status") or "failed")
-            succeeded = status == "completed"
-            style = SEMANTIC_STYLES["success"] if succeeded else SEMANTIC_STYLES["error"]
-            text.append("✓ " if succeeded else "✕ ", style=style)
-            text.append("子agent ", style=SEMANTIC_STYLES["muted"])
-            text.append(label, style=style)
-            text.append(" · 完成" if succeeded else " · 失败", style=SEMANTIC_STYLES["muted"])
-            duration = _compact_duration(payload.get("duration_ms"))
-            if duration:
-                text.append(f" · {duration}", style=SEMANTIC_STYLES["muted"])
-            summary = _one_line(
-                str(payload.get("summary") or ""),
-                limit=TRANSCRIPT_DETAIL_CHARS,
-            )
-            if summary:
-                text.append(" · ", style=SEMANTIC_STYLES["muted"])
-                text.append(summary)
-        elif event == "chat.profile.delegate.join":
-            count = payload.get("branch_count", "?")
-            succeeded = payload.get("succeeded", "?")
-            text.append("↳ ", style=SEMANTIC_STYLES["agent"])
-            text.append("并行子agent", style=SEMANTIC_STYLES["agent"])
-            text.append(f" · 汇总 {succeeded}/{count}", style=SEMANTIC_STYLES["muted"])
-            duration = _compact_duration(payload.get("duration_ms"))
-            if duration:
-                text.append(f" · {duration}", style=SEMANTIC_STYLES["muted"])
-        elif event == "chat.profile.handoff":
-            target = str(payload.get("recommended_agent_id") or "profile master")
-            source = str(payload.get("from_agent_id") or "unknown")
-            summary = _one_line(
-                str(payload.get("summary") or "任务已交接"),
-                limit=TRANSCRIPT_DETAIL_CHARS,
-            )
-            text.append("↳ ", style=SEMANTIC_STYLES["agent"])
-            text.append("子agent ", style=SEMANTIC_STYLES["muted"])
-            text.append(source, style=SEMANTIC_STYLES["agent"])
-            text.append(" → ", style=SEMANTIC_STYLES["muted"])
-            text.append(target, style=SEMANTIC_STYLES["agent"])
-            text.append(
-                f" · 交接 {payload.get('handoff_count', '?')}/{payload.get('handoff_limit', '?')}",
-                style=SEMANTIC_STYLES["muted"],
-            )
-            if summary:
-                text.append(" · ", style=SEMANTIC_STYLES["muted"])
-                text.append(summary)
-        elif event == "chat.profile.completion":
-            text.append("✓ ", style=SEMANTIC_STYLES["success"])
-            text.append("子agent ", style=SEMANTIC_STYLES["muted"])
-            text.append(
-                str(payload.get("agent_id") or "unknown"),
-                style=SEMANTIC_STYLES["success"],
-            )
-            text.append(" · 完成", style=SEMANTIC_STYLES["muted"])
-        else:
-            return
-        self._print_transcript_line(text)
 
     def _render_guard_decision(self, payload: dict[str, Any]) -> None:
         action = str(payload.get("action") or "").lower()
@@ -508,9 +422,9 @@ class TerminalEventRenderer:
         text = Text(no_wrap=True, overflow="ellipsis")
         text.append("✕ " if stopped else "⚠ ", style=style)
         source = str(payload.get("source") or "guard")
-        subagent_label = str(payload.get("subagent_label") or "")
-        if subagent_label:
-            source = f"{source}/{subagent_label}"
+        worker_label = str(payload.get("label") or "")
+        if worker_label:
+            source = f"{source}/{worker_label}"
         text.append("Guard", style=style)
         text.append(f" [{source}]", style=SEMANTIC_STYLES["muted"])
         label = GUARD_ACTION_LABELS.get(action, action or "决策")
@@ -536,8 +450,6 @@ class TerminalEventRenderer:
                 self.block_names[block_id] = str(block.get("name"))
             if "arguments" in block:
                 self.block_arguments[block_id] = block.get("arguments")
-            if block.get("subagent_label"):
-                self.block_agents[block_id] = str(block.get("subagent_label"))
             if "content" in block:
                 self.block_contents[block_id] = str(block.get("content") or "")
         if block_type == "tool_call":
@@ -601,7 +513,6 @@ class TerminalEventRenderer:
                 name=name,
                 status=rendered_status,
                 detail=detail,
-                subagent_label=self.block_agents.get(block_id),
             )
         )
         if name == "todowrite" and not failed:
@@ -833,9 +744,12 @@ class TerminalChatCli:
         if name == "/logs":
             self._configure_logs(args)
             return True
-        if name == "/profiles":
+        if name == "/worker-types":
             self.console.print_json(
-                json.dumps(self.orchestrator.worker_control.discover_profiles(), ensure_ascii=False)
+                json.dumps(
+                    self.orchestrator.worker_control.discover_worker_types(),
+                    ensure_ascii=False,
+                )
             )
             return True
         if name == "/workers":
@@ -869,26 +783,35 @@ class TerminalChatCli:
                 )
             return True
         if name == "/resume-worker":
-            if not args:
-                self.console.print("[red]Usage:[/] /resume-worker <run-id>")
+            if len(args) < 2:
+                self.console.print(
+                    "[red]Usage:[/] /resume-worker <run-id> <response>"
+                )
             else:
                 self.console.print_json(
                     json.dumps(
-                        await self.orchestrator.worker_control.resume_worker(args[0]),
+                        await self.orchestrator.worker_control.resume_worker(
+                            args[0],
+                            response=" ".join(args[1:]),
+                            idempotency_key=f"tui:resume:{uuid.uuid4().hex}",
+                            base_session_id=self.session_id,
+                        ),
                         ensure_ascii=False,
                     )
                 )
             return True
         if name == "/spawn":
             if len(args) < 2:
-                self.console.print("[red]Usage:[/] /spawn <profile> <task>")
+                self.console.print(
+                    "[red]Usage:[/] /spawn <worker-type> <objective>"
+                )
             else:
                 self.console.print_json(
                     json.dumps(
                         await self.orchestrator.worker_control.spawn_worker(
                             base_session_id=self.session_id,
-                            profile_id=args[0],
-                            task=" ".join(args[1:]),
+                            worker_type_id=args[0],
+                            objective=" ".join(args[1:]),
                             idempotency_key=f"tui:{uuid.uuid4().hex}",
                             progress=TurnEventProgress(
                                 session_id=self.session_id,
@@ -1028,7 +951,7 @@ def _tool_line(
     name: str,
     status: str,
     detail: str,
-    subagent_label: str | None = None,
+    worker_label: str | None = None,
 ) -> Text:
     failed = status == "error"
     completed = status == "done"
@@ -1046,8 +969,8 @@ def _tool_line(
     if name != "todowrite":
         text.append("工具 ", style=SEMANTIC_STYLES["muted"])
     text.append(label, style=SEMANTIC_STYLES["tool"])
-    if subagent_label:
-        text.append(f" [{subagent_label}]", style=SEMANTIC_STYLES["agent"])
+    if worker_label:
+        text.append(f" [{worker_label}]", style=SEMANTIC_STYLES["agent"])
     if detail:
         text.append(" · ", style=SEMANTIC_STYLES["muted"])
         text.append(_one_line(detail, limit=TRANSCRIPT_DETAIL_CHARS))
@@ -1055,9 +978,9 @@ def _tool_line(
 
 
 def _worker_label(payload: dict[str, Any]) -> str:
-    profile_id = str(payload.get("profile_id") or "worker")
+    worker_type_id = str(payload.get("worker_type_id") or "worker")
     worker_id = str(payload.get("worker_id") or "")[:8]
-    return f"{profile_id}#{worker_id}" if worker_id else profile_id
+    return f"{worker_type_id}#{worker_id}" if worker_id else worker_type_id
 
 
 def _worker_activity_summary(phase: str, tools: tuple[str, ...]) -> str:
@@ -1083,11 +1006,6 @@ def _worker_activity_summary(phase: str, tools: tuple[str, ...]) -> str:
         "processing": "分析工具结果",
         "working_step": "执行当前步骤",
         "finalizing": "整理并提交结果",
-        "delegating": "协调并行子任务",
-        "handoff": "切换执行角色",
-        "branch_running": "执行子任务",
-        "branch_done": "子任务已结束",
-        "synthesizing": "汇总子任务结果",
     }.get(phase, "")
 
 
@@ -1244,11 +1162,11 @@ def _tool_result_detail_text(
     if name == "todowrite":
         return _join_parts(_todo_progress_summary(args), duration)
     if name in {
-        "discover_profiles",
+        "discover_worker_types",
         "list_workers",
         "inspect_worker",
         "spawn_worker",
-        "send_worker",
+        "reuse_worker",
         "await_workers",
         "resume_worker",
         "cancel_worker",
@@ -1294,20 +1212,20 @@ def _scheduler_result_summary(name: str, text: str) -> str:
     except (TypeError, json.JSONDecodeError):
         return _one_line(text, limit=120)
 
-    if name == "discover_profiles" and isinstance(payload, list):
-        profile_ids = [
-            str(item.get("profile", {}).get("profile_id"))
+    if name == "discover_worker_types" and isinstance(payload, list):
+        worker_type_ids = [
+            str(item.get("id"))
             for item in payload
-            if isinstance(item, dict) and item.get("profile", {}).get("profile_id")
+            if isinstance(item, dict) and item.get("id")
         ]
         return _join_parts(
-            f"{len(profile_ids)} profiles",
-            ", ".join(profile_ids),
+            f"{len(worker_type_ids)} worker types",
+            ", ".join(worker_type_ids),
         )
     if name == "list_workers" and isinstance(payload, list):
         labels = [
             (
-                f"{item.get('profile', {}).get('profile_id')}#"
+                f"{item.get('snapshot', {}).get('id')}#"
                 f"{str(item.get('worker_id') or '')[:6]}"
                 f"{' [reusable]' if item.get('reusable') else ''}"
             )
@@ -1315,22 +1233,25 @@ def _scheduler_result_summary(name: str, text: str) -> str:
             if isinstance(item, dict)
         ]
         return _join_parts(f"{len(payload)} workers", ", ".join(labels))
-    if name in {"spawn_worker", "send_worker"} and isinstance(payload, dict):
-        profile_id = payload.get("profile", {}).get("profile_id")
+    if name in {"spawn_worker", "reuse_worker"} and isinstance(payload, dict):
+        worker_type_id = payload.get("snapshot", {}).get("id")
         worker_id = str(payload.get("worker_id") or "")[:8]
         run_id = str(payload.get("run_id") or "")[:8]
-        if name == "send_worker":
+        if name == "reuse_worker":
             action = "worker reused"
             run_action = "run created" if payload.get("created") else "existing run"
         else:
             action = "worker created" if payload.get("created") else "existing worker"
             run_action = ""
         return _join_parts(
-            f"{profile_id}#{worker_id}" if profile_id else f"worker {worker_id}",
+            (
+                f"{worker_type_id}#{worker_id}"
+                if worker_type_id
+                else f"worker {worker_id}"
+            ),
             f"run {run_id}",
             action,
             run_action,
-            "detached" if payload.get("detached") else "",
         )
     if name == "await_workers" and isinstance(payload, list):
         statuses: dict[str, int] = {}

@@ -28,9 +28,8 @@ _SAFE_REF_PREFIX = re.compile(r"[^a-zA-Z0-9._-]+")
 class AgentNode(StrEnum):
     """Nodes in the MVP state-machine execution graph."""
 
-    MASTER = "master"
-    WORKER = "worker"
-    CONTROL = "control"
+    ROUTER = "router"
+    MODEL = "model"
     TOOL = "tool"
     GUARD = "guard"
     DONE = "done"
@@ -54,38 +53,11 @@ class RunStatus(StrEnum):
         }
 
 
-@dataclass(frozen=True)
-class ProfileRef:
-    """Immutable artifact provenance pinned for one runtime turn."""
-
-    profile_id: str
-    revision: int
-    artifact_id: str
-    generation: int
-
-    def to_dict(self) -> dict[str, str | int]:
-        return {
-            "profile_id": self.profile_id,
-            "revision": self.revision,
-            "artifact_id": self.artifact_id,
-            "generation": self.generation,
-        }
-
-
-@dataclass(frozen=True)
-class PendingHandoff:
-    """Validated handoff intent waiting for profile-master routing."""
-
-    from_agent_id: str
-    summary: str
-    recommended_agent_id: str | None = None
-
-
 @dataclass
 class StateMetadata:
     """Small, typed control plane for a ``LightweightState``."""
 
-    phase: AgentNode = AgentNode.MASTER
+    phase: AgentNode = AgentNode.ROUTER
     status: RunStatus = RunStatus.RUNNING
     iteration: int = 0
     iteration_limit: int = 0
@@ -267,22 +239,10 @@ class LightweightState:
     transitions: list[TransitionRecord] = field(default_factory=list)
     token_ledger: TokenLedger = field(default_factory=TokenLedger)
     lazy_values: dict[str, LazyValue] = field(default_factory=dict, repr=False)
-    profile_ref: ProfileRef | None = None
-    active_agent_id: str | None = None
-    resume_agent_id: str | None = None
-    handoff_count: int = 0
-    pending_handoff: PendingHandoff | None = None
-    pending_control_call: ToolCallRequest | None = None
-    pending_profile_correction: str | None = None
-    delegation_count: int = 0
-    last_delegation_fingerprint: str | None = None
-    last_delegation_succeeded: bool = False
 
     def __post_init__(self) -> None:
         if self.minimal_context is None:
             self.minimal_context = list(self.messages)
-        self.handoff_count = max(0, int(self.handoff_count))
-        self.delegation_count = max(0, int(self.delegation_count))
 
     @classmethod
     def from_messages(
@@ -376,19 +336,6 @@ class LightweightState:
                 ref: lazy.to_digest_value() for ref, lazy in sorted(self.lazy_values.items())
             },
         }
-        if self.profile_ref is not None:
-            payload["profile"] = {
-                "ref": self.profile_ref.to_dict(),
-                "active_agent_id": self.active_agent_id,
-                "resume_agent_id": self.resume_agent_id,
-                "handoff_count": self.handoff_count,
-                "pending_handoff": _value_summary(self.pending_handoff),
-                "pending_control_call": _value_summary(self.pending_control_call),
-                "pending_profile_correction": _value_summary(self.pending_profile_correction),
-                "delegation_count": self.delegation_count,
-                "last_delegation_fingerprint": self.last_delegation_fingerprint,
-                "last_delegation_succeeded": self.last_delegation_succeeded,
-            }
         return _stable_hash(payload)
 
     def digest(self) -> str:

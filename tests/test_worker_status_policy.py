@@ -8,10 +8,15 @@ from unittest.mock import AsyncMock, MagicMock
 
 from pydantic import BaseModel, ConfigDict
 
-from aeloon_core.agents import AgentRuntime, ToolAgent, _guard_fallback_action
+from aeloon_core.agents import (
+    AgentRuntime,
+    GuardAgent,
+    RouterAgent,
+    ToolAgent,
+    _guard_fallback_action,
+)
 from aeloon_core.loop_guard import GuardAction, GuardEvent, GuardReviewer
 from aeloon_core.minimal_context import MinimalContextProcessor
-from aeloon_core.orchestrator import _worker_run_status
 from aeloon_core.providers.base import LLMResponse, ToolCallRequest
 from aeloon_core.state import AgentNode, LightweightState, RunStatus, StateMetadata
 from aeloon_core.tools.base import Tool
@@ -71,17 +76,16 @@ class GuardFallbackPolicyTests(unittest.TestCase):
 
 
 class WorkerRunStatusMappingTests(unittest.TestCase):
-    def test_guard_wrap_up_is_partial(self) -> None:
-        self.assertEqual(
-            _worker_run_status("terminated_by_guard"),
-            WorkerRunStatus.PARTIAL,
-        )
+    def test_waiting_is_settled_but_not_terminal(self) -> None:
+        self.assertTrue(WorkerRunStatus.WAITING_FOR_CONTEXT.settled)
+        self.assertFalse(WorkerRunStatus.WAITING_FOR_CONTEXT.terminal)
 
-    def test_completed_stays_completed(self) -> None:
-        self.assertEqual(_worker_run_status("completed"), WorkerRunStatus.COMPLETED)
+    def test_completed_is_terminal_and_settled(self) -> None:
+        self.assertTrue(WorkerRunStatus.COMPLETED.terminal)
+        self.assertTrue(WorkerRunStatus.COMPLETED.settled)
 
-    def test_hard_failed_stays_failed(self) -> None:
-        self.assertEqual(_worker_run_status("failed"), WorkerRunStatus.FAILED)
+    def test_running_is_not_settled(self) -> None:
+        self.assertFalse(WorkerRunStatus.RUNNING.settled)
 
 
 class SoftToolFeedbackTests(unittest.IsolatedAsyncioTestCase):
@@ -123,7 +127,7 @@ class SoftToolFeedbackTests(unittest.IsolatedAsyncioTestCase):
         state = await agent.run(state)
         self.assertIsNone(state.pending_guard_request)
         self.assertEqual(state.metadata.consecutive_tool_failure_rounds, 1)
-        self.assertEqual(state.metadata.phase, AgentNode.MASTER)
+        self.assertEqual(state.metadata.phase, AgentNode.ROUTER)
         self.assertTrue(
             any(
                 m.get("role") == "tool" and str(m.get("content", "")).startswith("Error")
@@ -214,7 +218,7 @@ class SoftToolFeedbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(state.pending_guard_request)
         self.assertEqual(state.metadata.budget_auto_continues_used, 1)
         self.assertEqual(state.metadata.iteration_limit, 2 + runtime.base_iteration_budget)
-        self.assertEqual(state.metadata.phase, AgentNode.MASTER)
+        self.assertEqual(state.metadata.phase, AgentNode.ROUTER)
 
         state.metadata.iteration = state.metadata.iteration_limit
         state = await runtime.grant_more_or_finalize(state)
@@ -229,6 +233,67 @@ class SoftToolFeedbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.pending_guard_request.evidence.event, GuardEvent.BUDGET_EXHAUSTED)
         self.assertEqual(state.pending_guard_request.fallback_action, GuardAction.CONTINUE)
 
+    async def test_hard_token_budget_stops_without_another_model_call(self) -> None:
+        runtime = self._runtime()
+        runtime.max_tokens = 10
+        state = LightweightState.from_messages(
+            [{"role": "user", "content": "do work"}],
+            max_iterations=10,
+        )
+        state.token_ledger.record("domain", {"total_tokens": 10})
+
+        state = await RouterAgent(runtime).run(state)
+
+        self.assertEqual(state.metadata.status, RunStatus.TERMINATED_BY_GUARD)
+        self.assertEqual(state.metadata.phase, AgentNode.DONE)
+        self.assertIn("token budget exhausted", state.metadata.final_content or "")
+
+    async def test_hard_tool_budget_rejects_whole_batch_without_side_effects(self) -> None:
+        runtime = self._runtime()
+        runtime.max_tool_calls = 1
+        state = LightweightState.from_messages(
+            [{"role": "user", "content": "do work"}],
+            max_iterations=10,
+            metadata=StateMetadata(phase=AgentNode.TOOL),
+        )
+        calls = [
+            ToolCallRequest(id="one", name="probe", arguments={}),
+            ToolCallRequest(id="two", name="probe", arguments={}),
+        ]
+        state.pending_tool_calls = calls
+        state.pending_response = LLMResponse(
+            content=None,
+            tool_calls=calls,
+            finish_reason="tool_calls",
+        )
+
+        state = await ToolAgent(runtime).run(state)
+
+        tool = runtime.tools.get("probe")
+        assert isinstance(tool, _FailThenSucceedTool)
+        self.assertEqual(tool.calls, 0)
+        self.assertEqual(state.metadata.status, RunStatus.TERMINATED_BY_GUARD)
+        self.assertIn("tool-call budget exhausted", state.metadata.final_content or "")
+
+    async def test_guard_falls_back_locally_when_remaining_tokens_cannot_fit(self) -> None:
+        runtime = self._runtime()
+        runtime.max_tokens = 100
+        state = LightweightState.from_messages(
+            [{"role": "user", "content": "do work"}],
+            max_iterations=10,
+        )
+        state.token_ledger.record("domain", {"total_tokens": 99})
+        state = await runtime.queue_guard(
+            state,
+            event=GuardEvent.RUNTIME_ERROR,
+            cause="needs review",
+        )
+
+        state = await GuardAgent(runtime).run(state)
+
+        runtime.provider.chat.assert_not_called()
+        self.assertEqual(state.metadata.phase, AgentNode.ROUTER)
+
     async def test_queue_guard_budget_fallback_is_continue(self) -> None:
         runtime = self._runtime()
         state = LightweightState.from_messages(
@@ -242,16 +307,6 @@ class SoftToolFeedbackTests(unittest.IsolatedAsyncioTestCase):
         )
         assert state.pending_guard_request is not None
         self.assertEqual(state.pending_guard_request.fallback_action, GuardAction.CONTINUE)
-
-
-class FinalizationStatusTests(unittest.TestCase):
-    def test_terminated_by_guard_maps_to_partial_for_workers(self) -> None:
-        # Successful wrap-ups now finish as terminated_by_guard even when the
-        # decision source was a local fallback, so Worker status stays partial.
-        self.assertEqual(
-            _worker_run_status(RunStatus.TERMINATED_BY_GUARD.value),
-            WorkerRunStatus.PARTIAL,
-        )
 
 
 if __name__ == "__main__":

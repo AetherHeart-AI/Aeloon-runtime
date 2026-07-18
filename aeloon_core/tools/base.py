@@ -22,6 +22,8 @@ class Tool(ABC):
     description: ClassVar[str]
     args_model: ClassVar[type[BaseModel]]
     concurrency_mode: ClassVar[Literal["read_only", "mutating", "exclusive"]] = "exclusive"
+    # Terminal tools explicitly end an agent loop after their sole call succeeds.
+    terminal: ClassVar[bool] = False
 
     @abstractmethod
     async def execute(self, **kwargs: Any) -> str:
@@ -51,6 +53,7 @@ class FunctionTool(Tool):
         args_model: type[BaseModel],
         handler: Callable[..., Awaitable[str]],
         concurrency_mode: Literal["read_only", "mutating", "exclusive"] = "exclusive",
+        terminal: bool = False,
     ) -> None:
         if concurrency_mode not in {"read_only", "mutating", "exclusive"}:
             raise ValueError(f"invalid concurrency mode: {concurrency_mode}")
@@ -59,6 +62,7 @@ class FunctionTool(Tool):
         self.args_model = args_model
         self._handler = handler
         self.concurrency_mode = concurrency_mode
+        self.terminal = bool(terminal)
 
     async def execute(self, **kwargs: Any) -> str:
         return await self._handler(**kwargs)
@@ -99,7 +103,13 @@ class WorkspaceTool(Tool):
         resolved = candidate.resolve(strict=False)
         if self.denied_paths and not resolved.is_relative_to(self.workspace):
             raise ValueError(f"path escapes workspace: {path}")
-        for denied in self.denied_paths:
-            if resolved == denied or resolved.is_relative_to(denied):
-                raise PermissionError(f"path is protected from agent tools: {path}")
+        if self._is_denied(resolved):
+            raise PermissionError(f"path is protected from agent tools: {path}")
         return resolved
+
+    def _is_denied(self, path: Path) -> bool:
+        resolved = path.resolve(strict=False)
+        return any(
+            resolved == denied or resolved.is_relative_to(denied)
+            for denied in self.denied_paths
+        )

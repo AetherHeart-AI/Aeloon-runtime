@@ -11,6 +11,7 @@ import copy
 import inspect
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from time import perf_counter
 from typing import Any, Literal
 
@@ -18,8 +19,8 @@ from loguru import logger
 
 from aeloon_core.worker_sessions import (
     ContextEnvelope,
-    ProfileHandle,
     ResultEnvelope,
+    WaitingRequest,
     WorkerReport,
     WorkerRunRecord,
     WorkerRunStatus,
@@ -27,6 +28,7 @@ from aeloon_core.worker_sessions import (
     WorkerStore,
 )
 from aeloon_core.worker_ui import WorkerUiJournal
+from aeloon_core.workers import WorkerSnapshot
 
 ToolOutcome = Literal["known", "unknown", "none"]
 
@@ -39,26 +41,44 @@ class WorkerExecutionOutcome:
     report: WorkerReport
     tool_outcome: ToolOutcome = "none"
     usage: dict[str, Any] = field(default_factory=dict)
+    checkpoint: dict[str, Any] | None = None
+    waiting_request: WaitingRequest | None = None
 
     def __post_init__(self) -> None:
         if self.status not in {
             WorkerRunStatus.COMPLETED,
             WorkerRunStatus.PARTIAL,
+            WorkerRunStatus.WAITING_FOR_CONTEXT,
             WorkerRunStatus.FAILED,
         }:
-            raise ValueError("Worker execution outcome requires a finalizable status")
+            raise ValueError("Worker execution outcome requires a settled status")
+        if (self.status is WorkerRunStatus.WAITING_FOR_CONTEXT) != (
+            self.waiting_request is not None
+        ):
+            raise ValueError("waiting_for_context requires exactly one structured request")
+        if (
+            self.status
+            in {
+                WorkerRunStatus.COMPLETED,
+                WorkerRunStatus.PARTIAL,
+                WorkerRunStatus.WAITING_FOR_CONTEXT,
+            }
+            and self.checkpoint is None
+        ):
+            raise ValueError(f"{self.status.value} requires a checkpoint")
         object.__setattr__(self, "usage", copy.deepcopy(self.usage))
+        object.__setattr__(self, "checkpoint", copy.deepcopy(self.checkpoint))
 
 
 WorkerExecutor = Callable[
     [WorkerRunRecord, WorkerSessionRecord],
-    Awaitable[WorkerExecutionOutcome | WorkerReport],
+    Awaitable[WorkerExecutionOutcome],
 ]
 LifecycleHook = Callable[[str, WorkerRunRecord], Any]
 
 
 class WorkerSessionManager:
-    """Atomic Worker primitives shared by Base tools, TUI, and Runner."""
+    """Atomic Worker primitives shared by Master tools, TUI, and Runner."""
 
     def __init__(
         self,
@@ -68,25 +88,35 @@ class WorkerSessionManager:
         on_lifecycle: LifecycleHook | None = None,
         max_concurrency: int = 4,
         heartbeat_interval_seconds: float = 10.0,
+        lease_timeout_seconds: float | None = None,
         ui_journal: WorkerUiJournal | None = None,
     ) -> None:
         self.store = store
         self.executor = executor
         self.on_lifecycle = on_lifecycle
         # This journal is an operator projection only. It is deliberately not
-        # surfaced by WorkerControlService, which is also callable by Base.
+        # surfaced by WorkerControlService, which is also callable by Master.
         self.ui_journal = ui_journal or WorkerUiJournal(store)
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._progress: dict[str, Any] = {}
-        # Hot Worker context belongs to the WorkerSession, never to Base history.
+        # Hot Worker context belongs to the WorkerSession, never to Master history.
         # Checkpoints remain the durable fallback after a process restart.
         self._contexts: dict[str, tuple[str, list[dict[str, Any]]]] = {}
         self._worker_locks: dict[str, asyncio.Lock] = {}
         self._semaphore = asyncio.Semaphore(max(1, max_concurrency))
         self.heartbeat_interval_seconds = max(0.01, heartbeat_interval_seconds)
+        requested_lease = (
+            max(30.0, self.heartbeat_interval_seconds * 3)
+            if lease_timeout_seconds is None
+            else max(0.01, lease_timeout_seconds)
+        )
+        self.lease_timeout_seconds = max(
+            requested_lease,
+            self.heartbeat_interval_seconds * 3,
+        )
 
     def progress_for(self, run_id: str) -> Any | None:
-        """Return the exact Base-turn observer attached to one WorkerRun."""
+        """Return the exact Master-turn observer attached to one WorkerRun."""
 
         return self._progress.get(run_id)
 
@@ -120,7 +150,7 @@ class WorkerSessionManager:
         self,
         *,
         base_session_id: str,
-        profile: ProfileHandle,
+        snapshot: WorkerSnapshot,
         context: ContextEnvelope,
         idempotency_key: str,
         base_turn_id: str | None = None,
@@ -129,7 +159,7 @@ class WorkerSessionManager:
     ) -> tuple[WorkerSessionRecord, WorkerRunRecord, bool]:
         session, run, created = self.store.create_worker(
             base_session_id=base_session_id,
-            profile=profile,
+            snapshot=snapshot,
             context=context,
             idempotency_key=idempotency_key,
             base_turn_id=base_turn_id,
@@ -141,18 +171,18 @@ class WorkerSessionManager:
             self.start(run.run_id)
         return session, run, created
 
-    async def send_worker(
+    async def reuse_worker(
         self,
         *,
         worker_id: str,
         context: ContextEnvelope,
         idempotency_key: str,
         base_turn_id: str | None = None,
-        source_run_id: str | None = None,
+        flow_source_run_id: str | None = None,
         start: bool = True,
         progress: Any | None = None,
     ) -> tuple[WorkerRunRecord, bool]:
-        if source_run_id is None:
+        if flow_source_run_id is None:
             run, created = self.store.create_run(
                 worker_id=worker_id,
                 context=context,
@@ -160,15 +190,41 @@ class WorkerSessionManager:
                 base_turn_id=base_turn_id,
             )
         else:
-            source = self.store.get_run(source_run_id)
-            if source.worker_id != worker_id:
-                raise ValueError("recovery source belongs to a different Worker")
-            run, created = self.store.create_recovery_run(
-                source_run_id=source_run_id,
+            if base_turn_id is None or not base_turn_id.startswith("flow:"):
+                raise ValueError("exact Flow reuse requires Flow ownership")
+            run, created = self.store.create_flow_reuse_run(
+                source_run_id=flow_source_run_id,
                 context=context,
                 idempotency_key=idempotency_key,
                 base_turn_id=base_turn_id,
             )
+            if run.worker_id != worker_id:
+                raise ValueError("Flow reuse source belongs to a different WorkerSession")
+        self._bind_progress(run, progress, created=created)
+        if created:
+            await self._emit("created", run)
+        if start:
+            self.start(run.run_id)
+        return run, created
+
+    async def resume_worker(
+        self,
+        *,
+        source_run_id: str,
+        context: ContextEnvelope,
+        idempotency_key: str,
+        base_turn_id: str | None = None,
+        start: bool = True,
+        progress: Any | None = None,
+    ) -> tuple[WorkerRunRecord, bool]:
+        """Create a continuation Run from an exact waiting checkpoint."""
+
+        run, created = self.store.create_resume_run(
+            source_run_id=source_run_id,
+            context=context,
+            idempotency_key=idempotency_key,
+            base_turn_id=base_turn_id,
+        )
         self._bind_progress(run, progress, created=created)
         if created:
             await self._emit("created", run)
@@ -183,10 +239,17 @@ class WorkerSessionManager:
             return
         self._tasks[run_id] = asyncio.create_task(self._execute(run_id))
 
-    def _bind_progress(self, run: WorkerRunRecord, progress: Any, *, created: bool) -> None:
-        """Attach one owning Base turn without rerouting idempotent replays."""
+    def start_existing(self, run_id: str, *, progress: Any | None = None) -> None:
+        """Activate a durable reserved Run after its owning Flow binding commits."""
 
-        if progress is None or run.status.terminal:
+        run = self.store.activate_run(run_id)
+        self._bind_progress(run, progress, created=False)
+        self.start(run_id)
+
+    def _bind_progress(self, run: WorkerRunRecord, progress: Any, *, created: bool) -> None:
+        """Attach one owning Master turn without rerouting idempotent replays."""
+
+        if progress is None or run.status.settled:
             return
         if created:
             self._progress[run.run_id] = progress
@@ -201,8 +264,9 @@ class WorkerSessionManager:
     ) -> list[WorkerRunRecord]:
         deadline = None if timeout is None else asyncio.get_running_loop().time() + timeout
         while True:
+            await self.reconcile_stale_runs()
             runs = [self.store.get_run(run_id) for run_id in run_ids]
-            if all(run.status.terminal for run in runs):
+            if all(run.status.settled for run in runs):
                 return runs
 
             remaining = None if deadline is None else deadline - asyncio.get_running_loop().time()
@@ -216,7 +280,7 @@ class WorkerSessionManager:
             local_tasks = [
                 self._tasks[run.run_id]
                 for run in runs
-                if not run.status.terminal and run.run_id in self._tasks
+                if not run.status.settled and run.run_id in self._tasks
             ]
             if local_tasks:
                 await asyncio.wait(
@@ -232,26 +296,31 @@ class WorkerSessionManager:
         return session, self.store.list_runs(worker_id)
 
     async def cancel_worker(self, run_id: str) -> WorkerRunRecord:
-        cancelled, changed = self.store.try_cancel_run(run_id)
+        requested, changed = self.store.try_cancel_run(run_id)
         task = self._tasks.get(run_id)
+        if task is not None and task.done() and self._tasks.get(run_id) is task:
+            self._tasks.pop(run_id, None)
+        # The execution outcome is already durable. Its local task may still be
+        # projecting the terminal lifecycle event, which cancellation must not
+        # interrupt.
+        if not changed and requested.status.settled:
+            return requested
         if task is not None and not task.done():
             task.cancel()
             if task is not asyncio.current_task():
                 await asyncio.gather(task, return_exceptions=True)
-        # A local cancellation is only shown after its executor and owned tools
-        # have torn down, so no tool result can appear after the terminal line.
-        if changed:
-            await self._emit("cancelled", cancelled)
-        return cancelled
-
-    async def resume_worker(self, run_id: str) -> WorkerRunRecord:
-        run = self.store.get_run(run_id)
-        if run.status is WorkerRunStatus.WAITING_FOR_CONTEXT:
-            raise ValueError("send_worker must provide the requested context before resuming")
-        if not run.status.terminal:
-            self.start(run_id)
-            return self.store.get_run(run_id)
-        raise ValueError("terminal WorkerRuns resume through a new continuation run")
+            if self._tasks.get(run_id) is task:
+                self._tasks.pop(run_id, None)
+            current = self.store.get_run(run_id)
+            if changed and requested.status is WorkerRunStatus.CANCELLED:
+                await self._emit("cancelled", current)
+            return current
+        # Queued work has no executing owner and is safe to settle immediately.
+        # A detached running owner observes the durable request and acknowledges
+        # cancellation only after its model/tool coroutine has torn down.
+        if changed and requested.status is WorkerRunStatus.CANCELLED:
+            await self._emit("cancelled", requested)
+        return requested
 
     def archive_worker(self, worker_id: str) -> WorkerSessionRecord:
         worker = self.store.archive_worker(worker_id)
@@ -263,12 +332,19 @@ class WorkerSessionManager:
     async def run_queued(self) -> list[WorkerRunRecord]:
         """Runner entry point: claim every currently queued Run in this process."""
 
-        runs = self.store.list_queued_runs()
-        for run in runs:
-            self.start(run.run_id)
+        await self.reconcile_stale_runs()
+        runs = self.start_queued()
         if self._tasks:
             await asyncio.gather(*tuple(self._tasks.values()), return_exceptions=True)
         return [self.store.get_run(run.run_id) for run in runs]
+
+    def start_queued(self) -> list[WorkerRunRecord]:
+        """Start currently queued Runs without waiting for unrelated live work."""
+
+        runs = self.store.list_queued_runs()
+        for run in runs:
+            self.start(run.run_id)
+        return runs
 
     async def _execute(self, run_id: str) -> None:
         run = self.store.get_run(run_id)
@@ -279,26 +355,27 @@ class WorkerSessionManager:
             async with lock:
                 await self._execute_serial(run_id)
         except asyncio.CancelledError:
-            cancelled, changed = self.store.try_cancel_run(run_id)
+            cancelled, changed = self.store.acknowledge_cancel_run(run_id)
             if changed:
                 await self._emit("cancelled", cancelled)
             raise
         except Exception as exc:
             logger.exception("Unhandled WorkerRun failure for {}: {}", run_id, exc)
             current = self.store.get_run(run_id)
-            if not current.status.terminal:
-                session = self.inspect_worker(current.worker_id)[0]
+            if not current.status.settled:
                 result = ResultEnvelope(
                     worker_id=current.worker_id,
                     run_id=current.run_id,
                     status=WorkerRunStatus.FAILED,
-                    profile=session.profile,
                     report=WorkerReport(summary=_safe_failure_summary(exc)),
                     tool_outcome="unknown",
                 )
                 failed, changed = self.store.try_finalize_run(run_id, result)
                 if changed:
-                    await self._emit("failed", failed)
+                    await self._emit(
+                        "cancelled" if failed.status is WorkerRunStatus.CANCELLED else "failed",
+                        failed,
+                    )
         finally:
             self._tasks.pop(run_id, None)
 
@@ -312,32 +389,46 @@ class WorkerSessionManager:
             # Another process owns this WorkerSession. Keep this queued Run
             # alive until the durable per-Worker execution slot is available.
             await asyncio.sleep(0.05)
-        await self._emit("running", running)
         started = perf_counter()
-        session = self.inspect_worker(running.worker_id)[0]
         heartbeat = self._start_heartbeat(running, started)
         try:
+            await self._emit("running", running)
+            session = self.inspect_worker(running.worker_id)[0]
             async with asyncio.timeout(running.context.budget.max_seconds):
-                async with self._semaphore:
-                    assert self.executor is not None
-                    execution = _normalize_execution_outcome(
-                        await self.executor(running, session)
-                    )
+                execution = await self._run_executor(running, session)
             result = ResultEnvelope(
                 worker_id=running.worker_id,
                 run_id=running.run_id,
                 status=execution.status,
-                profile=session.profile,
                 report=execution.report,
                 tool_outcome=execution.tool_outcome,
                 usage=execution.usage,
                 duration_ms=max(0, int((perf_counter() - started) * 1_000)),
             )
-            finalized, changed = self.store.try_finalize_run(run_id, result)
+            finalized, changed = self.store.try_finalize_run(
+                run_id,
+                result,
+                checkpoint=execution.checkpoint,
+                waiting_request=execution.waiting_request,
+            )
             if changed:
+                if finalized.status is WorkerRunStatus.CANCELLED:
+                    await self._emit("cancelled", finalized)
+                    return
+                checkpoint_messages = (
+                    execution.checkpoint.get("messages")
+                    if execution.checkpoint is not None
+                    else None
+                )
+                if isinstance(checkpoint_messages, list):
+                    self.save_live_context(
+                        running.worker_id,
+                        running.run_id,
+                        checkpoint_messages,
+                    )
                 await self._emit(_lifecycle_event(execution.status), finalized)
         except asyncio.CancelledError:
-            cancelled, changed = self.store.try_cancel_run(run_id)
+            cancelled, changed = self.store.acknowledge_cancel_run(run_id)
             if changed:
                 await self._emit("cancelled", cancelled)
             raise
@@ -347,11 +438,9 @@ class WorkerSessionManager:
                 worker_id=running.worker_id,
                 run_id=running.run_id,
                 status=WorkerRunStatus.FAILED,
-                profile=session.profile,
                 report=WorkerReport(
                     summary=(
-                        "Worker timed out after "
-                        f"{running.context.budget.max_seconds} seconds."
+                        f"Worker timed out after {running.context.budget.max_seconds} seconds."
                     )
                 ),
                 tool_outcome="unknown",
@@ -359,44 +448,119 @@ class WorkerSessionManager:
             )
             failed, changed = self.store.try_finalize_run(run_id, result)
             if changed:
-                await self._emit("timed_out", failed)
+                await self._emit(
+                    "cancelled" if failed.status is WorkerRunStatus.CANCELLED else "failed",
+                    failed,
+                )
         except Exception as exc:
             result = ResultEnvelope(
                 worker_id=running.worker_id,
                 run_id=running.run_id,
                 status=WorkerRunStatus.FAILED,
-                profile=session.profile,
                 report=WorkerReport(summary=_safe_failure_summary(exc)),
                 tool_outcome="unknown",
                 duration_ms=max(0, int((perf_counter() - started) * 1_000)),
             )
             failed, changed = self.store.try_finalize_run(run_id, result)
             if changed:
-                await self._emit("failed", failed)
+                await self._emit(
+                    "cancelled" if failed.status is WorkerRunStatus.CANCELLED else "failed",
+                    failed,
+                )
         finally:
             if heartbeat is not None:
                 heartbeat.cancel()
                 await asyncio.gather(heartbeat, return_exceptions=True)
 
+    async def _run_executor(
+        self,
+        run: WorkerRunRecord,
+        session: WorkerSessionRecord,
+    ) -> WorkerExecutionOutcome:
+        """Run one executor while observing cross-process cancellation requests."""
+
+        assert self.executor is not None
+
+        async def execute_with_slot() -> WorkerExecutionOutcome:
+            async with self._semaphore:
+                assert self.executor is not None
+                return await self.executor(run, session)
+
+        task = asyncio.create_task(execute_with_slot())
+        try:
+            while not task.done():
+                current = self.store.get_run(run.run_id)
+                if current.status is not WorkerRunStatus.RUNNING:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                    raise asyncio.CancelledError
+                if current.cancel_requested_at is not None:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                    raise asyncio.CancelledError
+                await asyncio.wait({task}, timeout=0.05)
+            return task.result()
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
     def _start_heartbeat(
         self,
         run: WorkerRunRecord,
         started: float,
-    ) -> asyncio.Task[None] | None:
-        if run.run_id not in self._progress:
-            return None
+    ) -> asyncio.Task[None]:
         return asyncio.create_task(self._heartbeat(run.run_id, started))
 
     async def _heartbeat(self, run_id: str, started: float) -> None:
-        while True:
-            await asyncio.sleep(self.heartbeat_interval_seconds)
-            run = self.store.get_run(run_id)
-            if run.status is not WorkerRunStatus.RUNNING:
-                return
-            await self._emit_heartbeat(
+        ui_task: asyncio.Task[None] | None = None
+        tearing_down = False
+        try:
+            while True:
+                await asyncio.sleep(self.heartbeat_interval_seconds)
+                if tearing_down:
+                    refreshed = self.store.refresh_run_teardown_lease(run_id)
+                else:
+                    refreshed = self.store.refresh_run_lease(run_id)
+                    if not refreshed:
+                        refreshed = self.store.refresh_run_teardown_lease(run_id)
+                        tearing_down = refreshed
+                if not refreshed:
+                    return
+                if run_id in self._progress and (ui_task is None or ui_task.done()):
+                    ui_task = asyncio.create_task(
+                        self._emit_heartbeat(
+                            self.store.get_run(run_id),
+                            elapsed_ms=max(
+                                0,
+                                int((perf_counter() - started) * 1_000),
+                            ),
+                        )
+                    )
+        finally:
+            if ui_task is not None and not ui_task.done():
+                ui_task.cancel()
+                await asyncio.gather(ui_task, return_exceptions=True)
+
+    def _expire_stale_leases(self) -> list[WorkerRunRecord]:
+        cutoff = (datetime.now(UTC) - timedelta(seconds=self.lease_timeout_seconds)).isoformat()
+        expired = self.store.expire_stale_running_runs(stale_before=cutoff)
+        for run in expired:
+            task = self._tasks.get(run.run_id)
+            if task is not None and not task.done():
+                task.cancel()
+        return expired
+
+    async def reconcile_stale_runs(self) -> list[WorkerRunRecord]:
+        """Settle expired owners and emit the durable terminal lifecycle once."""
+
+        expired = self._expire_stale_leases()
+        for run in expired:
+            await self._emit(
+                "cancelled" if run.status is WorkerRunStatus.CANCELLED else "failed",
                 run,
-                elapsed_ms=max(0, int((perf_counter() - started) * 1_000)),
             )
+        return expired
 
     async def _emit(self, event: str, run: WorkerRunRecord) -> None:
         try:
@@ -417,11 +581,11 @@ class WorkerSessionManager:
                     worker_id=run.worker_id,
                     run_id=run.run_id,
                     run_sequence=run.run_sequence,
-                    profile_id=worker.profile.profile_id,
+                    worker_type_id=worker.snapshot.id,
                     status=run.status.value,
                     duration_ms=run.result.duration_ms if run.result is not None else None,
                 )
-        if run.status.terminal:
+        if run.status.settled:
             self._progress.pop(run.run_id, None)
 
     async def _emit_heartbeat(self, run: WorkerRunRecord, *, elapsed_ms: int) -> None:
@@ -435,7 +599,7 @@ class WorkerSessionManager:
             worker_id=run.worker_id,
             run_id=run.run_id,
             run_sequence=run.run_sequence,
-            profile_id=worker.profile.profile_id,
+            worker_type_id=worker.snapshot.id,
             status=run.status.value,
             elapsed_ms=elapsed_ms,
         )
@@ -456,27 +620,13 @@ def _safe_failure_summary(exc: Exception) -> str:
     return f"Worker execution failed ({type(exc).__name__})."
 
 
-def _normalize_execution_outcome(
-    execution: WorkerExecutionOutcome | WorkerReport,
-) -> WorkerExecutionOutcome:
-    """Keep legacy executors compatible while preserving typed terminal outcomes."""
-
-    if isinstance(execution, WorkerExecutionOutcome):
-        return execution
-    if isinstance(execution, WorkerReport):
-        return WorkerExecutionOutcome(
-            status=WorkerRunStatus.COMPLETED,
-            report=execution,
-            tool_outcome="known",
-        )
-    raise TypeError("Worker executor must return WorkerExecutionOutcome or WorkerReport")
-
-
 def _lifecycle_event(status: WorkerRunStatus) -> str:
     if status is WorkerRunStatus.COMPLETED:
         return "completed"
     if status is WorkerRunStatus.PARTIAL:
         return "partial"
+    if status is WorkerRunStatus.WAITING_FOR_CONTEXT:
+        return "waiting_for_context"
     if status is WorkerRunStatus.FAILED:
         return "failed"
     raise ValueError(f"unsupported Worker execution status: {status.value}")

@@ -33,14 +33,9 @@ class TodoWriteTool(Tool):
     )
     args_model = TodoArgs
 
-    def __init__(self, *, data_dir: Path) -> None:
+    def __init__(self, *, data_dir: Path, run_id: str) -> None:
         self.data_dir = data_dir
-        self.session_id = "default"
-
-    def set_session_id(self, session_id: str) -> None:
-        """Set the current session id used for todo persistence."""
-
-        self.session_id = session_id or "default"
+        self.run_id = run_id
 
     async def execute(self, todos: list[dict[str, Any]]) -> str:
         cleaned: list[dict[str, str]] = []
@@ -58,12 +53,12 @@ class TodoWriteTool(Tool):
                     "status": status,
                 }
             )
-        path = self.data_dir / "todos" / f"{self.session_id}.json"
+        path = self.data_dir / "todos" / f"{self.run_id}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
             json.dumps(
                 {
-                    "session_id": self.session_id,
+                    "run_id": self.run_id,
                     "updated_at": datetime.now(UTC).isoformat(),
                     "todos": cleaned,
                 },

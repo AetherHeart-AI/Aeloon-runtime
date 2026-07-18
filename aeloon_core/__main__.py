@@ -11,13 +11,12 @@ from typing import Any
 
 from aeloon_core.config import Config, load_config, resolve_config_path, save_config
 from aeloon_core.orchestrator import AeloonCoreOrchestrator
-from aeloon_core.profile_cli import run_profile
 from aeloon_core.runner import run_worker_runner
 from aeloon_core.terminal_cli import LOG_LEVELS, run_terminal_cli
 from aeloon_core.turn_events import TurnEventProgress
 
-COMMANDS = {"run", "chat", "tui", "config", "profile", "runner"}
-REMOVED_COMMANDS = {"webui"}
+COMMANDS = {"run", "chat", "tui", "config", "runner"}
+REMOVED_COMMANDS = {"profile", "webui"}
 CHAT_ONLY_OPTIONS = {
     "--show-gateway-logs",
     "--hide-gateway-logs",
@@ -32,9 +31,6 @@ CONFIG_SETTERS = {
     "model": ("agents", "defaults", "model"),
     "reasoning-effort": ("agents", "defaults", "reasoning_effort"),
     "max-iterations": ("agents", "defaults", "max_iterations"),
-    "base-profile-id": ("agents", "defaults", "base_profile_id"),
-    "profile-id": ("agents", "defaults", "profile_id"),
-    "max-handoffs": ("agents", "defaults", "max_handoffs"),
     "context-compaction-enabled": ("agents", "defaults", "context_compaction", "enabled"),
     "context-compaction-trigger-ratio": (
         "agents",
@@ -137,74 +133,6 @@ def build_parser() -> argparse.ArgumentParser:
     config_set_parser.add_argument("key", choices=sorted(CONFIG_SETTERS))
     config_set_parser.add_argument("value")
 
-    profile_parser = subparsers.add_parser(
-        "profile",
-        help="Validate, compile, approve, and activate agent profiles.",
-    )
-    profile_subparsers = profile_parser.add_subparsers(
-        dest="profile_command",
-        required=True,
-    )
-
-    profile_validate = profile_subparsers.add_parser(
-        "validate",
-        help="Validate one PROFILE.md source file.",
-    )
-    profile_validate.add_argument("source", type=Path)
-
-    profile_compile = profile_subparsers.add_parser(
-        "compile",
-        help="Compile one validated PROFILE.md into an immutable candidate.",
-    )
-    profile_compile.add_argument("source", type=Path)
-    profile_compile.add_argument(
-        "--compiler",
-        choices=("deterministic", "llm"),
-        default="deterministic",
-    )
-    profile_compile.add_argument(
-        "--model",
-        default=None,
-        help="Model override for the experimental LLM compiler.",
-    )
-    _add_profile_store_args(profile_compile)
-
-    profile_inspect = profile_subparsers.add_parser(
-        "inspect",
-        help="Inspect one content-addressed artifact.",
-    )
-    profile_inspect.add_argument("artifact_id")
-    _add_profile_store_args(profile_inspect)
-
-    profile_approve = profile_subparsers.add_parser(
-        "approve",
-        help="Approve the exact digest of one validated artifact.",
-    )
-    profile_approve.add_argument("artifact_id")
-    profile_approve.add_argument("--approved-by", default=None)
-    _add_profile_store_args(profile_approve)
-
-    profile_activate = profile_subparsers.add_parser(
-        "activate",
-        help="Atomically activate one approved compatible artifact.",
-    )
-    profile_activate.add_argument("artifact_id")
-    _add_profile_store_args(profile_activate)
-
-    profile_status = profile_subparsers.add_parser(
-        "status",
-        help="Show active artifact status for one or all profiles.",
-    )
-    profile_status.add_argument("profile_id", nargs="?", default=None)
-    _add_profile_store_args(profile_status)
-
-    profile_rollback = profile_subparsers.add_parser(
-        "rollback",
-        help="Activate an approved compatible prior artifact.",
-    )
-    profile_rollback.add_argument("artifact_id")
-    _add_profile_store_args(profile_rollback)
-
     runner_parser = subparsers.add_parser("runner", help="Run queued Worker sessions.")
     runner_parser.add_argument(
         "--once",
@@ -229,12 +157,6 @@ def _add_path_args(parser: argparse.ArgumentParser, *, session: bool = False) ->
     parser.add_argument("--config", type=Path, default=None, help="Optional config JSON path.")
     if session:
         parser.add_argument("--session", default=None, help="Existing session id to continue.")
-    parser.add_argument("--workspace", type=Path, default=None, help="Override workspace.")
-    parser.add_argument("--data-dir", type=Path, default=None, help="Override data dir.")
-
-
-def _add_profile_store_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--config", type=Path, default=None, help="Optional config JSON path.")
     parser.add_argument("--workspace", type=Path, default=None, help="Override workspace.")
     parser.add_argument("--data-dir", type=Path, default=None, help="Override data dir.")
 
@@ -317,26 +239,6 @@ class _PlainTextProgressSink:
         elif event == "chat.turn.end":
             self._break_stream()
             print(f"\n[final]\n{payload.get('final', '')}")
-        elif event == "chat.profile.pinned":
-            self._break_stream()
-            profile = payload.get("profile", {})
-            print(
-                "[profile] "
-                f"{profile.get('profile_id')} revision={profile.get('revision')} "
-                f"generation={profile.get('generation')} "
-                f"artifact={profile.get('artifact_id')}"
-            )
-        elif event == "chat.profile.route":
-            self._break_stream()
-            fallback = " fallback" if payload.get("fallback_used") else ""
-            print(f"[role] {payload.get('agent_id')}{fallback}")
-        elif event == "chat.profile.handoff":
-            self._break_stream()
-            target = payload.get("recommended_agent_id") or "profile-master"
-            print(f"[handoff] {payload.get('from_agent_id')} -> {target}")
-        elif event == "chat.profile.completion":
-            self._break_stream()
-            print(f"[completion] {payload.get('agent_id')}")
 
     def _break_stream(self) -> None:
         if self._streaming:
@@ -489,17 +391,12 @@ def _set_nested_value(data: dict[str, Any], path: tuple[str, ...], value: Any) -
 
 
 def _coerce_config_value(key: str, value: str) -> Any:
-    if key == "profile-id" and value.strip().lower() in {"none", "null", "off"}:
-        return None
     if key == "context-compaction-preserve-recent-tokens":
         if value.strip().lower() in {"auto", "none", "null"}:
             return None
         return int(value)
     if key in {
         "max-iterations",
-        "max-auto-continue-iterations",
-        "max-finalization-iterations",
-        "max-handoffs",
         "context-compaction-preserve-recent-turns",
         "context-compaction-summary-max-tokens",
         "uasm-minimal-context-recent-turns",
@@ -513,9 +410,6 @@ def _coerce_config_value(key: str, value: str) -> Any:
         "skills-external",
         "skills-claude-code",
         "context-compaction-enabled",
-        "uasm-rule-engine-enabled",
-        "uasm-temporary-guard-enabled",
-        "uasm-minimal-context-enabled",
         "uasm-transition-trace-enabled",
     }:
         return _parse_bool(value)
@@ -594,16 +488,12 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "config":
         _run_config(args)
         return
-    if args.command == "profile":
-        asyncio.run(
-            run_profile(
-                args,
-                path_overrides=_load_with_path_overrides,
-            )
-        )
-        return
     if args.command == "runner":
-        config = _load_with_path_overrides(args)
+        config = _load_with_path_overrides(
+            args.config,
+            workspace=args.workspace,
+            data_dir=args.data_dir,
+        )
         asyncio.run(
             run_worker_runner(
                 AeloonCoreOrchestrator(config),

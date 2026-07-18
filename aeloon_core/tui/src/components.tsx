@@ -356,13 +356,53 @@ export function WorkerDetail(props: WorkerDetailProps) {
     <box width="100%" flexDirection="column" flexShrink={0}>
       <box width="100%" flexDirection="column" marginBottom={1} flexShrink={0}>
         <text fg={props.palette.accent} selectable selectionBg={props.palette.selection}>
-          <strong>{props.worker.label}</strong> · {props.worker.profileId} · {workerStatusLabel(props.worker.status)}
+          <strong>{props.worker.label}</strong> · {props.worker.workerTypeId} · {workerStatusLabel(props.worker.status)}
           {props.worker.durationMs !== undefined ? ` · ${formatElapsed(props.worker.durationMs)}` : ""}
         </text>
         <text fg={props.palette.foreground} selectable selectionBg={props.palette.selection} wrapMode="word">
-          {props.worker.goal || "Goal will appear when this Worker publishes its run context."}
+          {props.worker.objective || "Objective will appear when this Worker publishes its run context."}
         </text>
       </box>
+
+      <box width="100%" flexDirection="column" marginBottom={1} flexShrink={0}>
+        <text fg={props.palette.muted} selectable={false}>
+          WORKER TYPE
+        </text>
+        <text fg={props.palette.foreground} selectable selectionBg={props.palette.selection} wrapMode="word">
+          {props.worker.workerTypeId}
+          {props.worker.definitionSource ? ` · ${props.worker.definitionSource}` : ""}
+        </text>
+        <Show when={props.worker.definitionDescription} fallback={<EmptySlot />}>
+          {(description) => (
+            <text fg={props.palette.foreground} selectable selectionBg={props.palette.selection} wrapMode="word">
+              {description()}
+            </text>
+          )}
+        </Show>
+        <Show when={props.worker.definitionDigest} fallback={<EmptySlot />}>
+          {(digest) => (
+            <text fg={props.palette.muted} selectable selectionBg={props.palette.selection} wrapMode="word">
+              digest {digest()}
+            </text>
+          )}
+        </Show>
+      </box>
+
+      <Show when={props.worker.waitingQuestion} fallback={<EmptySlot />}>
+        {(question) => (
+          <box width="100%" flexDirection="column" marginBottom={1} flexShrink={0}>
+            <text fg={props.palette.warning} selectable={false}>
+              WAITING FOR CONTEXT
+            </text>
+            <text fg={props.palette.foreground} selectable selectionBg={props.palette.selection} wrapMode="word">
+              {question()}
+            </text>
+            <text fg={props.palette.muted} selectable={false}>
+              /resume-worker &lt;response&gt;
+            </text>
+          </box>
+        )}
+      </Show>
 
       <box width="100%" flexDirection="column" marginBottom={1} flexShrink={0}>
         <text fg={props.palette.muted} selectable={false}>
@@ -845,7 +885,7 @@ function statusColor(item: TimelineItem, palette: Palette): string {
 
 function workerStatusColor(status: string, palette: Palette): string {
   if (status === "completed") return palette.success
-  if (status === "failed" || status === "timed_out") return palette.error
+  if (status === "failed") return palette.error
   if (status === "cancelled" || status === "archived") return palette.cancelled
   if (status === "partial" || status === "waiting_for_context") return palette.warning
   return palette.accent
@@ -853,7 +893,7 @@ function workerStatusColor(status: string, palette: Palette): string {
 
 function statusDot(status: string): string {
   if (status === "completed") return "●"
-  if (status === "failed" || status === "timed_out") return "●"
+  if (status === "failed") return "●"
   if (status === "cancelled" || status === "archived") return "○"
   if (status === "partial" || status === "waiting_for_context") return "◐"
   return "◒"
@@ -861,7 +901,7 @@ function statusDot(status: string): string {
 
 function workerProgress(worker: WorkerInfo): string {
   if (
-    ["completed", "failed", "partial", "cancelled", "timed_out"].includes(worker.status)
+    ["completed", "failed", "partial", "cancelled", "waiting_for_context"].includes(worker.status)
   ) {
     const terminal = workerStatusLabel(worker.status)
     return worker.durationMs === undefined
@@ -885,7 +925,6 @@ function workerStatusLabel(status: string): string {
       partial: "partial",
       queued: "queued",
       running: "running",
-      timed_out: "timed out",
       waiting_for_context: "waiting",
     }[status] ?? status
   )
@@ -895,7 +934,7 @@ function workerTimelineStatus(status: string): TimelineItem["status"] {
   if (status === "completed") return "done"
   if (status === "cancelled") return "cancelled"
   if (status === "partial" || status === "waiting_for_context") return "partial"
-  if (status === "failed" || status === "timed_out") return "failed"
+  if (status === "failed") return "failed"
   return "running"
 }
 

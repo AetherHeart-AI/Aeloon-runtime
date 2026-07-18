@@ -1,4 +1,4 @@
-"""Privacy-preserving bridge from private Worker activity to Base UI events."""
+"""Privacy-preserving bridge from private Worker activity to Master UI events."""
 
 from __future__ import annotations
 
@@ -19,12 +19,7 @@ from aeloon_core.operator_output import sanitize_operator_output
 from aeloon_core.providers.base import ToolCallRequest
 from aeloon_core.task_graph import TaskNode
 
-_HIDDEN_CONTROL_TOOLS = {
-    "complete_task",
-    "delegate_tasks",
-    "handoff",
-    "request_handoff",
-}
+_HIDDEN_CONTROL_TOOLS = {"complete_work", "request_master"}
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
 _ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|[@-_])")
 _ACTIVITY_PHASES = {
@@ -35,11 +30,6 @@ _ACTIVITY_PHASES = {
     "processing",
     "working_step",
     "finalizing",
-    "delegating",
-    "handoff",
-    "branch_running",
-    "branch_done",
-    "synthesizing",
 }
 _MAX_PENDING_JOURNAL_CALLS = 64
 _MAX_TOOL_RESULT_PREVIEW_CHARS = 4_000
@@ -89,7 +79,7 @@ class WorkerProgress:
         parent: Any,
         worker_id: str,
         run_id: str,
-        profile_id: str,
+        worker_type_id: str,
         run_sequence: int = 1,
         journal: Any | None = None,
     ) -> None:
@@ -101,12 +91,11 @@ class WorkerProgress:
         self.worker_id = worker_id
         self.run_id = run_id
         self.run_sequence = max(1, int(run_sequence))
-        self.profile_id = profile_id
-        self.label = f"{profile_id}#{worker_id[:8]}"
+        self.worker_type_id = worker_type_id
+        self.label = f"{worker_type_id}#{worker_id[:8]}"
         self._tool_started: dict[str, float] = {}
         self._active_tools: dict[str, dict[str, str]] = {}
         self._current_steps: dict[str, tuple[str, int, int]] = {}
-        self._role_ids: dict[str, str] = {}
         self._last_activity: dict[str, tuple[Any, ...]] = {}
         self._activity_revisions: dict[str, int] = {}
         self._journal_calls: deque[_BufferedJournalCall] = deque()
@@ -150,7 +139,7 @@ class WorkerProgress:
             worker_id=self.worker_id,
             run_id=self.run_id,
             run_sequence=self.run_sequence,
-            profile_id=self.profile_id,
+            worker_type_id=self.worker_type_id,
             label=self.label,
             resolution=resolution,
         )
@@ -164,104 +153,19 @@ class WorkerProgress:
         self,
         *,
         phase: str,
-        role_id: str | None = None,
-        subagent_label: str | None = None,
-    ) -> None:
-        label = self._scope_label(subagent_label)
-        safe_role = _safe_identifier(role_id)
-        if safe_role is not None:
-            self._role_ids[label] = safe_role
-        await self._emit_activity(phase, label=label, role_id=safe_role)
-
-    async def on_profile_route(
-        self,
-        agent_id: str,
-        *,
-        source: str,
-        fallback_used: bool,
-    ) -> None:
-        del source, fallback_used
-        role_id = _safe_identifier(agent_id)
-        if role_id is not None:
-            self._role_ids[self.label] = role_id
-        await self._emit_activity("analyzing", label=self.label, role_id=role_id)
-
-    async def on_profile_handoff(
-        self,
-        from_agent_id: str,
-        recommended_agent_id: str | None,
-        summary: str,
-        **kwargs: Any,
-    ) -> None:
-        del from_agent_id, summary, kwargs
-        role_id = _safe_identifier(recommended_agent_id)
-        await self._emit_activity("handoff", label=self.label, role_id=role_id)
-
-    async def on_profile_completion(
-        self,
-        agent_id: str | None,
-        final_content: str,
-    ) -> None:
-        del final_content
-        await self._emit_activity(
-            "finalizing",
-            label=self.label,
-            role_id=_safe_identifier(agent_id),
-        )
-
-    async def on_profile_delegate_branch_start(
-        self,
-        branch_id: str,
-        label: str,
-        agent_id: str,
-        task: str,
-    ) -> None:
-        del branch_id, task
-        await self._emit_activity(
-            "branch_running",
-            label=self._scope_label(label),
-            role_id=_safe_identifier(agent_id),
-        )
-
-    async def on_profile_delegate_branch_complete(
-        self,
-        branch_id: str,
-        label: str,
-        agent_id: str,
-        *,
-        status: str,
-        summary: str,
-        duration_ms: int,
-        tools_used: list[str],
-    ) -> None:
-        del branch_id, status, summary, duration_ms, tools_used
-        await self._emit_activity(
-            "branch_done",
-            label=self._scope_label(label),
-            role_id=_safe_identifier(agent_id),
-        )
-
-    async def on_profile_delegate_join(
-        self,
-        source_agent_id: str,
         **kwargs: Any,
     ) -> None:
         del kwargs
-        await self._emit_activity(
-            "synthesizing",
-            label=self.label,
-            role_id=_safe_identifier(source_agent_id),
-        )
+        await self._emit_activity(phase, label=self.label)
 
     async def on_tool_calls(
         self,
         tool_calls: list[ToolCallRequest],
         *,
-        subagent_label: str | None = None,
         record_reasoning: bool = False,
     ) -> None:
         del record_reasoning
-        label = self._scope_label(subagent_label)
+        label = self.label
         now = perf_counter()
         visible_tools: list[str] = []
         control_tools: set[str] = set()
@@ -279,24 +183,19 @@ class WorkerProgress:
                 label=label,
                 tool_names=tuple(sorted(set(visible_tools))),
             )
-        elif "delegate_tasks" in control_tools:
-            await self._emit_activity("delegating", label=label)
-        elif control_tools & {"handoff", "request_handoff"}:
-            await self._emit_activity("handoff", label=label)
-        elif "complete_task" in control_tools:
+        elif control_tools:
             await self._emit_activity("finalizing", label=label)
 
     async def on_tool_result(
         self,
         node: TaskNode,
         *,
-        subagent_label: str | None = None,
         record_reasoning: bool = False,
     ) -> None:
         del record_reasoning
         if node.tool_name in _HIDDEN_CONTROL_TOOLS:
             return
-        label = self._scope_label(subagent_label)
+        label = self.label
         started = self._tool_started.pop(node.call_id, None)
         duration_ms = (
             max(0, int((perf_counter() - started) * 1_000)) if started is not None else None
@@ -318,7 +217,7 @@ class WorkerProgress:
             worker_id=self.worker_id,
             run_id=self.run_id,
             run_sequence=self.run_sequence,
-            profile_id=self.profile_id,
+            worker_type_id=self.worker_type_id,
             label=label,
             tool_name=tool_name,
             status=status,
@@ -345,16 +244,11 @@ class WorkerProgress:
         if label not in self._active_tools:
             await self._emit_activity("processing", label=label)
 
-    def _scope_label(self, subagent_label: str | None) -> str:
-        safe = _safe_identifier(subagent_label)
-        return f"{self.label}/{safe}" if safe is not None else self.label
-
     async def _emit_activity(
         self,
         phase: str,
         *,
         label: str,
-        role_id: str | None = None,
         tool_names: tuple[str, ...] = (),
     ) -> None:
         if phase not in _ACTIVITY_PHASES:
@@ -363,21 +257,15 @@ class WorkerProgress:
         detail_source = "host"
         if current_step is not None and phase not in {
             "finalizing",
-            "delegating",
-            "handoff",
-            "branch_done",
-            "synthesizing",
         }:
             phase = "working_step"
             tool_names = ()
             detail_source = "worker_declared"
-        resolved_role = role_id or self._role_ids.get(label)
         step_text = current_step[0] if current_step is not None else None
         completed = current_step[1] if current_step is not None else None
         total = current_step[2] if current_step is not None else None
         fingerprint = (
             phase,
-            None if detail_source == "worker_declared" else resolved_role,
             tool_names,
             step_text,
             completed,
@@ -393,7 +281,6 @@ class WorkerProgress:
             "record_activity",
             run_id=self.run_id,
             phase=phase,
-            role_id=resolved_role,
             tool_names=tool_names,
             current_step=step_text,
             todo_completed=completed,
@@ -405,11 +292,10 @@ class WorkerProgress:
             worker_id=self.worker_id,
             run_id=self.run_id,
             run_sequence=self.run_sequence,
-            profile_id=self.profile_id,
+            worker_type_id=self.worker_type_id,
             label=label,
             revision=revision,
             phase=phase,
-            role_id=resolved_role,
             tool_names=tool_names,
             current_step=step_text,
             todo_completed=completed,

@@ -1,8 +1,9 @@
-"""Tool registries for dynamic and role-scoped capability management."""
+"""Runtime tool registry."""
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+import inspect
+from collections.abc import Callable, Iterable
 from typing import Any
 
 from pydantic import ValidationError
@@ -13,8 +14,17 @@ from aeloon_core.tools.base import Tool
 class ToolRegistry:
     """Registry for agent tools."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        execution_guard: Callable[[Tool], Any] | None = None,
+        execution_started: Callable[[Tool], Any] | None = None,
+        execution_finished: Callable[[Tool], Any] | None = None,
+    ) -> None:
         self._tools: dict[str, Tool] = {}
+        self._execution_guard = execution_guard
+        self._execution_started = execution_started
+        self._execution_finished = execution_finished
 
     def register(self, tool: Tool) -> None:
         """Register a tool."""
@@ -47,8 +57,17 @@ class ToolRegistry:
                 "next_action='retry with one JSON object matching the advertised tool schema'"
                 f"{hint}"
             )
+        execution_started = False
         try:
-            result = await tool.execute(**args.model_dump(exclude_unset=True))
+            await self._invoke(self._execution_guard, tool)
+            await self._invoke(self._execution_started, tool)
+            execution_started = True
+            try:
+                result = await tool.execute(**args.model_dump(exclude_unset=True))
+                await self._invoke(self._execution_guard, tool)
+            finally:
+                if execution_started:
+                    await self._invoke(self._execution_finished, tool)
             if isinstance(result, str) and result.startswith("Error"):
                 return result + hint
             return result
@@ -61,52 +80,13 @@ class ToolRegistry:
                 f"{hint}"
             )
 
-
-class ScopedToolRegistry:
-    """A read/execute-only view that can only narrow a host registry."""
-
-    def __init__(self, registry: ToolRegistry, allowed_tools: Iterable[str]) -> None:
-        self._registry = registry
-        requested = frozenset(allowed_tools)
-        self._allowed_names = tuple(
-            name
-            for definition in registry.get_definitions()
-            if (name := _definition_name(definition)) is not None and name in requested
-        )
-
-    def get(self, name: str) -> Tool | None:
-        """Return a tool only when it remains present in the allowed host scope."""
-
-        if name not in self._allowed_names:
-            return None
-        return self._registry.get(name)
-
-    def get_definitions(self) -> list[dict[str, Any]]:
-        """Return schemas for currently present tools in the fixed allowed scope."""
-
-        return [
-            tool.to_schema()
-            for name in self._allowed_names
-            if (tool := self.get(name)) is not None
-        ]
-
-    async def execute(self, name: str, params: dict[str, Any]) -> str:
-        """Re-check scope immediately before delegating an allowed execution."""
-
-        if self.get(name) is None:
-            return _tool_not_found(name, self._available_names())
-        return await self._registry.execute(name, params)
-
-    def _available_names(self) -> tuple[str, ...]:
-        return tuple(name for name in self._allowed_names if self.get(name) is not None)
-
-
-def _definition_name(definition: dict[str, Any]) -> str | None:
-    function = definition.get("function")
-    if not isinstance(function, dict):
-        return None
-    name = function.get("name")
-    return name if isinstance(name, str) else None
+    @staticmethod
+    async def _invoke(callback: Callable[[Tool], Any] | None, tool: Tool) -> None:
+        if callback is None:
+            return
+        result = callback(tool)
+        if inspect.isawaitable(result):
+            await result
 
 
 def _tool_not_found(name: str, available: Iterable[str]) -> str:

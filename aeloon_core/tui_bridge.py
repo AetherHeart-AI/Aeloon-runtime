@@ -354,23 +354,26 @@ class TUIBridge:
         if command == "inspect_worker":
             worker_id = _required_text(payload, "worker_id")
             return _inspect_worker_detail(workers, worker_id)
-        if command == "discover_profiles":
-            return [_profile_view(item) for item in workers.discover_profiles()]
+        if command == "discover_worker_types":
+            return [
+                _worker_type_view(item)
+                for item in workers.discover_worker_types()
+            ]
         if command == "spawn_worker":
             session_id = _optional_text(payload, "session_id") or self.session_id
-            profile_id = _required_text(payload, "profile_id", aliases=("profile",))
-            task = _required_text(payload, "task")
+            worker_type_id = _required_text(
+                payload,
+                "worker_type_id",
+                aliases=("worker_type",),
+            )
+            objective = _required_text(payload, "objective")
             idempotency_key = _optional_text(payload, "idempotency_key")
-            detached = payload.get("detached", False)
-            if not isinstance(detached, bool):
-                raise BridgeCommandError("detached must be a boolean")
             result = await workers.spawn_worker(
                 base_session_id=session_id,
-                profile_id=profile_id,
-                task=task,
+                worker_type_id=worker_type_id,
+                objective=objective,
                 idempotency_key=idempotency_key or f"tui:{uuid.uuid4().hex}",
                 base_turn_id=_optional_text(payload, "base_turn_id"),
-                detached=detached,
                 progress=TurnEventProgress(
                     session_id=session_id,
                     emit=self.emit_event,
@@ -383,19 +386,11 @@ class TUIBridge:
             return _worker_run_view(await workers.cancel_worker(run_id))
         if command == "resume_worker":
             run_id = _required_text(payload, "run_id")
-            expected_sequence = payload.get("expected_run_sequence")
-            if expected_sequence is not None and (
-                isinstance(expected_sequence, bool)
-                or not isinstance(expected_sequence, int)
-                or expected_sequence < 1
-            ):
-                raise BridgeCommandError("expected_run_sequence must be a positive integer")
             result = await workers.resume_worker(
                 run_id,
-                instruction=_optional_text(payload, "instruction"),
+                response=_required_text(payload, "response"),
                 idempotency_key=f"tui:resume:{request_id}",
                 base_session_id=self.session_id,
-                expected_run_sequence=expected_sequence,
                 progress=TurnEventProgress(
                     session_id=self.session_id,
                     emit=self.emit_event,
@@ -708,17 +703,13 @@ async def _readline(stream: Any) -> str:
 
 def _history_turn_view(record: Any) -> dict[str, Any]:
     raw = _mapping(record)
-    profile_id = _profile_id(raw.get("profile"))
-    result = {
+    return {
         "created_at": raw.get("created_at"),
         "user_prompt": raw.get("user_prompt"),
         "final_content": raw.get("final_content"),
         "tools_used": list(raw.get("tools_used") or []),
         "usage": raw.get("usage") or {},
     }
-    if profile_id:
-        result["profile_id"] = profile_id
-    return result
 
 
 def _session_summary_view(item: Any) -> dict[str, Any]:
@@ -734,13 +725,15 @@ def _session_summary_view(item: Any) -> dict[str, Any]:
 def _worker_summary_view(item: Any) -> dict[str, Any]:
     raw = _mapping(item)
     worker_id = str(raw.get("worker_id") or "")
-    profile_id = _profile_id(raw.get("profile")) or str(raw.get("profile_id") or "worker")
+    snapshot = _mapping(raw.get("snapshot"))
+    worker_type_id = str(snapshot.get("id") or raw.get("worker_type_id") or "worker")
     latest = raw.get("latest_run")
     latest_view = _worker_run_view(latest) if isinstance(latest, dict) else None
     return {
         "worker_id": worker_id,
-        "label": f"{profile_id}#{worker_id[:4]}",
-        "profile_id": profile_id,
+        "label": f"{worker_type_id}#{worker_id[:4]}",
+        "worker_type_id": worker_type_id,
+        "definition": _worker_definition_view(snapshot),
         "status": raw.get("status"),
         "created_at": raw.get("created_at"),
         "reusable": bool(raw.get("reusable", False)),
@@ -753,7 +746,8 @@ def _worker_summary_view(item: Any) -> dict[str, Any]:
 def _worker_detail_view(item: Any) -> dict[str, Any]:
     raw = _mapping(item)
     worker_id = str(raw.get("worker_id") or "")
-    profile_id = _profile_id(raw.get("profile")) or str(raw.get("profile_id") or "worker")
+    snapshot = _mapping(raw.get("snapshot"))
+    worker_type_id = str(snapshot.get("id") or raw.get("worker_type_id") or "worker")
     runs = [
         _worker_run_view(run)
         for run in raw.get("runs", [])
@@ -761,8 +755,9 @@ def _worker_detail_view(item: Any) -> dict[str, Any]:
     ]
     return {
         "worker_id": worker_id,
-        "label": f"{profile_id}#{worker_id[:4]}",
-        "profile_id": profile_id,
+        "label": f"{worker_type_id}#{worker_id[:4]}",
+        "worker_type_id": worker_type_id,
+        "definition": _worker_definition_view(snapshot),
         "status": raw.get("status"),
         "created_at": raw.get("created_at"),
         "runs": runs,
@@ -805,13 +800,19 @@ def _worker_record_view(item: Any) -> dict[str, Any]:
         "worker_id": raw.get("worker_id"),
         "run_sequence": raw.get("run_sequence"),
         "status": status,
-        "goal": context.get("goal"),
+        "cancel_requested": bool(raw.get("cancel_requested_at")),
+        "objective": context.get("objective"),
+        "source_run_id": raw.get("source_run_id"),
         "created_at": raw.get("created_at"),
         "summary": summary,
         "duration_ms": result_envelope.get("duration_ms"),
         "tool_outcome": result_envelope.get("tool_outcome"),
         "usage": result_envelope.get("usage") or {},
     }
+    waiting_request = _mapping(raw.get("waiting_request"))
+    question = waiting_request.get("question") or _first_unresolved(report)
+    if question:
+        result["waiting_question"] = question
     if status == "failed" and summary:
         result["error_summary"] = summary
     return result
@@ -819,20 +820,35 @@ def _worker_record_view(item: Any) -> dict[str, Any]:
 
 def _worker_run_view(item: Any) -> dict[str, Any]:
     raw = _mapping(item)
+    context = _mapping(raw.get("context"))
+    result_envelope = _mapping(raw.get("result"))
+    report = _mapping(raw.get("report")) or _mapping(result_envelope.get("report"))
     status = _enum_value(raw.get("status"))
-    summary = raw.get("summary")
+    summary = raw.get("summary") or report.get("summary")
     result = {
         "run_id": raw.get("run_id"),
         "worker_id": raw.get("worker_id"),
         "run_sequence": raw.get("run_sequence"),
         "created_at": raw.get("created_at"),
         "status": status,
-        "goal": raw.get("goal") or raw.get("goal_preview"),
+        "cancel_requested": bool(raw.get("cancel_requested", False)),
+        "action": raw.get("action"),
+        "objective": (
+            raw.get("objective")
+            or raw.get("objective_preview")
+            or context.get("objective")
+        ),
+        "source_run_id": raw.get("source_run_id"),
         "summary": summary,
-        "duration_ms": raw.get("duration_ms"),
-        "tool_outcome": raw.get("tool_outcome"),
-        "usage": raw.get("usage") or {},
+        "duration_ms": raw.get("duration_ms") or result_envelope.get("duration_ms"),
+        "tool_outcome": raw.get("tool_outcome") or result_envelope.get("tool_outcome"),
+        "usage": raw.get("usage") or result_envelope.get("usage") or {},
     }
+    waiting_request = _mapping(raw.get("waiting_request"))
+    question = raw.get("waiting_question") or waiting_request.get("question")
+    question = question or _first_unresolved(report)
+    if question:
+        result["waiting_question"] = question
     if status == "failed" and summary:
         result["error_summary"] = summary
     return result
@@ -840,36 +856,45 @@ def _worker_run_view(item: Any) -> dict[str, Any]:
 
 def _resume_worker_view(item: Any) -> dict[str, Any]:
     raw = _mapping(item)
+    run = raw.get("run") if isinstance(raw.get("run"), dict) else raw
     return {
-        **_worker_run_view(raw),
+        **_worker_run_view(run),
         "action": raw.get("action"),
         "source_status": _enum_value(raw.get("source_status")),
         "created": bool(raw.get("created", False)),
     }
 
 
-def _profile_view(item: Any) -> dict[str, Any]:
+def _worker_type_view(item: Any) -> dict[str, Any]:
     raw = _mapping(item)
     return {
-        "profile_id": _profile_id(raw.get("profile")) or raw.get("profile_id"),
+        "id": raw.get("id"),
         "description": raw.get("description"),
-        "capability_tags": list(raw.get("capability_tags") or []),
-        "requested_tools": list(raw.get("requested_tools") or []),
-        "side_effect_level": raw.get("side_effect_level"),
-        "supports_parallel": bool(raw.get("supports_parallel", False)),
+        "source": _enum_value(raw.get("source")),
+        "digest": raw.get("digest"),
     }
 
 
 def _spawn_worker_view(item: Any) -> dict[str, Any]:
     raw = _mapping(item)
+    snapshot = _mapping(raw.get("snapshot"))
+    worker_id = raw.get("worker_id")
+    run_id = raw.get("run_id")
+    run_sequence = raw.get("run_sequence")
+    created_at = raw.get("created_at")
     return {
-        "worker_id": raw.get("worker_id"),
-        "run_id": raw.get("run_id"),
-        "run_sequence": raw.get("run_sequence"),
-        "created_at": raw.get("created_at"),
+        "worker_id": worker_id,
+        "created_at": created_at,
         "created": bool(raw.get("created", False)),
-        "detached": bool(raw.get("detached", False)),
-        "profile_id": _profile_id(raw.get("profile")) or raw.get("profile_id"),
+        "worker_type_id": snapshot.get("id") or raw.get("worker_type_id"),
+        "definition": _worker_definition_view(snapshot),
+        "latest_run": {
+            "worker_id": worker_id,
+            "run_id": run_id,
+            "run_sequence": run_sequence,
+            "created_at": created_at,
+            "status": _enum_value(raw.get("status")) or "queued",
+        },
     }
 
 
@@ -885,10 +910,20 @@ def _turn_result_view(item: Any) -> dict[str, Any]:
     }
 
 
-def _profile_id(value: Any) -> str | None:
-    raw = _mapping(value)
-    profile_id = raw.get("profile_id")
-    return str(profile_id) if profile_id else None
+def _worker_definition_view(value: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "id": value.get("id"),
+        "description": value.get("description"),
+        "source": _enum_value(value.get("source")),
+        "digest": value.get("digest"),
+    }
+
+
+def _first_unresolved(report: Mapping[str, Any]) -> Any:
+    unresolved = report.get("unresolved")
+    if isinstance(unresolved, list) and unresolved:
+        return unresolved[0]
+    return None
 
 
 def _enum_value(value: Any) -> Any:

@@ -22,7 +22,8 @@ class ResolveMaxArgumentCharsTests(unittest.TestCase):
 
     def test_min_of_default_and_model_max_output(self) -> None:
         self.assertEqual(resolve_max_argument_chars(384_000), 32_000)
-        self.assertEqual(resolve_max_argument_chars(8_192), 8_192)
+        self.assertEqual(resolve_max_argument_chars(8_192), 32_000)
+        self.assertEqual(resolve_max_argument_chars(4_096), 16_384)
 
     def test_invalid_model_limit_falls_back(self) -> None:
         self.assertEqual(resolve_max_argument_chars(0), 32_000)

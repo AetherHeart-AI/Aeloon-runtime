@@ -83,9 +83,8 @@ class TransitionRecord:
     token_usage: dict[str, int] = field(default_factory=dict)
     wall_time_ms: float = 0.0
     created_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
-    schema_version: int = 2
+    schema_version: int = 3
     component: str | None = None
-    profile: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "sequence", max(0, int(self.sequence)))
@@ -94,8 +93,6 @@ class TransitionRecord:
         object.__setattr__(self, "node_kind", NodeKind(self.node_kind))
         if self.component is not None:
             object.__setattr__(self, "component", str(self.component))
-        if self.profile is not None:
-            object.__setattr__(self, "profile", _json_safe(self.profile))
         object.__setattr__(self, "token_usage", normalize_usage(self.token_usage))
         object.__setattr__(self, "wall_time_ms", max(0.0, float(self.wall_time_ms)))
 
@@ -119,8 +116,6 @@ class TransitionRecord:
         }
         if self.component is not None:
             payload["component"] = self.component
-        if self.profile is not None:
-            payload["profile"] = dict(self.profile)
         return payload
 
 
@@ -246,7 +241,6 @@ class TransitionRecorder:
         node: str | Enum,
         node_kind: NodeKind | str,
         component: str | None = None,
-        profile: Mapping[str, Any] | None = None,
         before_digest: str,
         after_digest: str,
         decision: Any = None,
@@ -268,7 +262,6 @@ class TransitionRecorder:
             session_id=session_id if session_id is not None else self.session_id,
             turn_id=turn_id if turn_id is not None else self.turn_id,
             component=component,
-            profile=dict(profile) if profile is not None else None,
             decision=decision,
             token_usage=normalize_usage(token_usage),
             wall_time_ms=wall_time_ms,

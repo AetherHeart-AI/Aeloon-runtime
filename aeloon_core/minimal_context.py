@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
 from aeloon_core.context_compaction import is_compaction_message
-from aeloon_core.profile_runtime import CONTROL_TOOL_NAMES, DELEGATE_TOOL_NAME
 
 if TYPE_CHECKING:
     from aeloon_core.state import LightweightState
@@ -82,7 +81,7 @@ class MinimalContextProcessor:
             reference = self._replace_large_tool_result(
                 state,
                 message,
-                preserve_current_delegation=index > current_turn_start,
+                preserve_current_skill=index > current_turn_start,
             )
             if reference is not None and reference not in lazy_references:
                 lazy_references.append(reference)
@@ -91,11 +90,7 @@ class MinimalContextProcessor:
 
         return ForwardContextResult(
             messages=call_messages,
-            tools=_filter_tools(
-                tools,
-                state.active_tools,
-                include_profile_control=getattr(state, "profile_ref", None) is not None,
-            ),
+            tools=_filter_tools(tools, state.active_tools),
             lazy_references=tuple(lazy_references),
             original_message_count=len(messages),
         )
@@ -105,13 +100,13 @@ class MinimalContextProcessor:
         state: LightweightState,
         message: dict[str, Any],
         *,
-        preserve_current_delegation: bool,
+        preserve_current_skill: bool,
     ) -> str | None:
         if message.get("role") != "tool" or "content" not in message:
             return None
         if (
-            preserve_current_delegation
-            and message.get("name") == DELEGATE_TOOL_NAME
+            preserve_current_skill
+            and message.get("name") == "skill"
         ):
             return None
         content = message.get("content")
@@ -214,12 +209,8 @@ def _assistant_tool_call_ids(message: dict[str, Any]) -> list[str]:
 def _filter_tools(
     tools: list[dict[str, Any]],
     active_tools: list[str],
-    *,
-    include_profile_control: bool = False,
 ) -> list[dict[str, Any]]:
     allowed = set(active_tools)
-    if include_profile_control:
-        allowed.update(CONTROL_TOOL_NAMES)
     return [
         dict(tool)
         for tool in tools

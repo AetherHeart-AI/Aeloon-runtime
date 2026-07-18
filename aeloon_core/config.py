@@ -7,7 +7,11 @@ import os
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+
+_REMOVED_V1_AGENT_DEFAULTS = frozenset(
+    {"base_profile_id", "profile_id", "max_handoffs"}
+)
 
 
 class CustomProviderConfig(BaseModel):
@@ -50,18 +54,14 @@ class UASMConfig(BaseModel):
 class AgentDefaultsConfig(BaseModel):
     """Default generation settings."""
 
+    model_config = ConfigDict(extra="forbid")
+
     model: str = "default"
     temperature: float = 0.7
     reasoning_effort: str | None = None
     chat_timeout: int = 3600
     context_window_tokens: int = 128_000
     max_iterations: int = 25
-    base_profile_id: str = Field(default="base", pattern=r"^base$")
-    profile_id: str | None = Field(
-        default=None,
-        pattern=r"^[a-z][a-z0-9_-]{0,63}$",
-    )
-    max_handoffs: int = Field(default=8, ge=0)
     context_compaction: ContextCompactionConfig = Field(
         default_factory=ContextCompactionConfig
     )
@@ -145,9 +145,10 @@ def load_config(path: Path | str | None = None) -> Config:
     """Load config from JSON and environment overrides."""
 
     config_path = resolve_config_path(path)
-    data: dict[str, Any] = {}
+    data: Any = {}
     if config_path.exists():
         data = json.loads(config_path.read_text(encoding="utf-8"))
+        _drop_removed_v1_settings(data)
 
     config = Config.model_validate(data)
     updates: dict[str, Any] = {}
@@ -158,12 +159,6 @@ def load_config(path: Path | str | None = None) -> Config:
         updates.setdefault("providers", {}).setdefault("custom", {})["api_base"] = api_base
     if model := os.environ.get("AELOON_CORE_MODEL"):
         updates.setdefault("agents", {}).setdefault("defaults", {})["model"] = model
-    if profile_id := os.environ.get("AELOON_CORE_PROFILE_ID"):
-        updates.setdefault("agents", {}).setdefault("defaults", {})["profile_id"] = (
-            None
-            if profile_id.strip().lower() in {"none", "null", "off"}
-            else profile_id
-        )
     if workspace := os.environ.get("AELOON_CORE_WORKSPACE"):
         updates["workspace"] = workspace
     if data_dir := os.environ.get("AELOON_CORE_DATA_DIR"):
@@ -209,6 +204,19 @@ def _parse_bool(value: str) -> bool:
 
 def _split_env_list(value: str) -> list[str]:
     return [item.strip() for item in value.split(os.pathsep) if item.strip()]
+
+
+def _drop_removed_v1_settings(data: Any) -> None:
+    """Ignore only the Profile settings removed by the v2 runtime."""
+
+    if not isinstance(data, dict):
+        return
+    agents = data.get("agents")
+    defaults = agents.get("defaults") if isinstance(agents, dict) else None
+    if not isinstance(defaults, dict):
+        return
+    for key in _REMOVED_V1_AGENT_DEFAULTS:
+        defaults.pop(key, None)
 
 
 def _deep_update(target: dict[str, Any], updates: dict[str, Any]) -> None:

@@ -76,17 +76,20 @@ export interface GatewayLog {
 
 export interface WorkerInfo {
   currentStep?: string
+  definitionDescription?: string
+  definitionDigest?: string
+  definitionSource?: string
   durationMs?: number
-  goal?: string
   id: string
   label: string
   lastRevision: Record<string, number>
   phase: string
   phases: string[]
-  profileId: string
+  objective?: string
   report?: string
   runId?: string
   runSequence?: number
+  sourceRunId?: string
   startedAt?: number
   status: string
   timeline: TimelineItem[]
@@ -94,6 +97,8 @@ export interface WorkerInfo {
   todoTotal?: number
   unread: number
   usage: JsonObject
+  waitingQuestion?: string
+  workerTypeId: string
 }
 
 interface PendingBlock {
@@ -103,7 +108,6 @@ interface PendingBlock {
   name?: string
   startedAt?: string
   type: string
-  workerLabel?: string
 }
 
 export interface AppState {
@@ -135,7 +139,7 @@ export interface AppState {
 }
 
 const LOW_SIGNAL_TOOLS = new Set([
-  "discover_profiles",
+  "discover_worker_types",
   "glob",
   "grep",
   "inspect_worker",
@@ -146,13 +150,13 @@ const LOW_SIGNAL_TOOLS = new Set([
   "websearch",
 ])
 
-const TERMINAL_WORKER_STATES = new Set([
+const SETTLED_WORKER_STATES = new Set([
   "archived",
   "cancelled",
   "completed",
   "failed",
   "partial",
-  "timed_out",
+  "waiting_for_context",
 ])
 
 const LOG_LIMIT = 1_000
@@ -262,7 +266,7 @@ export function applyEvent(state: AppState, event: string, payload: JsonObject):
     if (usage) state.usage = { ...usage }
     return
   }
-  if (event === "chat.guard.decision" || event === "chat.profile.delegate.guard") {
+  if (event === "chat.guard.decision") {
     addGuard(state, payload)
     return
   }
@@ -289,9 +293,6 @@ export function applyEvent(state: AppState, event: string, payload: JsonObject):
   if (event === "chat.turn.end") {
     onTurnEnd(state, payload)
     return
-  }
-  if (event.startsWith("chat.profile.")) {
-    onProfileEvent(state, event, payload)
   }
 }
 
@@ -487,7 +488,7 @@ export function visibleWorkerItems(state: AppState, workerId: string): TimelineI
 export function runningWorkers(state: AppState): WorkerInfo[] {
   return state.workerOrder
     .map((workerId) => state.workers[workerId])
-    .filter((worker): worker is WorkerInfo => Boolean(worker) && !TERMINAL_WORKER_STATES.has(worker.status))
+    .filter((worker): worker is WorkerInfo => Boolean(worker) && !SETTLED_WORKER_STATES.has(worker.status))
 }
 
 export function waitingSummary(state: AppState): string {
@@ -527,24 +528,32 @@ export function applyCommandResult(state: AppState, command: string, result: unk
       if (command === "resume_worker") {
         const workerId = stringValue(result.worker_id)
         const worker = workerId ? state.workers[workerId] : undefined
+        addMasterItem(state, {
+          body: [worker?.label, "Continuation scheduled"].filter(Boolean).join(" · "),
+          kind: "lifecycle",
+          signal: "high",
+          status: "partial",
+          title: "WORKER RESUMED",
+        })
+      } else {
         const action = stringValue(result.action)
-        const labels: Record<string, string> = {
-          already_running: "Already running",
-          continued: "Continuation scheduled",
-          restarted: "Clean retry scheduled",
-          scheduled: "Run scheduled",
-        }
-        if (action) {
-          addMasterItem(state, {
-            body: [worker?.label, labels[action] ?? oneLine(action, 80)]
-              .filter(Boolean)
-              .join(" · "),
-            kind: "lifecycle",
-            signal: "high",
-            status: action === "already_running" ? "running" : "partial",
-            title: "WORKER RECOVERY",
-          })
-        }
+        const requested = action === "cancellation_requested"
+        const cancelled = action === "cancelled"
+        addMasterItem(state, {
+          body: requested
+            ? "Cancellation requested; waiting for the Worker runner to finish teardown."
+            : cancelled
+              ? "Worker cancellation completed."
+              : "Worker was already settled; no cancellation change was made.",
+          kind: "lifecycle",
+          signal: "high",
+          status: requested ? "running" : cancelled ? "cancelled" : "partial",
+          title: requested
+            ? "WORKER CANCELLING"
+            : cancelled
+              ? "WORKER CANCELLED"
+              : "CANCEL UNCHANGED",
+        })
       }
     }
     return
@@ -565,17 +574,24 @@ export function applyCommandResult(state: AppState, command: string, result: unk
     addMasterItem(state, { body, kind: "system", signal: "high", title: "SESSIONS" })
     return
   }
-  if (command === "discover_profiles") {
-    const profiles = arrayOfObjects(result)
-    const names = profiles
-      .map((item) => objectValue(item.profile)?.profile_id ?? item.profile_id)
-      .map(stringValue)
+  if (command === "discover_worker_types") {
+    const workerTypes = arrayOfObjects(result)
+    const rows = workerTypes
+      .map((item) => {
+        const id = stringValue(item.id)
+        if (!id) return ""
+        const description = oneLine(stringValue(item.description), 120)
+        const digest = stringValue(item.digest)
+        return [id, description, digest ? `digest ${digest}` : ""]
+          .filter(Boolean)
+          .join(" · ")
+      })
       .filter(Boolean)
     addMasterItem(state, {
-      body: names.length ? names.join(" · ") : "No active Worker profiles.",
+      body: rows.length ? rows.join("\n") : "No Worker types are available.",
       kind: "system",
       signal: "high",
-      title: "PROFILES",
+      title: "WORKER TYPES",
     })
   }
 }
@@ -660,7 +676,6 @@ function onBlockAdd(state: AppState, payload: JsonObject): void {
   if (type !== "tool_call") return
 
   const name = stringValue(block.name) || "tool"
-  const workerLabel = stringValue(block.subagent_label)
   const signal: SignalLevel = LOW_SIGNAL_TOOLS.has(name) ? "low" : "high"
   let aggregateId: string | undefined
   if (signal === "low") aggregateId = bumpMasterAggregate(state, name)
@@ -677,7 +692,6 @@ function onBlockAdd(state: AppState, payload: JsonObject): void {
     toolName: name,
     ts: stringValue(block.created_at),
     verb: toolVerb(name),
-    workerLabel: workerLabel || undefined,
   })
   state.pendingBlocks[id] = {
     aggregateId,
@@ -686,7 +700,6 @@ function onBlockAdd(state: AppState, payload: JsonObject): void {
     name,
     startedAt: stringValue(block.created_at),
     type,
-    workerLabel: workerLabel || undefined,
   }
   if (!state.turnToolNames.includes(name)) state.turnToolNames.push(name)
 }
@@ -758,7 +771,6 @@ function addGuard(state: AppState, payload: JsonObject): void {
     status: action === "finalize" ? "failed" : "partial",
     title: `GUARD · ${source}`,
     ts: stringValue(payload.ts),
-    workerLabel: stringValue(payload.subagent_label) || undefined,
   })
 }
 
@@ -794,7 +806,7 @@ function onWorkerLifecycle(state: AppState, payload: JsonObject): void {
   if (!advanceWorkerStatus(worker, normalizeWorkerStatus(status))) return
   worker.durationMs = numberValue(payload.duration_ms) ?? worker.durationMs
   if (worker.status === "running" && !worker.startedAt) worker.startedAt = Date.now()
-  if (TERMINAL_WORKER_STATES.has(worker.status)) {
+  if (SETTLED_WORKER_STATES.has(worker.status)) {
     worker.currentStep = undefined
     worker.phase = friendlyPhase(worker.status, [])
     if (worker.phases.at(-1) !== worker.phase) worker.phases.push(worker.phase)
@@ -825,7 +837,7 @@ function onWorkerLifecycle(state: AppState, payload: JsonObject): void {
 function onWorkerActivity(state: AppState, payload: JsonObject): void {
   const worker = ensureWorker(state, payload)
   if (!workerEventMatchesCurrentRun(worker, payload)) return
-  if (TERMINAL_WORKER_STATES.has(worker.status)) return
+  if (SETTLED_WORKER_STATES.has(worker.status)) return
   const label = stringValue(payload.label) || worker.label
   const revision = numberValue(payload.revision) ?? 0
   if (revision && revision <= (worker.lastRevision[label] ?? 0)) return
@@ -855,7 +867,7 @@ function onWorkerActivity(state: AppState, payload: JsonObject): void {
 function onWorkerToolResult(state: AppState, payload: JsonObject): void {
   const worker = ensureWorker(state, payload)
   if (!workerEventMatchesCurrentRun(worker, payload)) return
-  if (TERMINAL_WORKER_STATES.has(worker.status)) return
+  if (SETTLED_WORKER_STATES.has(worker.status)) return
   const name = stringValue(payload.tool_name) || "tool"
   const failed = stringValue(payload.status) !== "done"
   const signal: SignalLevel = failed || !LOW_SIGNAL_TOOLS.has(name) ? "high" : "low"
@@ -902,7 +914,7 @@ function onWorkerToolResult(state: AppState, payload: JsonObject): void {
 function updateWorkerHeartbeat(state: AppState, payload: JsonObject): void {
   const worker = ensureWorker(state, payload)
   if (!workerEventMatchesCurrentRun(worker, payload)) return
-  if (!TERMINAL_WORKER_STATES.has(worker.status)) worker.status = stringValue(payload.status) || "running"
+  if (!SETTLED_WORKER_STATES.has(worker.status)) worker.status = stringValue(payload.status) || "running"
   const elapsed = numberValue(payload.elapsed_ms)
   if (elapsed !== undefined) worker.durationMs = elapsed
 }
@@ -961,96 +973,24 @@ function onTurnEnd(state: AppState, payload: JsonObject): void {
   state.masterAggregateId = undefined
 }
 
-function onProfileEvent(state: AppState, event: string, payload: JsonObject): void {
-  if (event === "chat.profile.pinned") return
-  if (event === "chat.profile.route") {
-    addMasterItem(state, {
-      body: `${stringValue(payload.agent_id) || "agent"}${payload.fallback_used ? " · fallback route" : ""}`,
-      kind: "lifecycle",
-      signal: "high",
-      status: "running",
-      title: "AGENT DISPATCHED",
-      ts: stringValue(payload.ts),
-    })
-    return
-  }
-  if (event === "chat.profile.handoff") {
-    addMasterItem(state, {
-      body: `${stringValue(payload.from_agent_id) || "agent"} → ${stringValue(payload.recommended_agent_id) || "coordinator"} · ${oneLine(stringValue(payload.summary), 160)}`,
-      kind: "lifecycle",
-      signal: "high",
-      status: "partial",
-      title: "HANDOFF",
-      ts: stringValue(payload.ts),
-    })
-    return
-  }
-  if (event === "chat.profile.delegate.start") {
-    addMasterItem(state, {
-      body: oneLine(stringValue(payload.task), 180),
-      kind: "lifecycle",
-      signal: "high",
-      status: "running",
-      title: "DELEGATED",
-      ts: stringValue(payload.ts),
-      workerLabel: stringValue(payload.label) || stringValue(payload.agent_id) || undefined,
-    })
-    return
-  }
-  if (event === "chat.profile.delegate.complete") {
-    const completed = stringValue(payload.status) === "completed"
-    addMasterItem(state, {
-      body: oneLine(stringValue(payload.summary), 180),
-      kind: "lifecycle",
-      signal: "high",
-      status: completed ? "done" : "failed",
-      title: completed ? "DELEGATE COMPLETE" : "DELEGATE FAILED",
-      ts: stringValue(payload.ts),
-      workerLabel: stringValue(payload.label) || stringValue(payload.agent_id) || undefined,
-    })
-    return
-  }
-  if (event === "chat.profile.delegate.join") {
-    addMasterItem(state, {
-      body: `${numberValue(payload.succeeded) ?? 0}/${numberValue(payload.branch_count) ?? 0} joined${formatDuration(numberValue(payload.duration_ms)) ? ` · ${formatDuration(numberValue(payload.duration_ms))}` : ""}`,
-      kind: "lifecycle",
-      signal: "high",
-      status: "done",
-      title: "DELEGATES JOINED",
-      ts: stringValue(payload.ts),
-    })
-    return
-  }
-  if (event === "chat.profile.completion") {
-    addMasterItem(state, {
-      body: stringValue(payload.agent_id) || "agent",
-      kind: "lifecycle",
-      signal: "high",
-      status: "done",
-      title: "AGENT COMPLETE",
-      ts: stringValue(payload.ts),
-    })
-  }
-}
-
 function ensureWorker(state: AppState, payload: JsonObject): WorkerInfo {
-  const id = stringValue(payload.worker_id) || `unknown-${stringValue(payload.profile_id) || "worker"}`
+  const id = stringValue(payload.worker_id) || `unknown-${stringValue(payload.worker_type_id) || "worker"}`
   let worker = state.workers[id]
   if (worker) return worker
-  const profileId = stringValue(payload.profile_id) || "worker"
+  const workerTypeId = stringValue(payload.worker_type_id) || "worker"
   worker = {
     id,
-    label: workerLabel(profileId, id),
+    label: workerLabel(workerTypeId, id),
     lastRevision: {},
     phase: "queued",
     phases: [],
-    profileId,
     runId: stringValue(payload.run_id) || undefined,
     runSequence: numberValue(payload.run_sequence),
     status: stringValue(payload.status) || "queued",
     timeline: [],
     unread: 0,
     usage: {},
+    workerTypeId,
   }
   state.workers[id] = worker
   state.workerOrder.push(id)
@@ -1059,34 +999,38 @@ function ensureWorker(state: AppState, payload: JsonObject): WorkerInfo {
 
 function upsertWorkerSnapshot(state: AppState, snapshot: WorkerSnapshot): WorkerInfo {
   const id = stringValue(snapshot.worker_id) || "unknown-worker"
-  const profile = objectValue(snapshot.profile)
-  const profileId = stringValue(snapshot.profile_id) || stringValue(profile?.profile_id) || "worker"
+  const definition = objectValue(snapshot.definition)
+  const workerTypeId = stringValue(snapshot.worker_type_id) || stringValue(definition?.id) || "worker"
   const worker = ensureWorker(state, {
-    profile_id: profileId,
+    worker_type_id: workerTypeId,
     status: snapshot.status,
     worker_id: id,
   })
-  worker.profileId = profileId
-  worker.label = workerLabel(profileId, id)
+  worker.workerTypeId = workerTypeId
+  worker.definitionDescription = stringValue(definition?.description) || undefined
+  worker.definitionDigest = stringValue(definition?.digest) || undefined
+  worker.definitionSource = stringValue(definition?.source) || undefined
+  worker.label = workerLabel(workerTypeId, id)
   const runs = Array.isArray(snapshot.runs)
     ? (arrayOfObjects(snapshot.runs) as WorkerRunSnapshot[])
     : []
   const latest = (objectValue(snapshot.latest_run) as WorkerRunSnapshot | undefined) ?? runs.at(-1)
+  const sessionStatus = stringValue(snapshot.status)
   if (latest) {
     if (!mergeWorkerRun(worker, latest)) return worker
   } else {
-    const snapshotStatus = stringValue(snapshot.status)
-    if (snapshotStatus) advanceWorkerStatus(worker, normalizeWorkerStatus(snapshotStatus))
+    if (sessionStatus) advanceWorkerStatus(worker, normalizeWorkerStatus(sessionStatus))
   }
+  if (sessionStatus === "archived") worker.status = "archived"
 
   const phase = stringValue(snapshot.phase)
   if (phase) worker.phase = friendlyPhase(phase, [])
   const phases = arrayOfStrings(snapshot.phases).map((item) => friendlyPhase(item, []))
   if (phases.length) worker.phases = [...new Set(phases)]
   const currentStep = oneLine(stringValue(snapshot.current_step), 120)
-  if (currentStep && !TERMINAL_WORKER_STATES.has(worker.status)) {
+  if (currentStep && !SETTLED_WORKER_STATES.has(worker.status)) {
     worker.currentStep = currentStep
-  } else if (TERMINAL_WORKER_STATES.has(worker.status)) {
+  } else if (SETTLED_WORKER_STATES.has(worker.status)) {
     worker.currentStep = undefined
   }
   worker.todoCompleted = numberValue(snapshot.todo_completed) ?? worker.todoCompleted
@@ -1214,12 +1158,14 @@ function mergeWorkerRun(worker: WorkerInfo, run: WorkerRunSnapshot): boolean {
     )
   ) return false
   advanceWorkerStatus(worker, normalizeWorkerStatus(stringValue(run.status)))
-  worker.goal = stringValue(run.goal) || stringValue(run.goal_preview) || worker.goal
+  worker.objective = stringValue(run.objective) || stringValue(run.objective_preview) || worker.objective
+  worker.sourceRunId = stringValue(run.source_run_id) || undefined
+  worker.waitingQuestion = stringValue(run.waiting_question) || undefined
   if ("summary" in run) worker.report = stringValue(run.summary) || undefined
   worker.durationMs = numberValue(run.duration_ms) ?? worker.durationMs
   const usage = objectValue(run.usage)
   if (usage) worker.usage = { ...usage }
-  if (TERMINAL_WORKER_STATES.has(worker.status)) worker.currentStep = undefined
+  if (SETTLED_WORKER_STATES.has(worker.status)) worker.currentStep = undefined
   return true
 }
 
@@ -1252,17 +1198,19 @@ function beginWorkerRun(
   worker.runSequence = runSequence
   worker.currentStep = undefined
   worker.durationMs = undefined
-  worker.goal = undefined
+  worker.objective = undefined
   worker.lastRevision = {}
   worker.phase = "queued"
   worker.phases = []
   worker.report = undefined
+  worker.sourceRunId = undefined
   worker.startedAt = undefined
   worker.status = "queued"
   worker.timeline = []
   worker.todoCompleted = undefined
   worker.todoTotal = undefined
   worker.usage = {}
+  worker.waitingQuestion = undefined
   return true
 }
 
@@ -1283,16 +1231,16 @@ function workerEventMatchesCurrentRun(worker: WorkerInfo, payload: JsonObject): 
 
 function advanceWorkerStatus(worker: WorkerInfo, incoming: string): boolean {
   if (!incoming) return true
-  const currentTerminal = TERMINAL_WORKER_STATES.has(worker.status)
-  const incomingTerminal = TERMINAL_WORKER_STATES.has(incoming)
-  if (currentTerminal && !incomingTerminal) return false
+  const currentSettled = SETTLED_WORKER_STATES.has(worker.status)
+  const incomingSettled = SETTLED_WORKER_STATES.has(incoming)
+  if (currentSettled && !incomingSettled) return false
   const ranks: Record<string, number> = {
     created: 0,
     queued: 0,
     running: 1,
     waiting_for_context: 2,
   }
-  if (!incomingTerminal && (ranks[incoming] ?? 0) < (ranks[worker.status] ?? 0)) {
+  if (!incomingSettled && (ranks[incoming] ?? 0) < (ranks[worker.status] ?? 0)) {
     return false
   }
   worker.status = incoming
@@ -1600,15 +1548,10 @@ function friendlyPhase(phase: string, tools: string[]): string {
   return (
     {
       analyzing: "analyzing",
-      branch_done: "synthesizing",
-      branch_running: "executing",
-      delegating: "delegating",
       drafting: "drafting",
       finalizing: "finalizing",
-      handoff: "handoff",
       planning: "planning",
       processing: "processing",
-      synthesizing: "synthesizing",
       working_step: "working",
     }[phase] ?? phase
   )
@@ -1623,7 +1566,6 @@ function lifecycleBody(status: string, durationMs?: number): string {
       partial: "Partially completed",
       queued: "Queued",
       running: "Started",
-      timed_out: "Timed out",
       waiting_for_context: "Waiting for context",
     }[status] ?? status
   const duration = formatDuration(durationMs)
@@ -1631,7 +1573,6 @@ function lifecycleBody(status: string, durationMs?: number): string {
 }
 
 function normalizeWorkerStatus(value: string): string {
-  if (value === "timed_out") return "timed_out"
   return value || "running"
 }
 
@@ -1639,7 +1580,7 @@ function timelineStatus(status: string): TimelineStatus {
   if (status === "completed") return "done"
   if (status === "partial" || status === "waiting_for_context") return "partial"
   if (status === "cancelled") return "cancelled"
-  if (status === "failed" || status === "timed_out") return "failed"
+  if (status === "failed") return "failed"
   return "running"
 }
 
@@ -1647,9 +1588,9 @@ function guardActionLabel(action: string): string {
   return { continue: "Continue", finalize: "Stopped", retry: "Retrying" }[action] ?? action
 }
 
-function workerLabel(profileId: string, workerId: string): string {
+function workerLabel(workerTypeId: string, workerId: string): string {
   const suffix = workerId.replace(/[^a-zA-Z0-9]/g, "").slice(0, 4)
-  return suffix ? `${profileId}#${suffix}` : profileId
+  return suffix ? `${workerTypeId}#${suffix}` : workerTypeId
 }
 
 function isFailedStatus(value: unknown): boolean {

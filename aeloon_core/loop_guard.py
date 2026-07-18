@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Literal
 
+from aeloon_core.context_compaction import estimate_request_tokens
 from aeloon_core.providers.base import LLMProvider, ToolCallRequest
 from aeloon_core.transitions import normalize_usage
 from aeloon_core.utils.tool_history import (
@@ -230,7 +231,12 @@ class GuardReviewer:
         self.max_tokens = max(1, max_tokens)
         self.timeout_seconds = max(0.1, float(timeout_seconds))
 
-    async def decide(self, request: GuardRequest) -> GuardResolution:
+    async def decide(
+        self,
+        request: GuardRequest,
+        *,
+        token_budget: int | None = None,
+    ) -> GuardResolution:
         evidence = request.evidence.to_payload()
         allowed = tuple(action.value for action in request.allowed_actions)
         messages = [
@@ -249,13 +255,29 @@ class GuardReviewer:
                 ),
             },
         ]
+        call_max_tokens = self.max_tokens
+        if token_budget is not None:
+            estimated_input = estimate_request_tokens(
+                messages,
+                tools=[],
+                model=self.model,
+            )
+            if estimated_input >= token_budget:
+                return self._fallback(request, evidence)
+            call_max_tokens = min(call_max_tokens, token_budget - estimated_input)
+
         try:
             async with asyncio.timeout(self.timeout_seconds):
-                response = await self.provider.chat_with_retry(
+                call = (
+                    self.provider.chat
+                    if token_budget is not None
+                    else self.provider.chat_with_retry
+                )
+                response = await call(
                     messages=messages,
                     tools=[],
                     model=self.model,
-                    max_tokens=self.max_tokens,
+                    max_tokens=call_max_tokens,
                     temperature=0.0,
                     response_format={"type": "json_object"},
                 )
@@ -342,7 +364,15 @@ def suppress_successful_side_effect_duplicates(
     *,
     tool_modes: Mapping[str, str],
 ) -> ToolCallClassification:
-    seen = collect_successful_tool_call_fingerprints(messages)
+    # A new user assignment is a new execution boundary. Reuse/resume restores
+    # prior Worker history, but intentionally repeating an operation in the new
+    # WorkerRun must not be mistaken for a retry within the current Run.
+    current_turn = messages
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].get("role") == "user":
+            current_turn = messages[index + 1 :]
+            break
+    seen = collect_successful_tool_call_fingerprints(current_turn)
     batch_seen: set[str] = set()
     executable: list[ToolCallRequest] = []
     rejected: list[ToolCallRequest] = []

@@ -10,8 +10,10 @@ from typing import TYPE_CHECKING, Any
 from aeloon_core.agents import (
     AgentRuntime,
     BaseAgent,
-    MasterAgent,
-    WorkerAgent,
+    GuardAgent,
+    ModelAgent,
+    RouterAgent,
+    ToolAgent,
 )
 from aeloon_core.loop_guard import (
     GuardEvent,
@@ -21,21 +23,18 @@ from aeloon_core.loop_guard import (
 )
 from aeloon_core.minimal_context import MinimalContextProcessor
 from aeloon_core.model_input import PrepareModelInput
-from aeloon_core.profile_agents import ControlAgent, ProfileDomainAgent
-from aeloon_core.profile_runtime import LLMProfileMaster
+from aeloon_core.runtime_support import default_add_tool_result
 from aeloon_core.state import (
     AgentNode,
     LightweightState,
-    ProfileRef,
     RunStatus,
     StateMetadata,
 )
-from aeloon_core.tool_agents import GuardAgent, ToolAgent
 from aeloon_core.transitions import TransitionRecord, TransitionRecorder
 
 if TYPE_CHECKING:
-    from aeloon_core.profiles import RuntimeProfileSpec
-    from aeloon_core.providers.base import LLMProvider, ToolCallRequest
+    from aeloon_core.agents import CompletionGate
+    from aeloon_core.providers.base import LLMProvider
     from aeloon_core.tools.registry import ToolRegistry
 
 
@@ -51,20 +50,17 @@ async def run_agent_loop(
     minimal_context_tool_result_chars: int = 1_200,
     tool_error_guard_threshold: int = 3,
     budget_auto_continues: int = 2,
+    max_tokens: int | None = None,
+    max_tool_calls: int | None = None,
     session_id: str | None = None,
     turn_id: str | None = None,
     on_transition: Callable[[TransitionRecord], None] | None = None,
     on_progress: Callable[..., Awaitable[None]] | None = None,
     prepare_model_input: PrepareModelInput | None = None,
-    add_assistant_message: Callable[..., list[dict[str, Any]]] | None = None,
-    add_tool_result: Callable[[list[dict[str, Any]], str, str, str], list[dict[str, Any]]]
-    | None = None,
-    strip_think: Callable[[str | None], str | None] | None = None,
-    tool_hint: Callable[[list[ToolCallRequest]], str] | None = None,
-    profile: RuntimeProfileSpec | None = None,
-    max_handoffs: int = 8,
+    require_terminal: bool = False,
+    completion_gate: CompletionGate | None = None,
 ) -> LightweightState:
-    """Run the explicit Master -> Worker/Tool/Guard state machine."""
+    """Run the generic Router -> Model/Tool/Guard state machine."""
 
     if max_iterations < 1:
         raise ValueError("max_iterations must be at least 1")
@@ -72,6 +68,10 @@ async def run_agent_loop(
         raise ValueError("tool_error_guard_threshold must be at least 1")
     if budget_auto_continues < 0:
         raise ValueError("budget_auto_continues must be non-negative")
+    if max_tokens is not None and max_tokens < 1:
+        raise ValueError("max_tokens must be at least 1")
+    if max_tool_calls is not None and max_tool_calls < 1:
+        raise ValueError("max_tool_calls must be at least 1")
 
     metadata = StateMetadata(
         session_id=session_id,
@@ -84,17 +84,6 @@ async def run_agent_loop(
         max_iterations=max_iterations,
         metadata=metadata,
     )
-    if profile is not None:
-        artifact_id = profile.artifact_id or (
-            f"inline:{profile.profile_id}:revision-{profile.revision}"
-        )
-        state.profile_ref = ProfileRef(
-            profile_id=profile.profile_id,
-            revision=profile.revision,
-            artifact_id=artifact_id,
-            generation=profile.generation,
-        )
-        state.active_tools = []
     context_processor = MinimalContextProcessor(
         preserve_recent_turns=minimal_context_recent_turns,
         max_tool_result_chars=minimal_context_tool_result_chars,
@@ -104,15 +93,6 @@ async def run_agent_loop(
         turn_id=turn_id,
         persist=on_transition if transition_trace_enabled else None,
     )
-    runtime_kwargs: dict[str, Any] = {}
-    if add_assistant_message is not None:
-        runtime_kwargs["add_assistant_message"] = add_assistant_message
-    if add_tool_result is not None:
-        runtime_kwargs["add_tool_result"] = add_tool_result
-    if strip_think is not None:
-        runtime_kwargs["strip_think"] = strip_think
-    if tool_hint is not None:
-        runtime_kwargs["tool_hint"] = tool_hint
     runtime = AgentRuntime(
         provider=provider,
         model=model,
@@ -121,45 +101,28 @@ async def run_agent_loop(
         base_iteration_budget=max_iterations,
         context_processor=context_processor,
         recorder=recorder,
-        profile=profile,
-        profile_master=LLMProfileMaster(provider=provider, model=model)
-        if profile is not None
-        else None,
-        max_handoffs=max_handoffs,
+        require_terminal=require_terminal,
         tool_error_guard_threshold=tool_error_guard_threshold,
         budget_auto_continues=budget_auto_continues,
+        max_tokens=max_tokens,
+        max_tool_calls=max_tool_calls,
         trace_enabled=transition_trace_enabled,
         on_progress=on_progress,
         prepare_model_input=prepare_model_input,
-        **runtime_kwargs,
+        completion_gate=completion_gate,
     )
     agents: dict[AgentNode, BaseAgent] = {
-        AgentNode.MASTER: MasterAgent(runtime),
-        AgentNode.WORKER: WorkerAgent(runtime),
-        AgentNode.CONTROL: ControlAgent(runtime),
+        AgentNode.ROUTER: RouterAgent(runtime),
+        AgentNode.MODEL: ModelAgent(runtime),
         AgentNode.TOOL: ToolAgent(runtime),
         AgentNode.GUARD: GuardAgent(runtime),
     }
-    profile_agents = (
-        {agent.id: ProfileDomainAgent(runtime, agent.id) for agent in profile.agents}
-        if profile is not None
-        else {}
-    )
 
     await runtime.emit_hook("on_turn_start")
-    if state.profile_ref is not None:
-        await runtime.emit_hook("on_profile_pinned", state.profile_ref.to_dict())
     current_digest = state.digest() if transition_trace_enabled else ""
     while state.metadata.phase != AgentNode.DONE:
         node = state.metadata.phase
-        if (
-            node == AgentNode.WORKER
-            and profile is not None
-            and state.metadata.status != RunStatus.FINALIZING
-        ):
-            agent = profile_agents.get(state.active_agent_id or "")
-        else:
-            agent = agents.get(node)
+        agent = agents.get(node)
         if agent is None:
             await runtime.finish(
                 state,
@@ -198,7 +161,7 @@ async def run_agent_loop(
                     reason="guard or finalization failed",
                 )
             else:
-                failures, outcomes, side_effects = _pair_interrupted_tool_calls(state, runtime, exc)
+                failures, outcomes, side_effects = _pair_interrupted_tool_calls(state, exc)
                 state = await runtime.queue_guard(
                     state,
                     event=GuardEvent.RUNTIME_ERROR,
@@ -215,7 +178,6 @@ async def run_agent_loop(
                 node=node,
                 node_kind=node_kind,
                 component=component,
-                profile=(state.profile_ref.to_dict() if state.profile_ref is not None else None),
                 before_digest=runtime.step_before_digest or before_digest,
                 after_digest=state.digest(),
                 decision=runtime.last_decision,
@@ -248,7 +210,6 @@ def _active_tool_names(tool_defs: list[dict[str, Any]]) -> list[str]:
 
 def _pair_interrupted_tool_calls(
     state: LightweightState,
-    runtime: AgentRuntime,
     exc: Exception,
 ) -> tuple[
     tuple[dict[str, Any], ...],
@@ -272,7 +233,7 @@ def _pair_interrupted_tool_calls(
     for call in state.pending_tool_calls:
         if call.id in answered or call.id not in declared:
             continue
-        state.messages = runtime.add_tool_result(
+        state.messages = default_add_tool_result(
             state.messages,
             call.id,
             call.name,
@@ -281,7 +242,6 @@ def _pair_interrupted_tool_calls(
         )
     state.pending_response = None
     state.pending_tool_calls = []
-    state.pending_control_call = None
     failures: list[dict[str, Any]] = []
     outcomes: list[str] = []
     side_effects: list[dict[str, Any]] = []

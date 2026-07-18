@@ -125,8 +125,8 @@ class ExecTool(WorkspaceTool):
                 f'"{_sandbox_literal(path)}"))'
                 for path in self.denied_paths
             )
-            profile = f"(version 1)\n(allow default)\n{denied_rules}\n"
-            return [str(sandbox_exec), "-p", profile, "/bin/sh", "-c", command]
+            sandbox_policy = f"(version 1)\n(allow default)\n{denied_rules}\n"
+            return [str(sandbox_exec), "-p", sandbox_policy, "/bin/sh", "-c", command]
 
         bubblewrap = shutil.which("bwrap")
         if bubblewrap is None:

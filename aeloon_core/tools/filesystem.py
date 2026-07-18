@@ -93,9 +93,12 @@ class ReadTool(WorkspaceTool):
             return f"Error reading file: {exc}"
 
 
-# Host default per-call write/edit chunk size. Effective limit is
-# min(DEFAULT_MAX_ARGUMENT_CHARS, model_max_output_tokens) when metadata is known.
+# Host default per-call write/edit chunk size. Model metadata reports tokens,
+# while JSON Schema's maxLength and the runtime checks below count characters.
+# Use the same conservative token estimate used throughout the runtime before
+# applying the host ceiling.
 DEFAULT_MAX_ARGUMENT_CHARS = 32_000
+ESTIMATED_OUTPUT_CHARS_PER_TOKEN = 4
 _MAX_ARGUMENT_CHARS = DEFAULT_MAX_ARGUMENT_CHARS  # backward-compatible alias
 _MAX_FILE_BYTES = 16 * 1024 * 1024
 
@@ -103,9 +106,9 @@ _MAX_FILE_BYTES = 16 * 1024 * 1024
 def resolve_max_argument_chars(model_max_output_tokens: int | None = None) -> int:
     """Return the effective per-call write/edit character budget.
 
-    Defaults to 32,000 characters and never exceeds that host ceiling. When the
-    model's advertised max output length is known and smaller, use that instead
-    so a single tool argument cannot exceed what the model can emit in one shot.
+    Defaults to 32,000 characters and never exceeds that host ceiling. Model
+    output metadata is expressed in tokens, so convert it to an estimated
+    character capacity before comparing values with the same unit.
     """
 
     default = DEFAULT_MAX_ARGUMENT_CHARS
@@ -117,7 +120,8 @@ def resolve_max_argument_chars(model_max_output_tokens: int | None = None) -> in
         return default
     if model_limit <= 0:
         return default
-    return min(default, model_limit)
+    model_character_limit = model_limit * ESTIMATED_OUTPUT_CHARS_PER_TOKEN
+    return min(default, model_character_limit)
 
 
 def _render_value(value: Any) -> str:

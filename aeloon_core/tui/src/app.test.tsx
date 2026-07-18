@@ -19,13 +19,19 @@ const snapshot: ReadySnapshot = {
   session_id: "session-internal-uuid",
   workers: [
     {
+      definition: {
+        description: "Build and verify complete workspace changes.",
+        digest: "sha256:builder-v2",
+        id: "coding",
+        source: "builtin",
+      },
       latest_run: {
-        goal: "Build the safe Worker detail projection and verify its tests.",
+        objective: "Build the safe Worker detail projection and verify its tests.",
         run_id: "run-internal-uuid",
         run_sequence: 1,
         status: "running",
       },
-      profile_id: "coding",
+      worker_type_id: "coding",
       status: "running",
       worker_id: "ab12-worker-internal-uuid",
     },
@@ -91,7 +97,7 @@ const events: BridgeEnvelope[] = [
     event: "chat.worker.lifecycle",
     payload: {
       phase: "running",
-      profile_id: "coding",
+      worker_type_id: "coding",
       run_id: "run-internal-uuid",
       status: "running",
       worker_id: "ab12-worker-internal-uuid",
@@ -104,7 +110,7 @@ const events: BridgeEnvelope[] = [
       current_step: "Wire the operator-safe journal",
       label: "coding#ab12",
       phase: "using_tool",
-      profile_id: "coding",
+      worker_type_id: "coding",
       revision: 1,
       run_id: "run-internal-uuid",
       todo_completed: 2,
@@ -119,7 +125,7 @@ const events: BridgeEnvelope[] = [
     payload: {
       duration_ms: 15,
       metrics: { resource: "worker_sessions.py", result_chars: 840, result_lines: 31 },
-      profile_id: "coding",
+      worker_type_id: "coding",
       status: "done",
       tool_name: "read",
       worker_id: "ab12-worker-internal-uuid",
@@ -135,7 +141,7 @@ const events: BridgeEnvelope[] = [
         exit_code: 0,
         result_preview: "worker tests passed\nExit code: 0",
       },
-      profile_id: "coding",
+      worker_type_id: "coding",
       status: "done",
       tool_name: "exec",
       worker_id: "ab12-worker-internal-uuid",
@@ -147,7 +153,7 @@ const events: BridgeEnvelope[] = [
     payload: {
       duration_ms: 33,
       metrics: { new_chars: 310, old_chars: 240, resource: "worker_ui_journal.py" },
-      profile_id: "coding",
+      worker_type_id: "coding",
       status: "done",
       tool_name: "str_replace",
       worker_id: "ab12-worker-internal-uuid",
@@ -311,6 +317,8 @@ test("Tab opens the Worker workbench without stealing composer focus on updates"
   const frame = setup.captureCharFrame()
 
   expect(frame).toContain("Build the safe Worker detail projection")
+  expect(frame).toContain("Build and verify complete workspace changes")
+  expect(frame).toContain("sha256:builder-v2")
   expect(frame).toContain("PHASE")
   expect(frame).toContain("TODO")
   expect(frame).toContain("Wire the operator-safe journal")
@@ -336,11 +344,11 @@ test("terminal Worker refreshes its report without taking focus from Master", as
           current_step: "Verify focused tests",
           phase: "completed",
           phases: ["planning", "testing", "completed"],
-          profile_id: "coding",
+          worker_type_id: "coding",
           runs: [
             {
               duration_ms: 4_200,
-              goal: "Build the safe Worker detail projection and verify its tests.",
+              objective: "Build the safe Worker detail projection and verify its tests.",
               run_id: "run-internal-uuid",
               status: "completed",
               summary: "Safe journal implemented; focused tests pass.",
@@ -376,7 +384,7 @@ test("terminal Worker refreshes its report without taking focus from Master", as
     payload: {
       duration_ms: 4_200,
       phase: "completed",
-      profile_id: "coding",
+      worker_type_id: "coding",
       run_id: "run-internal-uuid",
       status: "completed",
       worker_id: "ab12-worker-internal-uuid",
@@ -495,7 +503,7 @@ test("late Worker inspection hydrates detail without stealing a newer Master sel
 
   setup.mockInput.pressKey("m")
   inspection.resolve({
-    profile_id: "coding",
+    worker_type_id: "coding",
     runs: [],
     status: "running",
     timeline: [],
@@ -638,7 +646,7 @@ test("manual spawn starts an attached in-process Worker", async () => {
         requests.push({ command, payload })
         return {
           created: true,
-          profile_id: "coding",
+          worker_type_id: "coding",
           run_id: "private-run",
           worker_id: "worker-manual",
         }
@@ -658,9 +666,9 @@ test("manual spawn starts an attached in-process Worker", async () => {
 
   const request = requests.find((item) => item.command === "spawn_worker")
   expect(request?.payload).toMatchObject({
-    detached: false,
-    profile_id: "coding",
-    task: "fix the queue",
+    objective: "fix the queue",
+    session_id: "session-internal-uuid",
+    worker_type_id: "coding",
   })
   setup.renderer.destroy()
 })
@@ -689,7 +697,7 @@ test("a terminal Worker event from another session cannot trigger detail hydrati
     event: "chat.worker.lifecycle",
     payload: {
       phase: "failed",
-      profile_id: "coding",
+      worker_type_id: "coding",
       session_id: "another-session",
       worker_id: "foreign-worker",
     },
@@ -735,7 +743,7 @@ test("a late Worker detail response cannot repopulate a newly selected session",
     },
   })
   inspection.resolve({
-    profile_id: "coding",
+    worker_type_id: "coding",
     runs: [],
     status: "running",
     timeline: [],
@@ -778,7 +786,7 @@ test("a late inspection cannot roll a Worker back to its previous run", async ()
     event: "chat.worker.lifecycle",
     payload: {
       phase: "running",
-      profile_id: "coding",
+      worker_type_id: "coding",
       run_id: "run-two",
       run_sequence: 2,
       worker_id: "ab12-worker-internal-uuid",
@@ -786,7 +794,7 @@ test("a late inspection cannot roll a Worker back to its previous run", async ()
   })
   inspection.resolve({
     phase: "completed",
-    profile_id: "coding",
+    worker_type_id: "coding",
     runs: [
       {
         run_id: "run-internal-uuid",
@@ -937,7 +945,7 @@ test("a bridge failure is visible and retains later composer input", async () =>
   setup.renderer.destroy()
 })
 
-test("Worker recovery pre-fills the composer and sends an explicit instruction", async () => {
+test("Worker resume pre-fills the composer and sends an explicit response", async () => {
   let options: BridgeClientOptions | undefined
   const requests: Array<{ command: string; payload?: JsonObject }> = []
   const bridgeFactory = (value: BridgeClientOptions): RuntimeBridge => {
@@ -948,7 +956,11 @@ test("Worker recovery pre-fills the composer and sends an explicit instruction",
         requests.push({ command, payload })
         return {}
       },
-      start: () => options?.onEnvelope({ type: "ready", payload: snapshot }),
+      start: () =>
+        options?.onEnvelope({
+          type: "ready",
+          payload: waitingSnapshot(),
+        }),
     }
   }
   const setup = await testRender(() => <App bridgeFactory={bridgeFactory} />, {
@@ -968,21 +980,20 @@ test("Worker recovery pre-fills the composer and sends an explicit instruction",
   ) as TextareaRenderable
   expect(composer.focused).toBeTrue()
   expect(composer.plainText).toBe("/resume-worker ")
+  expect(setup.captureCharFrame()).toContain("Which focused tests should I rerun?")
 
   await setup.mockInput.typeText("retry focused tests")
   setup.mockInput.pressEnter()
   await setup.waitFor(() => requests.some((item) => item.command === "resume_worker"))
 
   expect(requests.find((item) => item.command === "resume_worker")?.payload).toMatchObject({
-    expected_run_sequence: 1,
-    instruction: "retry focused tests",
+    response: "retry focused tests",
     run_id: "run-internal-uuid",
-    worker_id: "ab12-worker-internal-uuid",
   })
   setup.renderer.destroy()
 })
 
-test("Worker recovery never treats an instruction prefix as another Worker selector", async () => {
+test("Worker resume never treats a response prefix as another Worker selector", async () => {
   let options: BridgeClientOptions | undefined
   const requests: Array<{ command: string; payload?: JsonObject }> = []
   const bridgeFactory = (value: BridgeClientOptions): RuntimeBridge => {
@@ -997,17 +1008,17 @@ test("Worker recovery never treats an instruction prefix as another Worker selec
         options?.onEnvelope({
           type: "ready",
           payload: {
-            ...snapshot,
+            ...waitingSnapshot(),
             workers: [
-              ...(snapshot.workers ?? []),
+              ...(waitingSnapshot().workers ?? []),
               {
                 latest_run: {
-                  goal: "A different Worker whose label matches the instruction prefix.",
+                  objective: "A different Worker whose label matches the response prefix.",
                   run_id: "other-run",
                   run_sequence: 3,
                   status: "failed",
                 },
-                profile_id: "coding-other",
+                worker_type_id: "coding-other",
                 status: "failed",
                 worker_id: "coding-other-worker",
               },
@@ -1031,9 +1042,23 @@ test("Worker recovery never treats an instruction prefix as another Worker selec
   await setup.waitFor(() => requests.some((item) => item.command === "resume_worker"))
 
   expect(requests.find((item) => item.command === "resume_worker")?.payload).toMatchObject({
-    instruction: "coding-other fix focused tests",
+    response: "coding-other fix focused tests",
     run_id: "run-internal-uuid",
-    worker_id: "ab12-worker-internal-uuid",
   })
   setup.renderer.destroy()
 })
+
+function waitingSnapshot(): ReadySnapshot {
+  return {
+    ...snapshot,
+    workers: (snapshot.workers ?? []).map((worker) => ({
+      ...worker,
+      latest_run: {
+        ...(worker.latest_run ?? {}),
+        status: "waiting_for_context",
+        waiting_question: "Which focused tests should I rerun?",
+      },
+      status: "idle",
+    })),
+  }
+}

@@ -1,7 +1,7 @@
 """Operator-only, privacy-preserving Worker timeline storage and queries.
 
-This module is intentionally not part of :class:`WorkerControlService`. Base
-agents keep their existing bounded control surface, while the local operator UI
+This module is intentionally not part of :class:`WorkerControlService`. Master
+agents keep their bounded control surface, while the local operator UI
 can inspect a durable projection of Worker activity without reading private
 transcripts. Tool output is limited to bounded exec output and failure previews.
 """
@@ -25,7 +25,7 @@ from typing import Any
 from loguru import logger
 
 from aeloon_core.operator_output import sanitize_operator_output
-from aeloon_core.worker_sessions import WorkerRunRecord, WorkerStore
+from aeloon_core.worker_sessions import WorkerRunRecord, WorkerRunStatus, WorkerStore
 
 _MAX_EVENTS_PER_RUN = 500
 _MAX_TOTAL_EVENTS = 50_000
@@ -50,24 +50,19 @@ _ACTIVITY_PHASES = {
     "processing",
     "working_step",
     "finalizing",
-    "delegating",
-    "handoff",
-    "branch_running",
-    "branch_done",
-    "synthesizing",
 }
 _LIFECYCLE_EVENTS = {
     "created",
     "running",
     "completed",
     "partial",
+    "waiting_for_context",
     "failed",
     "cancelled",
-    "timed_out",
 }
 _TOOL_STATUSES = {"done", "error", "cancelled"}
 _LOW_SIGNAL_TOOLS = {
-    "discover_profiles",
+    "discover_worker_types",
     "glob",
     "grep",
     "inspect_worker",
@@ -177,13 +172,19 @@ class WorkerUiJournal:
             payload["summary"] = summary
             if status == "failed":
                 payload["error_summary"] = summary
-        terminal = event in {"completed", "partial", "failed", "cancelled", "timed_out"}
+        settled = event in {
+            "completed",
+            "partial",
+            "waiting_for_context",
+            "failed",
+            "cancelled",
+        }
         self._enqueue(
             _BufferedJournalRecord(
                 run_id=run.run_id,
                 kind=WorkerUiEventKind.LIFECYCLE,
                 payload=payload,
-                priority=3 if terminal else 1,
+                priority=3 if settled else 1,
             )
         )
 
@@ -192,14 +193,13 @@ class WorkerUiJournal:
         *,
         run_id: str,
         phase: str,
-        role_id: str | None = None,
         tool_names: tuple[str, ...] = (),
         current_step: str | None = None,
         todo_completed: int | None = None,
         todo_total: int | None = None,
         detail_source: str = "host",
     ) -> None:
-        del role_id, detail_source
+        del detail_source
         if phase not in _ACTIVITY_PHASES:
             return
         safe_tools = [
@@ -498,7 +498,7 @@ class WorkerUiJournal:
         return connection
 
 class WorkerUiQueryService:
-    """Operator capability for safe Worker details; never register as a Base tool."""
+    """Operator capability for safe Worker details; never register as a Master tool."""
 
     def __init__(self, *, manager: Any, journal: WorkerUiJournal) -> None:
         self.manager = manager
@@ -506,7 +506,8 @@ class WorkerUiQueryService:
 
     def inspect_worker(self, worker_id: str) -> dict[str, Any]:
         worker, runs = self.manager.inspect_worker(worker_id)
-        profile_id = worker.profile.profile_id
+        snapshot = worker.snapshot
+        worker_type_id = snapshot.id
         timeline: list[dict[str, Any]] = []
         run_views: list[dict[str, Any]] = []
         current_phase = "queued"
@@ -546,13 +547,19 @@ class WorkerUiQueryService:
                 _project_timeline(safe_events, run_sequence=run.run_sequence)
             )
         latest = runs[-1] if runs else None
-        if latest is not None and latest.status.terminal:
+        if latest is not None and latest.status.settled:
             current_phase = latest.status.value
             current_step = None
         return {
             "worker_id": worker.worker_id,
-            "label": f"{profile_id}#{worker.worker_id[:4]}",
-            "profile_id": profile_id,
+            "label": f"{worker_type_id}#{worker.worker_id[:4]}",
+            "worker_type_id": worker_type_id,
+            "definition": {
+                "id": snapshot.id,
+                "description": snapshot.description,
+                "source": snapshot.source,
+                "digest": snapshot.digest,
+            },
             "status": worker.status.value,
             "created_at": worker.created_at,
             "phase": current_phase,
@@ -578,14 +585,26 @@ def _run_view(run: WorkerRunRecord) -> dict[str, Any]:
         "worker_id": run.worker_id,
         "run_sequence": run.run_sequence,
         "status": run.status.value,
-        "goal": _safe_text(run.context.goal, limit=1_200),
+        "cancel_requested": run.cancel_requested_at is not None,
+        "objective": _safe_text(run.context.objective, limit=1_200),
+        "source_run_id": run.source_run_id,
         "created_at": run.created_at,
         "summary": summary or None,
         "duration_ms": result.duration_ms if result is not None else None,
         "tool_outcome": result.tool_outcome if result is not None else None,
         "usage": _safe_usage(result.usage if result is not None else {}),
     }
-    if run.status.value == "failed" and summary:
+    waiting_request = run.waiting_request
+    question = _safe_text(
+        waiting_request.question if waiting_request is not None else None,
+        limit=_MAX_SUMMARY_CHARS,
+    )
+    if not question and report is not None:
+        if report.unresolved:
+            question = _safe_text(report.unresolved[0], limit=_MAX_SUMMARY_CHARS)
+    if question:
+        view["waiting_question"] = question
+    if run.status is WorkerRunStatus.FAILED and summary:
         view["error_summary"] = summary
     return view
 

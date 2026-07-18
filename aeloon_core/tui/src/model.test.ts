@@ -311,7 +311,7 @@ describe("TUI event projection", () => {
       state,
       event("chat.worker.lifecycle", {
         phase: "running",
-        profile_id: "coding",
+        worker_type_id: "coding",
         run_id: "run-private",
         worker_id: "ab12ffff",
       }),
@@ -322,7 +322,7 @@ describe("TUI event projection", () => {
         current_step: "Implement the reducer",
         detail_source: "worker_declared",
         phase: "working_step",
-        profile_id: "coding",
+        worker_type_id: "coding",
         revision: 1,
         run_id: "run-private",
         todo_completed: 2,
@@ -344,7 +344,7 @@ describe("TUI event projection", () => {
       state,
       event("chat.worker.heartbeat", {
         elapsed_ms: 8_000,
-        profile_id: "coding",
+        worker_type_id: "coding",
         status: "running",
         worker_id: "ab12ffff",
       }),
@@ -362,7 +362,7 @@ describe("TUI event projection", () => {
       state,
       event("chat.worker.lifecycle", {
         phase: "created",
-        profile_id: "coding",
+        worker_type_id: "coding",
         run_id: "run-private-control-id",
         status: "queued",
         worker_id: "ab12ffff",
@@ -381,7 +381,7 @@ describe("TUI event projection", () => {
       state,
       event("chat.worker.lifecycle", {
         phase: "running",
-        profile_id: "coding",
+        worker_type_id: "coding",
         worker_id: "abcd1234",
       }),
     )
@@ -400,7 +400,7 @@ describe("TUI event projection", () => {
             : name === "write"
               ? { expected_offset: 128, input_bytes: 10, input_chars: 10 }
               : { result_chars: 10, result_lines: 2 },
-          profile_id: "coding",
+          worker_type_id: "coding",
           status: name === "exec" ? "error" : "done",
           tool_name: name,
           worker_id: "abcd1234",
@@ -435,13 +435,13 @@ describe("TUI event projection", () => {
     const state = createAppState()
     applyEnvelope(state, event("chat.worker.lifecycle", {
       phase: "running",
-      profile_id: "coding",
+      worker_type_id: "coding",
       worker_id: "abcd1234",
     }))
     const lifecycleUnread = state.workers.abcd1234?.unread
     applyEnvelope(state, event("chat.worker.tool.result", {
       metrics: { result_chars: 12, result_lines: 1 },
-      profile_id: "coding",
+      worker_type_id: "coding",
       status: "done",
       tool_name: "read",
       worker_id: "abcd1234",
@@ -451,7 +451,7 @@ describe("TUI event projection", () => {
 
     applyEnvelope(state, event("chat.worker.tool.result", {
       metrics: { result_preview: "Error: permission denied" },
-      profile_id: "coding",
+      worker_type_id: "coding",
       status: "error",
       tool_name: "read",
       worker_id: "abcd1234",
@@ -461,33 +461,16 @@ describe("TUI event projection", () => {
       .toMatchObject({ resultPreview: "Error: permission denied", status: "failed" })
   })
 
-  test("profile delegates stay in Master and do not masquerade as durable Workers", () => {
-    const state = createAppState()
-    applyEnvelope(
-      state,
-      event("chat.profile.delegate.start", {
-        agent_id: "reviewer",
-        branch_id: "internal-uuid",
-        label: "review#1",
-        task: "Review the patch",
-      }),
-    )
-
-    expect(state.workerOrder).toEqual([])
-    expect(visibleMasterItems(state)[0]?.title).toBe("DELEGATED")
-    expect(JSON.stringify(visibleMasterItems(state))).not.toContain("internal-uuid")
-  })
-
   test("hydrates the operator-only Worker journal into a readable workbench", () => {
     const state = createAppState()
     applyCommandResult(state, "inspect_worker", {
       current_step: "Run the focused regression suite",
       phase: "using_tool",
       phases: ["planning", "using_tool"],
-      profile_id: "coding",
+      worker_type_id: "coding",
       runs: [
         {
-          goal: "Persist only safe Worker progress",
+          objective: "Persist only safe Worker progress",
           run_id: "run-private-control-id",
           status: "running",
           worker_id: "ab12ffff",
@@ -522,7 +505,7 @@ describe("TUI event projection", () => {
 
     const worker = state.workers.ab12ffff
     expect(state.view).toEqual({ kind: "master" })
-    expect(worker?.goal).toBe("Persist only safe Worker progress")
+    expect(worker?.objective).toBe("Persist only safe Worker progress")
     expect(worker?.phase).toBe("executing")
     expect(worker?.currentStep).toBe("Run the focused regression suite")
     expect(worker?.todoCompleted).toBe(3)
@@ -562,7 +545,7 @@ describe("TUI event projection", () => {
       state,
       event("chat.worker.lifecycle", {
         phase: "failed",
-        profile_id: "coding",
+        worker_type_id: "coding",
         session_id: "session-a",
         worker_id: "old-worker",
       }),
@@ -577,11 +560,11 @@ describe("TUI event projection", () => {
     applyCommandResult(state, "inspect_worker", {
       current_step: "Old step",
       phase: "testing",
-      profile_id: "coding",
+      worker_type_id: "coding",
       runs: [
         {
           duration_ms: 500,
-          goal: "Old goal",
+          objective: "Old objective",
           run_id: "run-one",
           status: "completed",
           summary: "Old result",
@@ -600,7 +583,7 @@ describe("TUI event projection", () => {
       state,
       event("chat.worker.lifecycle", {
         phase: "created",
-        profile_id: "coding",
+        worker_type_id: "coding",
         run_id: "run-two",
         status: "queued",
         worker_id: "worker-one",
@@ -651,7 +634,7 @@ describe("TUI event projection", () => {
       state,
       event("chat.worker.lifecycle", {
         phase: "running",
-        profile_id: "coding",
+        worker_type_id: "coding",
         run_id: "run-one",
         worker_id: "worker-one",
       }),
@@ -659,7 +642,7 @@ describe("TUI event projection", () => {
 
     applyCommandResult(state, "spawn_worker", {
       created: true,
-      profile_id: "coding",
+      worker_type_id: "coding",
       run_id: "run-one",
       worker_id: "worker-one",
     })
@@ -702,7 +685,7 @@ describe("TUI event projection", () => {
       state,
       event("chat.worker.lifecycle", {
         phase: "cancelled",
-        profile_id: "coding",
+        worker_type_id: "coding",
         run_id: "run-one",
         worker_id: "worker-one",
       }),
@@ -718,7 +701,7 @@ describe("TUI event projection", () => {
       state,
       event("chat.worker.lifecycle", {
         phase: "running",
-        profile_id: "coding",
+        worker_type_id: "coding",
         run_id: "run-one",
         run_sequence: 1,
         worker_id: "worker-one",
@@ -728,7 +711,7 @@ describe("TUI event projection", () => {
       state,
       event("chat.worker.lifecycle", {
         phase: "running",
-        profile_id: "coding",
+        worker_type_id: "coding",
         run_id: "run-two",
         run_sequence: 2,
         worker_id: "worker-one",
@@ -738,7 +721,7 @@ describe("TUI event projection", () => {
       state,
       event("chat.worker.lifecycle", {
         phase: "completed",
-        profile_id: "coding",
+        worker_type_id: "coding",
         run_id: "run-one",
         run_sequence: 1,
         worker_id: "worker-one",
@@ -748,7 +731,7 @@ describe("TUI event projection", () => {
       state,
       event("chat.worker.activity", {
         current_step: "stale step",
-        profile_id: "coding",
+        worker_type_id: "coding",
         revision: 99,
         run_id: "run-one",
         run_sequence: 1,
@@ -757,7 +740,7 @@ describe("TUI event projection", () => {
     )
     applyCommandResult(state, "inspect_worker", {
       phase: "completed",
-      profile_id: "coding",
+      worker_type_id: "coding",
       runs: [
         {
           run_id: "run-one",
@@ -788,7 +771,7 @@ describe("TUI event projection", () => {
         state,
         event("chat.worker.lifecycle", {
           phase,
-          profile_id: "coding",
+          worker_type_id: "coding",
           run_id: "run-one",
           run_sequence: 1,
           worker_id: "worker-one",
@@ -800,13 +783,13 @@ describe("TUI event projection", () => {
     expect(state.workers["worker-one"]?.phase).toBe("completed")
   })
 
-  test("projects Worker recovery as a semantic action on the new run", () => {
+  test("projects Worker resume as a continuation on the new run", () => {
     const state = createAppState()
     applyEnvelope(
       state,
       event("chat.worker.lifecycle", {
-        phase: "partial",
-        profile_id: "coding",
+        phase: "waiting_for_context",
+        worker_type_id: "coding",
         run_id: "run-one",
         run_sequence: 1,
         worker_id: "worker-one",
@@ -816,17 +799,17 @@ describe("TUI event projection", () => {
     applyCommandResult(state, "resume_worker", {
       action: "continued",
       created: true,
-      goal: "finish the remaining tests",
+      objective: "finish the remaining tests",
       run_id: "run-two",
       run_sequence: 2,
-      source_status: "partial",
+      source_status: "waiting_for_context",
       status: "queued",
       worker_id: "worker-one",
     })
 
     expect(state.workers["worker-one"]?.runSequence).toBe(2)
     expect(state.workers["worker-one"]?.status).toBe("queued")
-    expect(state.masterTimeline.at(-1)?.title).toBe("WORKER RECOVERY")
+    expect(state.masterTimeline.at(-1)?.title).toBe("WORKER RESUMED")
     expect(state.masterTimeline.at(-1)?.body).toContain("Continuation scheduled")
   })
 })

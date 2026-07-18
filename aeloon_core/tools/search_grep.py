@@ -4,13 +4,72 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import glob as globlib
 import re
 import shutil
+import stat
+from datetime import UTC, datetime
 from pathlib import Path
 
 from pydantic import BaseModel, Field
 
 from aeloon_core.tools.base import WorkspaceTool
+
+
+class ListArgs(BaseModel):
+    path: str | None = Field(
+        default=None,
+        description="Directory to list. Relative paths resolve from workspace.",
+    )
+    all: bool = Field(default=False, description="Include dotfiles.")
+    detail: bool = Field(default=False, description="Include mode, byte size, and timestamp.")
+    limit: int = Field(default=200, ge=1, le=1000)
+
+
+class ListTool(WorkspaceTool):
+    """Perform a bounded, read-only directory observation."""
+
+    name = "list"
+    concurrency_mode = "read_only"
+    description = "List one directory without executing a shell command."
+    args_model = ListArgs
+
+    async def execute(
+        self,
+        path: str | None = None,
+        all: bool = False,
+        detail: bool = False,
+        limit: int = 200,
+    ) -> str:
+        directory = self._resolve(path)
+        if not directory.exists():
+            return f"Error: Path not found: {path or '.'}"
+        if not directory.is_dir():
+            return f"Error: Not a directory: {path or '.'}"
+        entries = sorted(
+            (
+                entry
+                for entry in directory.iterdir()
+                if (all or not entry.name.startswith(".")) and not self._is_denied(entry)
+            ),
+            key=lambda entry: (not entry.is_dir(), entry.name.casefold()),
+        )
+        visible = entries[:limit]
+        if not visible:
+            return "(empty directory)"
+        lines: list[str] = []
+        for entry in visible:
+            suffix = "/" if entry.is_dir() else ""
+            if not detail:
+                lines.append(entry.name + suffix)
+                continue
+            info = entry.lstat()
+            mode = stat.filemode(info.st_mode)
+            modified = datetime.fromtimestamp(info.st_mtime, tz=UTC).isoformat()
+            lines.append(f"{mode} {info.st_size:>10} {modified} {entry.name}{suffix}")
+        if len(entries) > len(visible):
+            lines.append(f"... {len(entries) - len(visible)} more")
+        return "\n".join(lines)
 
 
 class GlobArgs(BaseModel):
@@ -35,8 +94,17 @@ class GlobTool(WorkspaceTool):
         root: str | None = None,
         limit: int = 200,
     ) -> str:
+        pattern_path = Path(pattern)
+        if pattern_path.is_absolute() or ".." in pattern_path.parts:
+            return "Error: glob pattern must stay inside the workspace"
         base = self._resolve(root)
-        matches = sorted(path for path in base.glob(pattern) if path.exists())
+        matches = sorted(
+            path
+            for path in base.glob(pattern)
+            if path.exists()
+            and _is_under(path.resolve(strict=False), self.workspace)
+            and not self._is_denied(path)
+        )
         limited = matches[:limit]
         if not limited:
             return "(no matches)"
@@ -91,7 +159,14 @@ class GrepTool(WorkspaceTool):
         cmd = ["rg", "--line-number", "--color=never", "--no-heading"]
         if include:
             cmd.extend(["--glob", include])
-        cmd.extend([pattern, str(target)])
+        for denied in self.denied_paths:
+            if denied.is_relative_to(target):
+                relative = globlib.escape(str(denied.relative_to(target)))
+                cmd.extend(["--glob", f"!**/{relative}"])
+                cmd.extend(["--glob", f"!**/{relative}/**"])
+        # Stop option parsing before the model-authored pattern. Without this,
+        # values such as --pre could turn a read-only grep into command execution.
+        cmd.extend(["--", pattern, str(target)])
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -122,6 +197,11 @@ class GrepTool(WorkspaceTool):
         files = [target] if target.is_file() else [p for p in target.rglob("*") if p.is_file()]
         matches: list[str] = []
         for file_path in files:
+            if (
+                not _is_under(file_path.resolve(strict=False), self.workspace)
+                or self._is_denied(file_path)
+            ):
+                continue
             if include and not fnmatch.fnmatch(file_path.name, include):
                 continue
             try:

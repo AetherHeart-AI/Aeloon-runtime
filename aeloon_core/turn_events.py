@@ -25,11 +25,6 @@ _WORKER_ACTIVITY_PHASES = {
     "processing",
     "working_step",
     "finalizing",
-    "delegating",
-    "handoff",
-    "branch_running",
-    "branch_done",
-    "synthesizing",
 }
 _WORKER_ACTIVITY_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
 _WORKER_ACTIVITY_ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|[@-_])")
@@ -122,7 +117,7 @@ class TurnEventProgress:
         self,
         response: Any,
         *,
-        component: str = "worker",
+        component: str = "model",
     ) -> None:
         reasoning = str(getattr(response, "reasoning_content", None) or "").strip()
         if reasoning:
@@ -144,7 +139,7 @@ class TurnEventProgress:
         if isinstance(call_usage, dict):
             self._record_usage(
                 call_usage,
-                node_kind="domain",
+                node_kind="model",
                 component=component,
             )
         payload = self._payload(
@@ -193,12 +188,19 @@ class TurnEventProgress:
     ) -> None:
         """Record non-domain provider usage and publish the turn aggregate."""
 
+        normalized_node_kind = {
+            "context_processing": "guard",
+            "domain": "model",
+            "harness": "guard",
+        }.get(node_kind, node_kind)
         resolved_component = component or (
-            "minimal_context" if node_kind == "context_processing" else node_kind
+            "minimal_context"
+            if node_kind == "context_processing"
+            else normalized_node_kind
         )
         self._record_usage(
             usage,
-            node_kind=node_kind,
+            node_kind=normalized_node_kind,
             component=resolved_component,
         )
         await self.emit(
@@ -211,7 +213,7 @@ class TurnEventProgress:
                 by_component={
                     name: dict(values) for name, values in self.usage_by_component.items()
                 },
-                node_kind=node_kind,
+                node_kind=normalized_node_kind,
                 component=resolved_component,
                 ts=_now(),
             ),
@@ -223,7 +225,7 @@ class TurnEventProgress:
         if isinstance(usage, dict) and usage:
             await self.on_usage(
                 usage,
-                node_kind="harness",
+                node_kind="guard",
                 component="guard",
             )
         record = resolution.to_record()
@@ -238,7 +240,7 @@ class TurnEventProgress:
         event: str,
         worker_id: str,
         run_id: str,
-        profile_id: str,
+        worker_type_id: str,
         status: str,
         run_sequence: int = 1,
         duration_ms: int | None = None,
@@ -254,7 +256,7 @@ class TurnEventProgress:
                 worker_id=worker_id,
                 run_id=run_id,
                 run_sequence=max(1, int(run_sequence)),
-                profile_id=profile_id,
+                worker_type_id=worker_type_id,
                 status=status,
                 duration_ms=duration_ms,
                 ts=_now(),
@@ -266,7 +268,7 @@ class TurnEventProgress:
         *,
         worker_id: str,
         run_id: str,
-        profile_id: str,
+        worker_type_id: str,
         status: str,
         elapsed_ms: int,
         run_sequence: int = 1,
@@ -277,7 +279,7 @@ class TurnEventProgress:
                 worker_id=worker_id,
                 run_id=run_id,
                 run_sequence=max(1, int(run_sequence)),
-                profile_id=profile_id,
+                worker_type_id=worker_type_id,
                 status=status,
                 elapsed_ms=max(0, elapsed_ms),
                 ts=_now(),
@@ -289,27 +291,21 @@ class TurnEventProgress:
         *,
         worker_id: str,
         run_id: str,
-        profile_id: str,
+        worker_type_id: str,
         label: str,
         revision: int,
         phase: str,
         run_sequence: int = 1,
-        role_id: str | None = None,
         tool_names: tuple[str, ...] = (),
         current_step: str | None = None,
         todo_completed: int | None = None,
         todo_total: int | None = None,
         detail_source: str = "host",
     ) -> None:
-        """Publish one display-only Worker activity snapshot outside Base history."""
+        """Publish one display-only Worker activity snapshot outside Master history."""
 
         if phase not in _WORKER_ACTIVITY_PHASES:
             return
-        safe_role = (
-            role_id
-            if role_id is not None and _WORKER_ACTIVITY_IDENTIFIER.fullmatch(role_id)
-            else None
-        )
         safe_tools = tuple(
             name
             for name in tool_names[:4]
@@ -322,11 +318,10 @@ class TurnEventProgress:
                 worker_id=worker_id,
                 run_id=run_id,
                 run_sequence=max(1, int(run_sequence)),
-                profile_id=profile_id,
+                worker_type_id=worker_type_id,
                 label=label,
                 revision=max(1, int(revision)),
                 phase=phase,
-                role_id=safe_role,
                 tool_names=safe_tools,
                 current_step=safe_step or None,
                 todo_completed=(
@@ -345,7 +340,7 @@ class TurnEventProgress:
         *,
         worker_id: str,
         run_id: str,
-        profile_id: str,
+        worker_type_id: str,
         label: str,
         tool_name: str,
         status: str,
@@ -364,7 +359,7 @@ class TurnEventProgress:
                 worker_id=worker_id,
                 run_id=run_id,
                 run_sequence=max(1, int(run_sequence)),
-                profile_id=profile_id,
+                worker_type_id=worker_type_id,
                 label=label,
                 tool_name=tool_name,
                 status=status,
@@ -379,7 +374,7 @@ class TurnEventProgress:
         *,
         worker_id: str,
         run_id: str,
-        profile_id: str,
+        worker_type_id: str,
         label: str,
         resolution: Any,
         run_sequence: int = 1,
@@ -391,160 +386,10 @@ class TurnEventProgress:
                 worker_id=worker_id,
                 run_id=run_id,
                 run_sequence=max(1, int(run_sequence)),
-                profile_id=profile_id,
-                subagent_label=label,
+                worker_type_id=worker_type_id,
+                label=label,
                 **record,
                 ts=_now(),
-            ),
-        )
-
-    async def on_profile_pinned(self, profile: dict[str, Any]) -> None:
-        """Expose immutable turn provenance before any profile routing."""
-
-        await self.emit(
-            "chat.profile.pinned",
-            self._payload(profile=_json_safe(profile), ts=_now()),
-        )
-
-    async def on_profile_route(
-        self,
-        agent_id: str,
-        *,
-        source: str,
-        fallback_used: bool,
-    ) -> None:
-        await self.emit(
-            "chat.profile.route",
-            self._payload(
-                agent_id=agent_id,
-                source=source,
-                fallback_used=fallback_used,
-                ts=_now(),
-            ),
-        )
-        await self._append_reasoning_line(
-            f"Profile selected role {agent_id}",
-            kind="profile_route",
-            data={
-                "agent_id": agent_id,
-                "source": source,
-                "fallback_used": fallback_used,
-            },
-        )
-
-    async def on_profile_handoff(
-        self,
-        from_agent_id: str,
-        recommended_agent_id: str | None,
-        summary: str,
-        *,
-        handoff_count: int,
-        handoff_limit: int,
-    ) -> None:
-        await self.emit(
-            "chat.profile.handoff",
-            self._payload(
-                from_agent_id=from_agent_id,
-                recommended_agent_id=recommended_agent_id,
-                summary=summary,
-                handoff_count=handoff_count,
-                handoff_limit=handoff_limit,
-                ts=_now(),
-            ),
-        )
-
-    async def on_profile_completion(
-        self,
-        agent_id: str | None,
-        final_content: str,
-    ) -> None:
-        await self.emit(
-            "chat.profile.completion",
-            self._payload(
-                agent_id=agent_id,
-                final=_text_summary(final_content),
-                ts=_now(),
-            ),
-        )
-
-    async def on_profile_delegate_branch_start(
-        self,
-        branch_id: str,
-        label: str,
-        agent_id: str,
-        task: str,
-    ) -> None:
-        await self.emit(
-            "chat.profile.delegate.start",
-            self._payload(
-                branch_id=branch_id,
-                label=label,
-                agent_id=agent_id,
-                task=_preview_text(task),
-                ts=_now(),
-            ),
-        )
-
-    async def on_profile_delegate_branch_complete(
-        self,
-        branch_id: str,
-        label: str,
-        agent_id: str,
-        *,
-        status: str,
-        summary: str,
-        duration_ms: int,
-        tools_used: list[str],
-    ) -> None:
-        await self.emit(
-            "chat.profile.delegate.complete",
-            self._payload(
-                branch_id=branch_id,
-                label=label,
-                agent_id=agent_id,
-                status=status,
-                summary=_preview_text(summary),
-                duration_ms=max(0, int(duration_ms)),
-                tool_count=len(tools_used),
-                ts=_now(),
-            ),
-        )
-
-    async def on_profile_delegate_join(
-        self,
-        source_agent_id: str,
-        *,
-        delegation_round: int,
-        branch_count: int,
-        succeeded: int,
-        duration_ms: int,
-    ) -> None:
-        await self.emit(
-            "chat.profile.delegate.join",
-            self._payload(
-                source_agent_id=source_agent_id,
-                delegation_round=max(0, int(delegation_round)),
-                branch_count=max(0, int(branch_count)),
-                succeeded=max(0, int(succeeded)),
-                duration_ms=max(0, int(duration_ms)),
-                ts=_now(),
-            ),
-        )
-
-    async def on_profile_delegate_guard_resolution(
-        self,
-        branch_id: str,
-        subagent_label: str,
-        resolution: Any,
-    ) -> None:
-        record = resolution.to_record()
-        await self.emit(
-            "chat.profile.delegate.guard",
-            self._payload(
-                ts=_now(),
-                branch_id=branch_id,
-                subagent_label=subagent_label,
-                **record,
             ),
         )
 
@@ -552,7 +397,6 @@ class TurnEventProgress:
         self,
         tool_calls: list[ToolCallRequest],
         *,
-        subagent_label: str | None = None,
         record_reasoning: bool = True,
     ) -> None:
         for tool_call in tool_calls:
@@ -565,8 +409,6 @@ class TurnEventProgress:
                     "arguments": tool_call.arguments,
                     "summary": summary,
                 }
-                if subagent_label is not None:
-                    reasoning_data["subagent_label"] = subagent_label
                 await self._append_reasoning_line(
                     summary,
                     kind="tool_call",
@@ -581,8 +423,6 @@ class TurnEventProgress:
                 "result": None,
                 "created_at": _now(),
             }
-            if subagent_label is not None:
-                block["subagent_label"] = subagent_label
             self.blocks.append(block)
             payload = self._payload(block=block, ts=_now())
             await self.emit("chat.block.add", payload)
@@ -601,7 +441,6 @@ class TurnEventProgress:
         self,
         node: TaskNode,
         *,
-        subagent_label: str | None = None,
         record_reasoning: bool = True,
     ) -> None:
         result = str(node.result or "")
@@ -615,11 +454,7 @@ class TurnEventProgress:
                 "arguments": node.arguments,
                 "created_at": _now(),
             }
-            if subagent_label is not None:
-                block["subagent_label"] = subagent_label
             self.blocks.append(block)
-        elif subagent_label is not None:
-            block["subagent_label"] = subagent_label
         block["status"] = status
         block["result"] = result
         block["completed_at"] = _now()

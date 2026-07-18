@@ -9,24 +9,34 @@ export interface SessionRecord extends JsonObject {
 }
 
 export interface WorkerRunSnapshot extends JsonObject {
+  action?: string
+  cancel_requested?: boolean
   created_at?: string
   duration_ms?: number | null
-  goal?: string
+  objective?: string
   run_id?: string
   run_sequence?: number
+  source_run_id?: string | null
   status?: string
   summary?: string | null
   usage?: JsonObject
+  waiting_question?: string | null
+}
+
+export interface WorkerDefinitionSnapshot extends JsonObject {
+  description?: string
+  digest?: string
+  id?: string
+  source?: string
 }
 
 export interface WorkerSnapshot extends JsonObject {
   current_step?: string | null
+  definition?: WorkerDefinitionSnapshot
   latest_run?: WorkerRunSnapshot | null
   label?: string
   phase?: string
   phases?: string[]
-  profile?: JsonObject
-  profile_id?: string
   run_count?: number
   runs?: WorkerRunSnapshot[]
   status?: string
@@ -35,6 +45,7 @@ export interface WorkerSnapshot extends JsonObject {
   todo_completed?: number | null
   todo_total?: number | null
   worker_id?: string
+  worker_type_id?: string
 }
 
 export interface ReadySnapshot extends JsonObject {

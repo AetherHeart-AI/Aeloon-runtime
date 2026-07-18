@@ -15,8 +15,11 @@ async def run_worker_runner(
 ) -> None:
     """Run queued WorkerRuns until interrupted, or drain once for automation/tests."""
 
-    while True:
+    if once:
         await orchestrator.worker_manager.run_queued()
-        if once:
-            return
+        return
+
+    while True:
+        await orchestrator.worker_manager.reconcile_stale_runs()
+        orchestrator.worker_manager.start_queued()
         await asyncio.sleep(max(0.05, poll_seconds))

@@ -1,47 +1,68 @@
-"""Durable control-plane records for Base-owned Worker sessions.
-
-The UASM state machine remains the execution engine.  This module deliberately
-models its long-lived ownership separately: a WorkerSession holds immutable
-profile provenance and private context, while each WorkerRun owns one task and
-one terminal result.
-"""
+"""Durable v2 WorkerSession and WorkerRun control-plane records."""
 
 from __future__ import annotations
 
+import fcntl
 import json
+import os
+import shutil
 import sqlite3
 import uuid
+import weakref
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+
+from aeloon_core.flow_activation_fence import (
+    flow_activation_fence,
+    flow_id_from_turn_id,
+)
+from aeloon_core.workers import WorkerSnapshot
+
+SCHEMA_VERSION = 5
+ReportText = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=8_000),
+]
+ReportItem = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=1_000),
+]
+_OWNER_STORES: weakref.WeakSet[Any] = weakref.WeakSet()
+_OWNER_AT_FORK_REGISTERED = False
 
 
 class WorkerRunStatus(StrEnum):
-    CREATED = "created"
     QUEUED = "queued"
     RUNNING = "running"
-    WAITING_FOR_CONTEXT = "waiting_for_context"
     COMPLETED = "completed"
     PARTIAL = "partial"
+    WAITING_FOR_CONTEXT = "waiting_for_context"
     FAILED = "failed"
     CANCELLED = "cancelled"
-    ARCHIVED = "archived"
 
     @property
     def terminal(self) -> bool:
+        """Return whether no continuation semantics are attached to this Run."""
+
         return self in {
             self.COMPLETED,
             self.PARTIAL,
             self.FAILED,
             self.CANCELLED,
-            self.ARCHIVED,
         }
+
+    @property
+    def settled(self) -> bool:
+        """Return whether awaiters should stop waiting for this Run."""
+
+        return self is self.WAITING_FOR_CONTEXT or self.terminal
 
 
 class WorkerSessionStatus(StrEnum):
@@ -50,76 +71,61 @@ class WorkerSessionStatus(StrEnum):
     ARCHIVED = "archived"
 
 
-class RunnerAttemptStatus(StrEnum):
-    LEASED = "leased"
-    RUNNING = "running"
-    CANCEL_REQUESTED = "cancel_requested"
-    SUCCEEDED = "succeeded"
-    INTERRUPTED = "interrupted"
-    LOST = "lost"
-
-
 class WorkerOperation(StrEnum):
     SPAWN = "spawn"
-    SEND = "send"
-    RECOVERY = "recovery"
+    REUSE = "reuse"
+    RESUME = "resume"
 
 
 class IdempotencyConflictError(ValueError):
     """An idempotency key was reused for a different scheduling request."""
 
 
+class WorkerRunFencedError(RuntimeError):
+    """A Run lost durable execution authority before a tool boundary."""
+
+
 class _FrozenModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, str_strip_whitespace=True)
 
 
-class ProfileHandle(_FrozenModel):
-    profile_id: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")
-    artifact_id: str = Field(min_length=1)
-    generation: int = Field(ge=0)
-    activation_audit_id: str = Field(min_length=1)
-    contract_hash: str = Field(min_length=1)
-
-
 class PermissionSnapshot(_FrozenModel):
     tool_names: tuple[str, ...] = ()
-    workspace_paths: tuple[str, ...] = ()
-    network_hosts: tuple[str, ...] = ()
-    sensitivity: str = "normal"
+    skills_enabled: bool = True
 
 
 class BudgetGrant(_FrozenModel):
-    max_tokens: int = Field(ge=0)
-    max_seconds: int = Field(ge=0)
-    max_tool_calls: int = Field(ge=0)
+    # Cumulative Run limits are optional. They are deliberately separate from
+    # the model's per-request context window.
+    max_tokens: int | None = Field(default=None, ge=1)
+    max_seconds: int = Field(default=3_600, ge=1)
+    max_tool_calls: int | None = Field(default=None, ge=1)
 
 
 class ContextEnvelope(_FrozenModel):
-    envelope_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
-    goal: str = Field(min_length=1)
-    constraints: tuple[str, ...] = ()
-    excerpts: tuple[dict[str, Any], ...] = ()
-    artifact_refs: tuple[dict[str, Any], ...] = ()
+    objective: str = Field(min_length=1, max_length=64_000)
     permissions: PermissionSnapshot
     budget: BudgetGrant
-    expected_output: dict[str, Any] = Field(default_factory=dict)
 
 
 class WorkerReport(_FrozenModel):
-    """Model-authored data.  Lifecycle and accounting are host-owned."""
+    """Bounded model-authored data returned to the Master."""
 
-    summary: str = Field(min_length=1)
-    evidence: tuple[dict[str, Any], ...] = ()
-    artifacts: tuple[dict[str, Any], ...] = ()
-    unresolved_questions: tuple[str, ...] = ()
-    uncertainty: tuple[str, ...] = ()
+    summary: ReportText
+    artifacts: tuple[ReportItem, ...] = Field(default=(), max_length=32)
+    evidence: tuple[ReportItem, ...] = Field(default=(), max_length=32)
+    unresolved: tuple[ReportItem, ...] = Field(default=(), max_length=32)
+
+
+class WaitingRequest(_FrozenModel):
+    summary: ReportText
+    question: str = Field(min_length=1, max_length=1_000)
 
 
 class ResultEnvelope(_FrozenModel):
     worker_id: str
     run_id: str
     status: WorkerRunStatus
-    profile: ProfileHandle
     report: WorkerReport | None = None
     tool_outcome: Literal["known", "unknown", "none"] = "none"
     usage: dict[str, Any] = Field(default_factory=dict)
@@ -130,7 +136,7 @@ class ResultEnvelope(_FrozenModel):
 class WorkerSessionRecord:
     worker_id: str
     base_session_id: str
-    profile: ProfileHandle
+    snapshot: WorkerSnapshot
     status: WorkerSessionStatus
     created_at: str
 
@@ -146,70 +152,345 @@ class WorkerRunRecord:
     created_at: str
     result: ResultEnvelope | None = None
     run_sequence: int = 1
+    source_run_id: str | None = None
+    waiting_request: WaitingRequest | None = None
+    cancel_requested_at: str | None = None
+    activated_at: str | None = None
+    active_tool_count: int = 0
+    execution_owner_token: str | None = None
 
 
 class WorkerStore:
-    """SQLite authority for Worker lifecycle and idempotent scheduling."""
+    """SQLite authority for Worker lifecycle, snapshots, and continuation order."""
 
     def __init__(self, data_dir: Path) -> None:
         self.data_dir = Path(data_dir)
         self.path = self.data_dir / "worker-control.sqlite3"
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        # Schema discovery and migration must share one write lock. Otherwise
-        # two processes opening the same legacy database can both observe a
-        # missing column before either ALTER TABLE commits.
+        self._owner_pid = 0
+        self._owner_token = ""
+        self._owner_lock: Any | None = None
+        self._initialize()
+        self._ensure_execution_owner()
+        _register_execution_owner(self)
+
+    @property
+    def execution_owner_token(self) -> str:
+        """Return this process epoch's durable WorkerRun owner identity."""
+
+        self._ensure_execution_owner()
+        return self._owner_token
+
+    def _ensure_execution_owner(self) -> None:
+        """Hold a kernel-released lease that proves this exact owner is alive."""
+
+        pid = os.getpid()
+        if (
+            self._owner_pid == pid
+            and self._owner_token
+            and self._owner_lock is not None
+            and not self._owner_lock.closed
+        ):
+            return
+
+        # A fork inherits the original open-file description. Drop the child's
+        # reference and create a new epoch; it must never impersonate its parent.
+        if self._owner_lock is not None:
+            self._owner_lock.close()
+
+        token = uuid.uuid4().hex
+        lease_dir = self.data_dir / ".worker-owner-leases"
+        lease_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        handle = (lease_dir / f"{token}.lock").open("a+b")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            handle.seek(0)
+            handle.truncate()
+            handle.write(f"pid={pid}\n".encode())
+            handle.flush()
+        except BaseException:
+            handle.close()
+            raise
+        self._owner_pid = pid
+        self._owner_token = token
+        self._owner_lock = handle
+
+    def _discard_inherited_execution_owner(self) -> None:
+        """Ensure a forked child cannot keep its parent's owner lease alive."""
+
+        if self._owner_lock is not None:
+            self._owner_lock.close()
+        self._owner_pid = 0
+        self._owner_token = ""
+        self._owner_lock = None
+
+    @contextmanager
+    def _verified_dead_execution_owner(self, token: str | None) -> Iterator[bool]:
+        """Yield true only while holding proof that an exact owner exited.
+
+        The token names a unique lock file created before the Run claim commits.
+        A live or merely stalled process keeps its exclusive flock indefinitely;
+        the kernel releases it on process exit, including SIGKILL. Missing,
+        malformed, or inaccessible legacy ownership fails closed.
+        """
+
+        self._ensure_execution_owner()
+        if token is None or token == self._owner_token or not _valid_owner_token(token):
+            yield False
+            return
+        path = self.data_dir / ".worker-owner-leases" / f"{token}.lock"
+        try:
+            handle = path.open("rb")
+        except OSError:
+            yield False
+            return
+        acquired = False
+        try:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+            except (BlockingIOError, OSError):
+                yield False
+                return
+            yield True
+        finally:
+            if acquired:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
+
+    def _initialize(self) -> None:
         with self._transaction() as connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS worker_sessions (
-                  worker_id TEXT PRIMARY KEY,
-                  base_session_id TEXT NOT NULL,
-                  profile_json TEXT NOT NULL,
-                  status TEXT NOT NULL,
-                  created_at TEXT NOT NULL
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if version > SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"worker store schema v{version} is newer than supported v{SCHEMA_VERSION}"
                 )
-                """
-            )
+            if version < 2:
+                self._drop_legacy_schema(connection)
+                self._delete_legacy_transcripts()
+                self._create_schema(connection)
+                connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            elif version in {2, 3, 4}:
+                self._migrate_durable_execution(connection)
+                connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            self._validate_schema(connection)
+
+    @staticmethod
+    def _migrate_durable_execution(connection: sqlite3.Connection) -> None:
+        """Preserve v2/v3 data while adding durable execution fencing."""
+
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(worker_runs)").fetchall()
+        }
+        if "activated_at" not in columns:
+            connection.execute("ALTER TABLE worker_runs ADD COLUMN activated_at TEXT")
+        if "active_tool_count" not in columns:
             connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS worker_runs (
-                  run_id TEXT PRIMARY KEY,
-                  worker_id TEXT NOT NULL REFERENCES worker_sessions(worker_id),
-                  run_sequence INTEGER NOT NULL,
-                  base_turn_id TEXT,
-                  status TEXT NOT NULL,
-                  context_json TEXT NOT NULL,
-                  result_json TEXT,
-                  operation_type TEXT NOT NULL,
-                  idempotency_key TEXT NOT NULL,
-                  created_at TEXT NOT NULL,
-                  updated_at TEXT NOT NULL,
-                  UNIQUE(worker_id, idempotency_key)
-                )
-                """
+                "ALTER TABLE worker_runs ADD COLUMN active_tool_count INTEGER "
+                "NOT NULL DEFAULT 0 CHECK(active_tool_count >= 0)"
             )
+        if "execution_owner_token" not in columns:
             connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS worker_checkpoints (
-                  run_id TEXT PRIMARY KEY REFERENCES worker_runs(run_id),
-                  checkpoint_json TEXT NOT NULL,
-                  created_at TEXT NOT NULL
-                )
-                """
+                "ALTER TABLE worker_runs ADD COLUMN execution_owner_token TEXT"
             )
-            self._migrate_worker_run_operation_type(connection)
-            self._migrate_worker_run_sequence(connection)
+
+    @staticmethod
+    def _drop_legacy_schema(connection: sqlite3.Connection) -> None:
+        """Destructively remove v1 Worker data in dependency order."""
+
+        connection.execute("DROP TABLE IF EXISTS worker_ui_events")
+        connection.execute("DROP TABLE IF EXISTS worker_ui_state")
+        connection.execute("DROP TABLE IF EXISTS worker_checkpoints")
+        connection.execute("DROP TABLE IF EXISTS worker_runs")
+        connection.execute("DROP TABLE IF EXISTS worker_sessions")
+
+    def _delete_legacy_transcripts(self) -> None:
+        path = self.data_dir / "worker-sessions"
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+        elif path.exists():
+            shutil.rmtree(path)
+
+    @staticmethod
+    def _create_schema(connection: sqlite3.Connection) -> None:
+        statements = (
+            """CREATE TABLE worker_sessions (
+              worker_id TEXT PRIMARY KEY,
+              base_session_id TEXT NOT NULL,
+              snapshot_json TEXT NOT NULL,
+              status TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            )""",
+            """CREATE INDEX worker_sessions_base_idx
+              ON worker_sessions(base_session_id, created_at)""",
+            """CREATE TABLE worker_runs (
+              run_id TEXT PRIMARY KEY,
+              worker_id TEXT NOT NULL REFERENCES worker_sessions(worker_id) ON DELETE CASCADE,
+              run_sequence INTEGER NOT NULL,
+              source_run_id TEXT REFERENCES worker_runs(run_id),
+              base_turn_id TEXT,
+              activated_at TEXT,
+              active_tool_count INTEGER NOT NULL DEFAULT 0
+                CHECK(active_tool_count >= 0),
+              execution_owner_token TEXT,
+              status TEXT NOT NULL,
+              context_json TEXT NOT NULL,
+              result_json TEXT,
+              waiting_request_json TEXT,
+              cancel_requested_at TEXT,
+              operation_type TEXT NOT NULL,
+              idempotency_key TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              UNIQUE(worker_id, run_sequence),
+              UNIQUE(worker_id, idempotency_key)
+            )""",
+            """CREATE INDEX worker_runs_worker_idx
+              ON worker_runs(worker_id, run_sequence DESC)""",
+            """CREATE INDEX worker_runs_status_idx
+              ON worker_runs(status, created_at)""",
+            """CREATE TABLE worker_checkpoints (
+              run_id TEXT PRIMARY KEY REFERENCES worker_runs(run_id) ON DELETE CASCADE,
+              checkpoint_json TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            )""",
+            """CREATE TABLE worker_ui_events (
+              sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+              run_id TEXT NOT NULL REFERENCES worker_runs(run_id) ON DELETE CASCADE,
+              kind TEXT NOT NULL,
+              payload_json TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            )""",
+            """CREATE INDEX worker_ui_events_run_idx
+              ON worker_ui_events(run_id, sequence)""",
+            """CREATE TABLE worker_ui_state (
+              singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+              event_count INTEGER NOT NULL
+            )""",
+            "INSERT INTO worker_ui_state(singleton, event_count) VALUES (1, 0)",
+        )
+        for statement in statements:
+            connection.execute(statement)
+
+    @staticmethod
+    def _validate_schema(connection: sqlite3.Connection) -> None:
+        required = {
+            "worker_sessions": {
+                "worker_id",
+                "base_session_id",
+                "snapshot_json",
+                "status",
+                "created_at",
+            },
+            "worker_runs": {
+                "run_id",
+                "worker_id",
+                "run_sequence",
+                "source_run_id",
+                "base_turn_id",
+                "activated_at",
+                "active_tool_count",
+                "execution_owner_token",
+                "status",
+                "context_json",
+                "result_json",
+                "waiting_request_json",
+                "cancel_requested_at",
+                "operation_type",
+                "idempotency_key",
+                "created_at",
+                "updated_at",
+            },
+            "worker_checkpoints": {"run_id", "checkpoint_json", "created_at"},
+            "worker_ui_events": {
+                "sequence",
+                "run_id",
+                "kind",
+                "payload_json",
+                "created_at",
+            },
+            "worker_ui_state": {"singleton", "event_count"},
+        }
+        table_info: dict[str, list[sqlite3.Row]] = {}
+        for table, columns in required.items():
+            info = connection.execute(f"PRAGMA table_info({table})").fetchall()
+            table_info[table] = info
+            actual = {str(row["name"]) for row in info}
+            missing = columns - actual
+            if missing:
+                raise RuntimeError(
+                    f"worker store v{SCHEMA_VERSION} is invalid: {table} missing {sorted(missing)}"
+                )
+
+        required_primary_keys = {
+            "worker_sessions": ("worker_id",),
+            "worker_runs": ("run_id",),
+            "worker_checkpoints": ("run_id",),
+            "worker_ui_events": ("sequence",),
+            "worker_ui_state": ("singleton",),
+        }
+        for table, expected in required_primary_keys.items():
+            actual = tuple(
+                str(row["name"])
+                for row in sorted(table_info[table], key=lambda row: int(row["pk"]))
+                if int(row["pk"]) > 0
+            )
+            if actual != expected:
+                raise RuntimeError(
+                    f"worker store v{SCHEMA_VERSION} is invalid: {table} primary key "
+                    f"is {actual!r}, expected {expected!r}"
+                )
+
+        unique_indexes = {
+            tuple(
+                str(column["name"])
+                for column in connection.execute(f"PRAGMA index_info({index['name']})").fetchall()
+            )
+            for index in connection.execute("PRAGMA index_list(worker_runs)").fetchall()
+            if bool(index["unique"])
+        }
+        required_unique_indexes = {
+            ("worker_id", "run_sequence"),
+            ("worker_id", "idempotency_key"),
+        }
+        missing_indexes = required_unique_indexes - unique_indexes
+        if missing_indexes:
+            raise RuntimeError(
+                f"worker store v{SCHEMA_VERSION} is invalid: worker_runs missing unique "
+                f"indexes {sorted(missing_indexes)}"
+            )
+
+        required_foreign_keys = {
+            "worker_runs": {
+                ("worker_id", "worker_sessions", "worker_id"),
+                ("source_run_id", "worker_runs", "run_id"),
+            },
+            "worker_checkpoints": {("run_id", "worker_runs", "run_id")},
+            "worker_ui_events": {("run_id", "worker_runs", "run_id")},
+        }
+        for table, expected in required_foreign_keys.items():
+            actual = {
+                (str(row["from"]), str(row["table"]), str(row["to"]))
+                for row in connection.execute(f"PRAGMA foreign_key_list({table})").fetchall()
+            }
+            missing = expected - actual
+            if missing:
+                raise RuntimeError(
+                    f"worker store v{SCHEMA_VERSION} is invalid: {table} missing foreign "
+                    f"keys {sorted(missing)}"
+                )
 
     def create_worker(
         self,
         *,
         base_session_id: str,
-        profile: ProfileHandle,
+        snapshot: WorkerSnapshot,
         context: ContextEnvelope,
         idempotency_key: str,
         base_turn_id: str | None = None,
     ) -> tuple[WorkerSessionRecord, WorkerRunRecord, bool]:
-        """Create a Worker and its first queued Run, or return an idempotent match."""
+        """Create a WorkerSession and its first queued Run idempotently."""
 
         now = _now()
         worker_id = uuid.uuid4().hex
@@ -221,30 +502,39 @@ class WorkerStore:
                 (base_session_id, idempotency_key),
             ).fetchone()
             if existing is not None:
-                session = self._session_row(connection, existing["worker_id"])
+                session = self._session_row(connection, str(existing["worker_id"]))
                 self._validate_idempotent_replay(
                     existing,
                     operation=WorkerOperation.SPAWN,
                     base_turn_id=base_turn_id,
                     context=context,
-                    stored_profile=session.profile,
-                    requested_profile=profile,
+                    source_run_id=None,
+                    stored_snapshot=session.snapshot,
+                    requested_snapshot=snapshot,
                 )
                 return session, self._run_from_row(existing), False
+
             connection.execute(
-                "INSERT INTO worker_sessions VALUES (?, ?, ?, ?, ?)",
-                (worker_id, base_session_id, _dump(profile), WorkerSessionStatus.IDLE, now),
+                "INSERT INTO worker_sessions("
+                "worker_id, base_session_id, snapshot_json, status, created_at"
+                ") VALUES (?, ?, ?, ?, ?)",
+                (
+                    worker_id,
+                    base_session_id,
+                    _dump(snapshot),
+                    WorkerSessionStatus.IDLE,
+                    now,
+                ),
             )
             connection.execute(
                 "INSERT INTO worker_runs("
-                "run_id, worker_id, run_sequence, base_turn_id, status, "
-                "context_json, result_json, "
-                "operation_type, idempotency_key, created_at, updated_at"
-                ") VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
+                "run_id, worker_id, run_sequence, source_run_id, base_turn_id, status, "
+                "context_json, result_json, waiting_request_json, operation_type, "
+                "idempotency_key, created_at, updated_at"
+                ") VALUES (?, ?, 1, NULL, ?, ?, ?, NULL, NULL, ?, ?, ?, ?)",
                 (
                     run_id,
                     worker_id,
-                    self._next_run_sequence(connection, worker_id),
                     base_turn_id,
                     WorkerRunStatus.QUEUED,
                     _dump(context),
@@ -254,18 +544,23 @@ class WorkerStore:
                     now,
                 ),
             )
-            return (
-                WorkerSessionRecord(
-                    worker_id,
-                    base_session_id,
-                    profile,
-                    WorkerSessionStatus.IDLE,
-                    now,
-                ),
-                WorkerRunRecord(run_id, worker_id, base_turn_id, WorkerRunStatus.QUEUED,
-                                context, idempotency_key, now, run_sequence=1),
-                True,
+            session = WorkerSessionRecord(
+                worker_id=worker_id,
+                base_session_id=base_session_id,
+                snapshot=snapshot,
+                status=WorkerSessionStatus.IDLE,
+                created_at=now,
             )
+            run = WorkerRunRecord(
+                run_id=run_id,
+                worker_id=worker_id,
+                base_turn_id=base_turn_id,
+                status=WorkerRunStatus.QUEUED,
+                context=context,
+                idempotency_key=idempotency_key,
+                created_at=now,
+            )
+            return session, run, True
 
     def list_workers(self, base_session_id: str) -> list[WorkerSessionRecord]:
         with self._connect() as connection:
@@ -309,59 +604,39 @@ class WorkerStore:
         idempotency_key: str,
         base_turn_id: str | None = None,
     ) -> tuple[WorkerRunRecord, bool]:
-        """Queue a follow-up Run without reopening any prior terminal Run."""
+        """Create an explicit reuse Run from the latest completed checkpoint."""
 
-        now = _now()
-        run_id = uuid.uuid4().hex
-        with self._transaction() as connection:
-            self._session_row(connection, worker_id)
-            existing = connection.execute(
-                "SELECT * FROM worker_runs WHERE worker_id = ? AND idempotency_key = ?",
-                (worker_id, idempotency_key),
-            ).fetchone()
-            if existing is not None:
-                self._validate_idempotent_replay(
-                    existing,
-                    operation=WorkerOperation.SEND,
-                    base_turn_id=base_turn_id,
-                    context=context,
-                )
-                return self._run_from_row(existing), False
-            run_sequence = self._next_run_sequence(connection, worker_id)
-            connection.execute(
-                "INSERT INTO worker_runs("
-                "run_id, worker_id, run_sequence, base_turn_id, status, "
-                "context_json, result_json, "
-                "operation_type, idempotency_key, created_at, updated_at"
-                ") VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
-                (
-                    run_id,
-                    worker_id,
-                    run_sequence,
-                    base_turn_id,
-                    WorkerRunStatus.QUEUED,
-                    _dump(context),
-                    WorkerOperation.SEND,
-                    idempotency_key,
-                    now,
-                    now,
-                ),
-            )
-            return (
-                WorkerRunRecord(
-                    run_id,
-                    worker_id,
-                    base_turn_id,
-                    WorkerRunStatus.QUEUED,
-                    context,
-                    idempotency_key,
-                    now,
-                    run_sequence=run_sequence,
-                ),
-                True,
-            )
+        return self._create_followup(
+            worker_id=worker_id,
+            source_run_id=None,
+            context=context,
+            idempotency_key=idempotency_key,
+            base_turn_id=base_turn_id,
+            operation=WorkerOperation.REUSE,
+        )
 
-    def create_recovery_run(
+    def create_flow_reuse_run(
+        self,
+        *,
+        source_run_id: str,
+        context: ContextEnvelope,
+        idempotency_key: str,
+        base_turn_id: str,
+    ) -> tuple[WorkerRunRecord, bool]:
+        """Create a Flow-owned reuse Run from one exact latest source Run."""
+
+        source = self.get_run(source_run_id)
+        return self._create_followup(
+            worker_id=source.worker_id,
+            source_run_id=source_run_id,
+            context=context,
+            idempotency_key=idempotency_key,
+            base_turn_id=base_turn_id,
+            operation=WorkerOperation.REUSE,
+            exact_reuse_source=True,
+        )
+
+    def create_resume_run(
         self,
         *,
         source_run_id: str,
@@ -369,73 +644,143 @@ class WorkerStore:
         idempotency_key: str,
         base_turn_id: str | None = None,
     ) -> tuple[WorkerRunRecord, bool]:
-        """Atomically continue the latest terminal Run, or replay that recovery."""
+        """Atomically create one continuation from the latest waiting Run."""
 
+        source = self.get_run(source_run_id)
+        return self._create_followup(
+            worker_id=source.worker_id,
+            source_run_id=source_run_id,
+            context=context,
+            idempotency_key=idempotency_key,
+            base_turn_id=base_turn_id,
+            operation=WorkerOperation.RESUME,
+        )
+
+    def _create_followup(
+        self,
+        *,
+        worker_id: str,
+        source_run_id: str | None,
+        context: ContextEnvelope,
+        idempotency_key: str,
+        base_turn_id: str | None,
+        operation: WorkerOperation,
+        exact_reuse_source: bool = False,
+    ) -> tuple[WorkerRunRecord, bool]:
         now = _now()
         run_id = uuid.uuid4().hex
         with self._transaction() as connection:
-            source_row = connection.execute(
-                "SELECT * FROM worker_runs WHERE run_id = ?",
-                (source_run_id,),
-            ).fetchone()
-            if source_row is None:
-                raise KeyError(f"unknown worker run: {source_run_id}")
-            source = self._run_from_row(source_row)
-            session = self._session_row(connection, source.worker_id)
+            session = self._session_row(connection, worker_id)
             if session.status is WorkerSessionStatus.ARCHIVED:
-                raise ValueError("archived Workers cannot be recovered")
-            if source.status not in {
-                WorkerRunStatus.COMPLETED,
-                WorkerRunStatus.PARTIAL,
-                WorkerRunStatus.FAILED,
-                WorkerRunStatus.CANCELLED,
-            }:
-                raise ValueError(
-                    f"Worker run status {source.status.value!r} is not recoverable"
-                )
+                raise ValueError("archived Workers cannot be reused")
 
             existing = connection.execute(
                 "SELECT * FROM worker_runs WHERE worker_id = ? AND idempotency_key = ?",
-                (source.worker_id, idempotency_key),
+                (worker_id, idempotency_key),
             ).fetchone()
             if existing is not None:
                 self._validate_idempotent_replay(
                     existing,
-                    operation=WorkerOperation.RECOVERY,
+                    operation=operation,
                     base_turn_id=base_turn_id,
                     context=context,
+                    source_run_id=source_run_id,
                 )
-                if int(existing["run_sequence"]) != source.run_sequence + 1:
+                if exact_reuse_source and existing["source_run_id"] != source_run_id:
                     raise IdempotencyConflictError(
                         f"idempotency conflict for key {idempotency_key!r}: "
                         "request differs in source run"
                     )
                 return self._run_from_row(existing), False
 
-            latest = connection.execute(
-                "SELECT * FROM worker_runs WHERE worker_id = ? "
-                "ORDER BY run_sequence DESC LIMIT 1",
-                (source.worker_id,),
+            latest_row = connection.execute(
+                "SELECT * FROM worker_runs WHERE worker_id = ? ORDER BY run_sequence DESC LIMIT 1",
+                (worker_id,),
             ).fetchone()
-            assert latest is not None
-            if latest["run_id"] != source.run_id:
-                raise ValueError("the Worker already moved to a newer run; inspect it again")
+            if latest_row is None:
+                raise ValueError("the Worker has no prior Run to continue")
+            latest = self._run_from_row(latest_row)
 
-            run_sequence = source.run_sequence + 1
+            if _permissions_expand(latest.context.permissions, context.permissions):
+                raise ValueError("a continuation cannot expand Worker permissions")
+            if operation is WorkerOperation.RESUME:
+                if latest.run_id != source_run_id:
+                    raise ValueError("the Worker already moved to a newer run; inspect it again")
+                if latest.status is not WorkerRunStatus.WAITING_FOR_CONTEXT:
+                    raise ValueError("resume_worker requires the latest waiting_for_context Run")
+                checkpoint = connection.execute(
+                    "SELECT 1 FROM worker_checkpoints WHERE run_id = ?",
+                    (source_run_id,),
+                ).fetchone()
+                if checkpoint is None:
+                    raise ValueError("the waiting WorkerRun has no resumable checkpoint")
+                source_id = source_run_id
+            elif exact_reuse_source:
+                if latest.run_id != source_run_id:
+                    raise ValueError(
+                        "the WorkerSession context advanced beyond the requested source Run"
+                    )
+                if latest.status not in {
+                    WorkerRunStatus.COMPLETED,
+                    WorkerRunStatus.PARTIAL,
+                    WorkerRunStatus.FAILED,
+                    WorkerRunStatus.CANCELLED,
+                }:
+                    raise ValueError("the source WorkerRun is not safely reusable")
+                if (
+                    latest.status is WorkerRunStatus.FAILED
+                    and (
+                        latest.result is None
+                        or latest.result.tool_outcome == "unknown"
+                    )
+                ):
+                    raise ValueError("a WorkerRun with unknown outcome cannot be reused")
+                if (
+                    latest.result is not None
+                    and latest.result.tool_outcome == "unknown"
+                ):
+                    raise ValueError("a WorkerRun with unknown outcome cannot be reused")
+                checkpoint = connection.execute(
+                    "SELECT 1 FROM worker_checkpoints WHERE run_id = ?",
+                    (latest.run_id,),
+                ).fetchone()
+                if (
+                    latest.status
+                    in {WorkerRunStatus.COMPLETED, WorkerRunStatus.PARTIAL}
+                    and checkpoint is None
+                ):
+                    raise ValueError("the source WorkerRun has no reusable checkpoint")
+                source_id = latest.run_id
+            else:
+                if latest.status not in {
+                    WorkerRunStatus.COMPLETED,
+                    WorkerRunStatus.PARTIAL,
+                }:
+                    raise ValueError("reuse_worker requires the latest completed or partial Run")
+                checkpoint = connection.execute(
+                    "SELECT 1 FROM worker_checkpoints WHERE run_id = ?",
+                    (latest.run_id,),
+                ).fetchone()
+                if checkpoint is None:
+                    raise ValueError("the latest WorkerRun has no reusable checkpoint")
+                source_id = latest.run_id
+
+            run_sequence = latest.run_sequence + 1
             connection.execute(
                 "INSERT INTO worker_runs("
-                "run_id, worker_id, run_sequence, base_turn_id, status, "
-                "context_json, result_json, "
-                "operation_type, idempotency_key, created_at, updated_at"
-                ") VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
+                "run_id, worker_id, run_sequence, source_run_id, base_turn_id, status, "
+                "context_json, result_json, waiting_request_json, operation_type, "
+                "idempotency_key, created_at, updated_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?)",
                 (
                     run_id,
-                    source.worker_id,
+                    worker_id,
                     run_sequence,
+                    source_id,
                     base_turn_id,
                     WorkerRunStatus.QUEUED,
                     _dump(context),
-                    WorkerOperation.RECOVERY,
+                    operation,
                     idempotency_key,
                     now,
                     now,
@@ -443,120 +788,514 @@ class WorkerStore:
             )
             return (
                 WorkerRunRecord(
-                    run_id,
-                    source.worker_id,
-                    base_turn_id,
-                    WorkerRunStatus.QUEUED,
-                    context,
-                    idempotency_key,
-                    now,
+                    run_id=run_id,
+                    worker_id=worker_id,
+                    base_turn_id=base_turn_id,
+                    status=WorkerRunStatus.QUEUED,
+                    context=context,
+                    idempotency_key=idempotency_key,
+                    created_at=now,
                     run_sequence=run_sequence,
+                    source_run_id=source_id,
                 ),
                 True,
             )
 
-    def list_queued_runs(self) -> list[WorkerRunRecord]:
+    def list_queued_runs(
+        self,
+        *,
+        include_flow_owned: bool = False,
+    ) -> list[WorkerRunRecord]:
+        """List runnable queue entries; Flow reservations require durable activation."""
+
+        query = "SELECT * FROM worker_runs WHERE status = ?"
+        parameters: list[Any] = [WorkerRunStatus.QUEUED]
+        if not include_flow_owned:
+            query += (
+                " AND (base_turn_id IS NULL OR base_turn_id NOT LIKE 'flow:%' "
+                "OR activated_at IS NOT NULL)"
+            )
+        query += " ORDER BY created_at"
         with self._connect() as connection:
-            rows = connection.execute(
-                "SELECT * FROM worker_runs WHERE status = ? ORDER BY created_at",
-                (WorkerRunStatus.QUEUED,),
-            ).fetchall()
+            rows = connection.execute(query, parameters).fetchall()
         return [self._run_from_row(row) for row in rows]
 
-    def request_cancel(self, run_id: str) -> WorkerRunRecord:
-        """Cancel a not-yet-running Run; active execution is cancelled by its manager."""
-
-        return self.try_cancel_run(run_id)[0]
-
-    def try_start_run(self, run_id: str) -> tuple[WorkerRunRecord, bool]:
-        """Atomically claim one queued Run across in-process and detached runners."""
+    def activate_run(self, run_id: str) -> WorkerRunRecord:
+        """Make one reserved queued Run durably claimable by any runner."""
 
         with self._transaction() as connection:
-            row = connection.execute(
-                "SELECT * FROM worker_runs WHERE run_id = ?", (run_id,)
-            ).fetchone()
-            if row is None:
-                raise KeyError(f"unknown worker run: {run_id}")
+            current = self._run_from_row(self._required_run_row(connection, run_id))
+            if current.status is WorkerRunStatus.QUEUED and current.activated_at is None:
+                now = _now()
+                connection.execute(
+                    "UPDATE worker_runs SET activated_at = ?, updated_at = ? "
+                    "WHERE run_id = ? AND status = ? AND activated_at IS NULL",
+                    (
+                        now,
+                        now,
+                        run_id,
+                        WorkerRunStatus.QUEUED,
+                    ),
+                )
+            return self._run_from_row(self._required_run_row(connection, run_id))
+
+    def try_start_run(self, run_id: str) -> tuple[WorkerRunRecord, bool]:
+        """Atomically claim a queued Run while serializing each WorkerSession."""
+
+        current = self.get_run(run_id)
+        flow_id = flow_id_from_turn_id(current.base_turn_id)
+        if flow_id is None:
+            return self._try_start_run(run_id)
+        if current.status is not WorkerRunStatus.QUEUED or current.activated_at is None:
+            return current, False
+        with flow_activation_fence(self.data_dir, flow_id):
+            current = self.get_run(run_id)
+            if current.status is not WorkerRunStatus.QUEUED:
+                return current, False
+            if current.activated_at is None:
+                return current, False
+            claimable = self._flow_run_is_current(flow_id, current)
+            if claimable is None:
+                # A transient Flow-store read failure is not evidence that work is
+                # obsolete. Leave the reservation queued for a later runner pass.
+                return current, False
+            if not claimable:
+                return self.try_cancel_run(run_id)[0], False
+            return self._try_start_run(run_id)
+
+    def _try_start_run(self, run_id: str) -> tuple[WorkerRunRecord, bool]:
+        """Claim a Run after any Flow ownership fence has been satisfied."""
+
+        owner_token = self.execution_owner_token
+        with self._transaction() as connection:
+            row = self._required_run_row(connection, run_id)
             current = self._run_from_row(row)
             if current.status is not WorkerRunStatus.QUEUED:
                 return current, False
+            if (
+                current.base_turn_id is not None
+                and current.base_turn_id.startswith("flow:")
+                and current.activated_at is None
+            ):
+                return current, False
             other_running = connection.execute(
-                "SELECT 1 FROM worker_runs "
-                "WHERE worker_id = ? AND run_id != ? AND status = ? LIMIT 1",
+                "SELECT 1 FROM worker_runs WHERE worker_id = ? AND run_id != ? "
+                "AND status = ? LIMIT 1",
                 (current.worker_id, run_id, WorkerRunStatus.RUNNING),
             ).fetchone()
             if other_running is not None:
                 return current, False
             cursor = connection.execute(
-                "UPDATE worker_runs SET status = ?, updated_at = ? "
-                "WHERE run_id = ? AND status = ?",
+                "UPDATE worker_runs SET status = ?, execution_owner_token = ?, "
+                "updated_at = ? WHERE run_id = ? AND status = ?",
                 (
                     WorkerRunStatus.RUNNING,
+                    owner_token,
                     _now(),
                     run_id,
                     WorkerRunStatus.QUEUED,
                 ),
             )
             if cursor.rowcount != 1:
-                row = connection.execute(
-                    "SELECT * FROM worker_runs WHERE run_id = ?", (run_id,)
-                ).fetchone()
-                assert row is not None
-                return self._run_from_row(row), False
+                return self._run_from_row(self._required_run_row(connection, run_id)), False
             connection.execute(
                 "UPDATE worker_sessions SET status = ? WHERE worker_id = ?",
                 (WorkerSessionStatus.RUNNING, current.worker_id),
             )
-            row = connection.execute(
-                "SELECT * FROM worker_runs WHERE run_id = ?", (run_id,)
-            ).fetchone()
-            assert row is not None
-            return self._run_from_row(row), True
+            return self._run_from_row(self._required_run_row(connection, run_id)), True
 
-    def try_cancel_run(self, run_id: str) -> tuple[WorkerRunRecord, bool]:
-        """Atomically cancel one active Run without overwriting a terminal outcome."""
+    def _flow_run_is_current(
+        self,
+        flow_id: str,
+        run: WorkerRunRecord,
+    ) -> bool | None:
+        """Check the durable Flow binding while its activation fence is held."""
 
+        try:
+            from aeloon_core.flows import FlowStatus, FlowStore
+
+            flow = FlowStore(self.data_dir).get_flow(flow_id)
+        except KeyError:
+            return False
+        except (RuntimeError, sqlite3.Error):
+            return None
+        if flow.status is not FlowStatus.OPEN:
+            return False
+        worker = self.get_worker(run.worker_id)
+        if flow.base_session_id != worker.base_session_id:
+            return False
+        for node in flow.nodes:
+            if (
+                node.current_run_id != run.run_id
+                or node.worker_id != run.worker_id
+                or not node.status.active
+            ):
+                continue
+            binding = next(
+                (
+                    candidate
+                    for candidate in reversed(node.runs)
+                    if candidate.run_id == run.run_id
+                ),
+                None,
+            )
+            return bool(
+                binding is not None
+                and binding.worker_id == run.worker_id
+                and binding.generation == node.generation
+                and binding.attempt == node.attempt
+            )
+        return False
+
+    def refresh_run_lease(self, run_id: str) -> bool:
+        """Refresh one live owner's durable lease while it still owns the Run."""
+
+        current = self.get_run(run_id)
+        flow_id = flow_id_from_turn_id(current.base_turn_id)
+        if flow_id is None:
+            return self._refresh_run_lease(run_id)
+        with flow_activation_fence(self.data_dir, flow_id):
+            current = self.get_run(run_id)
+            authorized = self._flow_run_is_current(flow_id, current)
+            if authorized is None:
+                # Keep retrying the heartbeat without extending the durable
+                # lease. A transient Flow read is not cancellation authority.
+                return True
+            if not authorized:
+                self.try_cancel_run(run_id)
+                return False
+            return self._refresh_run_lease(run_id)
+
+    def _refresh_run_lease(self, run_id: str) -> bool:
+        """Refresh after any Flow execution fence has been satisfied."""
+
+        owner_token = self.execution_owner_token
         with self._transaction() as connection:
-            row = connection.execute(
-                "SELECT * FROM worker_runs WHERE run_id = ?", (run_id,)
-            ).fetchone()
-            if row is None:
-                raise KeyError(f"unknown worker run: {run_id}")
-            current = self._run_from_row(row)
-            if current.status.terminal:
-                return current, False
+            self._required_run_row(connection, run_id)
             cursor = connection.execute(
-                "UPDATE worker_runs SET status = ?, updated_at = ? "
-                "WHERE run_id = ? AND status = ?",
-                (WorkerRunStatus.CANCELLED, _now(), run_id, current.status),
+                "UPDATE worker_runs SET updated_at = ? WHERE run_id = ? AND status = ? "
+                "AND execution_owner_token = ?",
+                (_now(), run_id, WorkerRunStatus.RUNNING, owner_token),
+            )
+            return cursor.rowcount == 1
+
+    def refresh_run_teardown_lease(self, run_id: str) -> bool:
+        """Keep a revoked owner's lease alive only while it performs teardown."""
+
+        owner_token = self.execution_owner_token
+        with self._transaction() as connection:
+            self._required_run_row(connection, run_id)
+            cursor = connection.execute(
+                "UPDATE worker_runs SET updated_at = ? WHERE run_id = ? AND status = ? "
+                "AND cancel_requested_at IS NOT NULL AND execution_owner_token = ?",
+                (_now(), run_id, WorkerRunStatus.RUNNING, owner_token),
+            )
+            return cursor.rowcount == 1
+
+    def require_run_execution_authority(self, run_id: str) -> None:
+        """Fence stale owners before and after every Worker tool boundary."""
+
+        current = self.get_run(run_id)
+        flow_id = flow_id_from_turn_id(current.base_turn_id)
+        if flow_id is None:
+            self._require_run_execution_authority(run_id)
+            return
+        with flow_activation_fence(self.data_dir, flow_id):
+            current = self.get_run(run_id)
+            authorized = self._flow_run_is_current(flow_id, current)
+            if authorized is None:
+                raise WorkerRunFencedError(
+                    "Flow execution authority is temporarily unavailable"
+                )
+            if not authorized:
+                self.try_cancel_run(run_id)
+                raise WorkerRunFencedError(
+                    "Flow execution authority was revoked; no further tools may run"
+                )
+            self._require_run_execution_authority(run_id)
+
+    def _require_run_execution_authority(self, run_id: str) -> None:
+        """Check Worker authority after any Flow fence has been satisfied."""
+
+        owner_token = self.execution_owner_token
+        with self._connect() as connection:
+            row = self._required_run_row(connection, run_id)
+            status = WorkerRunStatus(str(row["status"]))
+            cancel_requested_at = row["cancel_requested_at"]
+            execution_owner_token = row["execution_owner_token"]
+        if (
+            status is not WorkerRunStatus.RUNNING
+            or cancel_requested_at is not None
+            or execution_owner_token != owner_token
+        ):
+            raise WorkerRunFencedError(
+                "WorkerRun execution authority was revoked; no further tools may run"
+            )
+
+    def begin_tool_execution(self, run_id: str) -> None:
+        """Durably mark one in-flight tool call before it can produce side effects."""
+
+        current = self.get_run(run_id)
+        flow_id = flow_id_from_turn_id(current.base_turn_id)
+        if flow_id is None:
+            self._begin_tool_execution(run_id)
+            return
+        with flow_activation_fence(self.data_dir, flow_id):
+            current = self.get_run(run_id)
+            authorized = self._flow_run_is_current(flow_id, current)
+            if authorized is None:
+                raise WorkerRunFencedError(
+                    "Flow execution authority is temporarily unavailable"
+                )
+            if not authorized:
+                self.try_cancel_run(run_id)
+                raise WorkerRunFencedError(
+                    "Flow execution authority was revoked; no further tools may run"
+                )
+            self._begin_tool_execution(run_id)
+
+    def _begin_tool_execution(self, run_id: str) -> None:
+        """Begin after any Flow execution fence has been satisfied."""
+
+        owner_token = self.execution_owner_token
+        with self._transaction() as connection:
+            row = self._required_run_row(connection, run_id)
+            if (
+                WorkerRunStatus(str(row["status"])) is not WorkerRunStatus.RUNNING
+                or row["cancel_requested_at"] is not None
+                or row["execution_owner_token"] != owner_token
+            ):
+                raise WorkerRunFencedError(
+                    "WorkerRun execution authority was revoked; no further tools may run"
+                )
+            cursor = connection.execute(
+                "UPDATE worker_runs SET active_tool_count = active_tool_count + 1, "
+                "updated_at = ? WHERE run_id = ? AND status = ? "
+                "AND cancel_requested_at IS NULL AND execution_owner_token = ?",
+                (_now(), run_id, WorkerRunStatus.RUNNING, owner_token),
             )
             if cursor.rowcount != 1:
-                row = connection.execute(
-                    "SELECT * FROM worker_runs WHERE run_id = ?", (run_id,)
-                ).fetchone()
-                assert row is not None
-                return self._run_from_row(row), False
+                raise WorkerRunFencedError(
+                    "WorkerRun execution authority was revoked; no further tools may run"
+                )
+
+    def end_tool_execution(self, run_id: str) -> None:
+        """Release one durable in-flight marker after tool teardown completes."""
+
+        owner_token = self.execution_owner_token
+        with self._transaction() as connection:
+            self._required_run_row(connection, run_id)
+            cursor = connection.execute(
+                "UPDATE worker_runs SET active_tool_count = active_tool_count - 1, "
+                "updated_at = ? WHERE run_id = ? AND active_tool_count > 0 "
+                "AND status = ? AND execution_owner_token = ?",
+                (_now(), run_id, WorkerRunStatus.RUNNING, owner_token),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("WorkerRun tool execution marker is unbalanced")
+
+    def expire_stale_running_runs(self, *, stale_before: str) -> list[WorkerRunRecord]:
+        """Settle expired leases without replaying side effects of uncertain Runs."""
+
+        expired: list[WorkerRunRecord] = []
+        # Keep every acquired dead-owner flock until the SQLite transaction has
+        # committed. This makes proof, marker cleanup, and terminal transition
+        # one indivisible recovery operation.
+        with ExitStack() as owner_proofs:
+            with self._transaction() as connection:
+                rows = connection.execute(
+                    "SELECT * FROM worker_runs WHERE status = ? AND updated_at <= ? "
+                    "ORDER BY updated_at",
+                    (WorkerRunStatus.RUNNING, stale_before),
+                ).fetchall()
+                now = _now()
+                touched_workers: set[str] = set()
+                dead_owners: dict[str | None, bool] = {}
+                for row in rows:
+                    current = self._run_from_row(row)
+                    tool_owner_died = current.active_tool_count > 0
+                    if tool_owner_died:
+                        token = current.execution_owner_token
+                        if token not in dead_owners:
+                            dead_owners[token] = owner_proofs.enter_context(
+                                self._verified_dead_execution_owner(token)
+                            )
+                        if not dead_owners[token]:
+                            # A live owner may be stalled, or this may be a legacy
+                            # marker with unknowable ownership. Both fail closed.
+                            continue
+
+                    if tool_owner_died:
+                        result = ResultEnvelope(
+                            worker_id=current.worker_id,
+                            run_id=current.run_id,
+                            status=WorkerRunStatus.FAILED,
+                            report=WorkerReport(
+                                summary=(
+                                    "Worker owner process exited while a tool was in "
+                                    "flight; execution outcome is unknown. External or "
+                                    "descendant side effects may still be running or may "
+                                    "already have completed. Clearing the control-plane "
+                                    "in-flight marker does not roll them back; inspect side "
+                                    "effects before retrying."
+                                )
+                            ),
+                            tool_outcome="unknown",
+                        )
+                        cursor = connection.execute(
+                            "UPDATE worker_runs SET status = ?, result_json = ?, "
+                            "waiting_request_json = NULL, active_tool_count = 0, "
+                            "updated_at = ? WHERE run_id = ? AND status = ? "
+                            "AND updated_at <= ? AND active_tool_count = ? "
+                            "AND execution_owner_token IS ?",
+                            (
+                                WorkerRunStatus.FAILED,
+                                _dump(result),
+                                now,
+                                current.run_id,
+                                WorkerRunStatus.RUNNING,
+                                stale_before,
+                                current.active_tool_count,
+                                current.execution_owner_token,
+                            ),
+                        )
+                    elif current.cancel_requested_at is not None:
+                        cursor = connection.execute(
+                            "UPDATE worker_runs SET status = ?, active_tool_count = 0, "
+                            "updated_at = ? WHERE run_id = ? AND status = ? "
+                            "AND updated_at <= ? AND active_tool_count = ? "
+                            "AND execution_owner_token IS ?",
+                            (
+                                WorkerRunStatus.CANCELLED,
+                                now,
+                                current.run_id,
+                                WorkerRunStatus.RUNNING,
+                                stale_before,
+                                current.active_tool_count,
+                                current.execution_owner_token,
+                            ),
+                        )
+                    else:
+                        result = ResultEnvelope(
+                            worker_id=current.worker_id,
+                            run_id=current.run_id,
+                            status=WorkerRunStatus.FAILED,
+                            report=WorkerReport(
+                                summary=(
+                                    "Worker owner lease expired; execution outcome is unknown. "
+                                    "Retry explicitly if it is safe."
+                                )
+                            ),
+                            tool_outcome="unknown",
+                        )
+                        cursor = connection.execute(
+                            "UPDATE worker_runs SET status = ?, result_json = ?, "
+                            "waiting_request_json = NULL, active_tool_count = 0, "
+                            "updated_at = ? WHERE run_id = ? AND status = ? "
+                            "AND updated_at <= ? AND active_tool_count = ? "
+                            "AND execution_owner_token IS ?",
+                            (
+                                WorkerRunStatus.FAILED,
+                                _dump(result),
+                                now,
+                                current.run_id,
+                                WorkerRunStatus.RUNNING,
+                                stale_before,
+                                current.active_tool_count,
+                                current.execution_owner_token,
+                            ),
+                        )
+                    if cursor.rowcount != 1:
+                        continue
+                    touched_workers.add(current.worker_id)
+                    expired.append(
+                        self._run_from_row(
+                            self._required_run_row(connection, current.run_id)
+                        )
+                    )
+                for worker_id in touched_workers:
+                    self._refresh_session_status(connection, worker_id)
+        return expired
+
+    def try_cancel_run(self, run_id: str) -> tuple[WorkerRunRecord, bool]:
+        """Cancel queued work or durably request teardown from its running owner."""
+
+        with self._transaction() as connection:
+            current = self._run_from_row(self._required_run_row(connection, run_id))
+            if (
+                current.status.settled
+                and current.status is not WorkerRunStatus.WAITING_FOR_CONTEXT
+            ):
+                return current, False
+            now = _now()
+            if current.status is WorkerRunStatus.RUNNING:
+                cursor = connection.execute(
+                    "UPDATE worker_runs SET cancel_requested_at = ?, updated_at = ? "
+                    "WHERE run_id = ? AND status = ? AND cancel_requested_at IS NULL",
+                    (now, now, run_id, WorkerRunStatus.RUNNING),
+                )
+                return self._run_from_row(
+                    self._required_run_row(connection, run_id)
+                ), cursor.rowcount == 1
+            cursor = connection.execute(
+                "UPDATE worker_runs SET status = ?, cancel_requested_at = ?, updated_at = ? "
+                "WHERE run_id = ? AND status IN (?, ?)",
+                (
+                    WorkerRunStatus.CANCELLED,
+                    now,
+                    now,
+                    run_id,
+                    WorkerRunStatus.QUEUED,
+                    WorkerRunStatus.WAITING_FOR_CONTEXT,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return self._run_from_row(self._required_run_row(connection, run_id)), False
             self._refresh_session_status(connection, current.worker_id)
-            row = connection.execute(
-                "SELECT * FROM worker_runs WHERE run_id = ?", (run_id,)
-            ).fetchone()
-            assert row is not None
-            return self._run_from_row(row), True
+            return self._run_from_row(self._required_run_row(connection, run_id)), True
+
+    def acknowledge_cancel_run(self, run_id: str) -> tuple[WorkerRunRecord, bool]:
+        """Mark cancellation settled after the owning executor has torn down."""
+
+        owner_token = self.execution_owner_token
+        with self._transaction() as connection:
+            current = self._run_from_row(self._required_run_row(connection, run_id))
+            if current.status.settled:
+                return current, False
+            if (
+                current.status is WorkerRunStatus.RUNNING
+                and current.execution_owner_token != owner_token
+            ):
+                return current, False
+            now = _now()
+            cursor = connection.execute(
+                "UPDATE worker_runs SET status = ?, cancel_requested_at = "
+                "COALESCE(cancel_requested_at, ?), updated_at = ? "
+                "WHERE run_id = ? AND active_tool_count = 0 AND (status = ? OR "
+                "(status = ? AND execution_owner_token = ?))",
+                (
+                    WorkerRunStatus.CANCELLED,
+                    now,
+                    now,
+                    run_id,
+                    WorkerRunStatus.QUEUED,
+                    WorkerRunStatus.RUNNING,
+                    owner_token,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return self._run_from_row(self._required_run_row(connection, run_id)), False
+            self._refresh_session_status(connection, current.worker_id)
+            return self._run_from_row(self._required_run_row(connection, run_id)), True
 
     def archive_worker(self, worker_id: str) -> WorkerSessionRecord:
-        """Archive only after every Run is terminal, retaining all audit records."""
+        """Soft-delete an idle WorkerSession while retaining its audit records."""
 
         with self._transaction() as connection:
             session = self._session_row(connection, worker_id)
             active = connection.execute(
-                "SELECT 1 FROM worker_runs WHERE worker_id = ? AND status IN (?, ?, ?, ?)",
-                (
-                    worker_id,
-                    WorkerRunStatus.CREATED,
-                    WorkerRunStatus.QUEUED,
-                    WorkerRunStatus.RUNNING,
-                    WorkerRunStatus.WAITING_FOR_CONTEXT,
-                ),
+                "SELECT 1 FROM worker_runs WHERE worker_id = ? AND status IN (?, ?) LIMIT 1",
+                (worker_id, WorkerRunStatus.QUEUED, WorkerRunStatus.RUNNING),
             ).fetchone()
             if active is not None:
                 raise ValueError("cancel or finish active worker runs before archiving")
@@ -565,24 +1304,11 @@ class WorkerStore:
                 (WorkerSessionStatus.ARCHIVED, worker_id),
             )
             return WorkerSessionRecord(
-                session.worker_id,
-                session.base_session_id,
-                session.profile,
-                WorkerSessionStatus.ARCHIVED,
-                session.created_at,
-            )
-
-    def save_checkpoint(self, run_id: str, checkpoint: dict[str, Any]) -> None:
-        """Persist a safe-point checkpoint; callers never resume from trace digests."""
-
-        self.get_run(run_id)
-        with self._transaction() as connection:
-            connection.execute(
-                "INSERT INTO worker_checkpoints(run_id, checkpoint_json, created_at) "
-                "VALUES (?, ?, ?) "
-                "ON CONFLICT(run_id) DO UPDATE SET checkpoint_json = excluded.checkpoint_json, "
-                "created_at = excluded.created_at",
-                (run_id, json.dumps(checkpoint, ensure_ascii=False, sort_keys=True), _now()),
+                worker_id=session.worker_id,
+                base_session_id=session.base_session_id,
+                snapshot=session.snapshot,
+                status=WorkerSessionStatus.ARCHIVED,
+                created_at=session.created_at,
             )
 
     def load_checkpoint(self, run_id: str) -> dict[str, Any] | None:
@@ -593,7 +1319,7 @@ class WorkerStore:
         return json.loads(row["checkpoint_json"]) if row is not None else None
 
     def append_transcript(self, run_id: str, payload: dict[str, Any]) -> Path:
-        """Append private Worker execution data; Base history never reads this file."""
+        """Append private execution data; the Master never reads this transcript."""
 
         run = self.get_run(run_id)
         path = (
@@ -609,107 +1335,166 @@ class WorkerStore:
             handle.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
         return path
 
-    def transition_run(
+    def complete_run(
         self,
         run_id: str,
+        result: ResultEnvelope,
         *,
-        expected: WorkerRunStatus,
-        status: WorkerRunStatus,
-        result: ResultEnvelope | None = None,
+        checkpoint: dict[str, Any] | None = None,
+        waiting_request: WaitingRequest | None = None,
     ) -> WorkerRunRecord:
-        """Compare-and-swap a Run state; terminal Runs cannot be reopened."""
-
-        if expected.terminal:
-            raise ValueError("terminal worker runs cannot transition")
-        with self._transaction() as connection:
-            cursor = connection.execute(
-                "UPDATE worker_runs SET status = ?, result_json = COALESCE(?, result_json), "
-                "updated_at = ? "
-                "WHERE run_id = ? AND status = ?",
-                (status, _dump(result) if result else None, _now(), run_id, expected),
-            )
-            if cursor.rowcount != 1:
-                raise ValueError("worker run state changed concurrently")
-            row = connection.execute(
-                "SELECT * FROM worker_runs WHERE run_id = ?", (run_id,)
-            ).fetchone()
-            assert row is not None
-            if status is WorkerRunStatus.RUNNING:
-                connection.execute(
-                    "UPDATE worker_sessions SET status = ? WHERE worker_id = ?",
-                    (WorkerSessionStatus.RUNNING, row["worker_id"]),
-                )
-            elif status is not WorkerRunStatus.QUEUED:
-                active = connection.execute(
-                    "SELECT 1 FROM worker_runs WHERE worker_id = ? AND status = ?",
-                    (row["worker_id"], WorkerRunStatus.RUNNING),
-                ).fetchone()
-                if active is None:
-                    connection.execute(
-                        "UPDATE worker_sessions SET status = ? WHERE worker_id = ?",
-                        (WorkerSessionStatus.IDLE, row["worker_id"]),
-                    )
-            return self._run_from_row(row)
-
-    def complete_run(self, run_id: str, result: ResultEnvelope) -> WorkerRunRecord:
-        return self.try_finalize_run(run_id, result)[0]
+        return self.try_finalize_run(
+            run_id,
+            result,
+            checkpoint=checkpoint,
+            waiting_request=waiting_request,
+        )[0]
 
     def try_finalize_run(
         self,
         run_id: str,
         result: ResultEnvelope,
+        *,
+        checkpoint: dict[str, Any] | None = None,
+        waiting_request: WaitingRequest | None = None,
     ) -> tuple[WorkerRunRecord, bool]:
-        """Atomically commit one terminal result; the first terminal writer wins."""
+        """Commit status, result, waiting request, and checkpoint in one transaction."""
 
         if result.run_id != run_id:
             raise ValueError("result run_id does not match the finalized WorkerRun")
-        if result.status not in {
+        allowed = {
             WorkerRunStatus.COMPLETED,
             WorkerRunStatus.PARTIAL,
+            WorkerRunStatus.WAITING_FOR_CONTEXT,
             WorkerRunStatus.FAILED,
-        }:
-            raise ValueError("Worker finalization requires completed, partial, or failed status")
+        }
+        if result.status not in allowed:
+            raise ValueError("Worker finalization requires a settled execution status")
+        if (result.status is WorkerRunStatus.WAITING_FOR_CONTEXT) != (waiting_request is not None):
+            raise ValueError("waiting_for_context requires exactly one structured request")
+        if (
+            result.status
+            in {
+                WorkerRunStatus.COMPLETED,
+                WorkerRunStatus.PARTIAL,
+                WorkerRunStatus.WAITING_FOR_CONTEXT,
+            }
+            and checkpoint is None
+        ):
+            raise ValueError(f"{result.status.value} requires an atomic checkpoint")
+
+        current = self.get_run(run_id)
+        flow_id = flow_id_from_turn_id(current.base_turn_id)
+        if flow_id is None or current.status.settled:
+            return self._try_finalize_run(
+                run_id,
+                result,
+                checkpoint=checkpoint,
+                waiting_request=waiting_request,
+            )
+        with flow_activation_fence(self.data_dir, flow_id):
+            current = self.get_run(run_id)
+            authorized = self._flow_run_is_current(flow_id, current)
+            if authorized is None:
+                raise WorkerRunFencedError(
+                    "Flow execution authority is temporarily unavailable"
+                )
+            if not authorized:
+                # Publish cancellation before attempting terminal settlement.
+                # _try_finalize_run will reject the model result and, once tool
+                # teardown is complete, settle this exact Run as cancelled.
+                self.try_cancel_run(run_id)
+            return self._try_finalize_run(
+                run_id,
+                result,
+                checkpoint=checkpoint,
+                waiting_request=waiting_request,
+            )
+
+    def _try_finalize_run(
+        self,
+        run_id: str,
+        result: ResultEnvelope,
+        *,
+        checkpoint: dict[str, Any] | None = None,
+        waiting_request: WaitingRequest | None = None,
+    ) -> tuple[WorkerRunRecord, bool]:
+        """Finalize after any Flow execution fence has been satisfied."""
+
+        owner_token = self.execution_owner_token
         with self._transaction() as connection:
-            row = connection.execute(
-                "SELECT * FROM worker_runs WHERE run_id = ?", (run_id,)
-            ).fetchone()
-            if row is None:
-                raise KeyError(f"unknown worker run: {run_id}")
-            current = self._run_from_row(row)
+            current = self._run_from_row(self._required_run_row(connection, run_id))
             if current.worker_id != result.worker_id:
                 raise ValueError("result worker_id does not match the finalized WorkerRun")
-            if current.status.terminal:
+            if current.status.settled:
                 return current, False
+            if current.status is not WorkerRunStatus.RUNNING:
+                raise ValueError("only a running WorkerRun can be finalized")
+            if current.execution_owner_token != owner_token:
+                raise WorkerRunFencedError(
+                    "WorkerRun execution authority belongs to another owner"
+                )
+            if current.active_tool_count:
+                raise WorkerRunFencedError(
+                    "cannot finalize a WorkerRun while tool execution remains in flight"
+                )
+            if current.cancel_requested_at is not None:
+                now = _now()
+                connection.execute(
+                    "UPDATE worker_runs SET status = ?, updated_at = ? WHERE run_id = ? "
+                    "AND status = ? AND execution_owner_token = ?",
+                    (
+                        WorkerRunStatus.CANCELLED,
+                        now,
+                        run_id,
+                        WorkerRunStatus.RUNNING,
+                        owner_token,
+                    ),
+                )
+                self._refresh_session_status(connection, current.worker_id)
+                return self._run_from_row(self._required_run_row(connection, run_id)), True
             cursor = connection.execute(
-                "UPDATE worker_runs SET status = ?, result_json = ?, updated_at = ? "
-                "WHERE run_id = ? AND status = ?",
-                (result.status, _dump(result), _now(), run_id, current.status),
+                "UPDATE worker_runs SET status = ?, result_json = ?, "
+                "waiting_request_json = ?, updated_at = ? WHERE run_id = ? AND status = ? "
+                "AND execution_owner_token = ?",
+                (
+                    result.status,
+                    _dump(result),
+                    _dump(waiting_request),
+                    _now(),
+                    run_id,
+                    WorkerRunStatus.RUNNING,
+                    owner_token,
+                ),
             )
             if cursor.rowcount != 1:
-                row = connection.execute(
-                    "SELECT * FROM worker_runs WHERE run_id = ?", (run_id,)
-                ).fetchone()
-                assert row is not None
-                return self._run_from_row(row), False
+                return self._run_from_row(self._required_run_row(connection, run_id)), False
+            if checkpoint is not None:
+                self._upsert_checkpoint(connection, run_id, checkpoint)
             self._refresh_session_status(connection, current.worker_id)
-            row = connection.execute(
-                "SELECT * FROM worker_runs WHERE run_id = ?", (run_id,)
-            ).fetchone()
-            assert row is not None
-            return self._run_from_row(row), True
+            return self._run_from_row(self._required_run_row(connection, run_id)), True
 
     @staticmethod
-    def _refresh_session_status(
+    def _upsert_checkpoint(
         connection: sqlite3.Connection,
-        worker_id: str,
+        run_id: str,
+        checkpoint: dict[str, Any],
     ) -> None:
+        connection.execute(
+            "INSERT INTO worker_checkpoints(run_id, checkpoint_json, created_at) "
+            "VALUES (?, ?, ?) ON CONFLICT(run_id) DO UPDATE SET "
+            "checkpoint_json = excluded.checkpoint_json, created_at = excluded.created_at",
+            (run_id, json.dumps(checkpoint, ensure_ascii=False, sort_keys=True), _now()),
+        )
+
+    @staticmethod
+    def _refresh_session_status(connection: sqlite3.Connection, worker_id: str) -> None:
         running = connection.execute(
             "SELECT 1 FROM worker_runs WHERE worker_id = ? AND status = ? LIMIT 1",
             (worker_id, WorkerRunStatus.RUNNING),
         ).fetchone()
         connection.execute(
-            "UPDATE worker_sessions SET status = ? "
-            "WHERE worker_id = ? AND status != ?",
+            "UPDATE worker_sessions SET status = ? WHERE worker_id = ? AND status != ?",
             (
                 WorkerSessionStatus.RUNNING if running is not None else WorkerSessionStatus.IDLE,
                 worker_id,
@@ -718,158 +1503,103 @@ class WorkerStore:
         )
 
     @staticmethod
-    def _migrate_worker_run_operation_type(connection: sqlite3.Connection) -> None:
-        """Add operation provenance to databases created before strict replay checks."""
-
-        columns = {
-            str(row["name"])
-            for row in connection.execute("PRAGMA table_info(worker_runs)").fetchall()
-        }
-        if "operation_type" in columns:
-            return
-        connection.execute(
-            "ALTER TABLE worker_runs ADD COLUMN operation_type "
-            "TEXT NOT NULL DEFAULT 'send'"
-        )
-        # Every Worker is born with exactly one Run, so the first inserted Run
-        # is the historical spawn operation. All later Runs are sends.
-        connection.execute(
-            "UPDATE worker_runs SET operation_type = ? WHERE rowid IN ("
-            "SELECT MIN(rowid) FROM worker_runs GROUP BY worker_id"
-            ")",
-            (WorkerOperation.SPAWN,),
-        )
-
-    @staticmethod
-    def _migrate_worker_run_sequence(connection: sqlite3.Connection) -> None:
-        """Add a durable per-Worker order to databases created before run sequences."""
-
-        columns = {
-            str(row["name"])
-            for row in connection.execute("PRAGMA table_info(worker_runs)").fetchall()
-        }
-        if "run_sequence" not in columns:
-            # SQLite cannot add a non-null column without a default. Zero is a
-            # migration-only sentinel; every row is backfilled before the unique
-            # index is installed, and application writes always allocate >= 1.
-            connection.execute(
-                "ALTER TABLE worker_runs ADD COLUMN run_sequence "
-                "INTEGER NOT NULL DEFAULT 0"
-            )
-
-        invalid = connection.execute(
-            "SELECT 1 FROM worker_runs WHERE run_sequence < 1 LIMIT 1"
-        ).fetchone()
-        duplicates = connection.execute(
-            "SELECT 1 FROM worker_runs GROUP BY worker_id, run_sequence "
-            "HAVING COUNT(*) > 1 LIMIT 1"
-        ).fetchone()
-        if invalid is not None or duplicates is not None:
-            rows = connection.execute(
-                "SELECT rowid, worker_id FROM worker_runs "
-                "ORDER BY worker_id, created_at, rowid"
-            ).fetchall()
-            worker_id: str | None = None
-            run_sequence = 0
-            for row in rows:
-                if row["worker_id"] != worker_id:
-                    worker_id = str(row["worker_id"])
-                    run_sequence = 0
-                run_sequence += 1
-                connection.execute(
-                    "UPDATE worker_runs SET run_sequence = ? WHERE rowid = ?",
-                    (run_sequence, row["rowid"]),
-                )
-
-        # Replace the old timestamp index only after backfill. The named unique
-        # index enforces allocation correctness for every future writer.
-        connection.execute("DROP INDEX IF EXISTS worker_runs_worker_idx")
-        connection.execute(
-            "CREATE INDEX IF NOT EXISTS worker_runs_worker_idx "
-            "ON worker_runs(worker_id, run_sequence DESC)"
-        )
-        connection.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS worker_runs_sequence_unique_idx "
-            "ON worker_runs(worker_id, run_sequence)"
-        )
-
-    @staticmethod
-    def _next_run_sequence(connection: sqlite3.Connection, worker_id: str) -> int:
-        """Allocate the next sequence inside the caller's immediate transaction."""
-
-        row = connection.execute(
-            "SELECT COALESCE(MAX(run_sequence), 0) + 1 AS next_sequence "
-            "FROM worker_runs WHERE worker_id = ?",
-            (worker_id,),
-        ).fetchone()
-        assert row is not None
-        return int(row["next_sequence"])
-
-    @staticmethod
     def _validate_idempotent_replay(
         row: sqlite3.Row,
         *,
         operation: WorkerOperation,
         base_turn_id: str | None,
         context: ContextEnvelope,
-        stored_profile: ProfileHandle | None = None,
-        requested_profile: ProfileHandle | None = None,
+        source_run_id: str | None,
+        stored_snapshot: WorkerSnapshot | None = None,
+        requested_snapshot: WorkerSnapshot | None = None,
     ) -> None:
         conflicts: list[str] = []
         if row["operation_type"] != operation:
             conflicts.append("operation type")
         if row["base_turn_id"] != base_turn_id:
             conflicts.append("base turn")
+        if operation is WorkerOperation.RESUME and row["source_run_id"] != source_run_id:
+            conflicts.append("source run")
         stored_context = ContextEnvelope.model_validate_json(row["context_json"])
         if _normalized_context(stored_context) != _normalized_context(context):
             conflicts.append("context envelope")
-        if operation is WorkerOperation.SPAWN and stored_profile != requested_profile:
-            conflicts.append("profile")
+        if operation is WorkerOperation.SPAWN and stored_snapshot != requested_snapshot:
+            conflicts.append("worker snapshot")
         if conflicts:
-            fields = ", ".join(conflicts)
             raise IdempotencyConflictError(
                 f"idempotency conflict for key {row['idempotency_key']!r}: "
-                f"request differs in {fields}"
+                f"request differs in {', '.join(conflicts)}"
             )
+
+    @staticmethod
+    def _required_run_row(connection: sqlite3.Connection, run_id: str) -> sqlite3.Row:
+        row = connection.execute("SELECT * FROM worker_runs WHERE run_id = ?", (run_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"unknown worker run: {run_id}")
+        return row
 
     def _session_row(self, connection: sqlite3.Connection, worker_id: str) -> WorkerSessionRecord:
         row = connection.execute(
             "SELECT * FROM worker_sessions WHERE worker_id = ?", (worker_id,)
         ).fetchone()
-        assert row is not None
+        if row is None:
+            raise KeyError(f"unknown worker: {worker_id}")
         return self._session_from_row(row)
 
     @staticmethod
     def _session_from_row(row: sqlite3.Row) -> WorkerSessionRecord:
         return WorkerSessionRecord(
-            row["worker_id"],
-            row["base_session_id"],
-            ProfileHandle.model_validate_json(row["profile_json"]),
-            WorkerSessionStatus(row["status"]),
-            row["created_at"],
+            worker_id=str(row["worker_id"]),
+            base_session_id=str(row["base_session_id"]),
+            snapshot=WorkerSnapshot.model_validate_json(row["snapshot_json"]),
+            status=WorkerSessionStatus(row["status"]),
+            created_at=str(row["created_at"]),
         )
 
     @staticmethod
     def _run_from_row(row: sqlite3.Row) -> WorkerRunRecord:
         return WorkerRunRecord(
-            row["run_id"], row["worker_id"], row["base_turn_id"], WorkerRunStatus(row["status"]),
-            ContextEnvelope.model_validate_json(row["context_json"]), row["idempotency_key"],
-            row["created_at"], ResultEnvelope.model_validate_json(row["result_json"])
-            if row["result_json"] else None, int(row["run_sequence"]),
+            run_id=str(row["run_id"]),
+            worker_id=str(row["worker_id"]),
+            base_turn_id=row["base_turn_id"],
+            status=WorkerRunStatus(row["status"]),
+            context=ContextEnvelope.model_validate_json(row["context_json"]),
+            idempotency_key=str(row["idempotency_key"]),
+            created_at=str(row["created_at"]),
+            result=(
+                ResultEnvelope.model_validate_json(row["result_json"])
+                if row["result_json"]
+                else None
+            ),
+            run_sequence=int(row["run_sequence"]),
+            source_run_id=row["source_run_id"],
+            waiting_request=(
+                WaitingRequest.model_validate_json(row["waiting_request_json"])
+                if row["waiting_request_json"]
+                else None
+            ),
+            cancel_requested_at=row["cancel_requested_at"],
+            activated_at=row["activated_at"],
+            active_tool_count=int(row["active_tool_count"]),
+            execution_owner_token=row["execution_owner_token"],
         )
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA foreign_keys=ON")
+        connection = sqlite3.connect(self.path, timeout=30, isolation_level=None)
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA busy_timeout=30000")
+            connection.execute("PRAGMA foreign_keys=ON")
+        except BaseException:
+            connection.close()
+            raise
         return connection
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
         connection = self._connect()
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("BEGIN EXCLUSIVE")
             yield connection
             connection.commit()
         except BaseException:
@@ -879,26 +1609,65 @@ class WorkerStore:
             connection.close()
 
 
-def _dump(value: BaseModel | None) -> str:
-    return json.dumps(
-        value.model_dump(mode="json") if value else None,
-        ensure_ascii=False,
-        sort_keys=True,
-    )
+def _register_execution_owner(store: WorkerStore) -> None:
+    global _OWNER_AT_FORK_REGISTERED
+
+    _OWNER_STORES.add(store)
+    if _OWNER_AT_FORK_REGISTERED or not hasattr(os, "register_at_fork"):
+        return
+    os.register_at_fork(after_in_child=_discard_inherited_execution_owners)
+    _OWNER_AT_FORK_REGISTERED = True
+
+
+def _discard_inherited_execution_owners() -> None:
+    for store in tuple(_OWNER_STORES):
+        store._discard_inherited_execution_owner()
+
+
+def _dump(value: BaseModel | None) -> str | None:
+    return value.model_dump_json() if value is not None else None
 
 
 def _normalized_context(context: ContextEnvelope) -> str:
-    """Canonical scheduling input, excluding the envelope's random identity."""
-
-    payload = context.model_dump(mode="json")
-    payload.pop("envelope_id", None)
     return json.dumps(
-        payload,
+        context.model_dump(mode="json"),
         ensure_ascii=False,
-        separators=(",", ":"),
         sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _permissions_expand(
+    previous: PermissionSnapshot,
+    requested: PermissionSnapshot,
+) -> bool:
+    return not set(requested.tool_names).issubset(previous.tool_names) or (
+        requested.skills_enabled and not previous.skills_enabled
     )
 
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _valid_owner_token(token: str) -> bool:
+    return len(token) == 32 and all(character in "0123456789abcdef" for character in token)
+
+
+__all__ = [
+    "BudgetGrant",
+    "ContextEnvelope",
+    "IdempotencyConflictError",
+    "PermissionSnapshot",
+    "ResultEnvelope",
+    "SCHEMA_VERSION",
+    "WaitingRequest",
+    "WorkerOperation",
+    "WorkerReport",
+    "WorkerRunRecord",
+    "WorkerRunFencedError",
+    "WorkerRunStatus",
+    "WorkerSessionRecord",
+    "WorkerSessionStatus",
+    "WorkerStore",
+]
