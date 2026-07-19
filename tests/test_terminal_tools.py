@@ -62,7 +62,7 @@ def _tool_state(*calls: ToolCallRequest) -> LightweightState:
     state.pending_response = LLMResponse(
         content=None,
         tool_calls=list(calls),
-        finish_reason="tool_calls",
+        finish_reason="tool_use",
     )
     return state
 
@@ -110,9 +110,15 @@ async def test_mixed_terminal_batch_has_zero_tool_side_effects() -> None:
     assert calls == {"complete": 0, "write": 0}
     assert state.metadata.status is RunStatus.RUNNING
     assert state.metadata.phase is AgentNode.ROUTER
-    results = [message for message in state.messages if message.get("role") == "tool"]
+    results = [
+        block
+        for message in state.messages
+        if message.get("role") == "user" and isinstance(message.get("content"), list)
+        for block in message["content"]
+        if isinstance(block, dict) and block.get("type") == "tool_result"
+    ]
     assert len(results) == 2
-    assert all("rejected without execution" in str(result.get("content")) for result in results)
+    assert all("rejected without execution" in str(result["content"]) for result in results)
 
 
 @pytest.mark.asyncio
@@ -205,20 +211,24 @@ async def test_new_user_assignment_resets_side_effect_deduplication() -> None:
         {"role": "user", "content": "first WorkerRun"},
         {
             "role": "assistant",
-            "content": None,
-            "tool_calls": [
+            "content": [
                 {
+                    "type": "tool_use",
                     "id": "prior",
-                    "type": "function",
-                    "function": {"name": "complete_work", "arguments": "{}"},
+                    "name": "complete_work",
+                    "input": {},
                 }
             ],
         },
         {
-            "role": "tool",
-            "name": "complete_work",
-            "tool_call_id": "prior",
-            "content": "accepted",
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "prior",
+                    "content": "accepted",
+                }
+            ],
         },
         {"role": "user", "content": "second WorkerRun"},
     ]
@@ -291,7 +301,7 @@ async def test_strict_loop_routes_bare_text_through_guard() -> None:
 
     state = await ModelAgent(runtime)._handle_text_response(
         state,
-        LLMResponse(content="I am done.", finish_reason="stop"),
+        LLMResponse(content="I am done.", finish_reason="end_turn"),
     )
 
     assert state.metadata.status is RunStatus.RUNNING

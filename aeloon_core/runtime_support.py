@@ -99,35 +99,39 @@ def default_tool_hint(tool_calls: list[ToolCallRequest]) -> str:
 def build_assistant_message(
     content: str | None,
     *,
-    tool_calls: list[dict[str, Any]] | None = None,
+    tool_uses: list[dict[str, Any]] | None = None,
     reasoning_content: str | None = None,
     thinking_blocks: list[dict[str, Any]] | None = None,
 ) -> Message:
-    """Build an OpenAI-compatible assistant message."""
+    """Build one Anthropic assistant message from typed content blocks."""
 
-    message: Message = {"role": "assistant", "content": content}
-    if tool_calls:
-        message["tool_calls"] = tool_calls
-        if content == "":
-            message["content"] = None
-    if reasoning_content:
-        message["reasoning_content"] = reasoning_content
-    if thinking_blocks:
-        message["thinking_blocks"] = thinking_blocks
-    return message
+    del reasoning_content
+    blocks: list[dict[str, Any]] = []
+    for block in thinking_blocks or []:
+        if isinstance(block, dict) and block.get("type") in {
+            "thinking",
+            "redacted_thinking",
+        }:
+            blocks.append(dict(block))
+    if content:
+        blocks.append({"type": "text", "text": content})
+    blocks.extend(dict(tool_use) for tool_use in tool_uses or [])
+    if not blocks:
+        blocks.append({"type": "text", "text": "(empty)"})
+    return {"role": "assistant", "content": blocks}
 
 
 def default_add_assistant_message(
     messages: list[Message],
     content: str | None,
-    tool_calls: list[dict[str, Any]] | None = None,
+    tool_uses: list[dict[str, Any]] | None = None,
     reasoning_content: str | None = None,
     thinking_blocks: list[dict[str, Any]] | None = None,
 ) -> list[Message]:
     messages.append(
         build_assistant_message(
             content,
-            tool_calls=tool_calls,
+            tool_uses=tool_uses,
             reasoning_content=reasoning_content,
             thinking_blocks=thinking_blocks,
         )
@@ -141,15 +145,30 @@ def default_add_tool_result(
     tool_name: str,
     result: str,
 ) -> list[Message]:
-    messages.append(
-        {
-            "role": "tool",
-            "tool_call_id": tool_call_id,
-            "name": tool_name,
-            "content": result,
-        }
-    )
+    block = {
+        "type": "tool_result",
+        "tool_use_id": tool_call_id,
+        "content": result,
+        "is_error": result.lstrip().lower().startswith("error"),
+    }
+    if messages and _is_tool_result_message(messages[-1]):
+        messages[-1]["content"].append(block)
+    else:
+        messages.append({"role": "user", "content": [block]})
     return messages
+
+
+def _is_tool_result_message(message: Message) -> bool:
+    content = message.get("content")
+    return (
+        message.get("role") == "user"
+        and isinstance(content, list)
+        and bool(content)
+        and all(
+            isinstance(block, dict) and block.get("type") == "tool_result"
+            for block in content
+        )
+    )
 
 
 async def execute_tool_batch(
@@ -222,33 +241,28 @@ _PROVIDER_TOOL_CALL_ARGS_MAX_CHARS = 4096
 _PROVIDER_TOOL_ARG_STRING_MAX_CHARS = 1024
 
 
-def _shrink_oversized_tool_arguments(raw: str) -> str:
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        return raw
-    if not isinstance(parsed, dict):
-        return raw
+def _shrink_oversized_tool_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    parsed = dict(arguments)
     for key, value in parsed.items():
         if isinstance(value, str) and len(value) > _PROVIDER_TOOL_ARG_STRING_MAX_CHARS:
             omitted = len(value) - _PROVIDER_TOOL_ARG_STRING_MAX_CHARS
             parsed[key] = (
                 value[:_PROVIDER_TOOL_ARG_STRING_MAX_CHARS] + f"... [truncated {omitted} chars]"
             )
-    shrunk = json.dumps(parsed, ensure_ascii=False)
-    if len(shrunk) <= _PROVIDER_TOOL_CALL_ARGS_MAX_CHARS:
-        return shrunk
-    return json.dumps(
-        {"_compacted_tool_arguments": True, "keys": list(parsed.keys())[:20]},
-        ensure_ascii=False,
-    )
+    if len(json.dumps(parsed, ensure_ascii=False)) <= _PROVIDER_TOOL_CALL_ARGS_MAX_CHARS:
+        return parsed
+    return {"_compacted_tool_arguments": True, "keys": list(parsed.keys())[:20]}
 
 
 def shrink_answered_tool_args_for_provider(messages: list[Message]) -> list[Message]:
     answered = {
-        message["tool_call_id"]
+        block["tool_use_id"]
         for message in messages
-        if message.get("role") == "tool" and isinstance(message.get("tool_call_id"), str)
+        if message.get("role") == "user" and isinstance(message.get("content"), list)
+        for block in message["content"]
+        if isinstance(block, dict)
+        and block.get("type") == "tool_result"
+        and isinstance(block.get("tool_use_id"), str)
     }
     if not answered:
         return messages
@@ -256,26 +270,28 @@ def shrink_answered_tool_args_for_provider(messages: list[Message]) -> list[Mess
     out: list[Message] = []
     changed = False
     for message in messages:
-        calls = message.get("tool_calls") if message.get("role") == "assistant" else None
-        if not isinstance(calls, list):
+        blocks = message.get("content") if message.get("role") == "assistant" else None
+        if not isinstance(blocks, list):
             out.append(message)
             continue
-        new_calls: list[Any] = []
+        new_blocks: list[Any] = []
         message_changed = False
-        for call in calls:
-            function = call.get("function") if isinstance(call, dict) else None
-            arguments = function.get("arguments") if isinstance(function, dict) else None
+        for block in blocks:
+            arguments = block.get("input") if isinstance(block, dict) else None
             if (
-                call.get("id") in answered
-                and isinstance(arguments, str)
-                and len(arguments) > _PROVIDER_TOOL_CALL_ARGS_MAX_CHARS
+                isinstance(block, dict)
+                and block.get("type") == "tool_use"
+                and block.get("id") in answered
+                and isinstance(arguments, dict)
+                and len(json.dumps(arguments, ensure_ascii=False))
+                > _PROVIDER_TOOL_CALL_ARGS_MAX_CHARS
             ):
                 shrunk = _shrink_oversized_tool_arguments(arguments)
                 if shrunk != arguments:
-                    new_calls.append({**call, "function": {**function, "arguments": shrunk}})
+                    new_blocks.append({**block, "input": shrunk})
                     message_changed = True
                     continue
-            new_calls.append(call)
-        out.append({**message, "tool_calls": new_calls} if message_changed else message)
+            new_blocks.append(block)
+        out.append({**message, "content": new_blocks} if message_changed else message)
         changed = changed or message_changed
     return out if changed else messages

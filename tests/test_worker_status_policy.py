@@ -120,7 +120,7 @@ class SoftToolFeedbackTests(unittest.IsolatedAsyncioTestCase):
         state.pending_response = LLMResponse(
             content="",
             tool_calls=[call],
-            finish_reason="tool_calls",
+            finish_reason="tool_use",
         )
 
         # Round 1 — soft feedback, no Guard.
@@ -130,8 +130,12 @@ class SoftToolFeedbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.metadata.phase, AgentNode.ROUTER)
         self.assertTrue(
             any(
-                m.get("role") == "tool" and str(m.get("content", "")).startswith("Error")
+                isinstance(block, dict)
+                and block.get("type") == "tool_result"
+                and str(block.get("content", "")).startswith("Error")
                 for m in state.messages
+                if m.get("role") == "user" and isinstance(m.get("content"), list)
+                for block in m["content"]
             )
         )
 
@@ -142,7 +146,7 @@ class SoftToolFeedbackTests(unittest.IsolatedAsyncioTestCase):
         state.pending_response = LLMResponse(
             content="",
             tool_calls=[call2],
-            finish_reason="tool_calls",
+            finish_reason="tool_use",
         )
         state = await agent.run(state)
         self.assertIsNone(state.pending_guard_request)
@@ -155,7 +159,7 @@ class SoftToolFeedbackTests(unittest.IsolatedAsyncioTestCase):
         state.pending_response = LLMResponse(
             content="",
             tool_calls=[call3],
-            finish_reason="tool_calls",
+            finish_reason="tool_use",
         )
         # Force another failure for the third round.
         tool = runtime.tools.get("probe")
@@ -185,7 +189,7 @@ class SoftToolFeedbackTests(unittest.IsolatedAsyncioTestCase):
         state.pending_response = LLMResponse(
             content="",
             tool_calls=[call],
-            finish_reason="tool_calls",
+            finish_reason="tool_use",
         )
         state = await agent.run(state)
         self.assertEqual(state.metadata.consecutive_tool_failure_rounds, 1)
@@ -198,7 +202,7 @@ class SoftToolFeedbackTests(unittest.IsolatedAsyncioTestCase):
         state.pending_response = LLMResponse(
             content="",
             tool_calls=[call2],
-            finish_reason="tool_calls",
+            finish_reason="tool_use",
         )
         state = await agent.run(state)
         self.assertEqual(state.metadata.consecutive_tool_failure_rounds, 0)
@@ -264,7 +268,7 @@ class SoftToolFeedbackTests(unittest.IsolatedAsyncioTestCase):
         state.pending_response = LLMResponse(
             content=None,
             tool_calls=calls,
-            finish_reason="tool_calls",
+            finish_reason="tool_use",
         )
 
         state = await ToolAgent(runtime).run(state)

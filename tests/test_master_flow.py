@@ -1338,9 +1338,9 @@ class MasterScriptProvider(LLMProvider):
                             },
                         )
                     ],
-                    finish_reason="tool_calls",
+                    finish_reason="tool_use",
                 ),
-                LLMResponse(content="I am done too early.", finish_reason="stop"),
+                LLMResponse(content="I am done too early.", finish_reason="end_turn"),
                 LLMResponse(
                     content=None,
                     tool_calls=[
@@ -1355,7 +1355,7 @@ class MasterScriptProvider(LLMProvider):
                             },
                         )
                     ],
-                    finish_reason="tool_calls",
+                    finish_reason="tool_use",
                 ),
                 LLMResponse(
                     content=None,
@@ -1366,7 +1366,7 @@ class MasterScriptProvider(LLMProvider):
                             arguments={"final_content": "Honest partial result."},
                         )
                     ],
-                    finish_reason="tool_calls",
+                    finish_reason="tool_use",
                 ),
             ]
         )
@@ -1396,9 +1396,13 @@ class MasterScriptProvider(LLMProvider):
         response = self.responses.popleft()
         if response.tool_calls and response.tool_calls[0].name == "complete_flow":
             flow_result = next(
-                message
+                block
                 for message in reversed(messages)
-                if message.get("role") == "tool" and message.get("name") == "create_flow"
+                if message.get("role") == "user" and isinstance(message.get("content"), list)
+                for block in message["content"]
+                if isinstance(block, dict)
+                and block.get("type") == "tool_result"
+                and block.get("tool_use_id") == "create-flow"
             )
             import json
 
@@ -1430,7 +1434,7 @@ class FinishTurnProvider(LLMProvider):
                     arguments={"final_content": self.final_content},
                 )
             ],
-            finish_reason="tool_calls",
+            finish_reason="tool_use",
         )
 
 

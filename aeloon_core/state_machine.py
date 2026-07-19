@@ -199,13 +199,11 @@ async def run_agent_loop(
 
 
 def _active_tool_names(tool_defs: list[dict[str, Any]]) -> list[str]:
-    names: list[str] = []
-    for tool in tool_defs:
-        function = tool.get("function")
-        name = function.get("name") if isinstance(function, dict) else None
-        if isinstance(name, str):
-            names.append(name)
-    return names
+    return [
+        str(tool["name"])
+        for tool in tool_defs
+        if isinstance(tool.get("name"), str)
+    ]
 
 
 def _pair_interrupted_tool_calls(
@@ -219,16 +217,23 @@ def _pair_interrupted_tool_calls(
     """Close any pending protocol calls without replaying uncertain side effects."""
 
     answered = {
-        str(message.get("tool_call_id"))
+        str(block.get("tool_use_id"))
         for message in state.messages
-        if message.get("role") == "tool" and message.get("tool_call_id")
+        if message.get("role") == "user" and isinstance(message.get("content"), list)
+        for block in message["content"]
+        if isinstance(block, dict)
+        and block.get("type") == "tool_result"
+        and block.get("tool_use_id")
     }
     declared = {
-        str(call.get("id"))
+        str(block.get("id"))
         for message in state.messages
         if message.get("role") == "assistant"
-        for call in (message.get("tool_calls") or [])
-        if isinstance(call, dict) and call.get("id")
+        and isinstance(message.get("content"), list)
+        for block in message["content"]
+        if isinstance(block, dict)
+        and block.get("type") == "tool_use"
+        and block.get("id")
     }
     for call in state.pending_tool_calls:
         if call.id in answered or call.id not in declared:

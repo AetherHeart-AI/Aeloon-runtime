@@ -14,11 +14,11 @@ _REMOVED_V1_AGENT_DEFAULTS = frozenset(
 )
 
 
-class CustomProviderConfig(BaseModel):
-    """OpenAI-compatible provider settings."""
+class AnthropicProviderConfig(BaseModel):
+    """Anthropic Messages API provider settings."""
 
     api_key: str = "no-key"
-    api_base: str = "http://localhost:8000/v1"
+    base_url: str = "https://api.anthropic.com"
     extra_headers: dict[str, str] = Field(default_factory=dict)
     proxy: str | None = None
 
@@ -26,7 +26,7 @@ class CustomProviderConfig(BaseModel):
 class ProvidersConfig(BaseModel):
     """Provider namespace."""
 
-    custom: CustomProviderConfig = Field(default_factory=CustomProviderConfig)
+    anthropic: AnthropicProviderConfig = Field(default_factory=AnthropicProviderConfig)
 
 
 class ContextCompactionConfig(BaseModel):
@@ -56,7 +56,7 @@ class AgentDefaultsConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    model: str = "default"
+    model: str = "claude-sonnet-4-6"
     temperature: float = 0.7
     reasoning_effort: str | None = None
     chat_timeout: int = 3600
@@ -149,16 +149,49 @@ def load_config(path: Path | str | None = None) -> Config:
     if config_path.exists():
         data = json.loads(config_path.read_text(encoding="utf-8"))
         _drop_removed_v1_settings(data)
+        _migrate_provider_settings(data)
 
     config = Config.model_validate(data)
     updates: dict[str, Any] = {}
 
-    if api_key := os.environ.get("AELOON_CORE_API_KEY"):
-        updates.setdefault("providers", {}).setdefault("custom", {})["api_key"] = api_key
-    if api_base := os.environ.get("AELOON_CORE_API_BASE"):
-        updates.setdefault("providers", {}).setdefault("custom", {})["api_base"] = api_base
-    if model := os.environ.get("AELOON_CORE_MODEL"):
+    if api_key := os.environ.get("ANTHROPIC_API_KEY"):
+        updates.setdefault("providers", {}).setdefault("anthropic", {})["api_key"] = api_key
+    if base_url := os.environ.get("ANTHROPIC_BASE_URL"):
+        updates.setdefault("providers", {}).setdefault("anthropic", {})[
+            "base_url"
+        ] = base_url
+    if model := os.environ.get("ANTHROPIC_MODEL"):
         updates.setdefault("agents", {}).setdefault("defaults", {})["model"] = model
+    max_context_tokens = os.environ.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS")
+    auto_compact_window = os.environ.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
+    parsed_max_context = (
+        _parse_positive_int(
+            max_context_tokens,
+            name="CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+        )
+        if max_context_tokens
+        else None
+    )
+    parsed_auto_compact = (
+        _parse_positive_int(
+            auto_compact_window,
+            name="CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+        )
+        if auto_compact_window
+        else None
+    )
+    context_tokens = parsed_max_context or parsed_auto_compact
+    if context_tokens is not None:
+        updates.setdefault("agents", {}).setdefault("defaults", {})[
+            "context_window_tokens"
+        ] = context_tokens
+    if parsed_auto_compact is not None and context_tokens is not None:
+        updates.setdefault("agents", {}).setdefault("defaults", {}).setdefault(
+            "context_compaction", {}
+        )["trigger_ratio"] = max(
+            0.1,
+            min(1.0, parsed_auto_compact / context_tokens),
+        )
     if workspace := os.environ.get("AELOON_CORE_WORKSPACE"):
         updates["workspace"] = workspace
     if data_dir := os.environ.get("AELOON_CORE_DATA_DIR"):
@@ -206,6 +239,16 @@ def _split_env_list(value: str) -> list[str]:
     return [item.strip() for item in value.split(os.pathsep) if item.strip()]
 
 
+def _parse_positive_int(value: str, *, name: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}") from exc
+    if parsed < 1:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    return parsed
+
+
 def _drop_removed_v1_settings(data: Any) -> None:
     """Ignore only the Profile settings removed by the v2 runtime."""
 
@@ -217,6 +260,23 @@ def _drop_removed_v1_settings(data: Any) -> None:
         return
     for key in _REMOVED_V1_AGENT_DEFAULTS:
         defaults.pop(key, None)
+
+
+def _migrate_provider_settings(data: Any) -> None:
+    """Upgrade the former custom provider config into Anthropic naming."""
+
+    if not isinstance(data, dict):
+        return
+    providers = data.get("providers")
+    if not isinstance(providers, dict):
+        return
+    legacy = providers.pop("custom", None)
+    if not isinstance(legacy, dict) or "anthropic" in providers:
+        return
+    migrated = dict(legacy)
+    if "api_base" in migrated and "base_url" not in migrated:
+        migrated["base_url"] = migrated.pop("api_base")
+    providers["anthropic"] = migrated
 
 
 def _deep_update(target: dict[str, Any], updates: dict[str, Any]) -> None:

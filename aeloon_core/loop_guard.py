@@ -285,7 +285,7 @@ class GuardReviewer:
             return self._fallback(request, evidence)
 
         usage = normalize_usage(response.usage)
-        if response.finish_reason != "stop" or response.tool_calls:
+        if response.finish_reason != "end_turn" or response.tool_calls:
             return self._fallback(request, evidence, usage=usage)
         action = _parse_action(response.content, allowed)
         if action is None:
@@ -369,7 +369,7 @@ def suppress_successful_side_effect_duplicates(
     # WorkerRun must not be mistaken for a retry within the current Run.
     current_turn = messages
     for index in range(len(messages) - 1, -1, -1):
-        if messages[index].get("role") == "user":
+        if _is_user_prompt(messages[index]):
             current_turn = messages[index + 1 :]
             break
     seen = collect_successful_tool_call_fingerprints(current_turn)
@@ -415,13 +415,10 @@ def suppress_successful_side_effect_duplicates(
     )
 
 
-def rejected_arguments_summary(tool_call: ToolCallRequest) -> str:
-    """Serialize rejected arguments without echoing malformed or large payloads."""
+def rejected_arguments_summary(tool_call: ToolCallRequest) -> dict[str, Any]:
+    """Return rejected argument metadata without malformed or large payloads."""
 
-    return json.dumps(
-        _rejected_arguments_metadata(tool_call),
-        ensure_ascii=False,
-    )
+    return _rejected_arguments_metadata(tool_call)
 
 
 def tool_result_failed(result: str | None) -> bool:
@@ -466,6 +463,16 @@ def local_failure_message(evidence: GuardEvidence) -> str:
     return (
         "The agent encountered a runtime error and could not safely produce a reliable "
         "final answer. Completed work, if any, has been preserved."
+    )
+
+
+def _is_user_prompt(message: Mapping[str, Any]) -> bool:
+    content = message.get("content")
+    if message.get("role") != "user" or not isinstance(content, list):
+        return message.get("role") == "user"
+    return not any(
+        isinstance(block, dict) and block.get("type") == "tool_result"
+        for block in content
     )
 
 

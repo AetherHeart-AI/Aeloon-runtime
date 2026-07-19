@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
@@ -71,16 +70,18 @@ class ToolCallRequest:
         if self.arguments_error is not None:
             self.arguments = {}
 
-    def to_openai_tool_call(self) -> dict[str, Any]:
-        """Serialize to an OpenAI-style tool_call payload."""
+    def to_anthropic_tool_use(
+        self,
+        *,
+        input_override: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Serialize to an Anthropic ``tool_use`` content block."""
 
         return {
+            "type": "tool_use",
             "id": self.id,
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "arguments": json.dumps(self.arguments, ensure_ascii=False),
-            },
+            "name": self.name,
+            "input": self.arguments if input_override is None else input_override,
         }
 
 
@@ -90,7 +91,7 @@ class LLMResponse:
 
     content: str | None
     tool_calls: list[ToolCallRequest] = field(default_factory=list)
-    finish_reason: str = "stop"
+    finish_reason: str = "end_turn"
     usage: dict[str, int] = field(default_factory=dict)
     reasoning_content: str | None = None
     thinking_blocks: list[dict] | None = None
@@ -125,47 +126,16 @@ class LLMProvider(ABC):
     def __init__(
         self,
         api_key: str | None = None,
-        api_base: str | None = None,
+        base_url: str | None = None,
         proxy: str | None = None,
         generation: GenerationSettings | None = None,
         chat_timeout: int = 3600,
     ) -> None:
         self.api_key = api_key
-        self.api_base = api_base
+        self.base_url = base_url
         self.proxy = proxy
         self.generation = generation or GenerationSettings()
         self.chat_timeout = chat_timeout
-
-    @staticmethod
-    def _sanitize_empty_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        result: list[dict[str, Any]] = []
-        for msg in messages:
-            content = msg.get("content")
-            if isinstance(content, str) and not content:
-                clean = dict(msg)
-                clean["content"] = (
-                    None
-                    if (msg.get("role") == "assistant" and msg.get("tool_calls"))
-                    else "(empty)"
-                )
-                result.append(clean)
-                continue
-            if isinstance(content, list):
-                new_items: list[Any] = []
-                changed = False
-                for item in content:
-                    if isinstance(item, dict) and "_meta" in item:
-                        new_items.append({k: v for k, v in item.items() if k != "_meta"})
-                        changed = True
-                    else:
-                        new_items.append(item)
-                if changed:
-                    clean = dict(msg)
-                    clean["content"] = new_items or "(empty)"
-                    result.append(clean)
-                    continue
-            result.append(msg)
-        return result
 
     @abstractmethod
     async def chat(
@@ -179,7 +149,7 @@ class LLMProvider(ABC):
         tool_choice: str | dict[str, Any] | None = None,
         response_format: ResponseFormat | None = None,
     ) -> LLMResponse:
-        """Send a chat completion request."""
+        """Send an Anthropic Messages API request."""
 
     @classmethod
     def _is_transient_error(cls, content: str | None) -> bool:
@@ -273,7 +243,7 @@ class LLMProvider(ABC):
         on_delta: Callable[[str], Awaitable[None]] | None = None,
         on_reasoning_delta: Callable[[str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
-        """Stream a chat completion when a provider supports it."""
+        """Stream an Anthropic Messages API response when supported."""
 
         del on_delta, on_reasoning_delta
         return await self.chat(

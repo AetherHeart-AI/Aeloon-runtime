@@ -20,12 +20,20 @@ not the execution engine.
 uv sync
 cd aeloon_core/tui && bun install && cd ../..
 
-export AELOON_CORE_API_KEY="..."
-export AELOON_CORE_API_BASE="https://api.openai.com/v1"
-export AELOON_CORE_MODEL="gpt-4.1-mini"
+export ANTHROPIC_BASE_URL="https://api.kimi.com/coding/"
+export ANTHROPIC_API_KEY="你的 API Key"
+export ANTHROPIC_MODEL="k3[1m]"
+export CLAUDE_CODE_AUTO_COMPACT_WINDOW=1048576
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS=1048576
 
 uv run aeloon-core
 ```
+
+The model gateway now uses Anthropic Messages format end to end. With the Kimi
+base URL above, the SDK sends requests to
+`https://api.kimi.com/coding/v1/messages`; tool definitions and history use
+Claude `tool_use` / `tool_result` content blocks. Aeloon accepts Claude Code's
+`k3[1m]` environment value and automatically sends Kimi's API model ID `k3`.
 
 Run one non-interactive turn with:
 
@@ -288,8 +296,8 @@ Configuration defaults to `~/.aeloon-core/config.json`:
 ```bash
 uv run aeloon-core config init \
   --api-key sk-... \
-  --api-base https://api.openai.com/v1 \
-  --model gpt-4.1-mini
+  --base-url https://api.kimi.com/coding/ \
+  --model 'k3[1m]'
 
 uv run aeloon-core config show
 uv run aeloon-core config set max-iterations 25
@@ -303,9 +311,11 @@ errors.
 
 Common environment overrides are:
 
-- `AELOON_CORE_API_KEY`
-- `AELOON_CORE_API_BASE`
-- `AELOON_CORE_MODEL`
+- `ANTHROPIC_API_KEY`
+- `ANTHROPIC_BASE_URL`
+- `ANTHROPIC_MODEL`
+- `CLAUDE_CODE_AUTO_COMPACT_WINDOW`
+- `CLAUDE_CODE_MAX_CONTEXT_TOKENS`
 - `AELOON_CORE_WORKSPACE`
 - `AELOON_CORE_DATA_DIR`
 - `AELOON_CORE_SKILLS_ENABLED`

@@ -734,7 +734,7 @@ class ModelAgent(BaseAgent):
                 cause="finalization failed",
             )
             if (
-                response.finish_reason != "stop"
+                response.finish_reason != "end_turn"
                 or clean is None
                 or _is_bare_dsml_tool_envelope(clean)
             ):
@@ -873,16 +873,18 @@ class ToolAgent(BaseAgent):
 
         malformed = classify_malformed_tool_calls(state.pending_tool_calls)
         malformed_ids = {call.id for call in malformed.rejected_calls}
-        tool_call_dicts: list[dict[str, Any]] = []
+        tool_use_blocks: list[dict[str, Any]] = []
         for tool_call in state.pending_tool_calls:
-            call_dict = tool_call.to_openai_tool_call()
+            input_override = None
             if tool_call.id in malformed_ids:
-                call_dict["function"]["arguments"] = rejected_arguments_summary(tool_call)
-            tool_call_dicts.append(call_dict)
+                input_override = rejected_arguments_summary(tool_call)
+            tool_use_blocks.append(
+                tool_call.to_anthropic_tool_use(input_override=input_override)
+            )
         state.messages = default_add_assistant_message(
             state.messages,
             response.content,
-            tool_calls=tool_call_dicts,
+            tool_uses=tool_use_blocks,
             reasoning_content=response.reasoning_content,
             thinking_blocks=response.thinking_blocks,
         )
@@ -987,11 +989,11 @@ class ToolAgent(BaseAgent):
     ) -> LightweightState:
         """Reject a mixed terminal batch before invoking any tool handler."""
 
-        calls = [call.to_openai_tool_call() for call in state.pending_tool_calls]
+        tool_uses = [call.to_anthropic_tool_use() for call in state.pending_tool_calls]
         state.messages = default_add_assistant_message(
             state.messages,
             response.content,
-            tool_calls=calls,
+            tool_uses=tool_uses,
             reasoning_content=response.reasoning_content,
             thinking_blocks=response.thinking_blocks,
         )
@@ -1147,7 +1149,7 @@ def _successful_side_effects(
 
 def _last_user_goal(state: LightweightState) -> str:
     for message in reversed(state.messages):
-        if message.get("role") == "user":
+        if message.get("role") == "user" and isinstance(message.get("content"), str):
             return str(message.get("content") or "")
     return ""
 
@@ -1155,11 +1157,24 @@ def _last_user_goal(state: LightweightState) -> str:
 def _recent_outcomes(state: LightweightState) -> tuple[str, ...]:
     outcomes: list[str] = []
     for message in reversed(state.messages):
-        if message.get("role") not in {"assistant", "tool"}:
-            continue
-        content = str(message.get("content") or "").strip()
-        if content:
-            outcomes.append(content)
+        role = message.get("role")
+        content = message.get("content")
+        if role == "assistant" and isinstance(content, list):
+            text = "\n".join(
+                str(block.get("text") or "")
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "text"
+            ).strip()
+            if text:
+                outcomes.append(text)
+        elif role == "user" and isinstance(content, list):
+            text = "\n".join(
+                str(block.get("content") or "")
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "tool_result"
+            ).strip()
+            if text:
+                outcomes.append(text)
         if len(outcomes) >= 5:
             break
     return tuple(reversed(outcomes))
@@ -1201,10 +1216,8 @@ def agent_node_kind(node: AgentNode) -> NodeKind:
 
 
 def _active_tool_names(tool_defs: list[dict[str, Any]]) -> list[str]:
-    names: list[str] = []
-    for definition in tool_defs:
-        function = definition.get("function")
-        name = function.get("name") if isinstance(function, dict) else None
-        if isinstance(name, str):
-            names.append(name)
-    return names
+    return [
+        str(definition["name"])
+        for definition in tool_defs
+        if isinstance(definition.get("name"), str)
+    ]

@@ -21,28 +21,33 @@ def collect_successful_tool_call_fingerprints(
     """Collect fingerprints only for calls with successful tool results."""
 
     answered = {
-        message["tool_call_id"]
+        block["tool_use_id"]
         for message in messages
-        if message.get("role") == "tool"
-        and isinstance(message.get("tool_call_id"), str)
-        and not _tool_result_failed(message.get("content"))
+        if message.get("role") == "user" and isinstance(message.get("content"), list)
+        for block in message["content"]
+        if isinstance(block, dict)
+        and block.get("type") == "tool_result"
+        and isinstance(block.get("tool_use_id"), str)
+        and not _tool_result_failed(block.get("content"))
     }
     seen: set[str] = set()
     for message in messages:
         if message.get("role") != "assistant":
             continue
-        for call in message.get("tool_calls") or []:
-            if not isinstance(call, dict) or call.get("id") not in answered:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if (
+                not isinstance(block, dict)
+                or block.get("type") != "tool_use"
+                or block.get("id") not in answered
+            ):
                 continue
-            function = call.get("function") or {}
-            name = function.get("name")
-            raw_args = function.get("arguments")
+            name = block.get("name")
+            arguments = block.get("input")
             if not isinstance(name, str):
                 continue
-            try:
-                arguments = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-            except json.JSONDecodeError:
-                arguments = raw_args
             seen.add(tool_call_fingerprint(name, arguments))
     return seen
 

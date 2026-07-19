@@ -236,7 +236,7 @@ def build_master_scheduler_tools(
             on_progress=on_progress,
         )
         for definition in flow_tools.get_definitions():
-            name = str(definition["function"]["name"])
+            name = str(definition["name"])
             tool = flow_tools.get(name)
             assert tool is not None
             registry.register(tool)

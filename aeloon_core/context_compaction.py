@@ -235,7 +235,7 @@ def _select_tail_start(
     turn_starts = [
         index
         for index, message in enumerate(messages[body_start:], start=body_start)
-        if message.get("role") == "user"
+        if _is_user_prompt(message)
     ]
     if len(turn_starts) < 2:
         return None
@@ -257,7 +257,7 @@ def _select_tail_start(
 
 def _has_compactable_content(messages: list[dict[str, Any]]) -> bool:
     return any(
-        message.get("role") in {"user", "assistant", "tool", "system"} for message in messages
+        message.get("role") in {"user", "assistant", "system"} for message in messages
     )
 
 
@@ -327,38 +327,60 @@ def _message_summary_text(message: dict[str, Any], *, model: str) -> str:
         return str(message.get("content") or "")
     if role == "assistant":
         return _assistant_summary_text(message, model=model)
-    if role == "tool":
-        return _tool_summary_text(message, model=model)
+    if role == "user" and _tool_result_blocks(message):
+        return _tool_results_summary_text(message, model=model)
     content = _content_to_text(message.get("content"))
     return truncate_middle_tokens(content, max_tokens=_SERIALIZED_MESSAGE_MAX_TOKENS, model=model)
 
 
 def _assistant_summary_text(message: dict[str, Any], *, model: str) -> str:
     parts: list[str] = []
-    content = _content_to_text(message.get("content"))
-    if content.strip():
+    content = message.get("content")
+    if isinstance(content, str) and content.strip():
         parts.append(content)
-    tool_calls = message.get("tool_calls")
-    if isinstance(tool_calls, list) and tool_calls:
-        rendered = []
-        for call in tool_calls:
-            function = call.get("function") if isinstance(call, dict) else None
-            name = function.get("name") if isinstance(function, dict) else "unknown"
-            arguments = function.get("arguments") if isinstance(function, dict) else None
-            arg_text = (
-                arguments if isinstance(arguments, str) else json.dumps(arguments, default=str)
-            )
-            rendered.append(f"- {name}: {arg_text}")
-        parts.append("Tool calls:\n" + "\n".join(rendered))
+    elif isinstance(content, list):
+        text = "\n".join(
+            str(block.get("text") or block.get("thinking") or "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") in {"text", "thinking"}
+        ).strip()
+        if text:
+            parts.append(text)
+        rendered = [
+            f"- {block.get('name', 'unknown')}: "
+            + json.dumps(block.get("input"), ensure_ascii=False, default=str)
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "tool_use"
+        ]
+        if rendered:
+            parts.append("Tool uses:\n" + "\n".join(rendered))
     text = "\n\n".join(parts)
     return truncate_middle_tokens(text, max_tokens=_SERIALIZED_MESSAGE_MAX_TOKENS, model=model)
 
 
-def _tool_summary_text(message: dict[str, Any], *, model: str) -> str:
-    name = str(message.get("name") or "tool")
-    content = _content_to_text(message.get("content"))
-    text = f"Tool result from {name}:\n{content}"
+def _tool_results_summary_text(message: dict[str, Any], *, model: str) -> str:
+    rendered = [
+        f"Tool result for {block.get('tool_use_id', 'unknown')}:\n"
+        f"{_content_to_text(block.get('content'))}"
+        for block in _tool_result_blocks(message)
+    ]
+    text = "\n\n".join(rendered)
     return truncate_middle_tokens(text, max_tokens=_SERIALIZED_MESSAGE_MAX_TOKENS, model=model)
+
+
+def _tool_result_blocks(message: dict[str, Any]) -> list[dict[str, Any]]:
+    content = message.get("content")
+    if message.get("role") != "user" or not isinstance(content, list):
+        return []
+    return [
+        block
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "tool_result"
+    ]
+
+
+def _is_user_prompt(message: dict[str, Any]) -> bool:
+    return message.get("role") == "user" and not _tool_result_blocks(message)
 
 
 def _content_to_text(content: Any) -> str:

@@ -55,7 +55,7 @@ class ScriptedProvider(LLMProvider):
         return LLMResponse(
             content=None,
             tool_calls=[ToolCallRequest(id=f"call-{name}", name=name, arguments=arguments)],
-            finish_reason="tool_calls",
+            finish_reason="tool_use",
         )
 
 
@@ -103,7 +103,7 @@ class HighUsageProvider(LLMProvider):
                         },
                     )
                 ],
-                finish_reason="tool_calls",
+                finish_reason="tool_use",
                 usage={"total_tokens": 127_999},
             )
         return LLMResponse(
@@ -115,7 +115,7 @@ class HighUsageProvider(LLMProvider):
                     arguments={"summary": "finished after multiple model rounds"},
                 )
             ],
-            finish_reason="tool_calls",
+            finish_reason="tool_use",
             usage={"total_tokens": 1_000},
         )
 
@@ -150,7 +150,7 @@ class CompactionAwareProvider(LLMProvider):
             self.summary_calls += 1
             return LLMResponse(
                 content="Earlier Worker progress was compressed into this checkpoint.",
-                finish_reason="stop",
+                finish_reason="end_turn",
                 usage={"total_tokens": 50},
             )
         self.domain_calls += 1
@@ -163,7 +163,7 @@ class CompactionAwareProvider(LLMProvider):
                     arguments={"summary": f"completed run {self.domain_calls}"},
                 )
             ],
-            finish_reason="tool_calls",
+            finish_reason="tool_use",
             usage={"total_tokens": 100},
         )
 
@@ -192,7 +192,7 @@ async def test_master_and_worker_tool_surfaces_are_disjoint(tmp_path: Path) -> N
         assert tool is not None
         master.register(tool)
     master_names = {
-        definition["function"]["name"] for definition in master.get_definitions()
+        definition["name"] for definition in master.get_definitions()
     }
 
     spawned = await app.worker_control.spawn_worker(
@@ -205,7 +205,7 @@ async def test_master_and_worker_tool_surfaces_are_disjoint(tmp_path: Path) -> N
     run = app.workers.get_run(spawned["run_id"])
     worker, _ = await app._build_worker_tools(run)
     worker_names = {
-        definition["function"]["name"] for definition in worker.get_definitions()
+        definition["name"] for definition in worker.get_definitions()
     }
 
     assert {"list", "read", "glob", "grep"}.issubset(master_names)
@@ -507,34 +507,42 @@ def test_current_run_keeps_full_skill_result_and_later_run_can_lazy_load() -> No
         {"role": "user", "content": "objective"},
         {
             "role": "assistant",
-            "content": None,
-            "tool_calls": [{"id": "skill-call", "function": {"name": "skill"}}],
+            "content": [
+                {"type": "tool_use", "id": "skill-call", "name": "skill", "input": {}}
+            ],
         },
         {
-            "role": "tool",
-            "name": "skill",
-            "tool_call_id": "skill-call",
-            "content": large_skill,
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "skill-call",
+                    "content": large_skill,
+                }
+            ],
         },
     ]
     tools = [
         {
-            "type": "function",
-            "function": {"name": "skill", "description": "load", "parameters": {}},
+            "name": "skill",
+            "description": "load",
+            "input_schema": {"type": "object", "properties": {}},
         }
     ]
     state = LightweightState.from_messages(messages, active_tools=["skill"], max_iterations=5)
     processor = MinimalContextProcessor(max_tool_result_chars=100)
 
     current = processor.process(state=state, messages=messages, tools=tools)
-    assert current.messages[-1]["content"] == large_skill
+    assert current.messages[-1]["content"][0]["content"] == large_skill
 
     later_messages = [*messages, {"role": "user", "content": "next objective"}]
     later = processor.process(state=state, messages=later_messages, tools=tools)
     skill_result = next(
-        message
+        block
         for message in later.messages
-        if message.get("role") == "tool" and message.get("name") == "skill"
+        if message.get("role") == "user" and isinstance(message.get("content"), list)
+        for block in message["content"]
+        if isinstance(block, dict) and block.get("type") == "tool_result"
     )
     assert str(skill_result["content"]).startswith(LAZY_TOOL_RESULT_MARKER)
 

@@ -16,6 +16,7 @@ from aeloon_core.context import (
     append_user_message,
     apply_skill_guidance,
     build_initial_messages,
+    normalize_claude_messages,
     refresh_initial_system_message,
     strip_skill_tool_history,
 )
@@ -30,9 +31,9 @@ from aeloon_core.flows import (
 )
 from aeloon_core.master_prompt import master_system_prompt
 from aeloon_core.master_tools import build_master_scheduler_tools
-from aeloon_core.model_metadata import resolve_context_window, resolve_max_output_tokens
+from aeloon_core.model_metadata import resolve_max_output_tokens
+from aeloon_core.providers.anthropic_provider import AnthropicProvider
 from aeloon_core.providers.base import GenerationSettings
-from aeloon_core.providers.custom_provider import CustomProvider
 from aeloon_core.session import SessionStore
 from aeloon_core.skills import SkillRegistry
 from aeloon_core.state_machine import run_agent_loop
@@ -167,10 +168,10 @@ class AeloonCoreOrchestrator:
     def __init__(self, config: Config) -> None:
         self.config = config
         defaults = config.agents.defaults
-        provider_config = config.providers.custom
-        self.provider = CustomProvider(
+        provider_config = config.providers.anthropic
+        self.provider = AnthropicProvider(
             api_key=provider_config.api_key,
-            api_base=provider_config.api_base,
+            base_url=provider_config.base_url,
             default_model=defaults.model,
             extra_headers=provider_config.extra_headers,
             proxy=provider_config.proxy,
@@ -331,6 +332,7 @@ class AeloonCoreOrchestrator:
             actual_session_id,
             initial_messages=build_initial_messages(workspace=self.config.workspace),
         )
+        messages = normalize_claude_messages(messages)
         messages = refresh_initial_system_message(messages, workspace=self.config.workspace)
         # v2 removes all Skill material persisted by a pre-v2 Master session.
         messages = strip_skill_tool_history(messages)
@@ -555,8 +557,7 @@ class AeloonCoreOrchestrator:
         defaults = self.config.agents.defaults
         if not defaults.context_compaction.enabled:
             return None
-        context_window_tokens = await resolve_context_window(defaults.model)
-        context_window_tokens = context_window_tokens or defaults.context_window_tokens
+        context_window_tokens = defaults.context_window_tokens
 
         async def prepare_model_input(
             current_messages: list[dict[str, Any]],
@@ -764,7 +765,7 @@ class AeloonCoreOrchestrator:
                 # WorkerSession identity without inheriting an unavailable context.
                 return [system]
             messages = stored
-        messages = [dict(message) for message in messages]
+        messages = normalize_claude_messages([dict(message) for message in messages])
         if messages and messages[0].get("role") == "system":
             messages[0] = system
         else:

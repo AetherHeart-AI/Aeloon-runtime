@@ -55,7 +55,7 @@ class WriteToolLimitTests(unittest.IsolatedAsyncioTestCase):
             workspace = Path(temporary)
             tool = WriteTool(workspace=workspace, max_content_chars=100)
             schema = tool.to_schema()
-            content_schema = schema["function"]["parameters"]["properties"]["content"]
+            content_schema = schema["input_schema"]["properties"]["content"]
             self.assertEqual(content_schema.get("maxLength"), 100)
 
             failed = await tool.execute(path="big.txt", content="x" * 101)

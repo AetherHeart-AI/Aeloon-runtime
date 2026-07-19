@@ -691,7 +691,7 @@ def _tool_call_detail(tool_call: ToolCallRequest) -> dict[str, Any]:
         "id": tool_call.id,
         "name": tool_call.name,
         "arguments": tool_call.arguments,
-        "openai_tool_call": tool_call.to_openai_tool_call(),
+        "anthropic_tool_use": tool_call.to_anthropic_tool_use(),
     }
 
 

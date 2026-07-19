@@ -69,22 +69,25 @@ class MinimalContextProcessor:
             (
                 index
                 for index, message in enumerate(messages)
-                if message.get("role") == "user"
+                if _is_user_prompt(message)
             ),
             default=-1,
         )
+        tool_names = _tool_names_by_id(messages)
 
         lazy_references: list[str] = []
         call_messages = []
         for index in sorted(selected_indexes):
             message = _copy_message(messages[index])
-            reference = self._replace_large_tool_result(
+            references = self._replace_large_tool_results(
                 state,
                 message,
                 preserve_current_skill=index > current_turn_start,
+                tool_names=tool_names,
             )
-            if reference is not None and reference not in lazy_references:
-                lazy_references.append(reference)
+            for reference in references:
+                if reference not in lazy_references:
+                    lazy_references.append(reference)
             call_messages.append(message)
         call_messages.extend(_copy_message(message) for message in additional_messages or [])
 
@@ -95,34 +98,38 @@ class MinimalContextProcessor:
             original_message_count=len(messages),
         )
 
-    def _replace_large_tool_result(
+    def _replace_large_tool_results(
         self,
         state: LightweightState,
         message: dict[str, Any],
         *,
         preserve_current_skill: bool,
-    ) -> str | None:
-        if message.get("role") != "tool" or "content" not in message:
-            return None
-        if (
-            preserve_current_skill
-            and message.get("name") == "skill"
-        ):
-            return None
+        tool_names: dict[str, str],
+    ) -> list[str]:
         content = message.get("content")
-        serialized = _serialized_content(content)
-        if len(serialized) <= self.max_tool_result_chars:
-            return None
-
-        reference = state.store_lazy(content, prefix="tool-result")
-        preview = _bounded_preview(serialized, self.max_tool_result_chars)
-        message["content"] = (
-            f"{LAZY_TOOL_RESULT_MARKER}\n"
-            f"ref: {reference}\n"
-            f"characters: {len(serialized)}\n"
-            f"bounded preview:\n{preview}"
-        )
-        return reference
+        if message.get("role") != "user" or not isinstance(content, list):
+            return []
+        references: list[str] = []
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            call_id = block.get("tool_use_id")
+            if preserve_current_skill and tool_names.get(str(call_id)) == "skill":
+                continue
+            result = block.get("content")
+            serialized = _serialized_content(result)
+            if len(serialized) <= self.max_tool_result_chars:
+                continue
+            reference = state.store_lazy(result, prefix="tool-result")
+            preview = _bounded_preview(serialized, self.max_tool_result_chars)
+            block["content"] = (
+                f"{LAZY_TOOL_RESULT_MARKER}\n"
+                f"ref: {reference}\n"
+                f"characters: {len(serialized)}\n"
+                f"bounded preview:\n{preview}"
+            )
+            references.append(reference)
+        return references
 
 
 def _selected_message_indexes(
@@ -134,7 +141,7 @@ def _selected_message_indexes(
 
     leading_system = _leading_system_indexes(messages)
     user_indexes = [
-        index for index, message in enumerate(messages) if message.get("role") == "user"
+        index for index, message in enumerate(messages) if _is_user_prompt(message)
     ]
     if len(user_indexes) <= preserve_recent_turns:
         return set(range(len(messages)))
@@ -174,16 +181,15 @@ def _complete_tool_pairs(
     for index, message in enumerate(messages):
         for call_id in _assistant_tool_call_ids(message):
             assistant_by_call_id[call_id] = index
-        if message.get("role") == "tool" and isinstance(message.get("tool_call_id"), str):
-            results_by_call_id.setdefault(message["tool_call_id"], []).append(index)
+        for call_id in _tool_result_ids(message):
+            results_by_call_id.setdefault(call_id, []).append(index)
 
     changed = True
     while changed:
         changed = False
         for index in tuple(selected):
             message = messages[index]
-            if message.get("role") == "tool":
-                call_id = message.get("tool_call_id")
+            for call_id in _tool_result_ids(message):
                 assistant_index = assistant_by_call_id.get(call_id)
                 if assistant_index is not None and assistant_index not in selected:
                     selected.add(assistant_index)
@@ -197,13 +203,49 @@ def _complete_tool_pairs(
 
 
 def _assistant_tool_call_ids(message: dict[str, Any]) -> list[str]:
-    if message.get("role") != "assistant" or not isinstance(message.get("tool_calls"), list):
+    content = message.get("content")
+    if message.get("role") != "assistant" or not isinstance(content, list):
         return []
     return [
         call_id
-        for call in message["tool_calls"]
-        if isinstance(call, dict) and isinstance((call_id := call.get("id")), str)
+        for block in content
+        if isinstance(block, dict)
+        and block.get("type") == "tool_use"
+        and isinstance((call_id := block.get("id")), str)
     ]
+
+
+def _tool_result_ids(message: dict[str, Any]) -> list[str]:
+    content = message.get("content")
+    if message.get("role") != "user" or not isinstance(content, list):
+        return []
+    return [
+        call_id
+        for block in content
+        if isinstance(block, dict)
+        and block.get("type") == "tool_result"
+        and isinstance((call_id := block.get("tool_use_id")), str)
+    ]
+
+
+def _is_user_prompt(message: dict[str, Any]) -> bool:
+    return message.get("role") == "user" and not _tool_result_ids(message)
+
+
+def _tool_names_by_id(messages: list[dict[str, Any]]) -> dict[str, str]:
+    names: dict[str, str] = {}
+    for message in messages:
+        content = message.get("content")
+        if message.get("role") != "assistant" or not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            call_id = block.get("id")
+            name = block.get("name")
+            if isinstance(call_id, str) and isinstance(name, str):
+                names[call_id] = name
+    return names
 
 
 def _filter_tools(
@@ -214,13 +256,18 @@ def _filter_tools(
     return [
         dict(tool)
         for tool in tools
-        if isinstance(tool.get("function"), dict)
-        and tool["function"].get("name") in allowed
+        if tool.get("name") in allowed
     ]
 
 
 def _copy_message(message: dict[str, Any]) -> dict[str, Any]:
-    return dict(message)
+    copied = dict(message)
+    if isinstance(message.get("content"), list):
+        copied["content"] = [
+            dict(block) if isinstance(block, dict) else block
+            for block in message["content"]
+        ]
+    return copied
 
 
 def _serialized_content(content: Any) -> str:

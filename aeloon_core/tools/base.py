@@ -30,15 +30,12 @@ class Tool(ABC):
         """Execute the tool with validated parameters."""
 
     def to_schema(self) -> dict[str, Any]:
-        """Convert tool to OpenAI function schema format."""
+        """Convert the tool to Anthropic's client-tool schema."""
 
         return {
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "description": self.description,
-                "parameters": _strip_titles(self.args_model.model_json_schema()),
-            },
+            "name": self.name,
+            "description": self.description,
+            "input_schema": _strip_titles(self.args_model.model_json_schema()),
         }
 
 

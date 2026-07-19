@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -67,57 +68,152 @@ def apply_skill_guidance(
 
 
 def strip_skill_tool_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Remove v1 Master-side Skill calls and their results from persisted history."""
+    """Remove historical Master-side Skill calls and their results."""
 
+    messages = normalize_claude_messages(messages)
     skill_call_ids: set[str] = set()
     for message in messages:
         if message.get("role") != "assistant":
             continue
-        for call in message.get("tool_calls") or []:
-            if not isinstance(call, dict):
+        for block in _content_blocks(message):
+            if block.get("type") != "tool_use" or block.get("name") != "skill":
                 continue
-            function = call.get("function")
-            if not isinstance(function, dict) or function.get("name") != "skill":
-                continue
-            call_id = call.get("id")
+            call_id = block.get("id")
             if isinstance(call_id, str):
                 skill_call_ids.add(call_id)
 
     cleaned: list[dict[str, Any]] = []
     for message in messages:
-        if message.get("role") == "tool" and (
-            message.get("name") == "skill"
-            or message.get("tool_call_id") in skill_call_ids
-        ):
-            continue
-        if message.get("role") != "assistant" or not isinstance(
-            message.get("tool_calls"), list
-        ):
+        content = message.get("content")
+        if not isinstance(content, list):
             cleaned.append(message)
             continue
-        remaining_calls = [
-            call
-            for call in message["tool_calls"]
+        remaining_blocks = [
+            block
+            for block in content
             if not (
-                isinstance(call, dict)
-                and isinstance(call.get("function"), dict)
-                and call["function"].get("name") == "skill"
+                isinstance(block, dict)
+                and (
+                    (
+                        message.get("role") == "assistant"
+                        and block.get("type") == "tool_use"
+                        and block.get("name") == "skill"
+                    )
+                    or (
+                        message.get("role") == "user"
+                        and block.get("type") == "tool_result"
+                        and block.get("tool_use_id") in skill_call_ids
+                    )
+                )
             )
         ]
-        if len(remaining_calls) == len(message["tool_calls"]):
+        if len(remaining_blocks) == len(content):
             cleaned.append(message)
             continue
         replacement = dict(message)
-        if remaining_calls:
-            replacement["tool_calls"] = remaining_calls
-        else:
-            replacement.pop("tool_calls", None)
-        if any(
-            replacement.get(field)
-            for field in ("content", "reasoning_content", "thinking_blocks", "tool_calls")
-        ):
+        replacement["content"] = remaining_blocks
+        if remaining_blocks:
             cleaned.append(replacement)
     return cleaned
+
+
+def normalize_claude_messages(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Normalize persisted history to Anthropic content-block messages.
+
+    Older sessions are upgraded on read so their next persisted checkpoint no
+    longer contains function-call roles or payloads from the previous protocol.
+    """
+
+    normalized: list[dict[str, Any]] = []
+    for message in messages:
+        role = message.get("role")
+        if role == "tool":
+            tool_use_id = message.get("tool_call_id")
+            if not isinstance(tool_use_id, str) or not tool_use_id:
+                continue
+            result = str(message.get("content") or "")
+            block = {
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": result,
+                "is_error": result.lstrip().lower().startswith("error"),
+            }
+            if normalized and _is_tool_result_message(normalized[-1]):
+                normalized[-1]["content"].append(block)
+            else:
+                normalized.append({"role": "user", "content": [block]})
+            continue
+        if role != "assistant":
+            normalized.append(_without_meta(message))
+            continue
+
+        blocks: list[dict[str, Any]] = []
+        for block in message.get("thinking_blocks") or []:
+            if isinstance(block, dict) and block.get("type") in {
+                "thinking",
+                "redacted_thinking",
+            }:
+                blocks.append(_without_meta(block))
+        content = message.get("content")
+        if isinstance(content, str) and content:
+            blocks.append({"type": "text", "text": content})
+        elif isinstance(content, list):
+            blocks.extend(
+                _without_meta(block) for block in content if isinstance(block, dict)
+            )
+        for call in message.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function")
+            if not isinstance(function, dict):
+                continue
+            name = function.get("name")
+            call_id = call.get("id")
+            if not isinstance(name, str) or not isinstance(call_id, str):
+                continue
+            raw_arguments = function.get("arguments")
+            try:
+                arguments = (
+                    json.loads(raw_arguments)
+                    if isinstance(raw_arguments, str)
+                    else raw_arguments
+                )
+            except (json.JSONDecodeError, ValueError):
+                arguments = {}
+            if not isinstance(arguments, dict):
+                arguments = {}
+            blocks.append(
+                {"type": "tool_use", "id": call_id, "name": name, "input": arguments}
+            )
+        normalized.append(
+            {
+                "role": "assistant",
+                "content": blocks or [{"type": "text", "text": "(empty)"}],
+            }
+        )
+    return normalized
+
+
+def _content_blocks(message: dict[str, Any]) -> list[dict[str, Any]]:
+    content = message.get("content")
+    if not isinstance(content, list):
+        return []
+    return [block for block in content if isinstance(block, dict)]
+
+
+def _is_tool_result_message(message: dict[str, Any]) -> bool:
+    blocks = _content_blocks(message)
+    return (
+        message.get("role") == "user"
+        and bool(blocks)
+        and all(block.get("type") == "tool_result" for block in blocks)
+    )
+
+
+def _without_meta(value: dict[str, Any]) -> dict[str, Any]:
+    return {key: child for key, child in value.items() if key != "_meta"}
 
 
 def append_user_message(messages: list[dict[str, Any]], prompt: str) -> list[dict[str, Any]]:

@@ -742,7 +742,7 @@ def test_master_tool_schema_exposes_session_policy_and_fresh_override(
         base_turn_id="turn",
     )
     definitions = {
-        definition["function"]["name"]: definition["function"]["parameters"]
+        definition["name"]: definition["input_schema"]
         for definition in registry.get_definitions()
     }
 

@@ -37,7 +37,7 @@ class ToolRegistry:
         return self._tools.get(name)
 
     def get_definitions(self) -> list[dict[str, Any]]:
-        """Get all tool definitions in OpenAI format."""
+        """Get all tool definitions in Anthropic format."""
 
         return [tool.to_schema() for tool in self._tools.values()]
 

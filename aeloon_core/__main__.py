@@ -26,8 +26,8 @@ CHAT_ONLY_OPTIONS = {
 CONFIG_SETTERS = {
     "workspace": ("workspace",),
     "data-dir": ("data_dir",),
-    "api-key": ("providers", "custom", "api_key"),
-    "api-base": ("providers", "custom", "api_base"),
+    "api-key": ("providers", "anthropic", "api_key"),
+    "base-url": ("providers", "anthropic", "base_url"),
     "model": ("agents", "defaults", "model"),
     "reasoning-effort": ("agents", "defaults", "reasoning_effort"),
     "max-iterations": ("agents", "defaults", "max_iterations"),
@@ -198,8 +198,8 @@ def _add_chat_args(parser: argparse.ArgumentParser) -> None:
 
 def _add_config_write_args(parser: argparse.ArgumentParser) -> None:
     _add_path_args(parser)
-    parser.add_argument("--api-key", default=None, help="OpenAI-compatible API key.")
-    parser.add_argument("--api-base", default=None, help="OpenAI-compatible API base URL.")
+    parser.add_argument("--api-key", default=None, help="Anthropic API key.")
+    parser.add_argument("--base-url", default=None, help="Anthropic API base URL.")
     parser.add_argument("--model", default=None, help="Default model.")
 
 
@@ -340,7 +340,7 @@ def _config_with_write_args(config: Config, args: argparse.Namespace) -> Config:
         "workspace": "workspace",
         "data_dir": "data-dir",
         "api_key": "api-key",
-        "api_base": "api-base",
+        "base_url": "base-url",
         "model": "model",
     }
     data = config.model_dump(mode="json")
