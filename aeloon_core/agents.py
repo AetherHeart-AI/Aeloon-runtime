@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
-from aeloon_core.context_compaction import estimate_request_tokens
+from aeloon_core.context_view import ContextViewPipeline
 from aeloon_core.loop_guard import (
     GuardAction,
     GuardEvent,
@@ -25,14 +25,15 @@ from aeloon_core.loop_guard import (
     classify_malformed_tool_calls,
     finalization_prompt_message,
     guard_progress_message,
+    guard_request_signature,
     local_failure_message,
     recovery_prompt_message,
     rejected_arguments_summary,
+    resolve_guard_policy,
     suppress_successful_side_effect_duplicates,
     tool_result_failed,
 )
-from aeloon_core.minimal_context import ContextProcessor
-from aeloon_core.model_input import PrepareModelInput, unpack_prepared_model_input
+from aeloon_core.master_prompt import MASTER_RUNTIME_MARKER, MASTER_USER_REQUEST_MARKER
 from aeloon_core.runtime_support import (
     ThinkTagDeltaFilter,
     default_add_assistant_message,
@@ -41,9 +42,9 @@ from aeloon_core.runtime_support import (
     default_tool_hint,
     execute_tool_batch,
     provider_supports_streaming,
-    shrink_answered_tool_args_for_provider,
 )
 from aeloon_core.state import AgentNode, LightweightState, RunStatus
+from aeloon_core.stuck_detection import detect_repeated_tool_exchanges
 from aeloon_core.task_graph import TaskNode
 from aeloon_core.transitions import NodeKind, TransitionRecorder, normalize_usage
 
@@ -56,6 +57,11 @@ CompletionGate = Callable[
     Awaitable[str | None] | str | None,
 ]
 
+_MAX_POLICY_RETRIES_PER_SIGNATURE = 1
+_MAX_RECOVERIES_PER_SIGNATURE = 2
+_MAX_TOTAL_GUARD_RECOVERIES = 4
+_MAX_BUDGET_GUARD_CONTINUES = 1
+
 
 @dataclass
 class AgentRuntime:
@@ -66,7 +72,7 @@ class AgentRuntime:
     tools: ToolRegistry
     guard: GuardReviewer
     base_iteration_budget: int
-    context_processor: ContextProcessor
+    context_pipeline: ContextViewPipeline
     recorder: TransitionRecorder
     # A strict loop may only finish through a successful terminal tool.
     require_terminal: bool = False
@@ -74,12 +80,13 @@ class AgentRuntime:
     tool_error_guard_threshold: int = 3
     # Automatic budget extensions before a Guard budget review is required.
     budget_auto_continues: int = 2
+    stuck_detection_enabled: bool = True
+    stuck_detection_threshold: int = 4
     # Optional hard WorkerRun grants. Master turns leave these unset.
     max_tokens: int | None = None
     max_tool_calls: int | None = None
     trace_enabled: bool = True
     on_progress: Callable[..., Awaitable[None]] | None = None
-    prepare_model_input: PrepareModelInput | None = None
     # Optional semantic completion policy above the generic UASM. Returning a
     # reason rejects bare text and gives the model another planning turn.
     completion_gate: CompletionGate | None = None
@@ -155,7 +162,6 @@ class AgentRuntime:
         allow_streaming: bool = True,
         max_tokens: int | None = None,
     ) -> LLMResponse:
-        provider_messages = shrink_answered_tool_args_for_provider(messages)
         delta_hook = (
             getattr(self.on_progress, "on_llm_delta", None)
             if self.on_progress and allow_streaming
@@ -200,7 +206,7 @@ class AgentRuntime:
                     "reasoning_effort": self.provider.generation.reasoning_effort,
                 }
             response = await stream(
-                messages=provider_messages,
+                messages=messages,
                 tools=tool_defs,
                 model=self.model,
                 max_tokens=max_tokens,
@@ -219,7 +225,7 @@ class AgentRuntime:
 
         if max_tokens is not None:
             return await self.provider.chat(
-                messages=provider_messages,
+                messages=messages,
                 tools=tool_defs,
                 model=self.model,
                 max_tokens=max_tokens,
@@ -227,7 +233,7 @@ class AgentRuntime:
                 reasoning_effort=self.provider.generation.reasoning_effort,
             )
         return await self.provider.chat_with_retry(
-            messages=provider_messages,
+            messages=messages,
             tools=tool_defs,
             model=self.model,
         )
@@ -329,6 +335,7 @@ class AgentRuntime:
             state,
             event=GuardEvent.RUNTIME_ERROR,
             cause=f"terminal tool protocol error: {reason}",
+            reason_code="terminal_protocol",
             recent_outcomes=outcomes,
         )
 
@@ -338,9 +345,11 @@ class AgentRuntime:
         *,
         event: GuardEvent,
         cause: str,
+        reason_code: str = "",
         failures: tuple[Mapping[str, Any], ...] = (),
         recent_outcomes: tuple[Any, ...] = (),
         successful_side_effects: tuple[Mapping[str, Any], ...] = (),
+        stuck: Mapping[str, Any] | None = None,
         allowed_actions: tuple[GuardAction, ...] | None = None,
     ) -> LightweightState:
         if allowed_actions is None:
@@ -352,6 +361,7 @@ class AgentRuntime:
         evidence = GuardEvidence(
             event=event,
             cause=cause,
+            reason_code=reason_code or event.value,
             goal=_last_user_goal(state),
             iteration=state.metadata.iteration,
             iteration_limit=state.metadata.iteration_limit,
@@ -361,10 +371,9 @@ class AgentRuntime:
             failures=failures,
             recent_outcomes=recent_outcomes or _recent_outcomes(state),
             successful_side_effects=successful_side_effects,
+            stuck=dict(stuck or {}),
             context={
                 "message_count": len(state.messages),
-                "minimal_context_count": len(state.minimal_context or []),
-                "lazy_reference_count": len(state.lazy_values),
                 "consecutive_tool_failure_rounds": state.metadata.consecutive_tool_failure_rounds,
                 "budget_auto_continues_used": state.metadata.budget_auto_continues_used,
             },
@@ -423,6 +432,7 @@ class AgentRuntime:
             state,
             event=GuardEvent.BUDGET_EXHAUSTED,
             cause="agent loop iteration budget reached",
+            reason_code="iteration_budget",
         )
 
     async def return_to_model(
@@ -471,6 +481,7 @@ class AgentRuntime:
                 "one or more calls failed in "
                 f"{state.metadata.consecutive_tool_failure_rounds} consecutive tool rounds"
             ),
+            reason_code="repeated_tool_error",
             failures=failures,
             recent_outcomes=recent_outcomes,
             successful_side_effects=successful_side_effects,
@@ -491,7 +502,7 @@ class AgentRuntime:
             iteration=state.metadata.iteration,
             node=AgentNode.MODEL,
             node_kind=NodeKind.CONTEXT_PROCESSING,
-            component="minimal_context",
+            component="context_view",
             before_digest=self.step_before_digest or before_digest,
             after_digest=state.digest(),
             decision=decision,
@@ -591,55 +602,41 @@ class ModelAgent(BaseAgent):
             self.runtime.step_before_digest or state.digest() if self.runtime.trace_enabled else ""
         )
         context_started = perf_counter()
-        context_usage: dict[str, int] = {}
-        prepared_tokens: int | None = None
-        if self.runtime.prepare_model_input is not None:
-            prepared = await self.runtime.prepare_model_input(
-                state.messages,
-                tool_defs,
-                additional_messages,
-            )
-            state.messages, context_usage, prepared_tokens = unpack_prepared_model_input(prepared)
-
-        original_tokens = (
-            prepared_tokens
-            if prepared_tokens is not None
-            else estimate_request_tokens(
-                [*state.messages, *additional_messages],
-                tools=tool_defs,
-                model=self.runtime.model,
-            )
-        )
-        context = self.runtime.context_processor.process(
-            state=state,
+        message_count_before = len(state.messages)
+        context = await self.runtime.context_pipeline.render(
             messages=state.messages,
             tools=tool_defs,
             additional_messages=additional_messages,
         )
-        state.minimal_context = context.messages
-        compact_tokens = estimate_request_tokens(
-            context.messages,
-            tools=context.tools,
-            model=self.runtime.model,
-        )
+        state.messages = context.canonical_messages
+        if context.usage:
+            await self.runtime.emit_hook(
+                "on_usage",
+                context.usage,
+                node_kind=NodeKind.CONTEXT_PROCESSING.value,
+                component="context_view",
+            )
         context_metrics = {
-            **context_usage,
-            "estimated_input_tokens_before": original_tokens,
-            "estimated_input_tokens_after": compact_tokens,
-            "estimated_input_tokens_saved": max(0, original_tokens - compact_tokens),
+            **context.usage,
+            "estimated_input_tokens_before": context.original_tokens,
+            "estimated_input_tokens_after": context.visible_tokens,
+            "estimated_input_tokens_saved": max(
+                0, context.original_tokens - context.visible_tokens
+            ),
         }
         normalized_context_usage = state.token_ledger.record(
             NodeKind.CONTEXT_PROCESSING,
             context_metrics,
-            component="minimal_context",
+            component="context_view",
         )
         self.runtime.record_context_transition(
             state,
             before_digest=context_before,
             decision={
-                "messages_before": len(state.messages),
+                "messages_before": message_count_before,
                 "messages_after": len(context.messages),
-                "lazy_references": list(context.lazy_references),
+                "transformations": list(context.transformations),
+                "prefix_reset_reason": context.prefix_reset_reason,
             },
             usage=normalized_context_usage,
             started_at=context_started,
@@ -648,13 +645,13 @@ class ModelAgent(BaseAgent):
         call_max_tokens: int | None = None
         if self.runtime.max_tokens is not None:
             remaining = self.runtime.max_tokens - state.token_ledger.total_tokens
-            if compact_tokens >= remaining:
+            if context.visible_tokens >= remaining:
                 return await self.runtime.finish_for_hard_budget(
                     state,
                     f"WorkerRun token budget cannot fit the next model input "
                     f"({self.runtime.max_tokens} tokens)",
                 )
-            call_max_tokens = max(1, remaining - compact_tokens)
+            call_max_tokens = max(1, remaining - context.visible_tokens)
 
         response = await self.runtime.do_llm_call(
             context.messages,
@@ -767,6 +764,7 @@ class ModelAgent(BaseAgent):
                 state,
                 event=GuardEvent.RUNTIME_ERROR,
                 cause=clean or "provider returned finish_reason=error",
+                reason_code="provider_error",
             )
 
         if clean is None:
@@ -783,6 +781,7 @@ class ModelAgent(BaseAgent):
                     if exhausted
                     else "model returned an empty response"
                 ),
+                reason_code="model_output_error",
             )
 
         if (
@@ -892,12 +891,13 @@ class ToolAgent(BaseAgent):
 
         execution_tools = self.runtime.tools
         tool_modes = {
-            call.name: (
+            str(definition["name"]): (
                 tool.concurrency_mode
-                if (tool := execution_tools.get(call.name)) is not None
+                if (tool := execution_tools.get(str(definition["name"]))) is not None
                 else "exclusive"
             )
-            for call in malformed.executable_calls
+            for definition in execution_tools.get_definitions()
+            if isinstance(definition.get("name"), str)
         }
         duplicates = suppress_successful_side_effect_duplicates(
             state.messages,
@@ -980,6 +980,24 @@ class ToolAgent(BaseAgent):
                 add_message=False,
             )
         state.metadata.consecutive_tool_failure_rounds = 0
+        if self.runtime.stuck_detection_enabled:
+            detection = detect_repeated_tool_exchanges(
+                state.messages,
+                tool_modes=tool_modes,
+                threshold=self.runtime.stuck_detection_threshold,
+            )
+            if detection is not None:
+                return await self.runtime.queue_guard(
+                    state,
+                    event=GuardEvent.STUCK,
+                    cause=(
+                        "the same successful read-only action and observation repeated "
+                        f"across {detection.repetitions} model steps"
+                    ),
+                    reason_code="repeated_action_observation",
+                    stuck=detection.to_payload(),
+                    allowed_actions=(GuardAction.RETRY, GuardAction.FINALIZE),
+                )
         return await self.runtime.grant_more_or_finalize(state)
 
     async def _reject_terminal_batch(
@@ -1046,15 +1064,48 @@ class GuardAgent(BaseAgent):
             self.runtime.describe_step({"route": "router", "reason": "no guard request"})
             return state
 
-        remaining_tokens = (
-            None
-            if self.runtime.max_tokens is None
-            else max(0, self.runtime.max_tokens - state.token_ledger.total_tokens)
+        signature = guard_request_signature(request)
+        recoveries = state.metadata.guard_recoveries.get(signature, 0)
+        policy_retries = state.metadata.guard_policy_retries.get(signature, 0)
+        recovery_cap_reached = (
+            recoveries >= _MAX_RECOVERIES_PER_SIGNATURE
+            or state.metadata.guard_total_recoveries >= _MAX_TOTAL_GUARD_RECOVERIES
         )
-        resolution = await self.runtime.guard.decide(
-            request,
-            token_budget=remaining_tokens,
+        budget_cap_reached = (
+            request.evidence.event == GuardEvent.BUDGET_EXHAUSTED
+            and state.metadata.budget_guard_continues >= _MAX_BUDGET_GUARD_CONTINUES
         )
+        if recovery_cap_reached or budget_cap_reached:
+            resolution = _policy_guard_resolution(request, GuardAction.FINALIZE)
+        else:
+            resolution = resolve_guard_policy(
+                request,
+                policy_retry_count=policy_retries,
+            )
+            if resolution is None:
+                remaining_tokens = (
+                    None
+                    if self.runtime.max_tokens is None
+                    else max(0, self.runtime.max_tokens - state.token_ledger.total_tokens)
+                )
+                resolution = await self.runtime.guard.decide(
+                    request,
+                    token_budget=remaining_tokens,
+                )
+
+        if resolution.action in {GuardAction.RETRY, GuardAction.CONTINUE}:
+            state.metadata.guard_recoveries[signature] = recoveries + 1
+            state.metadata.guard_total_recoveries += 1
+            if resolution.source == "policy" and resolution.action == GuardAction.RETRY:
+                state.metadata.guard_policy_retries[signature] = min(
+                    _MAX_POLICY_RETRIES_PER_SIGNATURE,
+                    policy_retries + 1,
+                )
+            if (
+                request.evidence.event == GuardEvent.BUDGET_EXHAUSTED
+                and resolution.action == GuardAction.CONTINUE
+            ):
+                state.metadata.budget_guard_continues += 1
         usage = state.token_ledger.record(
             NodeKind.HARNESS,
             resolution.usage,
@@ -1074,6 +1125,26 @@ class GuardAgent(BaseAgent):
             evidence=request.evidence,
             source=resolution.source,
         )
+
+
+def _policy_guard_resolution(
+    request: GuardRequest,
+    action: GuardAction,
+) -> GuardResolution:
+    """Create a local capped decision with the normal telemetry shape."""
+
+    if action not in request.allowed_actions:
+        action = (
+            GuardAction.FINALIZE
+            if GuardAction.FINALIZE in request.allowed_actions
+            else request.fallback_action
+        )
+    return GuardResolution(
+        event=request.evidence.event,
+        action=action,
+        source="policy",
+        evidence=request.evidence.to_payload(),
+    )
 
 
 def _append_tool_patches(
@@ -1150,7 +1221,10 @@ def _successful_side_effects(
 def _last_user_goal(state: LightweightState) -> str:
     for message in reversed(state.messages):
         if message.get("role") == "user" and isinstance(message.get("content"), str):
-            return str(message.get("content") or "")
+            content = str(message.get("content") or "")
+            if content.startswith(MASTER_RUNTIME_MARKER) and MASTER_USER_REQUEST_MARKER in content:
+                return content.rsplit(MASTER_USER_REQUEST_MARKER, 1)[-1]
+            return content
     return ""
 
 
@@ -1191,6 +1265,7 @@ def _fallback_evidence(state: LightweightState, *, cause: str) -> GuardEvidence:
     return GuardEvidence(
         event=GuardEvent.RUNTIME_ERROR,
         cause=cause,
+        reason_code="runtime_exception",
         goal=_last_user_goal(state),
         iteration=state.metadata.iteration,
         iteration_limit=state.metadata.iteration_limit,

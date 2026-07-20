@@ -8,12 +8,13 @@ import re
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
-from aeloon_core.model_input import Message
 from aeloon_core.providers.base import LLMProvider, ToolCallRequest
 from aeloon_core.task_graph import TaskNode, TaskState, build_task_graph
 
 if TYPE_CHECKING:
     from aeloon_core.tools.registry import ToolRegistry
+
+Message = dict[str, Any]
 
 
 def default_strip_think(text: str | None) -> str | None:

@@ -15,8 +15,8 @@ from aeloon_core.agents import (
     ToolAgent,
     _guard_fallback_action,
 )
+from aeloon_core.context_view import ContextViewPipeline
 from aeloon_core.loop_guard import GuardAction, GuardEvent, GuardReviewer
-from aeloon_core.minimal_context import MinimalContextProcessor
 from aeloon_core.providers.base import LLMResponse, ToolCallRequest
 from aeloon_core.state import AgentNode, LightweightState, RunStatus, StateMetadata
 from aeloon_core.tools.base import Tool
@@ -100,7 +100,7 @@ class SoftToolFeedbackTests(unittest.IsolatedAsyncioTestCase):
             tools=tools,
             guard=GuardReviewer(provider=provider, model="test-model"),
             base_iteration_budget=5,
-            context_processor=MinimalContextProcessor(),
+            context_pipeline=ContextViewPipeline(provider=provider, model="test-model"),
             recorder=TransitionRecorder(persist=None),
             tool_error_guard_threshold=threshold,
             budget_auto_continues=auto_continues,

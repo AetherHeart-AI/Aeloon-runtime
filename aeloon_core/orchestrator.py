@@ -11,7 +11,7 @@ from typing import Any
 
 from loguru import logger
 
-from aeloon_core.config import Config
+from aeloon_core.config import Config, ContextCompactionConfig
 from aeloon_core.context import (
     append_user_message,
     apply_skill_guidance,
@@ -20,7 +20,7 @@ from aeloon_core.context import (
     refresh_initial_system_message,
     strip_skill_tool_history,
 )
-from aeloon_core.context_compaction import CompactionResult, maybe_compact_messages
+from aeloon_core.context_view import ContextViewPipeline
 from aeloon_core.flow_control import FlowControlService
 from aeloon_core.flows import (
     DEFAULT_FLOW_TURN_LEASE_SECONDS,
@@ -29,12 +29,17 @@ from aeloon_core.flows import (
     FlowTurnCommit,
     FlowTurnConflictError,
 )
-from aeloon_core.master_prompt import master_system_prompt
+from aeloon_core.master_prompt import (
+    MASTER_USER_REQUEST_MARKER,
+    apply_master_system_prompt,
+    master_runtime_context,
+)
 from aeloon_core.master_tools import build_master_scheduler_tools
 from aeloon_core.model_metadata import resolve_max_output_tokens
 from aeloon_core.providers.anthropic_provider import AnthropicProvider
 from aeloon_core.providers.base import GenerationSettings
 from aeloon_core.session import SessionStore
+from aeloon_core.session_events import SessionHead
 from aeloon_core.skills import SkillRegistry
 from aeloon_core.state_machine import run_agent_loop
 from aeloon_core.tools.filesystem import (
@@ -175,6 +180,7 @@ class AeloonCoreOrchestrator:
             default_model=defaults.model,
             extra_headers=provider_config.extra_headers,
             proxy=provider_config.proxy,
+            prompt_caching=provider_config.prompt_caching,
             generation=GenerationSettings(
                 temperature=defaults.temperature,
                 reasoning_effort=defaults.reasoning_effort,
@@ -328,27 +334,24 @@ class AeloonCoreOrchestrator:
             actual_session_id,
             wait=True,
         )
-        messages = self.sessions.load_messages(
-            actual_session_id,
-            initial_messages=build_initial_messages(workspace=self.config.workspace),
-        )
+        messages = await self._load_master_messages(actual_session_id)
         messages = normalize_claude_messages(messages)
         messages = refresh_initial_system_message(messages, workspace=self.config.workspace)
         # v2 removes all Skill material persisted by a pre-v2 Master session.
         messages = strip_skill_tool_history(messages)
         messages = apply_skill_guidance(messages, None)
-        messages = list(messages)
-        messages[0] = {
-            **messages[0],
-            "content": str(messages[0].get("content") or "")
-            + "\n\n"
-            + master_system_prompt(
-                worker_types=self.worker_control.discover_worker_types(),
-                workers=self.worker_control.list_workers(actual_session_id),
-                flows=self.flow_control.list_flows(actual_session_id),
-            ),
-        }
-        messages = append_user_message(messages, prompt)
+        messages = apply_master_system_prompt(
+            list(messages),
+            worker_types=self.worker_control.discover_worker_types(),
+        )
+        runtime_context = master_runtime_context(
+            workers=self.worker_control.list_workers(actual_session_id),
+            flows=self.flow_control.list_flows(actual_session_id),
+        )
+        messages = append_user_message(
+            messages,
+            f"{runtime_context}{MASTER_USER_REQUEST_MARKER}{prompt}",
+        )
         tools = build_master_scheduler_tools(
             control=self.worker_control,
             base_session_id=actual_session_id,
@@ -365,7 +368,7 @@ class AeloonCoreOrchestrator:
             assert tool is not None
             tools.register(tool)
 
-        prepare_model_input = await self._prepare_model_input(on_progress)
+        context_pipeline = self._context_pipeline()
         fenced_progress = _CommitFencedProgress(on_progress) if on_progress is not None else None
         policy = self.config.agents.defaults.uasm
         trace_write_tail: asyncio.Task[None] | None = None
@@ -419,15 +422,15 @@ class AeloonCoreOrchestrator:
                 messages=messages,
                 max_iterations=self.config.agents.defaults.max_iterations,
                 transition_trace_enabled=policy.transition_trace_enabled,
-                minimal_context_recent_turns=policy.minimal_context_recent_turns,
-                minimal_context_tool_result_chars=policy.minimal_context_tool_result_chars,
                 tool_error_guard_threshold=policy.tool_error_guard_threshold,
                 budget_auto_continues=policy.budget_auto_continues,
+                stuck_detection_enabled=policy.stuck_detection_enabled,
+                stuck_detection_threshold=policy.stuck_detection_threshold,
                 session_id=actual_session_id,
                 turn_id=turn_id,
                 on_transition=(persist_transition if policy.transition_trace_enabled else None),
                 on_progress=fenced_progress,
-                prepare_model_input=prepare_model_input,
+                context_pipeline=context_pipeline,
                 completion_gate=completion_gate,
             )
         except BaseException:
@@ -553,34 +556,65 @@ class AeloonCoreOrchestrator:
         )
         await progress.release_final()
 
-    async def _prepare_model_input(self, on_progress: Any) -> Any:
+    def _context_pipeline(self, *, allow_compaction: bool = True) -> ContextViewPipeline:
+        """Build the one model-visible context policy shared by both actors."""
+
         defaults = self.config.agents.defaults
-        if not defaults.context_compaction.enabled:
-            return None
-        context_window_tokens = defaults.context_window_tokens
+        compaction = (
+            defaults.context_compaction
+            if allow_compaction
+            else ContextCompactionConfig(enabled=False)
+        )
+        return ContextViewPipeline(
+            provider=self.provider,
+            model=defaults.model,
+            compaction=compaction,
+            context_window_tokens=defaults.context_window_tokens,
+        )
 
-        async def prepare_model_input(
-            current_messages: list[dict[str, Any]],
-            current_tools: list[dict[str, Any]],
-            additional_messages: list[dict[str, Any]],
-        ) -> CompactionResult:
-            compaction = await maybe_compact_messages(
-                provider=self.provider,
-                model=defaults.model,
-                messages=current_messages,
-                tools=current_tools,
-                additional_messages=additional_messages,
-                config=defaults.context_compaction,
-                context_window_tokens=context_window_tokens,
-            )
-            usage_hook = getattr(on_progress, "on_usage", None)
-            if compaction.usage and usage_hook is not None:
-                result = usage_hook(compaction.usage, node_kind="context_processing")
-                if inspect.isawaitable(result):
-                    await result
-            return compaction
+    async def _load_master_messages(
+        self,
+        base_session_id: str,
+    ) -> list[dict[str, Any]]:
+        """Load the current durable head snapshot before the JSONL projection."""
 
-        return prepare_model_input
+        committed = await asyncio.to_thread(
+            self.flow_store.materialize_session_head_commit,
+            base_session_id,
+        )
+        if committed is not None:
+            messages = committed.payload.get("messages")
+            if (
+                isinstance(messages, list)
+                and messages
+                and all(isinstance(message, dict) for message in messages)
+            ):
+                return [dict(message) for message in messages]
+        return await asyncio.to_thread(
+            self.sessions.load_messages,
+            base_session_id,
+            initial_messages=build_initial_messages(workspace=self.config.workspace),
+        )
+
+    def _fork_conversation_only_session(
+        self,
+        source_session_id: str,
+        fork_session_id: str,
+    ) -> SessionHead:
+        """Create an internal branch only after every session authority is pristine."""
+
+        self.sessions.session_path(source_session_id)
+        self.sessions.session_path(fork_session_id)
+        if self.sessions.history(fork_session_id) or self.sessions.transition_history(
+            fork_session_id
+        ):
+            raise ValueError("fork target is not a pristine Master session")
+        if self.workers.list_workers(fork_session_id):
+            raise ValueError("fork target already owns WorkerSessions")
+        return self.flow_store._fork_conversation_only_session_head(
+            source_session_id,
+            fork_session_id,
+        )
 
     async def _execute_worker_run(self, run: Any, worker: Any) -> WorkerExecutionOutcome:
         """Run one private Worker context through the same generic UASM."""
@@ -626,10 +660,8 @@ class AeloonCoreOrchestrator:
         # Unlimited cumulative Runs still need bounded per-request context.
         # Explicit finite token grants retain their strict hard-cap path and do
         # not spend unaccounted summary tokens before the budget preflight.
-        prepare_model_input = (
-            await self._prepare_model_input(worker_progress)
-            if run.context.budget.max_tokens is None
-            else None
+        context_pipeline = self._context_pipeline(
+            allow_compaction=run.context.budget.max_tokens is None
         )
         state = await run_agent_loop(
             provider=self.provider,
@@ -638,16 +670,16 @@ class AeloonCoreOrchestrator:
             messages=messages,
             max_iterations=defaults.max_iterations,
             transition_trace_enabled=policy.transition_trace_enabled,
-            minimal_context_recent_turns=policy.minimal_context_recent_turns,
-            minimal_context_tool_result_chars=policy.minimal_context_tool_result_chars,
             tool_error_guard_threshold=policy.tool_error_guard_threshold,
             budget_auto_continues=policy.budget_auto_continues,
+            stuck_detection_enabled=policy.stuck_detection_enabled,
+            stuck_detection_threshold=policy.stuck_detection_threshold,
             max_tokens=run.context.budget.max_tokens,
             max_tool_calls=run.context.budget.max_tool_calls,
             session_id=worker.worker_id,
             turn_id=run.run_id,
             on_progress=worker_progress,
-            prepare_model_input=prepare_model_input,
+            context_pipeline=context_pipeline,
             require_terminal=True,
         )
 

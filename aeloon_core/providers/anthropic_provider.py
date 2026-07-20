@@ -25,6 +25,32 @@ _UNSUPPORTED_TOOL_MARKERS = (
     "tools are not supported",
     "tool use is not supported",
 )
+_PROMPT_CACHE_FIELD_MARKERS = (
+    "cache_control",
+    "cache control",
+    "prompt cache",
+    "prompt caching",
+)
+_PROMPT_CACHE_REJECTION_MARKERS = (
+    "does not support",
+    "extra_forbidden",
+    "extra fields not permitted",
+    "extra inputs are not permitted",
+    "invalid request argument",
+    "invalid field",
+    "not allowed",
+    "not permitted",
+    "not supported",
+    "unexpected keyword",
+    "unexpected argument",
+    "unknown argument",
+    "unknown field",
+    "unknown parameter",
+    "unrecognized field",
+    "unrecognized parameter",
+    "unrecognized request argument",
+    "unsupported",
+)
 _THINKING_TOOL_CHOICE_MARKER = "incompatible with thinking enabled"
 _COMPLETE_TOOL_STOP_REASONS = frozenset({"tool_use"})
 _MISSING_STOP_REASON = "unknown"
@@ -184,6 +210,15 @@ def _is_tooling_unsupported_error(exc: Exception) -> bool:
     return any(marker in text for marker in _UNSUPPORTED_TOOL_MARKERS)
 
 
+def _is_prompt_caching_unsupported_error(exc: Exception) -> bool:
+    """Return whether an endpoint clearly rejects the prompt-cache request field."""
+
+    text = str(exc).lower()
+    return any(marker in text for marker in _PROMPT_CACHE_FIELD_MARKERS) and any(
+        marker in text for marker in _PROMPT_CACHE_REJECTION_MARKERS
+    )
+
+
 class AnthropicProvider(LLMProvider):
     """Anthropic-compatible Messages API provider."""
 
@@ -198,6 +233,8 @@ class AnthropicProvider(LLMProvider):
         proxy: str | None = None,
         generation: GenerationSettings | None = None,
         chat_timeout: int = 3600,
+        *,
+        prompt_caching: bool = True,
     ) -> None:
         super().__init__(
             api_key,
@@ -207,6 +244,8 @@ class AnthropicProvider(LLMProvider):
             chat_timeout=chat_timeout,
         )
         self.default_model = default_model
+        self.prompt_caching = bool(prompt_caching)
+        self._prompt_caching_supported: bool | None = None
         default_headers = {
             "x-session-affinity": uuid.uuid4().hex,
             **(extra_headers or {}),
@@ -247,6 +286,11 @@ class AnthropicProvider(LLMProvider):
             "messages": conversation,
             "max_tokens": max(1, max_tokens or _DEFAULT_MAX_TOKENS),
         }
+        if self.prompt_caching and self._prompt_caching_supported is not False:
+            # The current Anthropic Messages API applies this marker to the last
+            # cacheable request block, allowing each append-only round to reuse
+            # the longest stable prompt prefix.
+            kwargs["cache_control"] = {"type": "ephemeral"}
         # Current Claude models reject sampling overrides. Anthropic-compatible
         # third-party models such as Kimi still accept the existing setting.
         if not resolved_model.startswith("claude-"):
@@ -331,31 +375,33 @@ class AnthropicProvider(LLMProvider):
         kwargs: dict[str, Any],
         run: Callable[[dict[str, Any]], Awaitable[LLMResponse]],
     ) -> LLMResponse:
-        """Run a message request, retrying without tools when unsupported."""
+        """Run a request with bounded prompt-cache and tool compatibility fallbacks."""
 
         try:
-            return await run(kwargs)
+            response = await run(kwargs)
+            if kwargs.get("cache_control") is not None:
+                self._prompt_caching_supported = True
+            return response
         except Exception as exc:
+            if kwargs.get("cache_control") is not None and _is_prompt_caching_unsupported_error(
+                exc
+            ):
+                # Remember the endpoint capability before retrying so every later
+                # request is built without the unsupported field. Recursing through
+                # the shared fallback path also covers streaming and any independent
+                # tool-compatibility fallback without permitting a second cache retry.
+                self._prompt_caching_supported = False
+                fallback = dict(kwargs)
+                fallback.pop("cache_control", None)
+                return await self._create_with_tool_fallback(fallback, run)
             if kwargs.get("tool_choice") and _THINKING_TOOL_CHOICE_MARKER in str(exc).lower():
                 fallback = dict(kwargs)
                 fallback.pop("tool_choice", None)
-                try:
-                    return await run(fallback)
-                except Exception as fallback_error:
-                    return LLMResponse(
-                        content=f"Error: {fallback_error}",
-                        finish_reason="error",
-                    )
+                return await self._create_with_tool_fallback(fallback, run)
             if kwargs.get("tools") and _is_tooling_unsupported_error(exc):
                 fallback = {key: value for key, value in kwargs.items() if key != "tools"}
                 fallback.pop("tool_choice", None)
-                try:
-                    return await run(fallback)
-                except Exception as fallback_error:
-                    return LLMResponse(
-                        content=f"Error: {fallback_error}",
-                        finish_reason="error",
-                    )
+                return await self._create_with_tool_fallback(fallback, run)
             return LLMResponse(content=f"Error: {exc}", finish_reason="error")
 
     async def chat(

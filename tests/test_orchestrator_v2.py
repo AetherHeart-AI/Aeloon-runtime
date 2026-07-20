@@ -17,11 +17,10 @@ from aeloon_core.config import (
 )
 from aeloon_core.context import strip_skill_tool_history
 from aeloon_core.context_compaction import COMPACTION_MARKER
+from aeloon_core.context_view import ContextViewPipeline
 from aeloon_core.master_tools import build_master_scheduler_tools
-from aeloon_core.minimal_context import LAZY_TOOL_RESULT_MARKER, MinimalContextProcessor
 from aeloon_core.orchestrator import AeloonCoreOrchestrator
 from aeloon_core.providers.base import LLMProvider, LLMResponse, ToolCallRequest
-from aeloon_core.state import LightweightState
 
 
 class ScriptedProvider(LLMProvider):
@@ -500,7 +499,8 @@ async def test_skill_catalog_and_tool_belong_only_to_worker(tmp_path: Path) -> N
     assert "demo" in str(app.skills.format_guidance())
 
 
-def test_current_run_keeps_full_skill_result_and_later_run_can_lazy_load() -> None:
+@pytest.mark.asyncio
+async def test_model_rounds_keep_full_skill_result_without_reprojection() -> None:
     large_skill = "trusted workflow\n" * 100
     messages = [
         {"role": "system", "content": "worker"},
@@ -529,14 +529,12 @@ def test_current_run_keeps_full_skill_result_and_later_run_can_lazy_load() -> No
             "input_schema": {"type": "object", "properties": {}},
         }
     ]
-    state = LightweightState.from_messages(messages, active_tools=["skill"], max_iterations=5)
-    processor = MinimalContextProcessor(max_tool_result_chars=100)
-
-    current = processor.process(state=state, messages=messages, tools=tools)
+    pipeline = ContextViewPipeline(provider=object(), model="test-model")
+    current = await pipeline.render(messages=messages, tools=tools)
     assert current.messages[-1]["content"][0]["content"] == large_skill
 
     later_messages = [*messages, {"role": "user", "content": "next objective"}]
-    later = processor.process(state=state, messages=later_messages, tools=tools)
+    later = await pipeline.render(messages=later_messages, tools=tools)
     skill_result = next(
         block
         for message in later.messages
@@ -544,7 +542,9 @@ def test_current_run_keeps_full_skill_result_and_later_run_can_lazy_load() -> No
         for block in message["content"]
         if isinstance(block, dict) and block.get("type") == "tool_result"
     )
-    assert str(skill_result["content"]).startswith(LAZY_TOOL_RESULT_MARKER)
+    assert skill_result["content"] == large_skill
+    assert later.canonical_messages is later_messages
+    assert later.transformations == ()
 
 
 def test_v2_master_strips_old_skill_calls_and_results() -> None:

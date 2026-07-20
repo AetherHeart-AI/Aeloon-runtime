@@ -28,6 +28,7 @@ CONFIG_SETTERS = {
     "data-dir": ("data_dir",),
     "api-key": ("providers", "anthropic", "api_key"),
     "base-url": ("providers", "anthropic", "base_url"),
+    "prompt-caching": ("providers", "anthropic", "prompt_caching"),
     "model": ("agents", "defaults", "model"),
     "reasoning-effort": ("agents", "defaults", "reasoning_effort"),
     "max-iterations": ("agents", "defaults", "max_iterations"),
@@ -62,17 +63,17 @@ CONFIG_SETTERS = {
         "uasm",
         "transition_trace_enabled",
     ),
-    "uasm-minimal-context-recent-turns": (
+    "uasm-stuck-detection-enabled": (
         "agents",
         "defaults",
         "uasm",
-        "minimal_context_recent_turns",
+        "stuck_detection_enabled",
     ),
-    "uasm-minimal-context-tool-result-chars": (
+    "uasm-stuck-detection-threshold": (
         "agents",
         "defaults",
         "uasm",
-        "minimal_context_tool_result_chars",
+        "stuck_detection_threshold",
     ),
     "skills-enabled": ("skills", "enabled"),
     "skills-external": ("skills", "external"),
@@ -399,8 +400,7 @@ def _coerce_config_value(key: str, value: str) -> Any:
         "max-iterations",
         "context-compaction-preserve-recent-turns",
         "context-compaction-summary-max-tokens",
-        "uasm-minimal-context-recent-turns",
-        "uasm-minimal-context-tool-result-chars",
+        "uasm-stuck-detection-threshold",
     }:
         return int(value)
     if key == "context-compaction-trigger-ratio":
@@ -411,6 +411,8 @@ def _coerce_config_value(key: str, value: str) -> Any:
         "skills-claude-code",
         "context-compaction-enabled",
         "uasm-transition-trace-enabled",
+        "uasm-stuck-detection-enabled",
+        "prompt-caching",
     }:
         return _parse_bool(value)
     if key == "skills-paths":

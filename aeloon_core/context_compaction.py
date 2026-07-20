@@ -54,15 +54,24 @@ async def maybe_compact_messages(
     provider: LLMProvider,
     model: str,
     messages: list[dict[str, Any]],
+    visible_messages: list[dict[str, Any]] | None = None,
     tools: list[dict[str, Any]] | None,
     additional_messages: list[dict[str, Any]] | None = None,
     config: ContextCompactionConfig,
     context_window_tokens: int,
 ) -> CompactionResult:
-    """Compact older history when the model-visible request is near the limit."""
+    """Compact canonical history when its one-to-one visible view nears the limit.
 
+    ``visible_messages`` may replace large answered arguments without discarding
+    their canonical source. It must preserve message boundaries so the selected
+    tail indices can be applied safely to the canonical transcript.
+    """
+
+    measured_messages = visible_messages if visible_messages is not None else messages
+    if len(measured_messages) != len(messages):
+        raise ValueError("visible_messages must preserve canonical message boundaries")
     original_tokens = estimate_request_tokens(
-        [*messages, *(additional_messages or [])],
+        [*measured_messages, *(additional_messages or [])],
         tools=tools,
         model=model,
     )
@@ -81,7 +90,7 @@ async def maybe_compact_messages(
 
     system_prefix = _runtime_system_prefix(messages)
     tail_start = _select_tail_start(
-        messages,
+        measured_messages,
         body_start=len(system_prefix),
         model=model,
         config=config,
@@ -110,7 +119,10 @@ async def maybe_compact_messages(
     source = _serialize_for_summary(head, model=model)
     source_budget = _summary_source_budget(
         trigger_tokens=trigger_tokens,
-        tail_tokens=estimate_messages_tokens(tail, model=model),
+        tail_tokens=estimate_messages_tokens(
+            measured_messages[tail_start:],
+            model=model,
+        ),
         summary_max_tokens=config.summary_max_tokens,
     )
     source = truncate_middle_tokens(source, max_tokens=source_budget, model=model)
@@ -126,8 +138,13 @@ async def maybe_compact_messages(
         _compaction_message(summary),
         *tail,
     ]
+    visible_compacted = [
+        *measured_messages[: len(system_prefix)],
+        _compaction_message(summary),
+        *measured_messages[tail_start:],
+    ]
     compacted_tokens = estimate_request_tokens(
-        [*compacted, *(additional_messages or [])],
+        [*visible_compacted, *(additional_messages or [])],
         tools=tools,
         model=model,
     )

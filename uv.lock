@@ -20,7 +20,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "anthropic", specifier = ">=0.75" },
+    { name = "anthropic", specifier = ">=0.117" },
     { name = "html2text", specifier = ">=2025.4.15" },
     { name = "httpx", specifier = ">=0.28" },
     { name = "loguru", specifier = ">=0.7" },

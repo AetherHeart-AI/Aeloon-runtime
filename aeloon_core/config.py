@@ -21,6 +21,7 @@ class AnthropicProviderConfig(BaseModel):
     base_url: str = "https://api.anthropic.com"
     extra_headers: dict[str, str] = Field(default_factory=dict)
     proxy: str | None = None
+    prompt_caching: bool = True
 
 
 class ProvidersConfig(BaseModel):
@@ -43,8 +44,8 @@ class UASMConfig(BaseModel):
     """Unified Agentic State Machine policy settings."""
 
     transition_trace_enabled: bool = True
-    minimal_context_recent_turns: int = Field(default=2, ge=1)
-    minimal_context_tool_result_chars: int = Field(default=1_200, ge=128)
+    stuck_detection_enabled: bool = True
+    stuck_detection_threshold: int = Field(default=4, ge=3, le=20)
     # Soft-feed tool errors back to the model this many consecutive rounds before Guard.
     tool_error_guard_threshold: int = Field(default=3, ge=1)
     # Grant this many automatic budget extensions before involving Guard.

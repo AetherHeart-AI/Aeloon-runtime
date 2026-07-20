@@ -194,7 +194,7 @@ class TurnEventProgress:
             "harness": "guard",
         }.get(node_kind, node_kind)
         resolved_component = component or (
-            "minimal_context"
+            "context_view"
             if node_kind == "context_processing"
             else normalized_node_kind
         )

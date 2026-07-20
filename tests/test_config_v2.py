@@ -60,6 +60,33 @@ def test_load_config_still_rejects_unknown_agent_defaults(tmp_path: Path) -> Non
         load_config(path)
 
 
+def test_removed_per_round_minimal_context_settings_are_not_persisted(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.json"
+    _write_config(
+        path,
+        {
+            "uasm": {
+                "minimal_context_recent_turns": 3,
+                "minimal_context_tool_result_chars": 2_400,
+            }
+        },
+    )
+
+    config = load_config(path)
+
+    assert config.agents.defaults.uasm.stuck_detection_enabled is True
+    assert config.agents.defaults.uasm.stuck_detection_threshold == 4
+    cleaned_path = tmp_path / "cleaned.json"
+    save_config(config, cleaned_path)
+    cleaned_uasm = json.loads(cleaned_path.read_text(encoding="utf-8"))["agents"][
+        "defaults"
+    ]["uasm"]
+    assert "minimal_context_recent_turns" not in cleaned_uasm
+    assert "minimal_context_tool_result_chars" not in cleaned_uasm
+
+
 def test_legacy_compatibility_is_limited_to_persisted_config_loading() -> None:
     with pytest.raises(ValidationError, match="profile_id"):
         Config.model_validate(

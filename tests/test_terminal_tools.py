@@ -9,8 +9,8 @@ import pytest
 from pydantic import BaseModel, ConfigDict
 
 from aeloon_core.agents import AgentRuntime, ModelAgent, RouterAgent, ToolAgent
+from aeloon_core.context_view import ContextViewPipeline
 from aeloon_core.loop_guard import GuardReviewer
-from aeloon_core.minimal_context import MinimalContextProcessor
 from aeloon_core.providers.base import LLMResponse, ToolCallRequest
 from aeloon_core.state import AgentNode, LightweightState, RunStatus, StateMetadata
 from aeloon_core.tools.base import FunctionTool
@@ -45,7 +45,7 @@ def _runtime(
         tools=tools,
         guard=GuardReviewer(provider=provider, model="test-model"),
         base_iteration_budget=5,
-        context_processor=MinimalContextProcessor(),
+        context_pipeline=ContextViewPipeline(provider=provider, model="test-model"),
         recorder=TransitionRecorder(persist=None),
         require_terminal=require_terminal,
         on_progress=AsyncMock(),

@@ -15,14 +15,13 @@ from aeloon_core.agents import (
     RouterAgent,
     ToolAgent,
 )
+from aeloon_core.context_view import ContextViewPipeline
 from aeloon_core.loop_guard import (
     GuardEvent,
     GuardEvidence,
     GuardReviewer,
     local_failure_message,
 )
-from aeloon_core.minimal_context import MinimalContextProcessor
-from aeloon_core.model_input import PrepareModelInput
 from aeloon_core.runtime_support import default_add_tool_result
 from aeloon_core.state import (
     AgentNode,
@@ -46,17 +45,17 @@ async def run_agent_loop(
     messages: list[dict[str, Any]],
     max_iterations: int = 25,
     transition_trace_enabled: bool = True,
-    minimal_context_recent_turns: int = 2,
-    minimal_context_tool_result_chars: int = 1_200,
     tool_error_guard_threshold: int = 3,
     budget_auto_continues: int = 2,
+    stuck_detection_enabled: bool = True,
+    stuck_detection_threshold: int = 4,
     max_tokens: int | None = None,
     max_tool_calls: int | None = None,
     session_id: str | None = None,
     turn_id: str | None = None,
     on_transition: Callable[[TransitionRecord], None] | None = None,
     on_progress: Callable[..., Awaitable[None]] | None = None,
-    prepare_model_input: PrepareModelInput | None = None,
+    context_pipeline: ContextViewPipeline | None = None,
     require_terminal: bool = False,
     completion_gate: CompletionGate | None = None,
 ) -> LightweightState:
@@ -68,6 +67,8 @@ async def run_agent_loop(
         raise ValueError("tool_error_guard_threshold must be at least 1")
     if budget_auto_continues < 0:
         raise ValueError("budget_auto_continues must be non-negative")
+    if not 3 <= stuck_detection_threshold <= 20:
+        raise ValueError("stuck_detection_threshold must be between 3 and 20")
     if max_tokens is not None and max_tokens < 1:
         raise ValueError("max_tokens must be at least 1")
     if max_tool_calls is not None and max_tool_calls < 1:
@@ -84,9 +85,9 @@ async def run_agent_loop(
         max_iterations=max_iterations,
         metadata=metadata,
     )
-    context_processor = MinimalContextProcessor(
-        preserve_recent_turns=minimal_context_recent_turns,
-        max_tool_result_chars=minimal_context_tool_result_chars,
+    resolved_context_pipeline = context_pipeline or ContextViewPipeline(
+        provider=provider,
+        model=model,
     )
     recorder = TransitionRecorder(
         session_id=session_id,
@@ -99,16 +100,17 @@ async def run_agent_loop(
         tools=tools,
         guard=GuardReviewer(provider=provider, model=model),
         base_iteration_budget=max_iterations,
-        context_processor=context_processor,
+        context_pipeline=resolved_context_pipeline,
         recorder=recorder,
         require_terminal=require_terminal,
         tool_error_guard_threshold=tool_error_guard_threshold,
         budget_auto_continues=budget_auto_continues,
+        stuck_detection_enabled=stuck_detection_enabled,
+        stuck_detection_threshold=stuck_detection_threshold,
         max_tokens=max_tokens,
         max_tool_calls=max_tool_calls,
         trace_enabled=transition_trace_enabled,
         on_progress=on_progress,
-        prepare_model_input=prepare_model_input,
         completion_gate=completion_gate,
     )
     agents: dict[AgentNode, BaseAgent] = {
@@ -166,6 +168,7 @@ async def run_agent_loop(
                     state,
                     event=GuardEvent.RUNTIME_ERROR,
                     cause=f"{type(exc).__name__}: {exc}",
+                    reason_code="runtime_exception",
                     failures=failures,
                     recent_outcomes=outcomes,
                     successful_side_effects=side_effects,

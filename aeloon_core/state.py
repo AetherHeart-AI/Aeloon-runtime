@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import hashlib
-import inspect
 import json
 import math
-import re
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, is_dataclass
 from enum import Enum, StrEnum
 from typing import TYPE_CHECKING, Any
@@ -20,9 +18,6 @@ if TYPE_CHECKING:
     from aeloon_core.task_graph import TaskNode
 
 Message = dict[str, Any]
-LazyLoader = Callable[[], Any]
-_UNRESOLVED = object()
-_SAFE_REF_PREFIX = re.compile(r"[^a-zA-Z0-9._-]+")
 
 
 class AgentNode(StrEnum):
@@ -65,6 +60,11 @@ class StateMetadata:
     consecutive_tool_failure_rounds: int = 0
     # How many times the host auto-extended the iteration budget without Guard.
     budget_auto_continues_used: int = 0
+    # Host-owned recovery caps, keyed by a stable bounded Guard signature.
+    guard_policy_retries: dict[str, int] = field(default_factory=dict)
+    guard_recoveries: dict[str, int] = field(default_factory=dict)
+    guard_total_recoveries: int = 0
+    budget_guard_continues: int = 0
     finalization_prompt: Message | None = None
     finalization_source: GuardSource | None = None
     finalization_evidence: GuardEvidence | None = None
@@ -81,6 +81,15 @@ class StateMetadata:
         self.iteration_limit = max(0, int(self.iteration_limit))
         self.consecutive_tool_failure_rounds = max(0, int(self.consecutive_tool_failure_rounds))
         self.budget_auto_continues_used = max(0, int(self.budget_auto_continues_used))
+        self.guard_policy_retries = {
+            str(key): max(0, int(value))
+            for key, value in self.guard_policy_retries.items()
+        }
+        self.guard_recoveries = {
+            str(key): max(0, int(value)) for key, value in self.guard_recoveries.items()
+        }
+        self.guard_total_recoveries = max(0, int(self.guard_total_recoveries))
+        self.budget_guard_continues = max(0, int(self.budget_guard_continues))
 
     @property
     def is_terminal(self) -> bool:
@@ -172,61 +181,10 @@ def _value_summary(value: Any) -> dict[str, Any] | None:
 
 
 @dataclass
-class LazyValue:
-    """A content-addressed value that may be resolved on first access."""
-
-    ref: str
-    value: Any = field(default=_UNRESOLVED, repr=False)
-    loader: LazyLoader | None = field(default=None, repr=False)
-
-    def __post_init__(self) -> None:
-        if not self.ref:
-            raise ValueError("lazy ref must not be empty")
-
-    @classmethod
-    def from_value(cls, value: Any, *, prefix: str = "context") -> LazyValue:
-        digest = _stable_hash(value)
-        return cls(ref=_lazy_ref(prefix, digest), value=value)
-
-    @classmethod
-    def deferred(cls, ref: str, loader: LazyLoader) -> LazyValue:
-        return cls(ref=ref, loader=loader)
-
-    @property
-    def is_loaded(self) -> bool:
-        return self.value is not _UNRESOLVED
-
-    def resolve(self) -> Any:
-        if self.is_loaded:
-            return self.value
-        if self.loader is None:
-            raise LookupError(f"no loader registered for {self.ref}")
-        value = self.loader()
-        if inspect.isawaitable(value):
-            raise TypeError("LazyValue loaders must be synchronous")
-        self.value = value
-        return value
-
-    def to_reference(self) -> dict[str, str]:
-        return {"$ref": self.ref}
-
-    def to_digest_value(self) -> dict[str, str]:
-        """Keep state digests stable before and after deferred loading."""
-
-        return {"ref": self.ref}
-
-
-def _lazy_ref(prefix: str, digest: str) -> str:
-    clean_prefix = _SAFE_REF_PREFIX.sub("-", prefix.strip()).strip("-") or "context"
-    return f"lazy://{clean_prefix}/{digest}"
-
-
-@dataclass
 class LightweightState:
     """Canonical UASM data passed through every explicit agent-node transition."""
 
     messages: list[Message]
-    minimal_context: list[Message] | None = None
     permissions: dict[str, Any] = field(default_factory=dict)
     active_tools: list[str] = field(default_factory=list)
     metadata: StateMetadata = field(default_factory=StateMetadata)
@@ -238,11 +196,6 @@ class LightweightState:
     tools_used: list[str] = field(default_factory=list)
     transitions: list[TransitionRecord] = field(default_factory=list)
     token_ledger: TokenLedger = field(default_factory=TokenLedger)
-    lazy_values: dict[str, LazyValue] = field(default_factory=dict, repr=False)
-
-    def __post_init__(self) -> None:
-        if self.minimal_context is None:
-            self.minimal_context = list(self.messages)
 
     @classmethod
     def from_messages(
@@ -261,48 +214,16 @@ class LightweightState:
 
         return cls(
             messages=messages,
-            minimal_context=list(messages),
             permissions=dict(permissions or {}),
             active_tools=list(active_tools or []),
             metadata=resolved_metadata,
         )
 
-    @property
-    def lazy_refs(self) -> dict[str, LazyValue]:
-        """Read-only-by-convention alias exposing registered references."""
-
-        return self.lazy_values
-
-    def store_lazy(self, value: Any, *, prefix: str = "context") -> str:
-        """Store a value by content digest and return its stable reference."""
-
-        lazy = LazyValue.from_value(value, prefix=prefix)
-        self.lazy_values.setdefault(lazy.ref, lazy)
-        return lazy.ref
-
-    def register_lazy(self, lazy: LazyValue) -> str:
-        """Register an eager or deferred lazy value."""
-
-        existing = self.lazy_values.get(lazy.ref)
-        if existing is not None and existing is not lazy:
-            raise ValueError(f"lazy ref already registered: {lazy.ref}")
-        self.lazy_values[lazy.ref] = lazy
-        return lazy.ref
-
-    def resolve_lazy(self, ref: str) -> Any:
-        try:
-            lazy = self.lazy_values[ref]
-        except KeyError as exc:
-            raise KeyError(f"unknown lazy ref: {ref}") from exc
-        return lazy.resolve()
-
     def stable_digest(self) -> str:
         """Hash a serializable state summary, excluding the trace itself."""
 
-        minimal_context = self.minimal_context or []
         payload = {
             "messages": [_value_summary(message) for message in self.messages],
-            "minimal_context": [_value_summary(message) for message in minimal_context],
             "permissions": _canonicalize(self.permissions),
             "active_tools": list(self.active_tools),
             "metadata": {
@@ -312,6 +233,10 @@ class LightweightState:
                 "iteration_limit": self.metadata.iteration_limit,
                 "consecutive_tool_failure_rounds": self.metadata.consecutive_tool_failure_rounds,
                 "budget_auto_continues_used": self.metadata.budget_auto_continues_used,
+                "guard_policy_retries": dict(self.metadata.guard_policy_retries),
+                "guard_recoveries": dict(self.metadata.guard_recoveries),
+                "guard_total_recoveries": self.metadata.guard_total_recoveries,
+                "budget_guard_continues": self.metadata.budget_guard_continues,
                 "finalization_prompt": _value_summary(self.metadata.finalization_prompt),
                 "finalization_source": self.metadata.finalization_source,
                 "finalization_evidence": _value_summary(self.metadata.finalization_evidence),
@@ -332,9 +257,6 @@ class LightweightState:
             "final_emitted": self.final_emitted,
             "tools_used": list(self.tools_used),
             "token_ledger": self.token_ledger.to_dict(),
-            "lazy_values": {
-                ref: lazy.to_digest_value() for ref, lazy in sorted(self.lazy_values.items())
-            },
         }
         return _stable_hash(payload)
 

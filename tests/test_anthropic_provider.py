@@ -9,9 +9,9 @@ import httpx
 import pytest
 from anthropic import AsyncAnthropic
 
-from aeloon_core.config import load_config
+from aeloon_core.config import AnthropicProviderConfig, load_config
 from aeloon_core.providers.anthropic_provider import AnthropicProvider
-from aeloon_core.providers.base import LLMResponse
+from aeloon_core.providers.base import GenerationSettings, LLMResponse
 
 
 def _value(**kwargs: Any) -> SimpleNamespace:
@@ -89,7 +89,38 @@ def test_builds_anthropic_messages_request_for_kimi() -> None:
     ]
     assert kwargs["messages"][-1]["content"][0]["type"] == "tool_result"
     assert kwargs["tools"][0]["input_schema"]["required"] == ["path"]
+    assert kwargs["cache_control"] == {"type": "ephemeral"}
     assert "response_format" not in kwargs
+
+
+def test_prompt_caching_can_be_disabled() -> None:
+    assert AnthropicProviderConfig().prompt_caching is True
+    assert AnthropicProviderConfig(prompt_caching=False).prompt_caching is False
+
+    provider = AnthropicProvider(api_key="sk-test", prompt_caching=False)
+    kwargs = provider._build_kwargs(
+        messages=[{"role": "user", "content": "Do not cache this request."}]
+    )
+
+    assert "cache_control" not in kwargs
+
+
+def test_prompt_caching_preserves_legacy_positional_constructor_order() -> None:
+    generation = GenerationSettings(temperature=0.2, reasoning_effort="high")
+
+    provider = AnthropicProvider(
+        "sk-test",
+        "https://api.anthropic.com",
+        "test-model",
+        {},
+        None,
+        generation,
+        17,
+    )
+
+    assert provider.generation is generation
+    assert provider.chat_timeout == 17
+    assert provider.prompt_caching is True
 
 
 def test_parses_anthropic_tool_use_and_usage() -> None:
@@ -156,6 +187,69 @@ async def test_retries_forced_tool_choice_as_auto_when_thinking_rejects_it() -> 
     assert "tool_choice" not in attempts[1]
 
 
+@pytest.mark.parametrize(
+    "error_message",
+    [
+        "Error code: 400 - cache_control: extra inputs are not permitted",
+        "Unrecognized request argument supplied: cache_control",
+        "cache_control [type=extra_forbidden]",
+    ],
+)
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.asyncio
+async def test_prompt_cache_rejection_falls_back_once_and_is_remembered(
+    streaming: bool,
+    error_message: str,
+) -> None:
+    provider = AnthropicProvider(api_key="sk-test")
+    attempts: list[dict[str, Any]] = []
+
+    async def create(**kwargs: Any) -> Any:
+        attempts.append(kwargs)
+        if len(attempts) == 1:
+            raise RuntimeError(error_message)
+        return _value(
+            content=[_value(type="text", text="Recovered without caching.")],
+            stop_reason="end_turn",
+            usage=_value(input_tokens=4, output_tokens=2),
+        )
+
+    provider._client = _value(messages=_value(create=create))
+    call = provider.chat_stream if streaming else provider.chat
+
+    response = await call(messages=[{"role": "user", "content": "Finish."}])
+
+    assert response.content == "Recovered without caching."
+    assert len(attempts) == 2
+    assert attempts[0]["cache_control"] == {"type": "ephemeral"}
+    assert "cache_control" not in attempts[1]
+    assert attempts[1].get("stream", False) is streaming
+    assert "cache_control" not in provider._build_kwargs(
+        messages=[{"role": "user", "content": "A later request."}]
+    )
+
+
+@pytest.mark.asyncio
+async def test_unrelated_provider_error_does_not_disable_or_retry_prompt_caching() -> None:
+    provider = AnthropicProvider(api_key="sk-test")
+    attempts: list[dict[str, Any]] = []
+
+    async def create(**kwargs: Any) -> Any:
+        attempts.append(kwargs)
+        raise RuntimeError("Error code: 400 - max_tokens must be greater than zero")
+
+    provider._client = _value(messages=_value(create=create))
+
+    response = await provider.chat(messages=[{"role": "user", "content": "Finish."}])
+
+    assert response.finish_reason == "error"
+    assert "max_tokens must be greater than zero" in str(response.content)
+    assert len(attempts) == 1
+    assert provider._build_kwargs(
+        messages=[{"role": "user", "content": "A later request."}]
+    )["cache_control"] == {"type": "ephemeral"}
+
+
 @pytest.mark.asyncio
 async def test_sdk_posts_anthropic_wire_format_to_kimi_messages_endpoint() -> None:
     captured: dict[str, Any] = {}
@@ -215,6 +309,7 @@ async def test_sdk_posts_anthropic_wire_format_to_kimi_messages_endpoint() -> No
     assert captured["body"]["system"] == [{"type": "text", "text": "Be concise."}]
     assert captured["body"]["messages"] == [{"role": "user", "content": "Finish."}]
     assert captured["body"]["tools"][0]["input_schema"]["type"] == "object"
+    assert captured["body"]["cache_control"] == {"type": "ephemeral"}
 
 
 @pytest.mark.asyncio
