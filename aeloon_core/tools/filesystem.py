@@ -9,6 +9,7 @@ import re
 import stat
 import tempfile
 from collections.abc import Callable, Iterable, Iterator
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -183,55 +184,14 @@ class _AtomicCommit:
     sha256: str
 
 
-def _baseline_from(path: Path, raw: bytes, *, display_path: str) -> _FileBaseline:
-    try:
-        before = path.lstat()
-    except FileNotFoundError as exc:
-        raise _ToolFailure(
-            "CONCURRENT_MODIFICATION",
-            "Target disappeared while it was being read.",
-            path=display_path,
-            next_action="Read the current file state and retry.",
-        ) from exc
-    if stat.S_ISLNK(before.st_mode):
-        raise _ToolFailure(
-            "PATH_SYMLINK",
-            "Symbolic links are not valid mutation targets.",
-            path=display_path,
-            next_action="Choose a regular file path inside the workspace.",
-        )
-    if not stat.S_ISREG(before.st_mode):
-        raise _ToolFailure(
-            "NOT_FILE",
-            "Mutation target is not a regular file.",
-            path=display_path,
-            next_action="Choose a regular file path inside the workspace.",
-        )
-    try:
-        after = path.lstat()
-    except FileNotFoundError as exc:
-        raise _ToolFailure(
-            "CONCURRENT_MODIFICATION",
-            "Target disappeared while it was being read.",
-            path=display_path,
-            next_action="Read the current file state and retry.",
-        ) from exc
-    stable_fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
-    if any(getattr(before, field) != getattr(after, field) for field in stable_fields):
-        raise _ToolFailure(
-            "CONCURRENT_MODIFICATION",
-            "Target changed while it was being read.",
-            path=display_path,
-            next_action="Read the current file and retry with its latest contents.",
-        )
-    return _FileBaseline(
-        device=after.st_dev,
-        inode=after.st_ino,
-        mode=after.st_mode,
-        size=after.st_size,
-        mtime_ns=after.st_mtime_ns,
-        ctime_ns=after.st_ctime_ns,
-        sha256=hashlib.sha256(raw).hexdigest(),
+def _stat_fingerprint(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
     )
 
 
@@ -268,29 +228,31 @@ def _read_snapshot(path: Path, *, display_path: str) -> tuple[bytes, _FileBaseli
             path=display_path,
             next_action="Read the current file state and retry.",
         ) from exc
-    baseline = _baseline_from(path, raw, display_path=display_path)
-    if (
-        initial.st_dev,
-        initial.st_ino,
-        initial.st_mode,
-        initial.st_size,
-        initial.st_mtime_ns,
-        initial.st_ctime_ns,
-    ) != (
-        baseline.device,
-        baseline.inode,
-        baseline.mode,
-        baseline.size,
-        baseline.mtime_ns,
-        baseline.ctime_ns,
-    ):
+    try:
+        current = path.lstat()
+    except FileNotFoundError as exc:
+        raise _ToolFailure(
+            "CONCURRENT_MODIFICATION",
+            "Target disappeared while it was being read.",
+            path=display_path,
+            next_action="Read the current file state and retry.",
+        ) from exc
+    if _stat_fingerprint(initial) != _stat_fingerprint(current):
         raise _ToolFailure(
             "CONCURRENT_MODIFICATION",
             "Target changed while it was being read.",
             path=display_path,
             next_action="Read the current file and retry with its latest contents.",
         )
-    return raw, baseline
+    return raw, _FileBaseline(
+        device=current.st_dev,
+        inode=current.st_ino,
+        mode=current.st_mode,
+        size=current.st_size,
+        mtime_ns=current.st_mtime_ns,
+        ctime_ns=current.st_ctime_ns,
+        sha256=hashlib.sha256(raw).hexdigest(),
+    )
 
 
 def _validate_utf8(content: bytes) -> None:
@@ -311,14 +273,7 @@ def _baseline_matches(path: Path, expected: _FileBaseline | None) -> bool:
         return expected is None
     if expected is None or not stat.S_ISREG(current.st_mode) or stat.S_ISLNK(current.st_mode):
         return False
-    metadata = (
-        current.st_dev,
-        current.st_ino,
-        current.st_mode,
-        current.st_size,
-        current.st_mtime_ns,
-        current.st_ctime_ns,
-    )
+    metadata = _stat_fingerprint(current)
     expected_metadata = (
         expected.device,
         expected.inode,
@@ -334,14 +289,7 @@ def _baseline_matches(path: Path, expected: _FileBaseline | None) -> bool:
         after = path.lstat()
     except FileNotFoundError:
         return False
-    after_metadata = (
-        after.st_dev,
-        after.st_ino,
-        after.st_mode,
-        after.st_size,
-        after.st_mtime_ns,
-        after.st_ctime_ns,
-    )
+    after_metadata = _stat_fingerprint(after)
     return after_metadata == expected_metadata and digest == expected.sha256
 
 
@@ -356,21 +304,19 @@ def _atomic_replace(
     """Stage content beside path, fsync it, then atomically replace after revalidation."""
 
     temp_path: Path | None = None
-    descriptor = -1
-    operation_succeeded = False
     digest = hashlib.sha256()
     total_bytes = 0
     try:
-        descriptor, temp_name = tempfile.mkstemp(
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
             prefix=f".{path.name}.",
             suffix=".tmp",
             dir=path.parent,
-        )
-        temp_path = Path(temp_name)
-        if baseline is not None:
-            os.fchmod(descriptor, stat.S_IMODE(baseline.mode))
-        with os.fdopen(descriptor, "wb") as handle:
-            descriptor = -1
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            if baseline is not None:
+                os.fchmod(handle.fileno(), stat.S_IMODE(baseline.mode))
             for chunk in chunks:
                 if not chunk:
                     continue
@@ -394,25 +340,11 @@ def _atomic_replace(
             )
         os.replace(temp_path, path)
         temp_path = None
-        operation_succeeded = True
         return _AtomicCommit(total_bytes=total_bytes, sha256=digest.hexdigest())
     finally:
-        cleanup_error: OSError | None = None
-        if descriptor >= 0:
-            try:
-                os.close(descriptor)
-            except OSError as exc:
-                cleanup_error = exc
         if temp_path is not None:
-            try:
+            with suppress(OSError):
                 temp_path.unlink()
-            except FileNotFoundError:
-                pass
-            except OSError as exc:
-                if cleanup_error is None:
-                    cleanup_error = exc
-        if operation_succeeded and cleanup_error is not None:
-            raise cleanup_error
 
 
 def _validate_mutation_path(tool: WorkspaceTool, path: str) -> Path:
@@ -516,14 +448,7 @@ def _validate_mutation_path(tool: WorkspaceTool, path: str) -> Path:
 
 def _prepare_parent(tool: WorkspaceTool, path: str, target: Path) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
-    validated = _validate_mutation_path(tool, path)
-    if validated != target:
-        raise _ToolFailure(
-            "PATH_INVALID",
-            "Mutation path changed during parent directory creation.",
-            path=path,
-            next_action="Retry with a stable workspace-relative path.",
-        )
+    _validate_mutation_path(tool, path)
 
 
 def _build_write_args_model(max_chars: int) -> type[BaseModel]:
@@ -532,17 +457,10 @@ def _build_write_args_model(max_chars: int) -> type[BaseModel]:
     class WriteArgs(BaseModel):
         model_config = ConfigDict(extra="forbid")
 
-        path: str = Field(description="Workspace-relative path of the file to create or append.")
+        path: str = Field(description="Workspace-relative path of the file to create or overwrite.")
         content: str = Field(
             json_schema_extra={"maxLength": limit},
-            description=f"UTF-8 text chunk to write, limited to {limit:,} characters.",
-        )
-        expected_offset: int | None = Field(
-            default=None,
-            json_schema_extra={"minimum": 0},
-            description=(
-                "Current UTF-8 byte size required before appending. Omit to create a new file."
-            ),
+            description=f"Complete UTF-8 file content, limited to {limit:,} characters.",
         )
 
     WriteArgs.__name__ = "WriteArgs"
@@ -555,15 +473,13 @@ WriteArgs = _build_write_args_model(DEFAULT_MAX_ARGUMENT_CHARS)
 
 
 class WriteTool(WorkspaceTool):
-    """Atomically create or conditionally append UTF-8 text."""
+    """Atomically create or overwrite a UTF-8 text file."""
 
     name = "write"
     concurrency_mode = "mutating"
     description = (
-        "Atomically create a new UTF-8 file, or append one chunk when expected_offset equals "
-        f"the file's current UTF-8 byte size. Each chunk is at most {DEFAULT_MAX_ARGUMENT_CHARS:,} "
-        "characters and the result is at most 16 MiB. Use the returned next_offset for the next "
-        "chunk; use str_replace to modify existing content."
+        f"Atomically create or overwrite a complete UTF-8 file with up to "
+        f"{DEFAULT_MAX_ARGUMENT_CHARS:,} characters and 16 MiB. Use str_replace for targeted edits."
     )
     args_model = WriteArgs
 
@@ -586,30 +502,17 @@ class WriteTool(WorkspaceTool):
         self.max_content_chars = limit
         self.args_model = _build_write_args_model(limit)
         self.description = (
-            "Atomically create a new UTF-8 file, or append one chunk when expected_offset equals "
-            f"the file's current UTF-8 byte size. Each chunk is at most {limit:,} characters and "
-            "the result is at most 16 MiB. Use the returned next_offset for the next chunk; use "
-            "str_replace to modify existing content."
+            f"Atomically create or overwrite a complete UTF-8 file with up to {limit:,} "
+            "characters and 16 MiB. Use str_replace for targeted edits."
         )
 
     async def execute(
         self,
         path: str,
         content: str,
-        expected_offset: int | None = None,
     ) -> str:
         limit = getattr(self, "max_content_chars", DEFAULT_MAX_ARGUMENT_CHARS)
         try:
-            if expected_offset is not None and expected_offset < 0:
-                return _error(
-                    "OFFSET_CONFLICT",
-                    "expected_offset must be a non-negative UTF-8 byte offset.",
-                    path=path,
-                    field="expected_offset",
-                    expected=">= 0",
-                    actual=expected_offset,
-                    next_action="Use the non-negative next_offset returned by the previous write.",
-                )
             if len(content) > limit:
                 return _error(
                     "CONTENT_TOO_LARGE",
@@ -618,7 +521,7 @@ class WriteTool(WorkspaceTool):
                     field="content",
                     actual=len(content),
                     limit=limit,
-                    next_action="Split the content into smaller chunks or separate files.",
+                    next_action="Reduce the content or split it across separate files.",
                 )
             try:
                 chunk = content.encode("utf-8")
@@ -631,62 +534,27 @@ class WriteTool(WorkspaceTool):
                     next_action="Remove invalid surrogate characters and retry.",
                 )
 
-            target = _validate_mutation_path(self, path)
-            if expected_offset is None:
-                try:
-                    target.lstat()
-                except FileNotFoundError:
-                    pass
-                else:
-                    return _error(
-                        "TARGET_EXISTS",
-                        "write without expected_offset only creates new files.",
-                        path=path,
-                        next_action=(
-                            "Use str_replace for edits, or append with the latest next_offset."
-                        ),
-                    )
+            try:
+                target = _validate_mutation_path(self, path)
+                _, baseline = _read_snapshot(target, display_path=path)
+            except _ToolFailure as exc:
+                if exc.code != "FILE_NOT_FOUND":
+                    raise
                 baseline = None
-                existing = b""
-            else:
-                existing, baseline = _read_snapshot(target, display_path=path)
-                try:
-                    _validate_utf8(existing)
-                except UnicodeDecodeError:
-                    return _error(
-                        "INVALID_UTF8",
-                        "Existing file is not valid UTF-8 text.",
-                        path=path,
-                        next_action="Choose a UTF-8 text file or repair its encoding first.",
-                    )
-                actual_offset = len(existing)
-                if expected_offset != actual_offset:
-                    return _error(
-                        "OFFSET_CONFLICT",
-                        "expected_offset does not match the file's current UTF-8 byte size.",
-                        path=path,
-                        expected=expected_offset,
-                        actual=actual_offset,
-                        next_action=(
-                            f"Retry with expected_offset={actual_offset} after verifying the file."
-                        ),
-                    )
-
-            candidate = existing + chunk
-            if len(candidate) > _MAX_FILE_BYTES:
+            if len(chunk) > _MAX_FILE_BYTES:
                 return _error(
                     "FILE_TOO_LARGE",
                     "write would exceed the maximum file size.",
                     path=path,
-                    actual=len(candidate),
+                    actual=len(chunk),
                     limit=_MAX_FILE_BYTES,
-                    next_action="Split the output into multiple files or reduce its size.",
+                    next_action="Reduce the content or split it across separate files.",
                 )
 
             _prepare_parent(self, path, target)
             commit = _atomic_replace(
                 target,
-                (candidate,),
+                (chunk,),
                 display_path=path,
                 baseline=baseline,
                 revalidate_path=lambda: _validate_mutation_path(self, path),
@@ -695,8 +563,7 @@ class WriteTool(WorkspaceTool):
             return (
                 "Successfully wrote file; "
                 f"path={relative_path!r}; chars={len(content)}; bytes={len(chunk)}; "
-                f"total_bytes={commit.total_bytes}; sha256={commit.sha256}; "
-                f"next_offset={commit.total_bytes}"
+                f"total_bytes={commit.total_bytes}; sha256={commit.sha256}"
             )
         except _ToolFailure as exc:
             return exc.render()
@@ -819,10 +686,15 @@ def _build_str_replace_args_model(max_chars: int) -> type[BaseModel]:
     class StrReplaceArgs(BaseModel):
         model_config = ConfigDict(extra="forbid")
 
-        path: str = Field(description="Workspace-relative path of the UTF-8 file to edit.")
+        path: str = Field(
+            description="Workspace-relative path of the UTF-8 file to edit or create."
+        )
         old_str: str = Field(
-            json_schema_extra={"minLength": 1, "maxLength": limit},
-            description="Exact text to replace; CRLF and LF are treated as equivalent.",
+            json_schema_extra={"maxLength": limit},
+            description=(
+                "Exact text to replace; CRLF and LF are treated as equivalent. "
+                "Use an empty string to create a file that does not exist."
+            ),
         )
         new_str: str = Field(
             json_schema_extra={"maxLength": limit},
@@ -841,14 +713,15 @@ StrReplaceArgs = _build_str_replace_args_model(DEFAULT_MAX_ARGUMENT_CHARS)
 
 
 class StrReplaceTool(WorkspaceTool):
-    """Atomically replace exact text while preserving file newline style."""
+    """Atomically replace exact text or create a missing UTF-8 file."""
 
     name = "str_replace"
     concurrency_mode = "mutating"
     description = (
-        "Atomically replace an exact, non-empty old_str in a UTF-8 file. CRLF and LF are "
-        "equivalent for matching and existing line endings are preserved. The match must be "
-        "unique unless replace_all=true."
+        "Atomically replace an exact old_str in a UTF-8 file. An empty old_str creates a missing "
+        "file from new_str, but refuses an existing target. For non-empty old_str, CRLF and LF "
+        "are equivalent and existing line endings are preserved. The match must be unique unless "
+        "replace_all=true."
     )
     args_model = StrReplaceArgs
 
@@ -880,14 +753,6 @@ class StrReplaceTool(WorkspaceTool):
     ) -> str:
         limit = getattr(self, "max_content_chars", DEFAULT_MAX_ARGUMENT_CHARS)
         try:
-            if not old_str:
-                return _error(
-                    "OLD_STR_EMPTY",
-                    "old_str must not be empty.",
-                    path=path,
-                    field="old_str",
-                    next_action="Provide a non-empty exact string from the target file.",
-                )
             for field_name, value in (("old_str", old_str), ("new_str", new_str)):
                 if len(value) > limit:
                     return _error(
@@ -911,6 +776,48 @@ class StrReplaceTool(WorkspaceTool):
                     )
 
             target = _validate_mutation_path(self, path)
+            if not old_str:
+                try:
+                    target.lstat()
+                except FileNotFoundError:
+                    pass
+                else:
+                    return _error(
+                        "TARGET_EXISTS",
+                        "An empty old_str only creates a missing file.",
+                        path=path,
+                        next_action=(
+                            "Use write to overwrite the complete file, or provide a non-empty "
+                            "old_str for a targeted edit."
+                        ),
+                    )
+
+                encoded_new = new_str.encode("utf-8")
+                if len(encoded_new) > _MAX_FILE_BYTES:
+                    return _error(
+                        "FILE_TOO_LARGE",
+                        "str_replace would exceed the maximum file size.",
+                        path=path,
+                        actual=len(encoded_new),
+                        limit=_MAX_FILE_BYTES,
+                        next_action="Reduce the content or split it across separate files.",
+                    )
+
+                _prepare_parent(self, path, target)
+                commit = _atomic_replace(
+                    target,
+                    (encoded_new,),
+                    display_path=path,
+                    baseline=None,
+                    revalidate_path=lambda: _validate_mutation_path(self, path),
+                )
+                relative_path = target.relative_to(self.workspace).as_posix()
+                return (
+                    "Successfully created file; "
+                    f"path={relative_path!r}; chars={len(new_str)}; bytes={len(encoded_new)}; "
+                    f"total_bytes={commit.total_bytes}; sha256={commit.sha256}"
+                )
+
             raw, baseline = _read_snapshot(target, display_path=path)
             try:
                 _validate_utf8(raw)

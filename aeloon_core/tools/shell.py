@@ -21,7 +21,7 @@ class ExecArgs(BaseModel):
     command: str = Field(
         description=(
             "Shell command to execute, at most 8192 characters. Do not put generated file or "
-            "long script bodies here; use write for new files and str_replace for edits."
+            "long script bodies here; use write for complete files and str_replace for edits."
         ),
         json_schema_extra={"maxLength": MAX_EXEC_COMMAND_CHARS},
     )
@@ -197,5 +197,5 @@ def _payload_violation_error(actual_chars: int) -> str:
     return (
         f"Error [EXEC_COMMAND_TOO_LARGE]: field=command; actual={actual_chars}; "
         f"limit={MAX_EXEC_COMMAND_CHARS}; next_action=run a short command by path, or use write "
-        "for a new file and str_replace for an existing file."
+        "for complete file content and str_replace for targeted edits."
     )
