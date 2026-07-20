@@ -1387,11 +1387,9 @@ function summarizeToolArguments(name: string, value: unknown): string {
   if (name === "read") return stringValue(args.path) || "Reading file"
   if (name === "write") {
     const content = stringValue(args.content)
-    const expectedOffset = numberValue(args.expected_offset)
     return [
       stringValue(args.path),
       `${content.length} chars`,
-      expectedOffset !== undefined ? `offset ${expectedOffset}` : "",
     ].filter(Boolean).join(" · ")
   }
   if (name === "str_replace") {
@@ -1429,11 +1427,9 @@ function summarizeToolResult(
   const duration = formatDuration(durationMs)
   if (failed) return ["Failed", oneLine(text, 160), duration].filter(Boolean).join(" · ")
   if (name === "write") {
-    const expectedOffset = numberValue(args.expected_offset)
     return [
       stringValue(args.path),
       `${stringValue(args.content).length} chars written`,
-      expectedOffset !== undefined ? `offset ${expectedOffset}` : "",
       duration,
     ]
       .filter(Boolean)
@@ -1467,10 +1463,8 @@ function workerToolDisplay(
   if (name === "write") {
     const inputChars = numberValue(metrics.input_chars)
     const inputBytes = numberValue(metrics.input_bytes)
-    const expectedOffset = numberValue(metrics.expected_offset)
     if (inputChars !== undefined) parts.push(`${inputChars} chars written`)
     else if (inputBytes !== undefined) parts.push(`${inputBytes} bytes written`)
-    if (expectedOffset !== undefined) parts.push(`offset ${expectedOffset}`)
   } else if (name === "str_replace") {
     const oldChars = numberValue(metrics.old_chars)
     const newChars = numberValue(metrics.new_chars)

@@ -112,11 +112,11 @@ describe("TUI event projection", () => {
     expect(rendered[2]?.body).toBe("HTTP 200")
   })
 
-  test("summarizes native write offsets and str_replace arguments", () => {
+  test("summarizes native write and str_replace arguments", () => {
     const state = createAppState()
     applyEnvelope(state, event("chat.block.add", {
       block: {
-        arguments: { content: "你好", expected_offset: 6, path: "notes.txt" },
+        arguments: { content: "你好", path: "notes.txt" },
         id: "write-chunk",
         name: "write",
         type: "tool_call",
@@ -138,7 +138,7 @@ describe("TUI event projection", () => {
 
     const rendered = visibleMasterItems(state).filter((item) => item.kind === "tool")
     expect(rendered[0]).toMatchObject({
-      primary: "notes.txt · 2 chars · offset 6",
+      primary: "notes.txt · 2 chars",
       verb: "WROTE",
     })
     expect(rendered[1]).toMatchObject({
@@ -398,7 +398,7 @@ describe("TUI event projection", () => {
                 result_preview: "one regression failed\nExit code: 1",
               }
             : name === "write"
-              ? { expected_offset: 128, input_bytes: 10, input_chars: 10 }
+              ? { input_bytes: 10, input_chars: 10 }
               : { result_chars: 10, result_lines: 2 },
           worker_type_id: "coding",
           status: name === "exec" ? "error" : "done",
@@ -423,7 +423,7 @@ describe("TUI event projection", () => {
       verb: "RAN",
     })
     expect(compact.find((item) => item.toolName === "write")?.metrics)
-      .toBe("10 chars written · offset 128 · 20ms")
+      .toBe("10 chars written · 20ms")
     expect(compact.at(-1)?.status).toBe("failed")
     expect(state.workers.abcd1234?.unread).toBe(3)
 

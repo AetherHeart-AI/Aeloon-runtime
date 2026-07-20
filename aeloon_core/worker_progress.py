@@ -470,9 +470,6 @@ def _safe_tool_projection(
             metrics["input_bytes"] = len(content_text.encode("utf-8"))
         except UnicodeEncodeError:
             pass
-        expected_offset = arguments.get("expected_offset")
-        if isinstance(expected_offset, int) and not isinstance(expected_offset, bool):
-            metrics["expected_offset"] = expected_offset
     elif node.tool_name == "str_replace":
         metrics["old_chars"] = len(str(arguments.get("old_str") or ""))
         metrics["new_chars"] = len(str(arguments.get("new_str") or ""))

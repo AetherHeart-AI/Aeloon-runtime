@@ -1020,9 +1020,6 @@ def _worker_tool_metric_summary(
         parts.append(resource)
     if name == "write" and isinstance(metrics.get("input_chars"), int):
         parts.append(f"wrote {metrics['input_chars']} chars")
-        expected_offset = metrics.get("expected_offset")
-        if isinstance(expected_offset, int):
-            parts.append(f"offset {expected_offset}")
     elif name == "str_replace":
         old_chars = metrics.get("old_chars")
         new_chars = metrics.get("new_chars")
@@ -1074,7 +1071,6 @@ def _tool_call_detail_text(name: str, arguments: Any) -> str:
         return _join_parts(
             _path_detail(args),
             f"{_string_arg_len(args, 'content')} chars",
-            _number_arg(args, "expected_offset"),
         )
     if name == "str_replace":
         return _join_parts(
@@ -1144,7 +1140,6 @@ def _tool_result_detail_text(
         return _join_parts(
             _path_detail(args),
             wrote,
-            _number_arg(args, "expected_offset"),
             duration,
         )
     if name == "str_replace":
