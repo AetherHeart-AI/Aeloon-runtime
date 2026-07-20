@@ -210,10 +210,14 @@ rejects permission expansion and idempotency conflicts. Each continuation receiv
 the current Run budget instead of inheriting an obsolete cap.
 
 WorkerRuns have no cumulative token or tool-call cap by default. The model context
-window is a separate per-request concern: Workers use the same automatic context
-compaction as Master, followed by the bounded minimal-context view. A finite internal
-grant remains a hard Run bound when an embedding host explicitly supplies one, and
-the wall-clock timeout plus `cancel_worker` remain the liveness controls.
+window is a separate per-request concern. A new Worker starts from the minimal dispatch
+envelope—its objective, permission domain, and budget—rather than a copy of the Master
+transcript. After dispatch, Master and Worker use the same context-view pipeline:
+canonical history remains append-only until an explicit context-window compaction
+checkpoint, and provider-only projections are applied in one place. There is no rolling
+minimal-context rewrite on every model round. A finite internal grant remains a hard Run
+bound when an embedding host explicitly supplies one, and the wall-clock timeout plus
+`cancel_worker` remain the liveness controls.
 
 Cancellation of queued work settles immediately. For a detached running Worker, the
 control service first records a durable cancellation request; the owning runner cancels
@@ -232,6 +236,26 @@ requested: clearing the control-plane marker cannot prove that shell descendants
 side effects stopped or rolled back. A cancelling Flow containing such a Run becomes `blocked`
 and instructs the Master to inspect side effects; only cancellation with no uncertain in-flight
 tool work becomes cleanly `cancelled`.
+
+## Loop liveness and prompt caching
+
+The loop deterministically detects an identical successful read-only tool action and
+observation repeated across four distinct model steps. It keeps at most 20 complete
+exchanges, compares canonical digests rather than raw large results, and never treats
+mutating, failed, incomplete, or same-batch calls as stuck. A match enters Guard with
+bounded evidence and requires either a materially different retry or finalization.
+
+Guard first resolves unambiguous cases locally: a terminal-protocol correction and one
+safe transient-provider retry do not spend another model call, while non-transient
+provider failures finalize locally. Semantic decisions such as stuck recovery and a
+spent iteration budget still go to the reviewer model. Host-owned per-signature and
+per-run recovery caps prevent Guard itself from becoming a loop.
+
+Anthropic prompt caching is enabled by default. The Master instruction block and Worker
+type metadata form a stable system prefix; volatile Worker/Flow state is appended at the
+user tail. Anthropic-compatible gateways that clearly reject `cache_control` are retried
+once without it and remembered for later requests; unrelated provider errors are not
+masked by this compatibility fallback.
 
 ## Skills
 
@@ -269,11 +293,17 @@ Skill remain untrusted task data.
 
 ## Persistence and v2 migration
 
-Master turns are JSONL records. Flow state, idempotent graph decisions, turn leases, and
-terminal-response commits use the independent `flow-control.sqlite3` store with current
-schema version 4. A terminal response is committed there before JSONL projection or UI
-delivery; a crash can therefore recover and project it idempotently without rerunning the
-model.
+Master turns remain JSONL projections. Flow state, idempotent graph decisions, turn
+leases, and terminal-response commits use the independent `flow-control.sqlite3` store
+with current schema version 5. Each terminal commit now atomically appends an immutable,
+parent-linked `turn.committed` event and advances a durable session-head pointer before
+JSONL projection or UI delivery. Event payloads reference the existing full commit
+snapshot instead of duplicating it. A crash can therefore recover and project the result
+idempotently without rerunning the model. Master resume resolves the current head snapshot
+through indexed lookups before falling back to the compatibility JSONL projection, while
+the shared head gives internal conversation-only forks O(1) data creation and establishes
+the boundary for future incremental events. Flow and Worker ownership are deliberately not
+inherited by such a fork.
 Worker control state uses `worker-control.sqlite3` at schema version 5; private
 Worker transcripts are stored below `worker-sessions/` and are never exposed to Master.
 
@@ -302,12 +332,16 @@ uv run aeloon-core config init \
 uv run aeloon-core config show
 uv run aeloon-core config set max-iterations 25
 uv run aeloon-core config set context-compaction-enabled true
+uv run aeloon-core config set prompt-caching true
+uv run aeloon-core config set uasm-stuck-detection-threshold 4
 ```
 
 When loading a v1 config, v2 ignores the removed `base_profile_id`, `profile_id`,
 and `max_handoffs` settings. The next `config set` or `config init --force` writes
-the file back without them; unrelated unknown agent settings remain validation
-errors.
+the file back without them. The former per-round
+`uasm.minimal_context_recent_turns` and `uasm.minimal_context_tool_result_chars`
+settings are likewise discarded because the rolling minimal-context layer no longer
+exists; unrelated unknown agent-default settings remain validation errors.
 
 Common environment overrides are:
 
@@ -323,11 +357,11 @@ Common environment overrides are:
 
 ## Atomic file tools
 
-`write` creates a new UTF-8 file or appends with the exact byte
-`expected_offset`; it never silently overwrites an existing file. `str_replace`
-requires an exact unique match unless `replace_all=true`. Both enforce the model-aware
-per-call character limit, reject symlink/protected paths, recheck the file baseline,
-and commit through an atomic same-directory replacement.
+`write` atomically creates or overwrites a complete UTF-8 file. Use `str_replace`
+for exact edits; an empty `old_str` creates a missing file, while non-empty matches
+must be unique unless `replace_all=true`. Both enforce the model-aware per-call
+character limit, reject symlink/protected paths, recheck the target before commit,
+and use an atomic same-directory replacement.
 
 ## Development
 
