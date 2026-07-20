@@ -197,7 +197,7 @@ def test_flow_store_migrates_v1_session_state(tmp_path: Path) -> None:
     FlowStore(data_dir)
 
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
         tables = {
             row[0]
             for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
@@ -218,7 +218,7 @@ def test_flow_store_migrates_v2_turn_lease_without_losing_seal(tmp_path: Path) -
 
     with sqlite3.connect(reopened.path) as connection:
         connection.row_factory = sqlite3.Row
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
         row = connection.execute(
             "SELECT * FROM flow_session_state WHERE base_session_id = 'master'"
         ).fetchone()
@@ -240,7 +240,7 @@ def test_flow_store_migrates_v3_terminal_commit_table(tmp_path: Path) -> None:
 
     with sqlite3.connect(reopened.path) as connection:
         connection.row_factory = sqlite3.Row
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
         tables = {
             str(row["name"])
             for row in connection.execute(
@@ -1416,6 +1416,7 @@ class FinishTurnProvider(LLMProvider):
         super().__init__()
         self.final_content = final_content
         self.call_count = 0
+        self.seen_messages: list[list[dict[str, Any]]] = []
 
     async def chat(
         self,
@@ -1423,7 +1424,8 @@ class FinishTurnProvider(LLMProvider):
         tools: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> LLMResponse:
-        del messages, tools, kwargs
+        self.seen_messages.append(messages)
+        del tools, kwargs
         self.call_count += 1
         return LLMResponse(
             content=None,
@@ -1646,6 +1648,67 @@ async def test_committed_turn_recovers_after_crash_without_rerunning_model(
             session_id="master",
             on_progress=conflicting,
         )
+
+
+@pytest.mark.asyncio
+async def test_conversation_fork_resumes_from_event_head_without_copying_jsonl(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = Config(
+        workspace=workspace,
+        data_dir=tmp_path / "data",
+        agents=AgentsConfig(
+            defaults=AgentDefaultsConfig(
+                context_compaction=ContextCompactionConfig(enabled=False)
+            )
+        ),
+        skills=SkillsConfig(enabled=False, external=False, claude_code=False),
+    ).normalized()
+    app = AeloonCoreOrchestrator(config)
+    app.provider = FinishTurnProvider("source answer")
+
+    await app.run_turn(
+        "source request",
+        session_id="source",
+        on_progress=TurnProgress("source-turn"),
+    )
+    source_head = app.flow_store.get_session_head("source")
+    assert source_head is not None
+
+    app.sessions.append_turn(
+        session_id="legacy-target",
+        user_prompt="legacy request",
+        final_content="legacy answer",
+        tools_used=[],
+        messages=[{"role": "assistant", "content": "legacy answer"}],
+    )
+    with pytest.raises(ValueError, match="not a pristine Master session"):
+        app._fork_conversation_only_session("source", "legacy-target")
+    assert app.flow_store.get_session_head("legacy-target") is None
+
+    fork_head = app._fork_conversation_only_session("source", "fork")
+
+    assert fork_head.head_event_id == source_head.head_event_id
+    assert app.sessions.history("fork") == []
+    fork_provider = FinishTurnProvider("fork answer")
+    app.provider = fork_provider
+    result = await app.run_turn(
+        "fork request",
+        session_id="fork",
+        on_progress=TurnProgress("fork-turn"),
+    )
+
+    assert result.final_content == "fork answer"
+    assert len(fork_provider.seen_messages) == 1
+    assert "source request" in str(fork_provider.seen_messages[0])
+    assert "source answer" in str(fork_provider.seen_messages[0])
+    assert [event.turn_id for event in app.flow_store.session_event_ancestry("fork")] == [
+        "source-turn",
+        "fork-turn",
+    ]
+    assert [record["turn_id"] for record in app.sessions.history("fork")] == ["fork-turn"]
 
 
 @pytest.mark.asyncio

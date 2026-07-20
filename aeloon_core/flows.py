@@ -15,7 +15,10 @@ from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
-FLOW_SCHEMA_VERSION = 4
+from aeloon_core import session_events
+from aeloon_core.session_events import SessionEvent, SessionHead
+
+FLOW_SCHEMA_VERSION = 5
 FLOW_STATE_VERSION = 2
 DEFAULT_FLOW_TURN_LEASE_SECONDS = 60.0
 MAX_FLOW_GOAL_CHARS = 16_000
@@ -707,8 +710,10 @@ class FlowStore:
                     raise FlowIdempotencyConflictError(
                         "Master turn commit was replayed with a different response"
                     )
+                session_events.require_turn_committed_event(connection, existing)
                 return self._turn_commit_from_row(existing), False
 
+            session_events.require_turn_commit_coverage(connection, base_session_id)
             self._require_active_turn_owner(
                 connection,
                 base_session_id,
@@ -745,6 +750,7 @@ class FlowStore:
                 (base_session_id, turn_id),
             ).fetchone()
             assert row is not None
+            session_events.append_turn_committed_event(connection, row)
             return self._turn_commit_from_row(row), True
 
     def get_turn_commit(
@@ -762,6 +768,109 @@ class FlowStore:
                 (base_session_id, turn_id),
             ).fetchone()
         return self._turn_commit_from_row(row) if row is not None else None
+
+    def get_session_head(self, base_session_id: str) -> SessionHead | None:
+        """Return the durable conversation head for one Master session."""
+
+        base_session_id = _normalized_text(base_session_id, "base_session_id")
+        with self._connect() as connection:
+            return session_events.get_session_head(connection, base_session_id)
+
+    def get_session_event(self, event_id: str) -> SessionEvent | None:
+        """Return one immutable durable conversation event."""
+
+        event_id = _normalized_text(event_id, "event_id")
+        with self._connect() as connection:
+            return session_events.get_session_event(connection, event_id)
+
+    def session_event_ancestry(self, base_session_id: str) -> list[SessionEvent]:
+        """Return the selected conversation ancestry in root-to-head order."""
+
+        base_session_id = _normalized_text(base_session_id, "base_session_id")
+        with self._connect() as connection:
+            head = session_events.get_session_head(connection, base_session_id)
+            if head is None:
+                return []
+            return session_events.list_event_ancestry(connection, head.head_event_id)
+
+    def materialize_session_head_commit(
+        self,
+        base_session_id: str,
+    ) -> FlowTurnCommit | None:
+        """Resolve a session head to its nearest immutable full turn snapshot."""
+
+        base_session_id = _normalized_text(base_session_id, "base_session_id")
+        with self._connect() as connection:
+            head = session_events.get_session_head(connection, base_session_id)
+            if head is None:
+                return None
+            row = connection.execute(
+                "SELECT commits.* FROM session_events AS event "
+                "JOIN flow_turn_commits AS commits "
+                "ON commits.commit_sequence = event.turn_commit_sequence "
+                "WHERE event.event_id = ?",
+                (head.head_event_id,),
+            ).fetchone()
+            if row is not None:
+                return self._turn_commit_from_row(row)
+
+            # All v1 session events are committed-turn snapshots, so the common
+            # path above is a direct unique-key lookup.  Keep ancestry fallback
+            # semantics ready for future non-snapshot event kinds.
+            row = connection.execute(
+                """WITH RECURSIVE ancestry(
+                  event_id, parent_event_id, turn_commit_sequence, depth
+                ) AS (
+                  SELECT event_id, parent_event_id, turn_commit_sequence, 0
+                  FROM session_events WHERE event_id = ?
+                  UNION ALL
+                  SELECT parent.event_id, parent.parent_event_id,
+                         parent.turn_commit_sequence, child.depth + 1
+                  FROM session_events AS parent
+                  JOIN ancestry AS child ON parent.event_id = child.parent_event_id
+                )
+                SELECT commits.*
+                FROM ancestry
+                JOIN flow_turn_commits AS commits
+                  ON commits.commit_sequence = ancestry.turn_commit_sequence
+                ORDER BY ancestry.depth
+                LIMIT 1""",
+                (head.head_event_id,),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("durable session head has no committed turn snapshot")
+        return self._turn_commit_from_row(row)
+
+    def _fork_conversation_only_session_head(
+        self,
+        source_session_id: str,
+        fork_session_id: str,
+    ) -> SessionHead:
+        """Share one event head without inheriting Flow or Worker ownership.
+
+        This storage-only primitive cannot inspect JSONL or WorkerStore state;
+        callers must validate those external authorities first. The orchestrator
+        facade performs that check. Flow and Worker ownership are not copied.
+        """
+
+        source_session_id = _normalized_text(source_session_id, "source_session_id")
+        fork_session_id = _normalized_text(fork_session_id, "fork_session_id")
+        if source_session_id == fork_session_id:
+            raise ValueError("a conversation fork requires a distinct session id")
+        with self._transaction() as connection:
+            for table in ("flow_turn_commits", "flows", "flow_session_state"):
+                occupied = connection.execute(
+                    f"SELECT 1 FROM {table} WHERE base_session_id = ? LIMIT 1",
+                    (fork_session_id,),
+                ).fetchone()
+                if occupied is not None:
+                    raise ValueError("fork target is not a pristine Master session")
+            return session_events.fork_conversation_only_head(
+                connection,
+                source_session_id=source_session_id,
+                fork_session_id=fork_session_id,
+                created_at=_now(),
+            )
 
     def list_unpersisted_turn_commits(
         self,
@@ -892,20 +1001,20 @@ class FlowStore:
                 )
                 self._create_session_state_table(connection)
                 self._create_turn_commits_table(connection)
-                connection.execute(f"PRAGMA user_version={FLOW_SCHEMA_VERSION}")
             elif version == 1:
                 self._create_session_state_table(connection)
                 self._create_turn_commits_table(connection)
-                connection.execute(f"PRAGMA user_version={FLOW_SCHEMA_VERSION}")
             elif version == 2:
                 connection.execute("ALTER TABLE flow_session_state ADD COLUMN active_turn_id TEXT")
                 connection.execute(
                     "ALTER TABLE flow_session_state ADD COLUMN lease_expires_at TEXT"
                 )
                 self._create_turn_commits_table(connection)
-                connection.execute(f"PRAGMA user_version={FLOW_SCHEMA_VERSION}")
             elif version == 3:
                 self._create_turn_commits_table(connection)
+            if version < FLOW_SCHEMA_VERSION:
+                session_events.create_session_event_schema(connection)
+                session_events.backfill_turn_commit_events(connection)
                 connection.execute(f"PRAGMA user_version={FLOW_SCHEMA_VERSION}")
             self._validate_schema(connection)
 
@@ -988,6 +1097,10 @@ class FlowStore:
                     f"Flow store v{FLOW_SCHEMA_VERSION} is invalid: "
                     f"{table} missing {sorted(missing)}"
                 )
+        session_events.validate_session_event_schema(
+            connection,
+            store_version=FLOW_SCHEMA_VERSION,
+        )
 
     @staticmethod
     def _required_flow_row(
