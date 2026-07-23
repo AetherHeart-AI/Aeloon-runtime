@@ -14,10 +14,12 @@ from typing import Any
 
 from loguru import logger
 
-from aeloon_core.loop_guard import tool_result_failed
 from aeloon_core.operator_output import sanitize_operator_output
-from aeloon_core.providers.base import ToolCallRequest
-from aeloon_core.task_graph import TaskNode
+from aeloon_core.runtime_events import (
+    ToolCallView,
+    ToolExecutionRecord,
+    tool_result_failed,
+)
 
 _HIDDEN_CONTROL_TOOLS = {"complete_work", "request_master"}
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
@@ -128,23 +130,6 @@ class WorkerProgress:
     ) -> None:
         del usage, node_kind, component
 
-    async def on_guard_resolution(self, resolution: Any) -> None:
-        self._call_journal(
-            "record_guard",
-            run_id=self.run_id,
-            resolution=resolution,
-        )
-        await self._call_parent(
-            "on_worker_guard_resolution",
-            worker_id=self.worker_id,
-            run_id=self.run_id,
-            run_sequence=self.run_sequence,
-            worker_type_id=self.worker_type_id,
-            label=self.label,
-            resolution=resolution,
-        )
-        await self._emit_activity("planning", label=self.label)
-
     async def on_final(self, content: str, **kwargs: Any) -> None:
         del content, kwargs
         await self._emit_activity("finalizing", label=self.label)
@@ -160,7 +145,7 @@ class WorkerProgress:
 
     async def on_tool_calls(
         self,
-        tool_calls: list[ToolCallRequest],
+        tool_calls: list[ToolCallView],
         *,
         record_reasoning: bool = False,
     ) -> None:
@@ -188,7 +173,7 @@ class WorkerProgress:
 
     async def on_tool_result(
         self,
-        node: TaskNode,
+        node: ToolExecutionRecord,
         *,
         record_reasoning: bool = False,
     ) -> None:
@@ -420,15 +405,13 @@ class WorkerProgress:
 def _journal_call_priority(name: str, kwargs: dict[str, Any]) -> int:
     if name == "record_activity":
         return 0
-    if name == "record_guard":
-        return 2
     if name == "record_tool" and kwargs.get("status") != "done":
         return 2
     return 1
 
 
 def _safe_tool_projection(
-    node: TaskNode,
+    node: ToolExecutionRecord,
     *,
     include_result_preview: bool = False,
 ) -> tuple[str, str, dict[str, Any]]:
@@ -547,7 +530,7 @@ def _safe_tool_result_preview(
     return sanitize_operator_output(value, limit=limit)
 
 
-def _safe_current_todo(node: TaskNode) -> tuple[str, int, int] | None:
+def _safe_current_todo(node: ToolExecutionRecord) -> tuple[str, int, int] | None:
     arguments = node.arguments if isinstance(node.arguments, dict) else {}
     todos = arguments.get("todos")
     if not isinstance(todos, list):

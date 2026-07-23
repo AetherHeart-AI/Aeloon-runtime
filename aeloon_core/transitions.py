@@ -83,7 +83,7 @@ class TransitionRecord:
     token_usage: dict[str, int] = field(default_factory=dict)
     wall_time_ms: float = 0.0
     created_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
-    schema_version: int = 3
+    schema_version: int = 4
     component: str | None = None
 
     def __post_init__(self) -> None:

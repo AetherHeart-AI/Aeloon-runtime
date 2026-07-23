@@ -21,9 +21,9 @@ from rich.table import Table
 from rich.text import Text
 
 from aeloon_core.config import Config
-from aeloon_core.loop_guard import tool_result_failed
 from aeloon_core.opentui_launcher import OpenTuiLaunchError, run_opentui
 from aeloon_core.orchestrator import AeloonCoreOrchestrator, TurnResult
+from aeloon_core.runtime_events import tool_result_failed
 from aeloon_core.turn_events import TurnEventProgress
 
 LOG_LEVELS = {
@@ -49,15 +49,10 @@ SEMANTIC_STYLES = {
     "assistant": "bold cyan",
     "tool": "cyan",
     "agent": "bold bright_blue",
-    "guard": "bold yellow",
+    "warning": "bold yellow",
     "success": "bold green",
     "error": "bold red",
     "muted": "dim",
-}
-GUARD_ACTION_LABELS = {
-    "continue": "继续",
-    "retry": "重试",
-    "finalize": "收尾",
 }
 TRANSCRIPT_DETAIL_CHARS = 160
 HISTORY_PREVIEW_CHARS = 160
@@ -240,12 +235,6 @@ class TerminalEventRenderer:
             return
         if event == "chat.status":
             return
-        if event == "chat.guard.decision":
-            self._render_guard_decision(payload)
-            return
-        if event == "chat.worker.guard":
-            self._render_guard_decision(payload)
-            return
         if event == "chat.worker.lifecycle":
             self._render_worker_lifecycle(payload)
             return
@@ -314,7 +303,7 @@ class TerminalEventRenderer:
             style = (
                 SEMANTIC_STYLES["error"]
                 if failed
-                else SEMANTIC_STYLES["guard"]
+                else SEMANTIC_STYLES["warning"]
                 if partial
                 else SEMANTIC_STYLES["success"]
             )
@@ -376,7 +365,7 @@ class TerminalEventRenderer:
         self._finish_stream_line()
         text = Text(no_wrap=True, overflow="ellipsis")
         declared_step = bool(current_step and payload.get("detail_source") == "worker_declared")
-        text.append("↳ " if declared_step else "◇ ", style=SEMANTIC_STYLES["guard"])
+        text.append("↳ " if declared_step else "◇ ", style=SEMANTIC_STYLES["warning"])
         text.append("Worker ", style=SEMANTIC_STYLES["muted"])
         text.append(label, style=SEMANTIC_STYLES["agent"])
         if declared_step:
@@ -413,32 +402,6 @@ class TerminalEventRenderer:
                 worker_label=str(payload.get("label") or _worker_label(payload)),
             )
         )
-
-    def _render_guard_decision(self, payload: dict[str, Any]) -> None:
-        action = str(payload.get("action") or "").lower()
-        self._finish_stream_line()
-        stopped = action == "finalize"
-        style = SEMANTIC_STYLES["error"] if stopped else SEMANTIC_STYLES["guard"]
-        text = Text(no_wrap=True, overflow="ellipsis")
-        text.append("✕ " if stopped else "⚠ ", style=style)
-        source = str(payload.get("source") or "guard")
-        worker_label = str(payload.get("label") or "")
-        if worker_label:
-            source = f"{source}/{worker_label}"
-        text.append("Guard", style=style)
-        text.append(f" [{source}]", style=SEMANTIC_STYLES["muted"])
-        label = GUARD_ACTION_LABELS.get(action, action or "决策")
-        text.append(f" · {label}", style=style)
-        if source == "fallback":
-            text.append(" · 回退", style=SEMANTIC_STYLES["guard"])
-        reason = _one_line(
-            str(payload.get("event") or ""),
-            limit=TRANSCRIPT_DETAIL_CHARS,
-        )
-        if reason:
-            text.append(" · ", style=SEMANTIC_STYLES["muted"])
-            text.append(reason)
-        self._print_transcript_line(text)
 
     def _render_block_add(self, payload: dict[str, Any]) -> None:
         block = payload.get("block") if isinstance(payload.get("block"), dict) else {}
@@ -674,6 +637,7 @@ class TerminalChatCli:
                 await self._run_turn(prompt)
         finally:
             logger.remove(sink_id)
+            await self.orchestrator.close()
 
     async def _run_turn(self, prompt: str) -> TurnResult | None:
         self.renderer.print_user(prompt)
@@ -961,7 +925,7 @@ def _tool_line(
         if failed
         else SEMANTIC_STYLES["success"]
         if completed
-        else SEMANTIC_STYLES["guard"]
+        else SEMANTIC_STYLES["warning"]
     )
     text = Text(no_wrap=True, overflow="ellipsis")
     text.append(f"{icon} ", style=icon_style)

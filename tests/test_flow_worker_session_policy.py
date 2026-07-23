@@ -23,12 +23,14 @@ from aeloon_core.master_flow_tools import build_master_flow_tools
 from aeloon_core.worker_control import WorkerControlService
 from aeloon_core.worker_manager import WorkerExecutionOutcome, WorkerSessionManager
 from aeloon_core.worker_sessions import (
+    BudgetIncrease,
     WaitingRequest,
     WorkerReport,
     WorkerRunStatus,
     WorkerStore,
 )
 from aeloon_core.workers import WorkerRegistry
+from tests.message_helpers import checkpoint as message_checkpoint
 
 
 class PolicyExecutor:
@@ -43,14 +45,7 @@ class PolicyExecutor:
         del worker
         await asyncio.sleep(0)
         objective = run.context.objective
-        checkpoint = {
-            "messages": [
-                {
-                    "role": "assistant",
-                    "content": f"checkpoint for {objective}",
-                }
-            ]
-        }
+        checkpoint = message_checkpoint(f"checkpoint for {objective}")
         if objective == "wait for context":
             request = WaitingRequest(
                 summary="a decision is required",
@@ -233,20 +228,42 @@ async def test_partial_retry_reuses_worker_session(tmp_path: Path) -> None:
     first = _view_node(await _advance(control, flow_id, turn_id="turn-1"), "build")
     assert first["status"] == "partial"
 
-    await control.retry_node(
+    with pytest.raises(ValueError, match="requires a Master-authored budget_increase"):
+        await control.retry_node(
+            flow_id,
+            "build",
+            base_session_id="master",
+            idempotency_key="retry-without-budget",
+        )
+    with pytest.raises(ValueError, match="must increase from 25"):
+        await control.retry_node(
+            flow_id,
+            "build",
+            base_session_id="master",
+            idempotency_key="retry-with-same-budget",
+            budget_increase=BudgetIncrease(max_requests=25),
+        )
+
+    increased = await control.retry_node(
         flow_id,
         "build",
         base_session_id="master",
         idempotency_key="retry",
+        budget_increase=BudgetIncrease(max_requests=50),
     )
+    assert _view_node(increased, "build")["budget"]["pending"]["max_requests"] == 50
     second = _view_node(await _advance(control, flow_id, turn_id="turn-2"), "build")
     binding = _stored_node(control, flow_id, "build").runs[-1]
+    second_run = control.workers.manager.store.get_run(second["run_id"])
 
     assert second["worker_id"] == first["worker_id"]
     assert second["run_id"] != first["run_id"]
     assert binding.source_run_id == first["run_id"]
     assert binding.session_action.value == "reuse"
     assert binding.session_reason == "same_node_retry"
+    assert binding.budget is not None
+    assert binding.budget.max_requests == 50
+    assert second_run.context.budget.max_requests == 50
 
 
 @pytest.mark.asyncio
@@ -350,6 +367,7 @@ async def test_waiting_fresh_policy_still_resumes_exact_worker(tmp_path: Path) -
         base_session_id="master",
         base_turn_id="turn-2",
         idempotency_key="resume",
+        budget_increase=BudgetIncrease(max_requests=50),
     )
     resumed_run_id = _view_node(resumed_view, "work")["run_id"]
     await control.workers.await_workers(
@@ -368,6 +386,8 @@ async def test_waiting_fresh_policy_still_resumes_exact_worker(tmp_path: Path) -
     assert binding.source_run_id == waiting["run_id"]
     assert binding.session_action.value == "resume"
     assert binding.session_reason == "waiting_exact_resume"
+    assert binding.budget is not None
+    assert binding.budget.max_requests == 50
 
 
 @pytest.mark.asyncio
@@ -654,7 +674,7 @@ async def test_v1_flow_state_migrates_without_breaking_create_replay(
 
     migrated = control.store.get_flow(flow_id, base_session_id="master")
     binding = migrated.node("work").runs[-1]
-    assert migrated.schema_version == 2
+    assert migrated.schema_version == 3
     assert migrated.node("work").worker_session_policy.value == "auto"
     assert binding.session_action.value == "new"
     assert binding.session_reason == "legacy_binding"
@@ -676,7 +696,7 @@ async def test_default_flow_mutations_keep_v1_operation_digests(tmp_path: Path) 
         base_session_id="master",
         goal="old add and retry payloads",
         idempotency_key="create-retry",
-        nodes=[_node("work", "partial work")],
+        nodes=[_node("work", "known failure")],
     )
     await _advance(control, retry_flow["flow_id"], turn_id="turn-1")
     await control.add_nodes(
@@ -732,7 +752,7 @@ async def test_default_flow_mutations_keep_v1_operation_digests(tmp_path: Path) 
     }
 
 
-def test_master_tool_schema_exposes_session_policy_and_fresh_override(
+def test_master_tool_schema_exposes_session_policy_fresh_override_and_budget_increase(
     tmp_path: Path,
 ) -> None:
     control = _control(tmp_path)
@@ -752,11 +772,22 @@ def test_master_tool_schema_exposes_session_policy_and_fresh_override(
         node = schema["$defs"]["FlowNodeSpec"]
         assert policy["enum"] == ["auto", "fresh"]
         assert node["properties"]["worker_session_policy"]["default"] == "auto"
-    for tool_name in ("revise_flow_node", "retry_flow_node"):
-        properties = definitions[tool_name]["properties"]
-        assert properties["fresh_worker"]["default"] is False
-        assert properties["fresh_reason"]["default"] is None
-        assert properties["fresh_reason"]["anyOf"][0]["maxLength"] == 1_000
+    for tool_name in ("revise_flow_node", "retry_flow_node", "resume_flow_node"):
+        schema = definitions[tool_name]
+        properties = schema["properties"]
+        if tool_name != "resume_flow_node":
+            assert properties["fresh_worker"]["default"] is False
+            assert properties["fresh_reason"]["default"] is None
+            assert properties["fresh_reason"]["anyOf"][0]["maxLength"] == 1_000
+        assert properties["budget_increase"]["default"] is None
+        increase = schema["$defs"]["BudgetIncrease"]["properties"]
+        assert set(increase) == {
+            "max_requests",
+            "max_output_tokens",
+            "max_tokens",
+            "max_seconds",
+            "max_tool_calls",
+        }
 
 
 @pytest.mark.asyncio
@@ -1094,13 +1125,14 @@ async def test_partial_skip_then_revision_reuses_last_healthy_session(
     )
     flow_id = created["flow_id"]
     first = _view_node(await _advance(control, flow_id, turn_id="turn-1"), "work")
-    await control.skip_node(
-        flow_id,
-        "work",
-        reason="temporarily waive it",
-        base_session_id="master",
-        idempotency_key="skip",
-    )
+    with pytest.raises(ValueError, match="partial node cannot be skipped"):
+        await control.skip_node(
+            flow_id,
+            "work",
+            reason="temporarily waive it",
+            base_session_id="master",
+            idempotency_key="skip",
+        )
     await control.revise_node(
         flow_id,
         "work",
@@ -1184,6 +1216,7 @@ async def test_source_loss_between_eligibility_and_reserve_falls_back_fresh(
         "work",
         base_session_id="master",
         idempotency_key="retry",
+        budget_increase=BudgetIncrease(max_requests=50),
     )
     original_reserve = control.workers._reserve_flow_reuse
 

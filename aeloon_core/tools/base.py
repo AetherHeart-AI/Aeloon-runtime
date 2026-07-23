@@ -22,8 +22,6 @@ class Tool(ABC):
     description: ClassVar[str]
     args_model: ClassVar[type[BaseModel]]
     concurrency_mode: ClassVar[Literal["read_only", "mutating", "exclusive"]] = "exclusive"
-    # Terminal tools explicitly end an agent loop after their sole call succeeds.
-    terminal: ClassVar[bool] = False
 
     @abstractmethod
     async def execute(self, **kwargs: Any) -> str:
@@ -50,7 +48,6 @@ class FunctionTool(Tool):
         args_model: type[BaseModel],
         handler: Callable[..., Awaitable[str]],
         concurrency_mode: Literal["read_only", "mutating", "exclusive"] = "exclusive",
-        terminal: bool = False,
     ) -> None:
         if concurrency_mode not in {"read_only", "mutating", "exclusive"}:
             raise ValueError(f"invalid concurrency mode: {concurrency_mode}")
@@ -59,7 +56,6 @@ class FunctionTool(Tool):
         self.args_model = args_model
         self._handler = handler
         self.concurrency_mode = concurrency_mode
-        self.terminal = bool(terminal)
 
     async def execute(self, **kwargs: Any) -> str:
         return await self._handler(**kwargs)

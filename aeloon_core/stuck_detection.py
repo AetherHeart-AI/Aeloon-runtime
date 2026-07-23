@@ -32,7 +32,7 @@ class StuckDetection:
     observation_chars: int
 
     def to_payload(self) -> dict[str, Any]:
-        """Return bounded telemetry/Guard evidence without raw arguments or results."""
+        """Return bounded telemetry without raw arguments or results."""
 
         return {
             "pattern": self.pattern,

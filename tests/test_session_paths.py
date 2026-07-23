@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from aeloon_core.session import SessionStore
+from tests.message_helpers import checkpoint as message_checkpoint
 
 
 def _store(tmp_path: Path) -> SessionStore:
@@ -38,7 +39,7 @@ def _append_once(store: SessionStore, session_id: str, turn_id: str) -> bool:
         user_prompt=f"prompt for {session_id}",
         final_content=f"answer for {session_id}",
         tools_used=[],
-        messages=[{"role": "assistant", "content": f"message for {session_id}"}],
+        messages=message_checkpoint(f"message for {session_id}")["messages"],
         turn_id=turn_id,
     )
 
@@ -73,7 +74,7 @@ def test_unsafe_session_ids_use_distinct_contained_paths(tmp_path: Path) -> None
     assert [record["session_id"] for record in store.history(formerly_colliding)] == [
         formerly_colliding
     ]
-    assert store.load_messages(unsafe)[-1]["content"] == "message for team/a"
+    assert "message for team/a" in str(store.load_messages(unsafe))
     assert store.transition_history(unsafe)[0]["state"] == "unsafe"
     assert store.transition_history(formerly_colliding)[0]["state"] == "safe"
 

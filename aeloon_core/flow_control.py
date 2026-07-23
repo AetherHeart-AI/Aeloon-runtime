@@ -32,7 +32,12 @@ from aeloon_core.flows import (
     skip_flow_node,
 )
 from aeloon_core.worker_control import WorkerControlService
-from aeloon_core.worker_sessions import WorkerRunStatus
+from aeloon_core.worker_sessions import (
+    BudgetGrant,
+    BudgetIncrease,
+    RelatedWorkerContext,
+    WorkerRunStatus,
+)
 
 
 class FlowControlService:
@@ -60,6 +65,10 @@ class FlowControlService:
         turn_id: str | None = None,
     ) -> dict[str, Any]:
         self._validate_worker_types(nodes)
+        self._validate_external_context_refs(
+            base_session_id=base_session_id,
+            nodes=nodes,
+        )
         flow, created = self.store.create_flow(
             base_session_id=base_session_id,
             goal=goal,
@@ -110,6 +119,10 @@ class FlowControlService:
         turn_id: str | None = None,
     ) -> dict[str, Any]:
         self._validate_worker_types(nodes)
+        self._validate_external_context_refs(
+            base_session_id=base_session_id,
+            nodes=nodes,
+        )
         async with self._lock(flow_id):
             await self._sync(
                 flow_id,
@@ -206,19 +219,28 @@ class FlowControlService:
         idempotency_key: str,
         fresh_worker: bool = False,
         fresh_reason: str | None = None,
+        budget_increase: BudgetIncrease | None = None,
         turn_id: str | None = None,
     ) -> dict[str, Any]:
         async with self._lock(flow_id):
-            await self._sync(
+            current = await self._sync(
                 flow_id,
                 base_session_id=base_session_id,
                 turn_id=turn_id,
+            )
+            budget = self._resolve_budget_increase(
+                current,
+                node_id,
+                budget_increase,
+                base_session_id=base_session_id,
             )
             payload: dict[str, Any] = {"node_id": node_id, "feedback": feedback}
             if fresh_worker:
                 payload["fresh_worker"] = True
             if fresh_reason is not None:
                 payload["fresh_reason"] = fresh_reason
+            if budget_increase is not None:
+                payload["budget_increase"] = budget_increase.model_dump(mode="json")
             flow, changed = self.store.mutate(
                 flow_id,
                 base_session_id=base_session_id,
@@ -231,6 +253,7 @@ class FlowControlService:
                     feedback,
                     fresh_worker=fresh_worker,
                     fresh_reason=fresh_reason,
+                    budget=budget,
                 ),
                 turn_id=turn_id,
             )
@@ -245,19 +268,46 @@ class FlowControlService:
         idempotency_key: str,
         fresh_worker: bool = False,
         fresh_reason: str | None = None,
+        budget_increase: BudgetIncrease | None = None,
         turn_id: str | None = None,
     ) -> dict[str, Any]:
         async with self._lock(flow_id):
-            await self._sync(
+            current = await self._sync(
                 flow_id,
                 base_session_id=base_session_id,
                 turn_id=turn_id,
+            )
+            node = current.node(node_id)
+            if (
+                node.status is FlowNodeStatus.PARTIAL
+                and budget_increase is None
+                and not fresh_worker
+                and node.current_run_id is not None
+                and self.workers.flow_reuse_ineligibility_reason(
+                    node.current_run_id,
+                    flow_id=flow_id,
+                    base_session_id=base_session_id,
+                    worker_type_id=node.worker_type_id,
+                )
+                is None
+            ):
+                raise ValueError(
+                    "retrying a reusable partial Flow node requires a Master-authored "
+                    "budget_increase"
+                )
+            budget = self._resolve_budget_increase(
+                current,
+                node_id,
+                budget_increase,
+                base_session_id=base_session_id,
             )
             payload: dict[str, Any] = {"node_id": node_id}
             if fresh_worker:
                 payload["fresh_worker"] = True
             if fresh_reason is not None:
                 payload["fresh_reason"] = fresh_reason
+            if budget_increase is not None:
+                payload["budget_increase"] = budget_increase.model_dump(mode="json")
             flow, changed = self.store.mutate(
                 flow_id,
                 base_session_id=base_session_id,
@@ -269,6 +319,7 @@ class FlowControlService:
                     node_id,
                     fresh_worker=fresh_worker,
                     fresh_reason=fresh_reason,
+                    budget=budget,
                 ),
                 turn_id=turn_id,
             )
@@ -284,11 +335,14 @@ class FlowControlService:
         base_turn_id: str,
         idempotency_key: str,
         progress: Any | None = None,
+        budget_increase: BudgetIncrease | None = None,
     ) -> dict[str, Any]:
         """Continue the exact waiting WorkerRun bound to one Flow node."""
 
         async with self._lock(flow_id):
             payload = {"node_id": node_id, "response": response}
+            if budget_increase is not None:
+                payload["budget_increase"] = budget_increase.model_dump(mode="json")
             flow, replayed = self.store.operation_state(
                 flow_id,
                 base_session_id=base_session_id,
@@ -313,13 +367,28 @@ class FlowControlService:
                     f"Flow node Run history limit reached ({MAX_FLOW_RUN_BINDINGS})"
                 )
             source_run_id = node.current_run_id
+            budget = (
+                self.workers.increased_budget(
+                    source_run_id,
+                    budget_increase,
+                    base_session_id=base_session_id,
+                )
+                if budget_increase is not None
+                else self.workers.default_budget
+            )
             worker_key = _resume_run_key(flow_id, node_id, source_run_id)
+            related_contexts = self.workers.related_contexts_for_run(
+                source_run_id,
+                base_session_id=base_session_id,
+            )
             resumed = self.workers.find_run_by_idempotency(
                 base_session_id=base_session_id,
                 idempotency_key=worker_key,
                 objective=response,
                 worker_id=node.worker_id,
                 allowed_source_run_ids={source_run_id},
+                budget=budget,
+                related_contexts=related_contexts,
             )
             adopted_external = False
             if resumed is None:
@@ -364,6 +433,7 @@ class FlowControlService:
                         idempotency_key=worker_key,
                         base_session_id=base_session_id,
                         progress=progress,
+                        budget_increase=budget_increase,
                     )
 
             def attach(current: MasterFlow) -> None:
@@ -655,7 +725,7 @@ class FlowControlService:
         *,
         wait: bool = False,
     ) -> list[str]:
-        """Fence pre-guard Flow Runs that are live without a safe binding."""
+        """Fence historical Flow Runs that are live without a safe binding."""
 
         flows = {
             flow.flow_id: flow
@@ -836,6 +906,12 @@ class FlowControlService:
         async def launch(node: FlowNode) -> tuple[FlowNode, dict[str, Any]]:
             idempotency_key = _node_run_key(flow.flow_id, node)
             source_run_id = node.reuse_source_run_id
+            budget = node.pending_budget or self.workers.default_budget
+            related_contexts = self._resolve_related_contexts(
+                flow,
+                node,
+                base_session_id=base_session_id,
+            )
             allowed_sources = {None}
             if source_run_id is not None:
                 allowed_sources.add(source_run_id)
@@ -845,6 +921,8 @@ class FlowControlService:
                 objective=node.execution_objective(),
                 worker_type_id=node.worker_type_id,
                 allowed_source_run_ids=allowed_sources,
+                budget=budget,
+                related_contexts=related_contexts,
             )
             if result is not None:
                 _annotate_recovered_session_decision(
@@ -881,6 +959,8 @@ class FlowControlService:
                             base_session_id=base_session_id,
                             worker_type_id=node.worker_type_id,
                             progress=progress,
+                            budget=budget,
+                            related_contexts=related_contexts,
                         )
                     except (KeyError, ValueError):
                         # A second controller may have resolved this epoch while
@@ -891,6 +971,8 @@ class FlowControlService:
                             objective=node.execution_objective(),
                             worker_type_id=node.worker_type_id,
                             allowed_source_run_ids=allowed_sources,
+                            budget=budget,
+                            related_contexts=related_contexts,
                         )
                         if result is not None:
                             unavailable = self.workers.flow_reuse_ineligibility_reason(
@@ -928,6 +1010,8 @@ class FlowControlService:
                     objective=node.execution_objective(),
                     worker_type_id=node.worker_type_id,
                     allowed_source_run_ids=allowed_sources,
+                    budget=budget,
+                    related_contexts=related_contexts,
                 )
             if result is not None:
                 _annotate_recovered_session_decision(
@@ -945,6 +1029,8 @@ class FlowControlService:
                     idempotency_key=idempotency_key,
                     progress=progress,
                     start=False,
+                    budget=budget,
+                    related_contexts=related_contexts,
                 )
                 result["worker_session_action"] = WorkerSessionAction.NEW.value
                 result["worker_session_reason"] = fresh_reason or "first_run"
@@ -1384,6 +1470,59 @@ class FlowControlService:
         for node in nodes:
             self.workers.worker_types.get(node.worker_type_id)
 
+    def _validate_external_context_refs(
+        self,
+        *,
+        base_session_id: str,
+        nodes: Sequence[FlowNodeSpec],
+    ) -> None:
+        """Fail before persisting when an external Run association is inaccessible."""
+
+        for node in nodes:
+            for reference in node.context_refs:
+                if reference.kind != "worker_run":
+                    continue
+                self.workers.related_context(
+                    reference.id,
+                    base_session_id=base_session_id,
+                    source_kind=reference.kind,
+                    source_id=reference.id,
+                    relation=reference.relation,
+                    include=reference.include,
+                )
+
+    def _resolve_related_contexts(
+        self,
+        flow: MasterFlow,
+        node: FlowNode,
+        *,
+        base_session_id: str,
+    ) -> tuple[RelatedWorkerContext, ...]:
+        """Resolve explicit associations without turning dependencies into context pipes."""
+
+        related: list[RelatedWorkerContext] = []
+        for reference in node.context_refs:
+            if reference.kind == "worker_run":
+                run_id = reference.id
+            else:
+                source_node = flow.node(reference.id)
+                if source_node.current_run_id is None:
+                    raise ValueError(
+                        f"related Flow node {reference.id!r} has no current WorkerRun"
+                    )
+                run_id = source_node.current_run_id
+            related.append(
+                self.workers.related_context(
+                    run_id,
+                    base_session_id=base_session_id,
+                    source_kind=reference.kind,
+                    source_id=reference.id,
+                    relation=reference.relation,
+                    include=reference.include,
+                )
+            )
+        return tuple(related)
+
     def _launch_is_obsolete(
         self,
         flow_id: str,
@@ -1452,6 +1591,28 @@ class FlowControlService:
             or node.current_run_id != source_run_id
         )
 
+    def _resolve_budget_increase(
+        self,
+        flow: MasterFlow,
+        node_id: str,
+        increase: BudgetIncrease | None,
+        *,
+        base_session_id: str,
+    ) -> BudgetGrant | None:
+        if increase is None:
+            return None
+        node = flow.node(node_id)
+        source_run_id = node.current_run_id
+        if source_run_id is None and node.runs:
+            source_run_id = node.runs[-1].run_id
+        if source_run_id is None:
+            raise ValueError("cannot increase budget before a Flow node has run")
+        return self.workers.increased_budget(
+            source_run_id,
+            increase,
+            base_session_id=base_session_id,
+        )
+
     def _lock(self, flow_id: str) -> asyncio.Lock:
         return self._locks.setdefault(flow_id, asyncio.Lock())
 
@@ -1483,6 +1644,7 @@ def _claim_ready_frontier(flow: MasterFlow) -> None:
             node.status = FlowNodeStatus.FAILED
             node.reuse_source_run_id = None
             node.pending_fresh_reason = None
+            node.pending_budget = None
             node.worker_id = None
             node.current_run_id = None
             node.result = {
@@ -1575,6 +1737,7 @@ def _fail_node_for_binding_limit(
     node.status = FlowNodeStatus.FAILED
     node.reuse_source_run_id = None
     node.pending_fresh_reason = None
+    node.pending_budget = None
     node.worker_id = None
     node.current_run_id = None
     node.result = {
@@ -1728,6 +1891,7 @@ def _attach_run_to_flow(
         node.status = _node_status(str(run_view.get("status") or "queued"))
         node.reuse_source_run_id = None
         node.pending_fresh_reason = None
+        node.pending_budget = None
         return
     raw_action = run_view.get("worker_session_action")
     if raw_action is None:
@@ -1783,12 +1947,14 @@ def _attach_run_to_flow(
             requested_session_policy=node.worker_session_policy,
             session_action=action,
             session_reason=session_reason,
+            budget=BudgetGrant.model_validate(run_view["budget"]),
             status=str(run_view.get("status") or "queued"),
             created_at=str(run_view.get("created_at") or _now()),
         ),
     ]
     node.reuse_source_run_id = None
     node.pending_fresh_reason = None
+    node.pending_budget = None
 
 
 def _unique(values: Sequence[str | None] | Any) -> list[str]:

@@ -12,6 +12,15 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    ToolCallPart,
+    ToolReturnPart,
+)
+from pydantic_ai.models.function import FunctionModel
 
 from aeloon_core.config import (
     AgentDefaultsConfig,
@@ -25,6 +34,7 @@ from aeloon_core.flows import (
     MAX_FLOW_RUN_BINDINGS,
     DependencyPolicy,
     FlowCompletion,
+    FlowContextRef,
     FlowNodeSpec,
     FlowNodeStatus,
     FlowRunBinding,
@@ -35,7 +45,6 @@ from aeloon_core.flows import (
     finish_flow,
 )
 from aeloon_core.orchestrator import AeloonCoreOrchestrator
-from aeloon_core.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from aeloon_core.session import SessionStore
 from aeloon_core.worker_control import WorkerControlService
 from aeloon_core.worker_manager import WorkerExecutionOutcome, WorkerSessionManager
@@ -46,6 +55,7 @@ from aeloon_core.worker_sessions import (
     WorkerStore,
 )
 from aeloon_core.workers import WorkerRegistry
+from tests.message_helpers import checkpoint as message_checkpoint
 
 
 class RecordingExecutor:
@@ -66,14 +76,14 @@ class RecordingExecutor:
             return WorkerExecutionOutcome(
                 status=WorkerRunStatus.WAITING_FOR_CONTEXT,
                 report=WorkerReport(summary=request.summary, unresolved=(request.question,)),
-                checkpoint={"messages": [{"role": "assistant", "content": "waiting"}]},
+                checkpoint=message_checkpoint("waiting"),
                 waiting_request=request,
             )
         if run.context.objective == "return partial":
             return WorkerExecutionOutcome(
                 status=WorkerRunStatus.PARTIAL,
                 report=WorkerReport(summary="partial result"),
-                checkpoint={"messages": [{"role": "assistant", "content": "partial"}]},
+                checkpoint=message_checkpoint("partial"),
             )
         return WorkerExecutionOutcome(
             status=WorkerRunStatus.COMPLETED,
@@ -81,7 +91,7 @@ class RecordingExecutor:
                 summary=f"completed: {run.context.objective}",
                 evidence=("verified",),
             ),
-            checkpoint={"messages": [{"role": "assistant", "content": "done"}]},
+            checkpoint=message_checkpoint("done"),
         )
 
 
@@ -109,6 +119,7 @@ def _node(
     worker_type_id: str = "builder",
     depends_on: tuple[str, ...] = (),
     dependency_policy: DependencyPolicy = DependencyPolicy.ALL_COMPLETED,
+    context_refs: tuple[FlowContextRef, ...] = (),
 ) -> FlowNodeSpec:
     return FlowNodeSpec(
         node_id=node_id,
@@ -116,6 +127,7 @@ def _node(
         objective=objective,
         depends_on=depends_on,
         dependency_policy=dependency_policy,
+        context_refs=context_refs,
     )
 
 
@@ -336,6 +348,154 @@ async def test_plan_parallel_builds_and_review_execute_one_frontier_at_a_time(
     )
     assert third["frontier_node_ids"] == ["review"]
     assert {node["status"] for node in third["nodes"]} == {"completed"}
+
+
+@pytest.mark.asyncio
+async def test_fresh_follow_up_receives_explicit_prior_run_context(tmp_path: Path) -> None:
+    control, _ = _flow_control(tmp_path)
+    original = control.create_flow(
+        base_session_id="master",
+        goal="build the original implementation",
+        idempotency_key="create-original",
+        nodes=[_node("original_build", "build original")],
+    )
+    completed = await control.advance_flow(
+        original["flow_id"],
+        base_session_id="master",
+        base_turn_id="turn-original",
+        timeout_seconds=2,
+    )
+    source_node = completed["nodes"][0]
+
+    follow_up = control.create_flow(
+        base_session_id="master",
+        goal="fix a newly reported problem",
+        idempotency_key="create-follow-up",
+        nodes=[
+            _node(
+                "fix",
+                "fix the follow-up defect",
+                context_refs=(
+                    FlowContextRef(
+                        kind="worker_run",
+                        id=source_node["run_id"],
+                        relation="original implementation",
+                        include=("summary", "evidence"),
+                    ),
+                ),
+            )
+        ],
+    )
+    fixed = await control.advance_flow(
+        follow_up["flow_id"],
+        base_session_id="master",
+        base_turn_id="turn-follow-up",
+        timeout_seconds=2,
+    )
+    fixed_node = fixed["nodes"][0]
+    run = control.workers.manager.store.get_run(fixed_node["run_id"])
+
+    assert fixed_node["worker_id"] != source_node["worker_id"]
+    assert run.source_run_id is None
+    assert len(run.context.related_contexts) == 1
+    related = run.context.related_contexts[0]
+    assert related.source_kind == "worker_run"
+    assert related.source_id == source_node["run_id"]
+    assert related.run_id == source_node["run_id"]
+    assert related.relation == "original implementation"
+    assert related.included_sections == ("summary", "evidence")
+    assert related.objective is None
+    assert related.summary == "completed: build original"
+    assert related.evidence == ("verified",)
+
+    with pytest.raises(ValueError, match="another Master session"):
+        control.create_flow(
+            base_session_id="different-master",
+            goal="must not import another session's Worker context",
+            idempotency_key="cross-session-association",
+            nodes=[
+                _node(
+                    "invalid",
+                    "consume inaccessible context",
+                    context_refs=(
+                        FlowContextRef(
+                            kind="worker_run",
+                            id=source_node["run_id"],
+                            relation="cross-session attempt",
+                        ),
+                    ),
+                )
+            ],
+        )
+
+
+@pytest.mark.asyncio
+async def test_flow_node_context_ref_resolves_only_an_ancestor_run(tmp_path: Path) -> None:
+    control, _ = _flow_control(tmp_path)
+    created = control.create_flow(
+        base_session_id="master",
+        goal="build then independently review with bounded context",
+        idempotency_key="create-associated-flow",
+        nodes=[
+            _node("build", "build feature"),
+            _node(
+                "review",
+                "review feature",
+                worker_type_id="reviewer",
+                depends_on=("build",),
+                context_refs=(
+                    FlowContextRef(
+                        kind="flow_node",
+                        id="build",
+                        relation="implementation under review",
+                        include=("summary", "artifacts", "evidence"),
+                    ),
+                ),
+            ),
+        ],
+    )
+    built = await control.advance_flow(
+        created["flow_id"],
+        base_session_id="master",
+        base_turn_id="turn-build",
+        timeout_seconds=2,
+    )
+    reviewed = await control.advance_flow(
+        created["flow_id"],
+        base_session_id="master",
+        base_turn_id="turn-review",
+        timeout_seconds=2,
+    )
+    by_id = {node["node_id"]: node for node in reviewed["nodes"]}
+    review_run = control.workers.manager.store.get_run(by_id["review"]["run_id"])
+    related = review_run.context.related_contexts[0]
+
+    assert by_id["review"]["worker_id"] != by_id["build"]["worker_id"]
+    assert related.source_kind == "flow_node"
+    assert related.source_id == "build"
+    assert related.run_id == built["nodes"][0]["run_id"]
+    assert related.summary == "completed: build feature"
+
+    with pytest.raises(ValueError, match="only reference an ancestor"):
+        control.create_flow(
+            base_session_id="master",
+            goal="reject an implicit peer context pipe",
+            idempotency_key="create-invalid-association",
+            nodes=[
+                _node("peer", "peer work"),
+                _node(
+                    "consumer",
+                    "consume peer",
+                    context_refs=(
+                        FlowContextRef(
+                            kind="flow_node",
+                            id="peer",
+                            relation="not a dependency",
+                        ),
+                    ),
+                ),
+            ],
+        )
 
 
 @pytest.mark.asyncio
@@ -1018,7 +1178,7 @@ async def test_sync_does_not_resurrect_a_concurrently_cancelled_node(
         return WorkerExecutionOutcome(
             status=WorkerRunStatus.COMPLETED,
             report=WorkerReport(summary="done"),
-            checkpoint={"messages": [{"role": "assistant", "content": "done"}]},
+            checkpoint=message_checkpoint("done"),
         )
 
     control.workers.manager.executor = blocked_executor
@@ -1314,18 +1474,15 @@ async def test_round_limit_blocks_before_unbounded_dynamic_loop(tmp_path: Path) 
     assert "max_rounds=1" in blocked["completion_summary"]
 
 
-class MasterScriptProvider(LLMProvider):
+class MasterScriptModel(FunctionModel):
     def __init__(self) -> None:
-        super().__init__()
         self.responses = deque(
             [
-                LLMResponse(
-                    content=None,
-                    tool_calls=[
-                        ToolCallRequest(
-                            id="create-flow",
-                            name="create_flow",
-                            arguments={
+                ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            "create_flow",
+                            {
                                 "goal": "prove completion is gated",
                                 "nodes": [
                                     {
@@ -1336,124 +1493,91 @@ class MasterScriptProvider(LLMProvider):
                                 ],
                                 "idempotency_key": "create-flow",
                             },
+                            "create-flow",
                         )
                     ],
-                    finish_reason="tool_use",
                 ),
-                LLMResponse(content="I am done too early.", finish_reason="end_turn"),
-                LLMResponse(
-                    content=None,
-                    tool_calls=[
-                        ToolCallRequest(
-                            id="complete-flow",
-                            name="complete_flow",
-                            arguments={
-                                "flow_id": "FLOW_ID",
-                                "outcome": FlowCompletion.PARTIAL.value,
-                                "summary": "stopped intentionally for the test",
-                                "idempotency_key": "complete-flow",
-                            },
+                ModelResponse(parts=[TextPart("I am done too early.")]),
+                "complete_flow",
+                ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            "finish_turn",
+                            {"final_content": "Honest partial result."},
+                            "finish-turn",
                         )
                     ],
-                    finish_reason="tool_use",
-                ),
-                LLMResponse(
-                    content=None,
-                    tool_calls=[
-                        ToolCallRequest(
-                            id="finish-turn",
-                            name="finish_turn",
-                            arguments={"final_content": "Honest partial result."},
-                        )
-                    ],
-                    finish_reason="tool_use",
                 ),
             ]
         )
         self.call_count = 0
 
-    async def chat(
-        self,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None = None,
-        model: str | None = None,
-        max_tokens: int | None = None,
-        temperature: float = 0.7,
-        reasoning_effort: str | None = None,
-        tool_choice: str | dict[str, Any] | None = None,
-        response_format: dict[str, str] | None = None,
-    ) -> LLMResponse:
-        del (
-            tools,
-            model,
-            max_tokens,
-            temperature,
-            reasoning_effort,
-            tool_choice,
-            response_format,
-        )
-        self.call_count += 1
-        response = self.responses.popleft()
-        if response.tool_calls and response.tool_calls[0].name == "complete_flow":
-            flow_result = next(
-                block
-                for message in reversed(messages)
-                if message.get("role") == "user" and isinstance(message.get("content"), list)
-                for block in message["content"]
-                if isinstance(block, dict)
-                and block.get("type") == "tool_result"
-                and block.get("tool_use_id") == "create-flow"
-            )
-            import json
+        async def function(messages: list[ModelMessage], _info: Any) -> ModelResponse:
+            self.call_count += 1
+            response = self.responses.popleft()
+            if response == "complete_flow":
+                flow_result = next(
+                    part
+                    for message in reversed(messages)
+                    if isinstance(message, ModelRequest)
+                    for part in message.parts
+                    if isinstance(part, ToolReturnPart)
+                    and part.tool_call_id == "create-flow"
+                )
+                import json
 
-            flow_id = json.loads(str(flow_result["content"]))["flow_id"]
-            response.tool_calls[0].arguments["flow_id"] = flow_id
-        return response
+                flow_id = json.loads(str(flow_result.content))["flow_id"]
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            "complete_flow",
+                            {
+                                "flow_id": flow_id,
+                                "outcome": FlowCompletion.PARTIAL.value,
+                                "summary": "stopped intentionally for the test",
+                                "idempotency_key": "complete-flow",
+                            },
+                            "complete-flow",
+                        )
+                    ]
+                )
+            assert isinstance(response, ModelResponse)
+            return response
+
+        super().__init__(function=function)
 
 
-class FinishTurnProvider(LLMProvider):
+class FinishTurnModel(FunctionModel):
     def __init__(self, final_content: str) -> None:
-        super().__init__()
         self.final_content = final_content
         self.call_count = 0
-        self.seen_messages: list[list[dict[str, Any]]] = []
+        self.seen_messages: list[list[ModelMessage]] = []
 
-    async def chat(
-        self,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None = None,
-        **kwargs: Any,
-    ) -> LLMResponse:
-        self.seen_messages.append(messages)
-        del tools, kwargs
-        self.call_count += 1
-        return LLMResponse(
-            content=None,
-            tool_calls=[
-                ToolCallRequest(
-                    id=f"finish-{self.call_count}",
-                    name="finish_turn",
-                    arguments={"final_content": self.final_content},
-                )
-            ],
-            finish_reason="tool_use",
-        )
+        async def function(messages: list[ModelMessage], _info: Any) -> ModelResponse:
+            self.seen_messages.append(messages)
+            self.call_count += 1
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "finish_turn",
+                        {"final_content": self.final_content},
+                        f"finish-{self.call_count}",
+                    )
+                ]
+            )
+
+        super().__init__(function=function)
 
 
-class FailIfCalledProvider(LLMProvider):
+class FailIfCalledModel(FunctionModel):
     def __init__(self) -> None:
-        super().__init__()
         self.call_count = 0
 
-    async def chat(
-        self,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None = None,
-        **kwargs: Any,
-    ) -> LLMResponse:
-        del messages, tools, kwargs
-        self.call_count += 1
-        raise AssertionError("a durable committed turn must not rerun the model")
+        async def function(_messages: list[ModelMessage], _info: Any) -> ModelResponse:
+            self.call_count += 1
+            raise AssertionError("a durable committed turn must not rerun the model")
+
+        super().__init__(function=function)
 
 
 class TurnProgress:
@@ -1498,14 +1622,14 @@ async def test_open_flow_rejects_premature_master_text(tmp_path: Path) -> None:
             skills=SkillsConfig(enabled=False, external=False, claude_code=False),
         ).normalized()
     )
-    provider = MasterScriptProvider()
-    app.provider = provider
+    model = MasterScriptModel()
+    app.model = model
 
     result = await app.run_turn("Use a Flow for this work", session_id="master")
 
     assert result.final_content == "Honest partial result."
-    assert provider.call_count == 4
-    assert "COMPLETION GATE" in str(result.messages)
+    assert model.call_count == 4
+    assert "finish_turn" in str(result.messages)
     flows = app.flow_control.list_flows("master", include_terminal=True)
     assert flows[0]["status"] == FlowStatus.PARTIAL.value
 
@@ -1527,8 +1651,8 @@ async def test_lease_takeover_fences_stalled_terminal_response_and_final_event(
     ).normalized()
     old = AeloonCoreOrchestrator(config)
     successor = AeloonCoreOrchestrator(config)
-    old.provider = FinishTurnProvider("stale terminal")
-    successor.provider = FinishTurnProvider("successor terminal")
+    old.model = FinishTurnModel("stale terminal")
+    successor.model = FinishTurnModel("successor terminal")
 
     old_events: list[str] = []
     successor_events: list[str] = []
@@ -1601,7 +1725,7 @@ async def test_committed_turn_recovers_after_crash_without_rerunning_model(
         skills=SkillsConfig(enabled=False, external=False, claude_code=False),
     ).normalized()
     crashed = AeloonCoreOrchestrator(config)
-    crashed.provider = FinishTurnProvider("durable terminal")
+    crashed.model = FinishTurnModel("durable terminal")
     first_progress = TurnProgress("stable-turn")
 
     async def crash_after_commit(
@@ -1627,7 +1751,7 @@ async def test_committed_turn_recovers_after_crash_without_rerunning_model(
     assert first_progress.finals == []
 
     recovered = AeloonCoreOrchestrator(config)
-    recovered.provider = FailIfCalledProvider()
+    recovered.model = FailIfCalledModel()
     second_progress = TurnProgress("stable-turn")
     result = await recovered.run_turn(
         "same prompt",
@@ -1636,7 +1760,7 @@ async def test_committed_turn_recovers_after_crash_without_rerunning_model(
     )
 
     assert result.final_content == "durable terminal"
-    assert recovered.provider.call_count == 0
+    assert recovered.model.call_count == 0
     assert second_progress.finals == ["durable terminal"]
     assert len(recovered.sessions.history("master")) == 1
     assert recovered.flow_store.get_turn_commit("master", "stable-turn").persisted_at is not None
@@ -1667,7 +1791,7 @@ async def test_conversation_fork_resumes_from_event_head_without_copying_jsonl(
         skills=SkillsConfig(enabled=False, external=False, claude_code=False),
     ).normalized()
     app = AeloonCoreOrchestrator(config)
-    app.provider = FinishTurnProvider("source answer")
+    app.model = FinishTurnModel("source answer")
 
     await app.run_turn(
         "source request",
@@ -1677,12 +1801,10 @@ async def test_conversation_fork_resumes_from_event_head_without_copying_jsonl(
     source_head = app.flow_store.get_session_head("source")
     assert source_head is not None
 
-    app.sessions.append_turn(
-        session_id="legacy-target",
-        user_prompt="legacy request",
-        final_content="legacy answer",
-        tools_used=[],
-        messages=[{"role": "assistant", "content": "legacy answer"}],
+    legacy_target = app.sessions.session_path("legacy-target")
+    legacy_target.write_text(
+        '{"type":"turn","session_id":"legacy-target","user_prompt":"legacy request"}\n',
+        encoding="utf-8",
     )
     with pytest.raises(ValueError, match="not a pristine Master session"):
         app._fork_conversation_only_session("source", "legacy-target")
@@ -1692,8 +1814,8 @@ async def test_conversation_fork_resumes_from_event_head_without_copying_jsonl(
 
     assert fork_head.head_event_id == source_head.head_event_id
     assert app.sessions.history("fork") == []
-    fork_provider = FinishTurnProvider("fork answer")
-    app.provider = fork_provider
+    fork_model = FinishTurnModel("fork answer")
+    app.model = fork_model
     result = await app.run_turn(
         "fork request",
         session_id="fork",
@@ -1701,9 +1823,9 @@ async def test_conversation_fork_resumes_from_event_head_without_copying_jsonl(
     )
 
     assert result.final_content == "fork answer"
-    assert len(fork_provider.seen_messages) == 1
-    assert "source request" in str(fork_provider.seen_messages[0])
-    assert "source answer" in str(fork_provider.seen_messages[0])
+    assert len(fork_model.seen_messages) == 1
+    assert "source request" in str(fork_model.seen_messages[0])
+    assert "source answer" in str(fork_model.seen_messages[0])
     assert [event.turn_id for event in app.flow_store.session_event_ancestry("fork")] == [
         "source-turn",
         "fork-turn",
@@ -1728,8 +1850,8 @@ async def test_concurrent_duplicate_turn_id_cannot_join_live_lease(
     ).normalized()
     first = AeloonCoreOrchestrator(config)
     duplicate = AeloonCoreOrchestrator(config)
-    first.provider = FinishTurnProvider("first terminal")
-    duplicate.provider = FinishTurnProvider("duplicate terminal")
+    first.model = FinishTurnModel("first terminal")
+    duplicate.model = FinishTurnModel("duplicate terminal")
     entered = asyncio.Event()
     release = asyncio.Event()
     commit = first._commit_turn_result
@@ -1759,7 +1881,7 @@ async def test_concurrent_duplicate_turn_id_cannot_join_live_lease(
     release.set()
     result = await first_task
     assert result.final_content == "first terminal"
-    assert duplicate.provider.call_count == 0
+    assert duplicate.model.call_count == 0
 
 
 def test_session_projection_repairs_partial_tail_before_marking_turn_durable(
@@ -1769,13 +1891,14 @@ def test_session_projection_repairs_partial_tail_before_marking_turn_durable(
     path = store.session_path("master")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b'{"type":"turn","turn_id":"crash')
+    messages = message_checkpoint("answer")["messages"]
 
     created = store.append_turn_once(
         session_id="master",
         user_prompt="prompt",
         final_content="answer",
         tools_used=["finish_turn"],
-        messages=[{"role": "assistant", "content": "answer"}],
+        messages=messages,
         blocks=[{"type": "text", "content": "answer"}],
         usage={"total_tokens": 1},
         turn_id="turn-one",
@@ -1785,7 +1908,7 @@ def test_session_projection_repairs_partial_tail_before_marking_turn_durable(
         user_prompt="prompt",
         final_content="answer",
         tools_used=["finish_turn"],
-        messages=[{"role": "assistant", "content": "answer"}],
+        messages=messages,
         blocks=[{"type": "text", "content": "answer"}],
         usage={"total_tokens": 1},
         turn_id="turn-one",

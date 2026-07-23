@@ -10,9 +10,11 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 
-from aeloon_core.loop_guard import tool_result_failed
-from aeloon_core.providers.base import ToolCallRequest
-from aeloon_core.task_graph import TaskNode
+from aeloon_core.runtime_events import (
+    ToolCallView,
+    ToolExecutionRecord,
+    tool_result_failed,
+)
 from aeloon_core.transitions import accumulate_usage
 
 Emit = Callable[[str, dict[str, Any]], Awaitable[None]]
@@ -189,9 +191,9 @@ class TurnEventProgress:
         """Record non-domain provider usage and publish the turn aggregate."""
 
         normalized_node_kind = {
-            "context_processing": "guard",
+            "context_processing": "runtime",
             "domain": "model",
-            "harness": "guard",
+            "harness": "runtime",
         }.get(node_kind, node_kind)
         resolved_component = component or (
             "context_view"
@@ -217,21 +219,6 @@ class TurnEventProgress:
                 component=resolved_component,
                 ts=_now(),
             ),
-        )
-
-    async def on_guard_resolution(self, resolution: Any) -> None:
-        """Account for and publish one bounded Guard control decision."""
-        usage = getattr(resolution, "usage", {})
-        if isinstance(usage, dict) and usage:
-            await self.on_usage(
-                usage,
-                node_kind="guard",
-                component="guard",
-            )
-        record = resolution.to_record()
-        await self.emit(
-            "chat.guard.decision",
-            self._payload(ts=_now(), **record),
         )
 
     async def on_worker_lifecycle(
@@ -369,33 +356,9 @@ class TurnEventProgress:
             ),
         )
 
-    async def on_worker_guard_resolution(
-        self,
-        *,
-        worker_id: str,
-        run_id: str,
-        worker_type_id: str,
-        label: str,
-        resolution: Any,
-        run_sequence: int = 1,
-    ) -> None:
-        record = resolution.to_record()
-        await self.emit(
-            "chat.worker.guard",
-            self._payload(
-                worker_id=worker_id,
-                run_id=run_id,
-                run_sequence=max(1, int(run_sequence)),
-                worker_type_id=worker_type_id,
-                label=label,
-                **record,
-                ts=_now(),
-            ),
-        )
-
     async def on_tool_calls(
         self,
-        tool_calls: list[ToolCallRequest],
+        tool_calls: list[ToolCallView],
         *,
         record_reasoning: bool = True,
     ) -> None:
@@ -439,7 +402,7 @@ class TurnEventProgress:
 
     async def on_tool_result(
         self,
-        node: TaskNode,
+        node: ToolExecutionRecord,
         *,
         record_reasoning: bool = True,
     ) -> None:
@@ -532,8 +495,20 @@ class TurnEventProgress:
         block = None
         if self._text_block_id:
             block = self._find_block(self._text_block_id)
-        if block is None or not str(block.get("content") or "").strip():
+        current_content = str((block or {}).get("content") or "")
+        if block is None or not current_content.strip():
             block = await self._ensure_text_block()
+            block["content"] = content
+            await self.emit(
+                "chat.block.update",
+                self._payload(block_id=block["id"], patch={"content": content}, ts=_now()),
+            )
+        elif current_content.strip() != content.strip():
+            # Streaming text may be process narration from an earlier Master model
+            # round. Preserve it, but project finish_turn(final_content) as a distinct
+            # canonical answer block for both the live UI and persisted session record.
+            block = await self._ensure_block(None, "text")
+            self._text_block_id = block["id"]
             block["content"] = content
             await self.emit(
                 "chat.block.update",
@@ -686,7 +661,7 @@ class TurnEventProgress:
         accumulate_usage(component_bucket, usage)
 
 
-def _tool_call_detail(tool_call: ToolCallRequest) -> dict[str, Any]:
+def _tool_call_detail(tool_call: ToolCallView) -> dict[str, Any]:
     return {
         "id": tool_call.id,
         "name": tool_call.name,
@@ -708,7 +683,7 @@ def _safe_worker_activity_text(value: Any, *, limit: int = 100) -> str:
     return " ".join(text.split())[:limit]
 
 
-def _task_node_detail(node: TaskNode) -> dict[str, Any]:
+def _task_node_detail(node: ToolExecutionRecord) -> dict[str, Any]:
     return {
         "index": node.index,
         "call_id": node.call_id,

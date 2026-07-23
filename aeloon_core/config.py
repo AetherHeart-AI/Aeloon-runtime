@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -24,10 +24,21 @@ class AnthropicProviderConfig(BaseModel):
     prompt_caching: bool = True
 
 
+class VolcengineProviderConfig(BaseModel):
+    """Volcano Engine Ark Agent Plan settings for the OpenAI Responses API."""
+
+    api_key: str = "no-key"
+    base_url: str = "https://ark.cn-beijing.volces.com/api/plan/v3"
+    extra_headers: dict[str, str] = Field(default_factory=dict)
+    proxy: str | None = None
+
+
 class ProvidersConfig(BaseModel):
     """Provider namespace."""
 
+    active: Literal["anthropic", "volcengine"] = "anthropic"
     anthropic: AnthropicProviderConfig = Field(default_factory=AnthropicProviderConfig)
+    volcengine: VolcengineProviderConfig = Field(default_factory=VolcengineProviderConfig)
 
 
 class ContextCompactionConfig(BaseModel):
@@ -40,16 +51,12 @@ class ContextCompactionConfig(BaseModel):
     summary_max_tokens: int = Field(default=4096, ge=256)
 
 
-class UASMConfig(BaseModel):
-    """Unified Agentic State Machine policy settings."""
+class AgentRuntimePolicy(BaseModel):
+    """Host policy layered around the PydanticAI execution loop."""
 
     transition_trace_enabled: bool = True
     stuck_detection_enabled: bool = True
     stuck_detection_threshold: int = Field(default=4, ge=3, le=20)
-    # Soft-feed tool errors back to the model this many consecutive rounds before Guard.
-    tool_error_guard_threshold: int = Field(default=3, ge=1)
-    # Grant this many automatic budget extensions before involving Guard.
-    budget_auto_continues: int = Field(default=2, ge=0)
 
 
 class AgentDefaultsConfig(BaseModel):
@@ -66,7 +73,7 @@ class AgentDefaultsConfig(BaseModel):
     context_compaction: ContextCompactionConfig = Field(
         default_factory=ContextCompactionConfig
     )
-    uasm: UASMConfig = Field(default_factory=UASMConfig)
+    runtime: AgentRuntimePolicy = Field(default_factory=AgentRuntimePolicy)
 
 
 class AgentsConfig(BaseModel):
@@ -150,19 +157,44 @@ def load_config(path: Path | str | None = None) -> Config:
     if config_path.exists():
         data = json.loads(config_path.read_text(encoding="utf-8"))
         _drop_removed_v1_settings(data)
+        _migrate_agent_runtime_settings(data)
         _migrate_provider_settings(data)
 
     config = Config.model_validate(data)
     updates: dict[str, Any] = {}
 
-    if api_key := os.environ.get("ANTHROPIC_API_KEY"):
-        updates.setdefault("providers", {}).setdefault("anthropic", {})["api_key"] = api_key
-    if base_url := os.environ.get("ANTHROPIC_BASE_URL"):
-        updates.setdefault("providers", {}).setdefault("anthropic", {})[
-            "base_url"
-        ] = base_url
-    if model := os.environ.get("ANTHROPIC_MODEL"):
-        updates.setdefault("agents", {}).setdefault("defaults", {})["model"] = model
+    active_provider = os.environ.get("AELOON_CORE_PROVIDER", config.providers.active)
+    if active_provider not in {"anthropic", "volcengine"}:
+        raise ValueError(
+            "AELOON_CORE_PROVIDER must be 'anthropic' or 'volcengine', "
+            f"got {active_provider!r}"
+        )
+    updates.setdefault("providers", {})["active"] = active_provider
+
+    if active_provider == "volcengine":
+        if api_key := os.environ.get("ARK_API_KEY"):
+            updates.setdefault("providers", {}).setdefault("volcengine", {})[
+                "api_key"
+            ] = api_key
+        if base_url := os.environ.get("ARK_BASE_URL"):
+            updates.setdefault("providers", {}).setdefault("volcengine", {})[
+                "base_url"
+            ] = base_url
+        if model := os.environ.get("ARK_MODEL"):
+            updates.setdefault("agents", {}).setdefault("defaults", {})["model"] = model
+    else:
+        if api_key := os.environ.get("ANTHROPIC_API_KEY"):
+            updates.setdefault("providers", {}).setdefault("anthropic", {})[
+                "api_key"
+            ] = api_key
+        if base_url := os.environ.get("ANTHROPIC_BASE_URL"):
+            updates.setdefault("providers", {}).setdefault("anthropic", {})[
+                "base_url"
+            ] = base_url
+        if model := os.environ.get("ANTHROPIC_MODEL"):
+            updates.setdefault("agents", {}).setdefault("defaults", {})[
+                "model"
+            ] = model
     max_context_tokens = os.environ.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS")
     auto_compact_window = os.environ.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
     parsed_max_context = (
@@ -278,6 +310,29 @@ def _migrate_provider_settings(data: Any) -> None:
     if "api_base" in migrated and "base_url" not in migrated:
         migrated["base_url"] = migrated.pop("api_base")
     providers["anthropic"] = migrated
+
+
+def _migrate_agent_runtime_settings(data: Any) -> None:
+    """Move safe legacy policy fields and discard removed reviewer behavior."""
+
+    if not isinstance(data, dict):
+        return
+    agents = data.get("agents")
+    defaults = agents.get("defaults") if isinstance(agents, dict) else None
+    if not isinstance(defaults, dict):
+        return
+    legacy = defaults.pop("uasm", None)
+    if not isinstance(legacy, dict) or "runtime" in defaults:
+        return
+    defaults["runtime"] = {
+        key: legacy[key]
+        for key in (
+            "transition_trace_enabled",
+            "stuck_detection_enabled",
+            "stuck_detection_threshold",
+        )
+        if key in legacy
+    }
 
 
 def _deep_update(target: dict[str, Any], updates: dict[str, Any]) -> None:

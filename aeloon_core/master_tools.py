@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from aeloon_core.tools.base import FunctionTool
 from aeloon_core.tools.registry import ToolRegistry
 from aeloon_core.worker_control import WorkerControlService
+from aeloon_core.worker_sessions import BudgetIncrease
 
 if TYPE_CHECKING:
     from aeloon_core.flow_control import FlowControlService
@@ -43,12 +44,14 @@ class _ReuseArgs(_Args):
     worker_id: str = Field(min_length=1)
     objective: str = Field(min_length=1)
     idempotency_key: str = Field(min_length=1)
+    budget_increase: BudgetIncrease | None = None
 
 
 class _ResumeArgs(_Args):
     run_id: str = Field(min_length=1)
     response: str = Field(min_length=1)
     idempotency_key: str = Field(min_length=1)
+    budget_increase: BudgetIncrease | None = None
 
 
 class _AwaitArgs(_Args):
@@ -100,6 +103,7 @@ def build_master_scheduler_tools(
         worker_id: str,
         objective: str,
         idempotency_key: str,
+        budget_increase: dict[str, Any] | None = None,
     ) -> str:
         return _json(
             await control.reuse_worker(
@@ -109,6 +113,11 @@ def build_master_scheduler_tools(
                 idempotency_key=idempotency_key,
                 base_turn_id=base_turn_id,
                 progress=on_progress,
+                budget_increase=(
+                    BudgetIncrease.model_validate(budget_increase)
+                    if budget_increase is not None
+                    else None
+                ),
             )
         )
 
@@ -127,6 +136,7 @@ def build_master_scheduler_tools(
         run_id: str,
         response: str,
         idempotency_key: str,
+        budget_increase: dict[str, Any] | None = None,
     ) -> str:
         return _json(
             await control.resume_worker(
@@ -136,6 +146,11 @@ def build_master_scheduler_tools(
                 base_session_id=base_session_id,
                 base_turn_id=base_turn_id,
                 progress=on_progress,
+                budget_increase=(
+                    BudgetIncrease.model_validate(budget_increase)
+                    if budget_increase is not None
+                    else None
+                ),
             )
         )
 
@@ -180,7 +195,8 @@ def build_master_scheduler_tools(
         ),
         (
             "reuse_worker",
-            "Explicitly reuse an idle related WorkerSession for a new objective.",
+            "Explicitly reuse an idle related WorkerSession for a new objective. A "
+            "partial source requires budget_increase with one or more higher target limits.",
             _ReuseArgs,
             reuse_worker,
             "mutating",
@@ -195,7 +211,7 @@ def build_master_scheduler_tools(
         (
             "resume_worker",
             "Answer a waiting low-level Worker that is not Flow-owned. Use "
-            "resume_flow_node for a Flow node.",
+            "resume_flow_node for a Flow node. budget_increase may raise its next grant.",
             _ResumeArgs,
             resume_worker,
             "mutating",

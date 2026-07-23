@@ -88,7 +88,6 @@ class WorkerUiEventKind(StrEnum):
     LIFECYCLE = "lifecycle"
     PHASE = "phase"
     TOOL = "tool"
-    GUARD = "guard"
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,21 +266,6 @@ class WorkerUiJournal:
                 kind=WorkerUiEventKind.TOOL,
                 payload=payload,
                 priority=0 if payload["signal"] == "low" else 2,
-            )
-        )
-
-    def record_guard(self, *, run_id: str, resolution: Any) -> None:
-        record = resolution.to_record()
-        event = _safe_identifier(record.get("event")) or "runtime_error"
-        action = _safe_identifier(record.get("action")) or "finalize"
-        source = _safe_identifier(record.get("source")) or "guard"
-        # Deliberately omit evidence, usage, causes, and model-authored text.
-        self._enqueue(
-            _BufferedJournalRecord(
-                run_id=run_id,
-                kind=WorkerUiEventKind.GUARD,
-                payload={"event": event, "action": action, "source": source},
-                priority=2,
             )
         )
 

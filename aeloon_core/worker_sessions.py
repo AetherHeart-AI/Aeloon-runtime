@@ -5,7 +5,6 @@ from __future__ import annotations
 import fcntl
 import json
 import os
-import shutil
 import sqlite3
 import uuid
 import weakref
@@ -17,11 +16,16 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 from aeloon_core.flow_activation_fence import (
     flow_activation_fence,
     flow_id_from_turn_id,
+)
+from aeloon_core.message_history import (
+    MESSAGE_FORMAT,
+    MESSAGE_SCHEMA_VERSION,
+    LegacySessionError,
 )
 from aeloon_core.workers import WorkerSnapshot
 
@@ -94,18 +98,96 @@ class PermissionSnapshot(_FrozenModel):
     skills_enabled: bool = True
 
 
+RelatedContextSection = Literal[
+    "objective",
+    "summary",
+    "artifacts",
+    "evidence",
+    "unresolved",
+]
+
+
+class RelatedWorkerContext(_FrozenModel):
+    """Bounded reference material from an explicitly associated WorkerRun."""
+
+    source_kind: Literal["worker_run", "flow_node"]
+    source_id: str = Field(min_length=1, max_length=128)
+    relation: str = Field(min_length=1, max_length=128)
+    run_id: str = Field(min_length=1, max_length=128)
+    worker_id: str = Field(min_length=1, max_length=128)
+    worker_type_id: str = Field(min_length=1, max_length=128)
+    status: str = Field(min_length=1, max_length=64)
+    included_sections: tuple[RelatedContextSection, ...] = ()
+    objective: str | None = Field(default=None, max_length=2_000)
+    summary: str | None = Field(default=None, max_length=4_000)
+    artifacts: tuple[ReportItem, ...] = Field(default=(), max_length=8)
+    evidence: tuple[ReportItem, ...] = Field(default=(), max_length=8)
+    unresolved: tuple[ReportItem, ...] = Field(default=(), max_length=4)
+
+
 class BudgetGrant(_FrozenModel):
     # Cumulative Run limits are optional. They are deliberately separate from
     # the model's per-request context window.
+    max_requests: int = Field(default=25, ge=1)
+    max_output_tokens: int | None = Field(default=None, ge=1)
     max_tokens: int | None = Field(default=None, ge=1)
     max_seconds: int = Field(default=3_600, ge=1)
     max_tool_calls: int | None = Field(default=None, ge=1)
+
+
+class BudgetIncrease(_FrozenModel):
+    """Master-authored target limits for an exact checkpoint continuation."""
+
+    max_requests: int | None = Field(default=None, ge=1)
+    max_output_tokens: int | None = Field(default=None, ge=1)
+    max_tokens: int | None = Field(default=None, ge=1)
+    max_seconds: int | None = Field(default=None, ge=1)
+    max_tool_calls: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def _contains_target(self) -> BudgetIncrease:
+        if all(value is None for value in self.model_dump().values()):
+            raise ValueError("a budget increase requires at least one target limit")
+        return self
+
+    def apply(self, current: BudgetGrant) -> BudgetGrant:
+        """Return a strictly larger grant without silently reducing another limit."""
+
+        updates: dict[str, int] = {}
+        for field_name, target in self.model_dump().items():
+            if target is None:
+                continue
+            existing = getattr(current, field_name)
+            if existing is None:
+                if field_name == "max_output_tokens":
+                    updates[field_name] = target
+                    continue
+                raise ValueError(f"{field_name} is already unlimited and cannot be increased")
+            if target <= existing:
+                raise ValueError(
+                    f"{field_name} must increase from {existing}; requested {target}"
+                )
+            updates[field_name] = target
+        return current.model_copy(update=updates)
 
 
 class ContextEnvelope(_FrozenModel):
     objective: str = Field(min_length=1, max_length=64_000)
     permissions: PermissionSnapshot
     budget: BudgetGrant
+    related_contexts: tuple[RelatedWorkerContext, ...] = Field(default=(), max_length=4)
+
+    @model_validator(mode="after")
+    def _related_context_is_bounded(self) -> ContextEnvelope:
+        encoded = json.dumps(
+            [item.model_dump(mode="json") for item in self.related_contexts],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if len(encoded) > 64_000:
+            raise ValueError("related Worker context exceeds 64000 characters")
+        return self
 
 
 class WorkerReport(_FrozenModel):
@@ -266,8 +348,7 @@ class WorkerStore:
                     f"worker store schema v{version} is newer than supported v{SCHEMA_VERSION}"
                 )
             if version < 2:
-                self._drop_legacy_schema(connection)
-                self._delete_legacy_transcripts()
+                self._archive_legacy_schema(connection)
                 self._create_schema(connection)
                 connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             elif version in {2, 3, 4}:
@@ -296,21 +377,34 @@ class WorkerStore:
             )
 
     @staticmethod
-    def _drop_legacy_schema(connection: sqlite3.Connection) -> None:
-        """Destructively remove v1 Worker data in dependency order."""
+    def _archive_legacy_schema(connection: sqlite3.Connection) -> None:
+        """Move v1 tables aside intact before creating the current authority tables."""
 
-        connection.execute("DROP TABLE IF EXISTS worker_ui_events")
-        connection.execute("DROP TABLE IF EXISTS worker_ui_state")
-        connection.execute("DROP TABLE IF EXISTS worker_checkpoints")
-        connection.execute("DROP TABLE IF EXISTS worker_runs")
-        connection.execute("DROP TABLE IF EXISTS worker_sessions")
-
-    def _delete_legacy_transcripts(self) -> None:
-        path = self.data_dir / "worker-sessions"
-        if path.is_symlink() or path.is_file():
-            path.unlink()
-        elif path.exists():
-            shutil.rmtree(path)
+        for table in (
+            "worker_ui_events",
+            "worker_ui_state",
+            "worker_checkpoints",
+            "worker_runs",
+            "worker_sessions",
+        ):
+            exists = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table,),
+            ).fetchone()
+            if exists is None:
+                continue
+            archived = f"legacy_v1_{table}"
+            archived_exists = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (archived,),
+            ).fetchone()
+            if archived_exists is not None:
+                raise RuntimeError(f"cannot archive legacy table: {archived} already exists")
+            connection.execute(f"ALTER TABLE {table} RENAME TO {archived}")
+            for index in connection.execute(f"PRAGMA index_list({archived})").fetchall():
+                name = str(index["name"])
+                if not name.startswith("sqlite_autoindex"):
+                    connection.execute(f'DROP INDEX "{name}"')
 
     @staticmethod
     def _create_schema(connection: sqlite3.Connection) -> None:
@@ -709,11 +803,12 @@ class WorkerStore:
                 if latest.status is not WorkerRunStatus.WAITING_FOR_CONTEXT:
                     raise ValueError("resume_worker requires the latest waiting_for_context Run")
                 checkpoint = connection.execute(
-                    "SELECT 1 FROM worker_checkpoints WHERE run_id = ?",
+                    "SELECT checkpoint_json FROM worker_checkpoints WHERE run_id = ?",
                     (source_run_id,),
                 ).fetchone()
                 if checkpoint is None:
                     raise ValueError("the waiting WorkerRun has no resumable checkpoint")
+                _require_current_checkpoint(checkpoint, source_run_id)
                 source_id = source_run_id
             elif exact_reuse_source:
                 if latest.run_id != source_run_id:
@@ -741,7 +836,7 @@ class WorkerStore:
                 ):
                     raise ValueError("a WorkerRun with unknown outcome cannot be reused")
                 checkpoint = connection.execute(
-                    "SELECT 1 FROM worker_checkpoints WHERE run_id = ?",
+                    "SELECT checkpoint_json FROM worker_checkpoints WHERE run_id = ?",
                     (latest.run_id,),
                 ).fetchone()
                 if (
@@ -750,6 +845,8 @@ class WorkerStore:
                     and checkpoint is None
                 ):
                     raise ValueError("the source WorkerRun has no reusable checkpoint")
+                if checkpoint is not None:
+                    _require_current_checkpoint(checkpoint, latest.run_id)
                 source_id = latest.run_id
             else:
                 if latest.status not in {
@@ -758,11 +855,12 @@ class WorkerStore:
                 }:
                     raise ValueError("reuse_worker requires the latest completed or partial Run")
                 checkpoint = connection.execute(
-                    "SELECT 1 FROM worker_checkpoints WHERE run_id = ?",
+                    "SELECT checkpoint_json FROM worker_checkpoints WHERE run_id = ?",
                     (latest.run_id,),
                 ).fetchone()
                 if checkpoint is None:
                     raise ValueError("the latest WorkerRun has no reusable checkpoint")
+                _require_current_checkpoint(checkpoint, latest.run_id)
                 source_id = latest.run_id
 
             run_sequence = latest.run_sequence + 1
@@ -1628,6 +1726,20 @@ def _dump(value: BaseModel | None) -> str | None:
     return value.model_dump_json() if value is not None else None
 
 
+def _require_current_checkpoint(row: sqlite3.Row, run_id: str) -> dict[str, Any]:
+    payload = json.loads(str(row["checkpoint_json"]))
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != MESSAGE_SCHEMA_VERSION
+        or payload.get("message_format") != MESSAGE_FORMAT
+    ):
+        raise LegacySessionError(
+            f"Worker checkpoint {run_id!r} uses the legacy message format; "
+            "create a new WorkerSession. Existing data was not modified."
+        )
+    return payload
+
+
 def _normalized_context(context: ContextEnvelope) -> str:
     return json.dumps(
         context.model_dump(mode="json"),
@@ -1655,10 +1767,13 @@ def _valid_owner_token(token: str) -> bool:
 
 
 __all__ = [
+    "BudgetIncrease",
     "BudgetGrant",
     "ContextEnvelope",
     "IdempotencyConflictError",
     "PermissionSnapshot",
+    "RelatedContextSection",
+    "RelatedWorkerContext",
     "ResultEnvelope",
     "SCHEMA_VERSION",
     "WaitingRequest",

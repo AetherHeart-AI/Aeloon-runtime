@@ -26,8 +26,7 @@ CHAT_ONLY_OPTIONS = {
 CONFIG_SETTERS = {
     "workspace": ("workspace",),
     "data-dir": ("data_dir",),
-    "api-key": ("providers", "anthropic", "api_key"),
-    "base-url": ("providers", "anthropic", "base_url"),
+    "provider": ("providers", "active"),
     "prompt-caching": ("providers", "anthropic", "prompt_caching"),
     "model": ("agents", "defaults", "model"),
     "reasoning-effort": ("agents", "defaults", "reasoning_effort"),
@@ -57,22 +56,22 @@ CONFIG_SETTERS = {
         "context_compaction",
         "summary_max_tokens",
     ),
-    "uasm-transition-trace-enabled": (
+    "runtime-transition-trace-enabled": (
         "agents",
         "defaults",
-        "uasm",
+        "runtime",
         "transition_trace_enabled",
     ),
-    "uasm-stuck-detection-enabled": (
+    "runtime-stuck-detection-enabled": (
         "agents",
         "defaults",
-        "uasm",
+        "runtime",
         "stuck_detection_enabled",
     ),
-    "uasm-stuck-detection-threshold": (
+    "runtime-stuck-detection-threshold": (
         "agents",
         "defaults",
-        "uasm",
+        "runtime",
         "stuck_detection_threshold",
     ),
     "skills-enabled": ("skills", "enabled"),
@@ -80,6 +79,11 @@ CONFIG_SETTERS = {
     "skills-claude-code": ("skills", "claude_code"),
     "skills-paths": ("skills", "paths"),
 }
+DYNAMIC_PROVIDER_SETTERS = {
+    "api-key": "api_key",
+    "base-url": "base_url",
+}
+CONFIG_KEYS = {*CONFIG_SETTERS, *DYNAMIC_PROVIDER_SETTERS}
 SECRET_KEYS = {"api_key"}
 
 
@@ -131,7 +135,7 @@ def build_parser() -> argparse.ArgumentParser:
     config_set_parser.add_argument(
         "--config", type=Path, default=None, help="Optional config JSON path."
     )
-    config_set_parser.add_argument("key", choices=sorted(CONFIG_SETTERS))
+    config_set_parser.add_argument("key", choices=sorted(CONFIG_KEYS))
     config_set_parser.add_argument("value")
 
     runner_parser = subparsers.add_parser("runner", help="Run queued Worker sessions.")
@@ -199,8 +203,14 @@ def _add_chat_args(parser: argparse.ArgumentParser) -> None:
 
 def _add_config_write_args(parser: argparse.ArgumentParser) -> None:
     _add_path_args(parser)
-    parser.add_argument("--api-key", default=None, help="Anthropic API key.")
-    parser.add_argument("--base-url", default=None, help="Anthropic API base URL.")
+    parser.add_argument(
+        "--provider",
+        choices=("anthropic", "volcengine"),
+        default=None,
+        help="Model provider.",
+    )
+    parser.add_argument("--api-key", default=None, help="Active provider API key.")
+    parser.add_argument("--base-url", default=None, help="Active provider API base URL.")
     parser.add_argument("--model", default=None, help="Default model.")
 
 
@@ -254,17 +264,20 @@ async def _run_prompt(args: argparse.Namespace) -> None:
         data_dir=getattr(args, "data_dir", None),
     )
     orchestrator = AeloonCoreOrchestrator(config)
-    prompt = " ".join(args.prompt)
-    session_id = args.session or orchestrator.sessions.new_session()
-    progress = TurnEventProgress(session_id=session_id, emit=_PlainTextProgressSink().emit)
-    result = await orchestrator.run_turn(
-        prompt,
-        session_id=session_id,
-        on_progress=progress,
-    )
-    print(f"\n[session] {result.session_id}")
-    if result.tools_used:
-        print(f"[tools used] {', '.join(result.tools_used)}")
+    try:
+        prompt = " ".join(args.prompt)
+        session_id = args.session or orchestrator.sessions.new_session()
+        progress = TurnEventProgress(session_id=session_id, emit=_PlainTextProgressSink().emit)
+        result = await orchestrator.run_turn(
+            prompt,
+            session_id=session_id,
+            on_progress=progress,
+        )
+        print(f"\n[session] {result.session_id}")
+        if result.tools_used:
+            print(f"[tools used] {', '.join(result.tools_used)}")
+    finally:
+        await orchestrator.close()
 
 
 async def _run_chat(args: argparse.Namespace) -> None:
@@ -308,7 +321,9 @@ def _run_config(args: argparse.Namespace) -> None:
         config = load_config(args.config)
         data = config.model_dump(mode="json")
         _set_nested_value(
-            data, CONFIG_SETTERS[args.key], _coerce_config_value(args.key, args.value)
+            data,
+            _config_setter_path(data, args.key),
+            _coerce_config_value(args.key, args.value),
         )
         written = save_config(Config.model_validate(data), args.config)
         print(f"Updated {args.key} in {written}")
@@ -337,6 +352,9 @@ def _load_with_path_overrides(
 
 def _config_with_write_args(config: Config, args: argparse.Namespace) -> Config:
     # Map each --init flag to the same nested config path the `set` command uses.
+    data = config.model_dump(mode="json")
+    if args.provider is not None:
+        _set_nested_value(data, CONFIG_SETTERS["provider"], args.provider)
     write_arg_keys = {
         "workspace": "workspace",
         "data_dir": "data-dir",
@@ -344,13 +362,26 @@ def _config_with_write_args(config: Config, args: argparse.Namespace) -> Config:
         "base_url": "base-url",
         "model": "model",
     }
-    data = config.model_dump(mode="json")
     for attr, key in write_arg_keys.items():
         raw = getattr(args, attr, None)
         if raw is None:
             continue
-        _set_nested_value(data, CONFIG_SETTERS[key], _coerce_config_value(key, str(raw)))
+        _set_nested_value(
+            data,
+            _config_setter_path(data, key),
+            _coerce_config_value(key, str(raw)),
+        )
     return Config.model_validate(data)
+
+
+def _config_setter_path(data: dict[str, Any], key: str) -> tuple[str, ...]:
+    if field := DYNAMIC_PROVIDER_SETTERS.get(key):
+        providers = data.get("providers")
+        active = providers.get("active") if isinstance(providers, dict) else None
+        if active not in {"anthropic", "volcengine"}:
+            raise SystemExit(f"Unknown active provider: {active!r}")
+        return ("providers", active, field)
+    return CONFIG_SETTERS[key]
 
 
 def _config_dump(config: Config, *, show_secrets: bool) -> dict[str, Any]:
@@ -400,7 +431,7 @@ def _coerce_config_value(key: str, value: str) -> Any:
         "max-iterations",
         "context-compaction-preserve-recent-turns",
         "context-compaction-summary-max-tokens",
-        "uasm-stuck-detection-threshold",
+        "runtime-stuck-detection-threshold",
     }:
         return int(value)
     if key == "context-compaction-trigger-ratio":
@@ -410,8 +441,8 @@ def _coerce_config_value(key: str, value: str) -> Any:
         "skills-external",
         "skills-claude-code",
         "context-compaction-enabled",
-        "uasm-transition-trace-enabled",
-        "uasm-stuck-detection-enabled",
+        "runtime-transition-trace-enabled",
+        "runtime-stuck-detection-enabled",
         "prompt-caching",
     }:
         return _parse_bool(value)
@@ -496,13 +527,18 @@ def main(argv: list[str] | None = None) -> None:
             workspace=args.workspace,
             data_dir=args.data_dir,
         )
-        asyncio.run(
-            run_worker_runner(
-                AeloonCoreOrchestrator(config),
-                once=args.once,
-                poll_seconds=args.poll_seconds,
-            )
-        )
+        async def run() -> None:
+            orchestrator = AeloonCoreOrchestrator(config)
+            try:
+                await run_worker_runner(
+                    orchestrator,
+                    once=args.once,
+                    poll_seconds=args.poll_seconds,
+                )
+            finally:
+                await orchestrator.close()
+
+        asyncio.run(run())
         return
     raise SystemExit(f"Unknown command: {args.command}")
 

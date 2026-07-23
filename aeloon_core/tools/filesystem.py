@@ -94,35 +94,35 @@ class ReadTool(WorkspaceTool):
             return f"Error reading file: {exc}"
 
 
-# Host default per-call write/edit chunk size. Model metadata reports tokens,
-# while JSON Schema's maxLength and the runtime checks below count characters.
-# Use the same conservative token estimate used throughout the runtime before
-# applying the host ceiling.
-DEFAULT_MAX_ARGUMENT_CHARS = 32_000
+# Default per-call write/edit budget when model metadata is unavailable. Model
+# metadata reports tokens, while JSON Schema's maxLength and the runtime checks
+# below count characters. Keep a separate host ceiling so capable models are
+# not constrained by the fallback while tool arguments remain resource-bounded.
+DEFAULT_MAX_ARGUMENT_CHARS = 128_000
 ESTIMATED_OUTPUT_CHARS_PER_TOKEN = 4
-_MAX_ARGUMENT_CHARS = DEFAULT_MAX_ARGUMENT_CHARS  # backward-compatible alias
 _MAX_FILE_BYTES = 16 * 1024 * 1024
+HOST_MAX_ARGUMENT_CHARS = _MAX_FILE_BYTES
+_MAX_ARGUMENT_CHARS = DEFAULT_MAX_ARGUMENT_CHARS  # backward-compatible alias
 
 
 def resolve_max_argument_chars(model_max_output_tokens: int | None = None) -> int:
     """Return the effective per-call write/edit character budget.
 
-    Defaults to 32,000 characters and never exceeds that host ceiling. Model
-    output metadata is expressed in tokens, so convert it to an estimated
-    character capacity before comparing values with the same unit.
+    Defaults to 128,000 characters when metadata is unavailable. Otherwise,
+    convert the model's token ceiling to an estimated character capacity and
+    constrain it only by the independent host resource ceiling.
     """
 
-    default = DEFAULT_MAX_ARGUMENT_CHARS
     if model_max_output_tokens is None:
-        return default
+        return DEFAULT_MAX_ARGUMENT_CHARS
     try:
         model_limit = int(model_max_output_tokens)
     except (TypeError, ValueError):
-        return default
+        return DEFAULT_MAX_ARGUMENT_CHARS
     if model_limit <= 0:
-        return default
+        return DEFAULT_MAX_ARGUMENT_CHARS
     model_character_limit = model_limit * ESTIMATED_OUTPUT_CHARS_PER_TOKEN
-    return min(default, model_character_limit)
+    return min(HOST_MAX_ARGUMENT_CHARS, model_character_limit)
 
 
 def _render_value(value: Any) -> str:

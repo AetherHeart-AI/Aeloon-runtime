@@ -11,15 +11,16 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
 from aeloon_core import session_events
 from aeloon_core.session_events import SessionEvent, SessionHead
+from aeloon_core.worker_sessions import BudgetGrant, RelatedContextSection
 
 FLOW_SCHEMA_VERSION = 5
-FLOW_STATE_VERSION = 2
+FLOW_STATE_VERSION = 3
 DEFAULT_FLOW_TURN_LEASE_SECONDS = 60.0
 MAX_FLOW_GOAL_CHARS = 16_000
 MAX_FLOW_OBJECTIVE_CHARS = 32_000
@@ -131,6 +132,33 @@ class _StrictModel(BaseModel):
     )
 
 
+class FlowContextRef(_StrictModel):
+    """Master-authored reference to bounded context from related work."""
+
+    kind: Literal["worker_run", "flow_node"]
+    id: str = Field(min_length=1, max_length=128)
+    relation: str = Field(min_length=1, max_length=128)
+    include: tuple[RelatedContextSection, ...] = (
+        "objective",
+        "summary",
+        "artifacts",
+        "evidence",
+        "unresolved",
+    )
+
+    @field_validator("include")
+    @classmethod
+    def _sections_are_unique(
+        cls,
+        value: tuple[RelatedContextSection, ...],
+    ) -> tuple[RelatedContextSection, ...]:
+        if len(set(value)) != len(value):
+            raise ValueError("context reference include sections must be unique")
+        if not value:
+            raise ValueError("context reference include requires at least one section")
+        return value
+
+
 class FlowNodeSpec(_StrictModel):
     """Immutable semantic definition supplied by Master."""
 
@@ -140,12 +168,24 @@ class FlowNodeSpec(_StrictModel):
     depends_on: tuple[FlowNodeId, ...] = Field(default=(), max_length=64)
     dependency_policy: DependencyPolicy = DependencyPolicy.ALL_COMPLETED
     worker_session_policy: WorkerSessionPolicy = WorkerSessionPolicy.AUTO
+    context_refs: tuple[FlowContextRef, ...] = Field(default=(), max_length=4)
 
     @field_validator("depends_on")
     @classmethod
     def _dependencies_are_unique(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         if len(set(value)) != len(value):
             raise ValueError("depends_on must not contain duplicates")
+        return value
+
+    @field_validator("context_refs")
+    @classmethod
+    def _context_refs_are_unique(
+        cls,
+        value: tuple[FlowContextRef, ...],
+    ) -> tuple[FlowContextRef, ...]:
+        identities = [(item.kind, item.id, item.relation) for item in value]
+        if len(set(identities)) != len(identities):
+            raise ValueError("context_refs must not contain duplicates")
         return value
 
 
@@ -160,6 +200,7 @@ class FlowRunBinding(_StrictModel):
     requested_session_policy: WorkerSessionPolicy = WorkerSessionPolicy.AUTO
     session_action: WorkerSessionAction = WorkerSessionAction.NEW
     session_reason: str = Field(default="legacy_binding", min_length=1, max_length=1_000)
+    budget: BudgetGrant | None = None
     status: str = Field(min_length=1, max_length=64)
     created_at: str
 
@@ -173,6 +214,7 @@ class FlowNode(_StrictModel):
     depends_on: tuple[FlowNodeId, ...] = Field(default=(), max_length=64)
     dependency_policy: DependencyPolicy = DependencyPolicy.ALL_COMPLETED
     worker_session_policy: WorkerSessionPolicy = WorkerSessionPolicy.AUTO
+    context_refs: tuple[FlowContextRef, ...] = Field(default=(), max_length=4)
     status: FlowNodeStatus = FlowNodeStatus.PENDING
     generation: int = Field(default=1, ge=1)
     attempt: int = Field(default=0, ge=0)
@@ -180,6 +222,7 @@ class FlowNode(_StrictModel):
     input_generations: dict[str, int] = Field(default_factory=dict)
     reuse_source_run_id: str | None = Field(default=None, max_length=128)
     pending_fresh_reason: str | None = Field(default=None, max_length=1_000)
+    pending_budget: BudgetGrant | None = None
     worker_id: str | None = Field(default=None, max_length=128)
     current_run_id: str | None = Field(default=None, max_length=128)
     result: dict[str, Any] | None = None
@@ -275,6 +318,21 @@ class MasterFlow(_StrictModel):
                     ),
                     "source_run_id": (
                         last_binding.source_run_id if last_binding is not None else None
+                    ),
+                },
+                "context_refs": [
+                    reference.model_dump(mode="json") for reference in node.context_refs
+                ],
+                "budget": {
+                    "pending": (
+                        node.pending_budget.model_dump(mode="json")
+                        if node.pending_budget is not None
+                        else None
+                    ),
+                    "last": (
+                        last_binding.budget.model_dump(mode="json")
+                        if last_binding is not None and last_binding.budget is not None
+                        else None
                     ),
                 },
             }
@@ -1251,6 +1309,7 @@ def add_flow_nodes(flow: MasterFlow, specs: Sequence[FlowNodeSpec]) -> None:
             depends_on=node.depends_on,
             dependency_policy=node.dependency_policy,
             worker_session_policy=node.worker_session_policy,
+            context_refs=node.context_refs,
         )
         for node in flow.nodes
     ]
@@ -1266,6 +1325,7 @@ def revise_flow_node(
     *,
     fresh_worker: bool = False,
     fresh_reason: str | None = None,
+    budget: BudgetGrant | None = None,
 ) -> None:
     """Create a new node generation and invalidate only affected descendants."""
 
@@ -1287,6 +1347,7 @@ def revise_flow_node(
     target.worker_id = None
     target.current_run_id = None
     target.result = None
+    target.pending_budget = budget
     _invalidate_descendants(
         flow,
         node_id,
@@ -1301,6 +1362,7 @@ def retry_flow_node(
     *,
     fresh_worker: bool = False,
     fresh_reason: str | None = None,
+    budget: BudgetGrant | None = None,
 ) -> None:
     """Retry a technical/non-success outcome without changing its generation."""
 
@@ -1327,6 +1389,7 @@ def retry_flow_node(
     node.worker_id = None
     node.current_run_id = None
     node.result = None
+    node.pending_budget = budget
     flow.revision += 1
 
 
@@ -1337,6 +1400,11 @@ def skip_flow_node(flow: MasterFlow, node_id: str, reason: str) -> None:
     node = flow.node(node_id)
     if node.status.active or node.status is FlowNodeStatus.COMPLETED:
         raise ValueError("an active or completed node cannot be skipped")
+    if node.status is FlowNodeStatus.PARTIAL:
+        raise ValueError(
+            "a partial node cannot be skipped; retry it with a Master-authored "
+            "budget increase or finish the Flow as partial"
+        )
     _invalidate_descendants(
         flow,
         node_id,
@@ -1344,6 +1412,7 @@ def skip_flow_node(flow: MasterFlow, node_id: str, reason: str) -> None:
     )
     node.status = FlowNodeStatus.SKIPPED
     node.reuse_source_run_id = None
+    node.pending_budget = None
     node.worker_id = None
     node.current_run_id = None
     node.result = {"summary": reason[:4_000], "status": FlowNodeStatus.SKIPPED.value}
@@ -1430,6 +1499,7 @@ def cancel_flow_state(
             node.status = FlowNodeStatus.CANCELLED
             node.reuse_source_run_id = None
             node.pending_fresh_reason = None
+            node.pending_budget = None
 
 
 def _invalidate_descendants(
@@ -1465,6 +1535,7 @@ def _invalidate_descendants(
             node.input_generations = {}
             node.reuse_source_run_id = None
             node.pending_fresh_reason = "upstream_context_changed"
+            node.pending_budget = None
             node.worker_id = None
             node.current_run_id = None
             node.result = None
@@ -1556,6 +1627,33 @@ def _validate_graph(
     for node_id in ids:
         visit(node_id)
 
+    def ancestors(node_id: str) -> set[str]:
+        result: set[str] = set()
+        pending = list(dependencies[node_id])
+        while pending:
+            dependency = pending.pop()
+            if dependency in result:
+                continue
+            result.add(dependency)
+            pending.extend(dependencies[dependency])
+        return result
+
+    for spec in specs:
+        allowed_flow_nodes = ancestors(spec.node_id)
+        for reference in spec.context_refs:
+            if reference.kind != "flow_node":
+                continue
+            if reference.id not in known:
+                raise ValueError(
+                    f"Flow node {spec.node_id!r} references unknown context node "
+                    f"{reference.id!r}"
+                )
+            if reference.id not in allowed_flow_nodes:
+                raise ValueError(
+                    f"Flow node {spec.node_id!r} may only reference an ancestor for context; "
+                    f"got {reference.id!r}"
+                )
+
 
 def _require_open(flow: MasterFlow) -> None:
     if flow.status is not FlowStatus.OPEN:
@@ -1598,14 +1696,16 @@ def _dump_flow(flow: MasterFlow) -> str:
 def _flow_from_row(row: sqlite3.Row) -> MasterFlow:
     payload = json.loads(str(row["state_json"]))
     version = int(payload.get("schema_version", 1))
-    if version not in {1, FLOW_STATE_VERSION}:
+    if version not in {1, 2, FLOW_STATE_VERSION}:
         raise RuntimeError(f"unsupported Flow state version: {version}")
-    if version == 1:
+    if version in {1, 2}:
         for node in payload.get("nodes", []):
             node.setdefault("worker_session_policy", WorkerSessionPolicy.AUTO.value)
             node.setdefault("reuse_source_run_id", None)
             node.setdefault("pending_fresh_reason", None)
+            node.setdefault("pending_budget", None)
             for binding in node.get("runs", []):
+                binding.setdefault("budget", None)
                 binding.setdefault(
                     "session_action",
                     (
@@ -1629,6 +1729,8 @@ def flow_node_spec_payload(node: FlowNodeSpec) -> dict[str, Any]:
     payload = node.model_dump(mode="json")
     if node.worker_session_policy is WorkerSessionPolicy.AUTO:
         payload.pop("worker_session_policy", None)
+    if not node.context_refs:
+        payload.pop("context_refs", None)
     return payload
 
 
@@ -1662,6 +1764,7 @@ __all__ = [
     "DependencyPolicy",
     "DEFAULT_FLOW_TURN_LEASE_SECONDS",
     "FlowCompletion",
+    "FlowContextRef",
     "FlowIdempotencyConflictError",
     "FlowSessionSealedError",
     "FlowTurnCommit",

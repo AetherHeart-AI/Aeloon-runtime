@@ -113,6 +113,7 @@ class TUIBridge:
         session_id: str | None = None,
     ) -> None:
         self.config = config.normalized()
+        self._owns_orchestrator = orchestrator is None
         self.orchestrator = orchestrator or AeloonCoreOrchestrator(self.config)
         self.sink = sink or NDJSONWriter()
         self.session_id = session_id or self.orchestrator.sessions.new_session()
@@ -234,6 +235,12 @@ class TUIBridge:
                 break
             else:
                 self._prompt_queue.task_done()
+        if self._owns_orchestrator:
+            close = getattr(self.orchestrator, "close", None)
+            if close is not None:
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
 
     async def _enqueue_prompt(self, request_id: Any, payload: dict[str, Any]) -> None:
         prompt = _required_prompt(payload)

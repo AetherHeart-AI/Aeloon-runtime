@@ -11,6 +11,7 @@ from aeloon_core.flow_control import FlowControlService
 from aeloon_core.flows import FlowCompletion, FlowNodeSpec
 from aeloon_core.tools.base import FunctionTool
 from aeloon_core.tools.registry import ToolRegistry
+from aeloon_core.worker_sessions import BudgetIncrease
 
 
 class _Args(BaseModel):
@@ -56,6 +57,7 @@ class _NodeMutation(_FlowMutation):
 class _RerunNodeArgs(_NodeMutation):
     fresh_worker: bool = False
     fresh_reason: str | None = Field(default=None, min_length=1, max_length=1_000)
+    budget_increase: BudgetIncrease | None = None
 
     @model_validator(mode="after")
     def _fresh_reason_matches_flag(self) -> _RerunNodeArgs:
@@ -76,6 +78,7 @@ class _RetryNodeArgs(_RerunNodeArgs):
 
 class _ResumeNodeArgs(_NodeMutation):
     response: str = Field(min_length=1, max_length=32_000)
+    budget_increase: BudgetIncrease | None = None
 
 
 class _SkipNodeArgs(_NodeMutation):
@@ -91,7 +94,7 @@ class _CompleteFlowArgs(_FlowMutation):
     summary: str = Field(min_length=1, max_length=16_000)
 
 
-class _FinishTurnArgs(_Args):
+class FinishTurnArgs(_Args):
     final_content: str = Field(min_length=1, max_length=64_000)
 
 
@@ -182,6 +185,7 @@ def build_master_flow_tools(
         idempotency_key: str,
         fresh_worker: bool = False,
         fresh_reason: str | None = None,
+        budget_increase: dict[str, Any] | None = None,
     ) -> str:
         return _json(
             await control.revise_node(
@@ -190,6 +194,11 @@ def build_master_flow_tools(
                 feedback=feedback,
                 fresh_worker=fresh_worker,
                 fresh_reason=fresh_reason,
+                budget_increase=(
+                    BudgetIncrease.model_validate(budget_increase)
+                    if budget_increase is not None
+                    else None
+                ),
                 base_session_id=base_session_id,
                 idempotency_key=idempotency_key,
                 turn_id=base_turn_id,
@@ -202,6 +211,7 @@ def build_master_flow_tools(
         idempotency_key: str,
         fresh_worker: bool = False,
         fresh_reason: str | None = None,
+        budget_increase: dict[str, Any] | None = None,
     ) -> str:
         return _json(
             await control.retry_node(
@@ -209,6 +219,11 @@ def build_master_flow_tools(
                 node_id,
                 fresh_worker=fresh_worker,
                 fresh_reason=fresh_reason,
+                budget_increase=(
+                    BudgetIncrease.model_validate(budget_increase)
+                    if budget_increase is not None
+                    else None
+                ),
                 base_session_id=base_session_id,
                 idempotency_key=idempotency_key,
                 turn_id=base_turn_id,
@@ -220,6 +235,7 @@ def build_master_flow_tools(
         node_id: str,
         response: str,
         idempotency_key: str,
+        budget_increase: dict[str, Any] | None = None,
     ) -> str:
         return _json(
             await control.resume_node(
@@ -230,6 +246,11 @@ def build_master_flow_tools(
                 base_turn_id=base_turn_id,
                 idempotency_key=idempotency_key,
                 progress=on_progress,
+                budget_increase=(
+                    BudgetIncrease.model_validate(budget_increase)
+                    if budget_increase is not None
+                    else None
+                ),
             )
         )
 
@@ -292,13 +313,6 @@ def build_master_flow_tools(
             )
         )
 
-    async def finish_turn(final_content: str) -> str:
-        return await control.finish_turn(
-            final_content,
-            base_session_id=base_session_id,
-            turn_id=base_turn_id,
-        )
-
     async def cancel_flow(
         flow_id: str,
         idempotency_key: str,
@@ -319,11 +333,12 @@ def build_master_flow_tools(
             "create_flow",
             "Create a durable dynamic DAG for a multi-stage outcome. Nodes describe "
             "semantic objectives, dependencies, soft Worker responsibilities, and an "
-            "optional worker_session_policy of auto or fresh.",
+            "optional worker_session_policy of auto or fresh. context_refs explicitly "
+            "associate bounded untrusted context from an ancestor flow_node or a settled "
+            "same-session worker_run.",
             _CreateFlowArgs,
             create_flow,
             "mutating",
-            False,
         ),
         (
             "list_flows",
@@ -331,7 +346,6 @@ def build_master_flow_tools(
             _ListFlowsArgs,
             list_flows,
             "read_only",
-            False,
         ),
         (
             "inspect_flow",
@@ -339,17 +353,16 @@ def build_master_flow_tools(
             _FlowId,
             inspect_flow,
             "read_only",
-            False,
         ),
         (
             "add_flow_nodes",
             "Dynamically append validated nodes to an open Flow after observing results. "
             "Set worker_session_policy=fresh for a node that requires a clean, "
-            "independent WorkerSession on every non-resume execution.",
+            "independent WorkerSession on every non-resume execution. Use context_refs "
+            "when that fresh Worker needs bounded evidence from related prior work.",
             _AddNodesArgs,
             add_flow_nodes,
             "mutating",
-            False,
         ),
         (
             "advance_flow",
@@ -358,44 +371,44 @@ def build_master_flow_tools(
             _AdvanceArgs,
             advance_flow,
             "mutating",
-            False,
         ),
         (
             "revise_flow_node",
             "Create a new generation with review feedback and mark only affected "
             "descendants stale for targeted re-execution. The same healthy "
             "WorkerSession is reused by default; set fresh_worker with fresh_reason "
-            "when its context must be discarded.",
+            "when its context must be discarded. budget_increase raises target limits "
+            "for the next Run.",
             _ReviseNodeArgs,
             revise_flow_node,
             "mutating",
-            False,
         ),
         (
             "retry_flow_node",
             "Retry a partial, failed, or cancelled node without changing its semantics. "
             "The same healthy WorkerSession is reused by default; set fresh_worker "
-            "with fresh_reason for a clean retry.",
+            "with fresh_reason for a clean retry. Partial nodes require a strictly "
+            "larger Master-authored budget_increase.",
             _RetryNodeArgs,
             retry_flow_node,
             "mutating",
-            False,
         ),
         (
             "resume_flow_node",
-            "Answer the exact waiting WorkerRun bound to a Flow node.",
+            "Answer the exact waiting WorkerRun bound to a Flow node. "
+            "budget_increase may raise the continuation's target limits.",
             _ResumeNodeArgs,
             resume_flow_node,
             "mutating",
-            False,
         ),
         (
             "skip_flow_node",
-            "Explicitly waive one non-active node so successful joins can proceed.",
+            "Explicitly waive one non-active, non-partial node so successful joins can "
+            "proceed. A partial node must be retried with budget_increase, revised, or "
+            "reported through a partial Flow outcome.",
             _SkipNodeArgs,
             skip_flow_node,
             "mutating",
-            False,
         ),
         (
             "pause_flow",
@@ -403,7 +416,6 @@ def build_master_flow_tools(
             _PauseFlowArgs,
             pause_flow,
             "mutating",
-            False,
         ),
         (
             "resume_flow",
@@ -411,7 +423,6 @@ def build_master_flow_tools(
             _FlowMutation,
             resume_flow,
             "mutating",
-            False,
         ),
         (
             "complete_flow",
@@ -420,16 +431,6 @@ def build_master_flow_tools(
             _CompleteFlowArgs,
             complete_flow,
             "mutating",
-            False,
-        ),
-        (
-            "finish_turn",
-            "Answer the user after every open Flow has been completed, paused, blocked, "
-            "or cancelled. Must be the response's only tool call.",
-            _FinishTurnArgs,
-            finish_turn,
-            "mutating",
-            True,
         ),
         (
             "cancel_flow",
@@ -439,10 +440,9 @@ def build_master_flow_tools(
             _CancelFlowArgs,
             cancel_flow,
             "mutating",
-            False,
         ),
     )
-    for name, description, model, handler, concurrency_mode, terminal in specifications:
+    for name, description, model, handler, concurrency_mode in specifications:
         registry.register(
             FunctionTool(
                 name=name,
@@ -450,7 +450,6 @@ def build_master_flow_tools(
                 args_model=model,
                 handler=handler,
                 concurrency_mode=concurrency_mode,
-                terminal=terminal,
             )
         )
     return registry
@@ -464,4 +463,4 @@ def _node_specs(values: list[dict[str, Any]]) -> list[FlowNodeSpec]:
     return [FlowNodeSpec.model_validate(value) for value in values]
 
 
-__all__ = ["build_master_flow_tools"]
+__all__ = ["FinishTurnArgs", "build_master_flow_tools"]

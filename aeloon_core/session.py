@@ -14,6 +14,12 @@ from pathlib import Path
 from typing import Any
 
 from aeloon_core.context import build_initial_messages
+from aeloon_core.message_history import (
+    MESSAGE_FORMAT,
+    MESSAGE_SCHEMA_VERSION,
+    LegacySessionError,
+    deserialize_messages,
+)
 
 _ENCODED_SESSION_PREFIX = "~"
 _JSONL_SUFFIX = ".jsonl"
@@ -74,6 +80,26 @@ class SessionStore:
                 return messages
         return initial_messages or build_initial_messages(workspace=self.workspace)
 
+    def load_pydantic_messages(self, session_id: str) -> list[dict[str, Any]]:
+        """Load executable v2 history, rejecting but never altering legacy data."""
+
+        records = self._read_records(session_id)
+        if not records:
+            return []
+        record = records[-1]
+        if (
+            record.get("schema_version") != MESSAGE_SCHEMA_VERSION
+            or record.get("message_format") != MESSAGE_FORMAT
+        ):
+            raise LegacySessionError(
+                f"Session {session_id!r} uses the legacy message format; "
+                "create a new session to continue. Existing data was not modified."
+            )
+        messages = record.get("messages")
+        if not isinstance(messages, list):
+            raise ValueError("PydanticAI session record has no message array")
+        return messages
+
     def append_turn(
         self,
         *,
@@ -88,10 +114,13 @@ class SessionStore:
     ) -> None:
         """Append one completed turn."""
 
+        deserialize_messages(messages)
         path = self._writable_path(self.sessions_dir, session_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         record = {
             "type": "turn",
+            "schema_version": MESSAGE_SCHEMA_VERSION,
+            "message_format": MESSAGE_FORMAT,
             "session_id": session_id,
             "turn_id": turn_id,
             "created_at": datetime.now(UTC).isoformat(),
@@ -125,10 +154,13 @@ class SessionStore:
         fsyncs it before the caller marks the durable commit as projected.
         """
 
+        deserialize_messages(messages)
         path = self._writable_path(self.sessions_dir, session_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         expected = {
             "type": "turn",
+            "schema_version": MESSAGE_SCHEMA_VERSION,
+            "message_format": MESSAGE_FORMAT,
             "session_id": session_id,
             "turn_id": turn_id,
             "user_prompt": user_prompt,

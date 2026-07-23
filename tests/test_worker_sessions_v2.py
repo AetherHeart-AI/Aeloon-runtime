@@ -10,10 +10,11 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from typing import Any
 
 import pytest
 from pydantic import BaseModel
+from pydantic_ai.messages import ModelResponse, TextPart
 
 from aeloon_core.flows import (
     FlowNodeSpec,
@@ -22,6 +23,12 @@ from aeloon_core.flows import (
     FlowStore,
     cancel_flow_state,
 )
+from aeloon_core.message_history import (
+    MESSAGE_FORMAT,
+    MESSAGE_SCHEMA_VERSION,
+    LegacySessionError,
+    serialize_messages,
+)
 from aeloon_core.runner import run_worker_runner
 from aeloon_core.tools.base import FunctionTool
 from aeloon_core.tools.registry import ToolRegistry
@@ -29,6 +36,7 @@ from aeloon_core.worker_control import WorkerControlService
 from aeloon_core.worker_manager import WorkerExecutionOutcome, WorkerSessionManager
 from aeloon_core.worker_sessions import (
     BudgetGrant,
+    BudgetIncrease,
     ContextEnvelope,
     IdempotencyConflictError,
     PermissionSnapshot,
@@ -40,6 +48,14 @@ from aeloon_core.worker_sessions import (
     WorkerStore,
 )
 from aeloon_core.workers import WorkerRegistry, parse_worker
+
+
+def _checkpoint(content: str) -> dict[str, Any]:
+    return {
+        "schema_version": MESSAGE_SCHEMA_VERSION,
+        "message_format": MESSAGE_FORMAT,
+        "messages": serialize_messages([ModelResponse(parts=[TextPart(content)])]),
+    }
 
 
 def _snapshot():
@@ -102,7 +118,7 @@ def _complete(store: WorkerStore, run_id: str) -> None:
             report=WorkerReport(summary="done"),
             tool_outcome="known",
         ),
-        checkpoint={"messages": [{"role": "assistant", "content": "checkpoint"}]},
+        checkpoint=_checkpoint("checkpoint"),
     )
 
 
@@ -268,7 +284,7 @@ def test_flow_cancel_wins_race_with_worker_finalization(tmp_path: Path) -> None:
     cancelled, changed = store.try_finalize_run(
         running.run_id,
         result,
-        checkpoint={"messages": [{"role": "assistant", "content": "must not persist"}]},
+        checkpoint=_checkpoint("must not persist"),
     )
 
     assert changed is True
@@ -452,7 +468,7 @@ def _make_v1_database(data_dir: Path) -> Path:
     return path
 
 
-def test_v1_migration_is_destructive_atomic_and_idempotent(tmp_path: Path) -> None:
+def test_v1_migration_archives_legacy_data_and_is_idempotent(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     path = _make_v1_database(data_dir)
 
@@ -470,8 +486,12 @@ def test_v1_migration_is_destructive_atomic_and_idempotent(tmp_path: Path) -> No
             "worker_ui_events",
         ):
             assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+            assert connection.execute(
+                f"SELECT COUNT(*) FROM legacy_v1_{table}"
+            ).fetchone()[0] == 1
         assert connection.execute("SELECT event_count FROM worker_ui_state").fetchone()[0] == 0
-    assert not (data_dir / "worker-sessions").exists()
+    transcript = data_dir / "worker-sessions" / "old-worker" / "transcript.jsonl"
+    assert transcript.read_text(encoding="utf-8") == "legacy private data\n"
 
     worker, _, _ = store.create_worker(
         base_session_id="master",
@@ -480,28 +500,12 @@ def test_v1_migration_is_destructive_atomic_and_idempotent(tmp_path: Path) -> No
         idempotency_key="new",
     )
     current_transcript = data_dir / "worker-sessions" / "current.txt"
-    current_transcript.parent.mkdir(parents=True)
+    current_transcript.parent.mkdir(parents=True, exist_ok=True)
     current_transcript.write_text("v2", encoding="utf-8")
 
     reopened = WorkerStore(data_dir)
     assert reopened.get_worker(worker.worker_id).snapshot.digest == worker.snapshot.digest
     assert current_transcript.read_text(encoding="utf-8") == "v2"
-
-
-def test_failed_transcript_cleanup_rolls_back_schema_migration(tmp_path: Path) -> None:
-    data_dir = tmp_path / "data"
-    path = _make_v1_database(data_dir)
-
-    with patch(
-        "aeloon_core.worker_sessions.shutil.rmtree",
-        side_effect=OSError("cannot remove transcript"),
-    ):
-        with pytest.raises(OSError, match="cannot remove transcript"):
-            WorkerStore(data_dir)
-
-    with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
-        assert connection.execute("SELECT COUNT(*) FROM worker_sessions").fetchone()[0] == 1
 
 
 def test_v5_schema_missing_a_runtime_column_blocks_startup(tmp_path: Path) -> None:
@@ -677,7 +681,7 @@ async def test_followup_runs_use_current_budget_instead_of_legacy_cap(
             ),
             tool_outcome="known",
         ),
-        checkpoint={"messages": [{"role": "assistant", "content": "checkpoint"}]},
+        checkpoint=_checkpoint("checkpoint"),
         waiting_request=waiting_request,
     )
 
@@ -719,19 +723,18 @@ async def test_waiting_is_settled_and_checkpoint_request_result_are_atomic(
         tool_outcome="known",
     )
 
+    checkpoint = _checkpoint("exact state")
     waiting, changed = store.try_finalize_run(
         run.run_id,
         result,
-        checkpoint={"messages": [{"role": "assistant", "content": "exact state"}]},
+        checkpoint=checkpoint,
         waiting_request=request,
     )
 
     assert changed
     assert waiting.status is WorkerRunStatus.WAITING_FOR_CONTEXT
     assert waiting.waiting_request == request
-    assert store.load_checkpoint(run.run_id) == {
-        "messages": [{"role": "assistant", "content": "exact state"}]
-    }
+    assert store.load_checkpoint(run.run_id) == checkpoint
     manager = WorkerSessionManager(store=store)
     returned = await manager.await_workers([run.run_id], timeout=0.01)
     assert returned[0].status is WorkerRunStatus.WAITING_FOR_CONTEXT
@@ -770,7 +773,7 @@ async def test_running_lease_heartbeats_without_a_progress_observer(
         return WorkerExecutionOutcome(
             status=WorkerRunStatus.COMPLETED,
             report=WorkerReport(summary="done"),
-            checkpoint={"messages": [{"role": "assistant", "content": "done"}]},
+            checkpoint=_checkpoint("done"),
         )
 
     runner = WorkerSessionManager(
@@ -837,7 +840,7 @@ async def test_expired_running_lease_fails_without_replaying_the_run(
     unchanged, changed = store.try_finalize_run(
         run.run_id,
         late_result,
-        checkpoint={"messages": [{"role": "assistant", "content": "late"}]},
+        checkpoint=_checkpoint("late"),
     )
     assert changed is False
     assert unchanged.status is WorkerRunStatus.FAILED
@@ -913,6 +916,7 @@ def test_concurrent_resume_creates_one_exact_continuation(tmp_path: Path) -> Non
     store = WorkerStore(tmp_path)
     _, source = _create_running(store)
     request = WaitingRequest(summary="blocked", question="Choose A or B")
+    checkpoint = _checkpoint("waiting")
     store.try_finalize_run(
         source.run_id,
         ResultEnvelope(
@@ -921,7 +925,7 @@ def test_concurrent_resume_creates_one_exact_continuation(tmp_path: Path) -> Non
             status=WorkerRunStatus.WAITING_FOR_CONTEXT,
             report=WorkerReport(summary="blocked", unresolved=(request.question,)),
         ),
-        checkpoint={"messages": [{"role": "tool", "content": "waiting"}]},
+        checkpoint=checkpoint,
         waiting_request=request,
     )
     response = _context("Choose A")
@@ -942,9 +946,7 @@ def test_concurrent_resume_creates_one_exact_continuation(tmp_path: Path) -> Non
     assert continuation.source_run_id == source.run_id
     assert continuation.run_sequence == source.run_sequence + 1
     assert store.get_run(source.run_id).status is WorkerRunStatus.WAITING_FOR_CONTEXT
-    assert store.load_checkpoint(source.run_id) == {
-        "messages": [{"role": "tool", "content": "waiting"}]
-    }
+    assert store.load_checkpoint(source.run_id) == checkpoint
     with pytest.raises(ValueError, match="newer run"):
         store.create_resume_run(
             source_run_id=source.run_id,
@@ -983,6 +985,31 @@ def test_reuse_requires_checkpoint_and_cannot_expand_permissions(tmp_path: Path)
     assert created is True
     assert replay_created is False
     assert replay.run_id == first.run_id
+
+
+def test_legacy_checkpoint_is_preserved_but_cannot_be_reused(tmp_path: Path) -> None:
+    store = WorkerStore(tmp_path)
+    _, running = _create_running(store)
+    legacy = {"messages": [{"role": "assistant", "content": "old format"}]}
+    store.complete_run(
+        running.run_id,
+        ResultEnvelope(
+            worker_id=running.worker_id,
+            run_id=running.run_id,
+            status=WorkerRunStatus.COMPLETED,
+            report=WorkerReport(summary="legacy result"),
+            tool_outcome="known",
+        ),
+        checkpoint=legacy,
+    )
+
+    with pytest.raises(LegacySessionError, match="create a new WorkerSession"):
+        store.create_run(
+            worker_id=running.worker_id,
+            context=_context("continue"),
+            idempotency_key="reuse-legacy",
+        )
+    assert store.load_checkpoint(running.run_id) == legacy
 
 
 def test_spawn_idempotency_conflict_checks_snapshot_and_objective(tmp_path: Path) -> None:
@@ -1062,7 +1089,7 @@ async def test_cross_worker_runs_execute_concurrently(tmp_path: Path) -> None:
         return WorkerExecutionOutcome(
             status=WorkerRunStatus.COMPLETED,
             report=WorkerReport(summary=f"done {run.run_id}"),
-            checkpoint={"messages": [{"role": "assistant", "content": "done"}]},
+            checkpoint=_checkpoint("done"),
         )
 
     manager = WorkerSessionManager(store=store, executor=executor, max_concurrency=2)
@@ -1105,7 +1132,7 @@ async def test_runner_cannot_start_a_flow_reservation_without_current_binding(
         return WorkerExecutionOutcome(
             status=WorkerRunStatus.COMPLETED,
             report=WorkerReport(summary="done"),
-            checkpoint={"messages": [{"role": "assistant", "content": "done"}]},
+            checkpoint=_checkpoint("done"),
         )
 
     manager = WorkerSessionManager(store=store, executor=executor)
@@ -1197,7 +1224,7 @@ async def test_detached_runner_recovers_an_activated_flow_run(
         return WorkerExecutionOutcome(
             status=WorkerRunStatus.COMPLETED,
             report=WorkerReport(summary="recovered"),
-            checkpoint={"messages": [{"role": "assistant", "content": "done"}]},
+            checkpoint=_checkpoint("done"),
         )
 
     runner = WorkerSessionManager(
@@ -1227,7 +1254,7 @@ async def test_busy_worker_cannot_be_reused_and_cancel_then_archive_is_normal(
         return WorkerExecutionOutcome(
             status=WorkerRunStatus.COMPLETED,
             report=WorkerReport(summary="done"),
-            checkpoint={"messages": [{"role": "assistant", "content": "done"}]},
+            checkpoint=_checkpoint("done"),
         )
 
     manager = WorkerSessionManager(store=store, executor=executor)
@@ -1359,7 +1386,7 @@ async def test_detached_cancellation_is_observed_while_waiting_for_slot(
         return WorkerExecutionOutcome(
             status=WorkerRunStatus.COMPLETED,
             report=WorkerReport(summary="done"),
-            checkpoint={"messages": [{"role": "assistant", "content": "done"}]},
+            checkpoint=_checkpoint("done"),
         )
 
     runner_manager = WorkerSessionManager(
@@ -1481,7 +1508,7 @@ async def test_cancel_does_not_interrupt_terminal_lifecycle_projection(
         return WorkerExecutionOutcome(
             status=WorkerRunStatus.COMPLETED,
             report=WorkerReport(summary=f"done {run.context.objective}"),
-            checkpoint={"messages": [{"role": "assistant", "content": "done"}]},
+            checkpoint=_checkpoint("done"),
         )
 
     store = WorkerStore(tmp_path / "data")
@@ -1529,7 +1556,7 @@ async def test_continuous_runner_polls_while_other_workers_are_active(
         return WorkerExecutionOutcome(
             status=WorkerRunStatus.COMPLETED,
             report=WorkerReport(summary=f"done {run.context.objective}"),
-            checkpoint={"messages": [{"role": "assistant", "content": "done"}]},
+            checkpoint=_checkpoint("done"),
         )
 
     manager = WorkerSessionManager(store=store, executor=executor, max_concurrency=2)
@@ -1575,3 +1602,29 @@ async def test_continuous_runner_polls_while_other_workers_are_active(
         release_first.set()
         runner.cancel()
         await asyncio.gather(runner, return_exceptions=True)
+
+
+def test_budget_increase_only_raises_master_selected_targets() -> None:
+    current = BudgetGrant(
+        max_requests=25,
+        max_output_tokens=None,
+        max_tokens=100_000,
+        max_seconds=3_600,
+        max_tool_calls=20,
+    )
+
+    increased = BudgetIncrease(
+        max_requests=50,
+        max_output_tokens=16_384,
+        max_tool_calls=40,
+    ).apply(current)
+
+    assert increased == BudgetGrant(
+        max_requests=50,
+        max_output_tokens=16_384,
+        max_tokens=100_000,
+        max_seconds=3_600,
+        max_tool_calls=40,
+    )
+    with pytest.raises(ValueError, match="already unlimited"):
+        BudgetIncrease(max_tokens=200_000).apply(BudgetGrant())

@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Sequence
+from typing import Any, Literal
 
 from aeloon_core.worker_manager import WorkerSessionManager
 from aeloon_core.worker_sessions import (
     BudgetGrant,
+    BudgetIncrease,
     ContextEnvelope,
     PermissionSnapshot,
+    RelatedContextSection,
+    RelatedWorkerContext,
     WorkerRunStatus,
     WorkerSessionStatus,
 )
@@ -95,6 +99,8 @@ class WorkerControlService:
         detached: bool = False,
         progress: Any | None = None,
         start: bool | None = None,
+        budget: BudgetGrant | None = None,
+        related_contexts: Sequence[RelatedWorkerContext] = (),
     ) -> dict[str, Any]:
         snapshot = self.worker_types.get(worker_type_id)
         context = ContextEnvelope(
@@ -103,7 +109,8 @@ class WorkerControlService:
                 tool_names=self.worker_tool_names,
                 skills_enabled=self.skills_enabled,
             ),
-            budget=self.default_budget,
+            budget=budget or self.default_budget,
+            related_contexts=tuple(related_contexts),
         )
         worker, run, created = await self.manager.spawn_worker(
             base_session_id=base_session_id,
@@ -124,6 +131,7 @@ class WorkerControlService:
             "created": created,
             "detached": detached,
             "worker_session_action": "new",
+            "budget": run.context.budget.model_dump(mode="json"),
             "snapshot": worker.snapshot.descriptor(),
         }
 
@@ -136,6 +144,7 @@ class WorkerControlService:
         idempotency_key: str,
         base_turn_id: str | None = None,
         progress: Any | None = None,
+        budget_increase: BudgetIncrease | None = None,
     ) -> dict[str, Any]:
         worker, runs = self._owned_worker(worker_id, base_session_id)
         if worker.status is WorkerSessionStatus.ARCHIVED:
@@ -147,12 +156,22 @@ class WorkerControlService:
             raise ValueError(
                 "this Worker belongs to a Flow; revise or retry the Flow node instead"
             )
+        if latest.status is WorkerRunStatus.PARTIAL and budget_increase is None:
+            raise ValueError(
+                "reusing a partial WorkerRun requires a Master-authored budget_increase"
+            )
+        budget = (
+            budget_increase.apply(latest.context.budget)
+            if budget_increase is not None
+            else self.default_budget
+        )
         context = ContextEnvelope(
             objective=objective,
             permissions=latest.context.permissions,
             # Each Run receives the current host grant. In particular, a v2
             # continuation must not inherit the old context-window-as-budget cap.
-            budget=self.default_budget,
+            budget=budget,
+            related_contexts=latest.context.related_contexts,
         )
         run, created = await self.manager.reuse_worker(
             worker_id=worker_id,
@@ -169,6 +188,7 @@ class WorkerControlService:
             "created_at": run.created_at,
             "created": created,
             "reused_worker": True,
+            "budget": run.context.budget.model_dump(mode="json"),
             "snapshot": worker.snapshot.descriptor(),
         }
 
@@ -181,6 +201,7 @@ class WorkerControlService:
         base_session_id: str | None = None,
         base_turn_id: str | None = None,
         progress: Any | None = None,
+        budget_increase: BudgetIncrease | None = None,
     ) -> dict[str, Any]:
         """Continue the exact latest waiting Run without reopening it."""
 
@@ -198,7 +219,12 @@ class WorkerControlService:
         context = ContextEnvelope(
             objective=response,
             permissions=source.context.permissions,
-            budget=self.default_budget,
+            budget=(
+                budget_increase.apply(source.context.budget)
+                if budget_increase is not None
+                else self.default_budget
+            ),
+            related_contexts=source.context.related_contexts,
         )
         continuation, created = await self.manager.resume_worker(
             source_run_id=source.run_id,
@@ -223,6 +249,7 @@ class WorkerControlService:
         idempotency_key: str,
         base_session_id: str,
         progress: Any | None = None,
+        budget_increase: BudgetIncrease | None = None,
     ) -> dict[str, Any]:
         """Reserve an exact Flow continuation for attach-before-start dispatch."""
 
@@ -236,7 +263,12 @@ class WorkerControlService:
         context = ContextEnvelope(
             objective=response,
             permissions=source.context.permissions,
-            budget=self.default_budget,
+            budget=(
+                budget_increase.apply(source.context.budget)
+                if budget_increase is not None
+                else self.default_budget
+            ),
+            related_contexts=source.context.related_contexts,
         )
         continuation, created = await self.manager.resume_worker(
             source_run_id=source.run_id,
@@ -314,6 +346,8 @@ class WorkerControlService:
         base_session_id: str,
         worker_type_id: str,
         progress: Any | None = None,
+        budget: BudgetGrant | None = None,
+        related_contexts: Sequence[RelatedWorkerContext] = (),
     ) -> dict[str, Any]:
         """Reserve an exact same-node Flow reuse before durable attachment."""
 
@@ -329,7 +363,8 @@ class WorkerControlService:
         context = ContextEnvelope(
             objective=objective,
             permissions=source.context.permissions,
-            budget=self.default_budget,
+            budget=budget or self.default_budget,
+            related_contexts=tuple(related_contexts),
         )
         continuation, created = await self.manager.reuse_worker(
             worker_id=source.worker_id,
@@ -346,6 +381,18 @@ class WorkerControlService:
             "worker_session_reason": "same_node_reuse",
             "created": created,
         }
+
+    def increased_budget(
+        self,
+        run_id: str,
+        increase: BudgetIncrease,
+        *,
+        base_session_id: str,
+    ) -> BudgetGrant:
+        """Resolve a Master-authored increase against one owned Run's exact grant."""
+
+        source = self._owned_run(run_id, base_session_id)
+        return increase.apply(source.context.budget)
 
     def start_worker_run(
         self,
@@ -414,6 +461,8 @@ class WorkerControlService:
         worker_type_id: str | None = None,
         worker_id: str | None = None,
         allowed_source_run_ids: set[str] | None = None,
+        budget: BudgetGrant | None = None,
+        related_contexts: Sequence[RelatedWorkerContext] | None = None,
     ) -> dict[str, Any] | None:
         """Recover an exact durable Run created before its caller saved a binding."""
 
@@ -430,6 +479,17 @@ class WorkerControlService:
                     raise ValueError(
                         "durable WorkerRun idempotency key has a different objective"
                     )
+                if budget is not None and run.context.budget != budget:
+                    raise ValueError(
+                        "durable WorkerRun idempotency key has a different budget grant"
+                    )
+                if (
+                    related_contexts is not None
+                    and run.context.related_contexts != tuple(related_contexts)
+                ):
+                    raise ValueError(
+                        "durable WorkerRun idempotency key has different related context"
+                    )
                 if (
                     allowed_source_run_ids is not None
                     and run.source_run_id not in allowed_source_run_ids
@@ -441,6 +501,66 @@ class WorkerControlService:
         if len(matches) > 1:
             raise RuntimeError("Worker idempotency lookup is ambiguous")
         return self._run_view(matches[0]) if matches else None
+
+    def related_context(
+        self,
+        run_id: str,
+        *,
+        base_session_id: str,
+        source_kind: Literal["worker_run", "flow_node"],
+        source_id: str,
+        relation: str,
+        include: tuple[RelatedContextSection, ...],
+    ) -> RelatedWorkerContext:
+        """Resolve one same-session settled Run into bounded untrusted reference data."""
+
+        run = self._owned_run(run_id, base_session_id)
+        if not run.status.settled:
+            raise ValueError(f"related WorkerRun {run_id!r} is not settled")
+        worker = self.manager.store.get_worker(run.worker_id)
+        report = run.result.report if run.result is not None else None
+        sections = set(include)
+        return RelatedWorkerContext(
+            source_kind=source_kind,
+            source_id=source_id,
+            relation=relation,
+            run_id=run.run_id,
+            worker_id=run.worker_id,
+            worker_type_id=worker.snapshot.id,
+            status=run.status.value,
+            included_sections=include,
+            objective=(run.context.objective[:2_000] if "objective" in sections else None),
+            summary=(
+                report.summary[:4_000]
+                if report is not None and "summary" in sections
+                else None
+            ),
+            artifacts=(
+                _bounded_context_items(report.artifacts, limit=8)
+                if report is not None and "artifacts" in sections
+                else ()
+            ),
+            evidence=(
+                _bounded_context_items(report.evidence, limit=8)
+                if report is not None and "evidence" in sections
+                else ()
+            ),
+            unresolved=(
+                _bounded_context_items(report.unresolved, limit=4)
+                if report is not None and "unresolved" in sections
+                else ()
+            ),
+        )
+
+    def related_contexts_for_run(
+        self,
+        run_id: str,
+        *,
+        base_session_id: str,
+    ) -> tuple[RelatedWorkerContext, ...]:
+        """Return the bounded associations carried by one owned Run."""
+
+        return self._owned_run(run_id, base_session_id).context.related_contexts
 
     def find_continuation(
         self,
@@ -539,7 +659,9 @@ class WorkerControlService:
             "status": run.status.value,
             "cancel_requested": run.cancel_requested_at is not None,
             "objective_preview": run.context.objective[:240],
+            "budget": run.context.budget.model_dump(mode="json"),
             "summary": report.summary[:400] if report is not None else None,
+            "related_context_refs": _related_context_refs(run.context.related_contexts),
             "waiting_question": (
                 run.waiting_request.question if run.waiting_request is not None else None
             ),
@@ -558,6 +680,8 @@ class WorkerControlService:
             "status": run.status.value,
             "cancel_requested": run.cancel_requested_at is not None,
             "objective": run.context.objective[:2_000],
+            "budget": run.context.budget.model_dump(mode="json"),
+            "related_context_refs": _related_context_refs(run.context.related_contexts),
             "summary": report.summary[:4_000] if report is not None else None,
             "artifacts": _bounded_items(report.artifacts) if report is not None else [],
             "evidence": _bounded_items(report.evidence) if report is not None else [],
@@ -576,6 +700,22 @@ class WorkerControlService:
 
 def _bounded_items(items: tuple[str, ...], *, limit: int = 20) -> list[str]:
     return [item[:500] for item in items[:limit]]
+
+
+def _bounded_context_items(items: tuple[str, ...], *, limit: int) -> tuple[str, ...]:
+    return tuple(item[:500] for item in items[:limit])
+
+
+def _related_context_refs(items: tuple[RelatedWorkerContext, ...]) -> list[dict[str, str]]:
+    return [
+        {
+            "source_kind": item.source_kind,
+            "source_id": item.source_id,
+            "relation": item.relation,
+            "run_id": item.run_id,
+        }
+        for item in items
+    ]
 
 
 def _is_flow_owned(run: Any) -> bool:
