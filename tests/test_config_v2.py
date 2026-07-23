@@ -7,7 +7,7 @@ import pytest
 from pydantic import ValidationError
 
 from aeloon_core.__main__ import main
-from aeloon_core.config import Config, load_config, save_config
+from aeloon_core.config import Config, load_config, parse_model_ref, save_config
 
 
 def _write_config(path: Path, defaults: dict[str, object]) -> None:
@@ -32,6 +32,7 @@ def test_load_config_discards_removed_v1_profile_settings(tmp_path: Path) -> Non
     config = load_config(path)
 
     assert config.agents.defaults.model == "test-model"
+    assert config.agents.defaults.provider == "anthropic"
     dumped_defaults = config.model_dump(mode="json")["agents"]["defaults"]
     assert "base_profile_id" not in dumped_defaults
     assert "profile_id" not in dumped_defaults
@@ -57,7 +58,7 @@ def test_model_routing_config_supports_master_and_worker_overrides(tmp_path: Pat
                         "master": "fast-model",
                         "workers": {
                             "explorer": "search-model",
-                            "reviewer": "strong-model",
+                            "reviewer": "volcengine/strong-model",
                         },
                     }
                 }
@@ -71,7 +72,7 @@ def test_model_routing_config_supports_master_and_worker_overrides(tmp_path: Pat
     assert config.agents.routing.master == "fast-model"
     assert config.agents.routing.workers == {
         "explorer": "search-model",
-        "reviewer": "strong-model",
+        "reviewer": "volcengine/strong-model",
     }
 
 
@@ -170,7 +171,7 @@ def test_non_object_config_uses_normal_validation_error(tmp_path: Path) -> None:
         load_config(path)
 
 
-def test_volcengine_environment_selects_agent_plan_provider(
+def test_volcengine_environment_selects_default_provider(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -180,13 +181,53 @@ def test_volcengine_environment_selects_agent_plan_provider(
 
     config = load_config(tmp_path / "missing.json")
 
-    assert config.providers.active == "volcengine"
+    assert "active" not in config.model_dump(mode="json")["providers"]
+    assert config.agents.defaults.provider == "volcengine"
     assert config.providers.volcengine.api_key == "ark-test-key"
     assert (
         config.providers.volcengine.base_url
         == "https://ark.cn-beijing.volces.com/api/plan/v3"
     )
     assert config.agents.defaults.model == "ark-code-latest"
+    assert config.agents.defaults.model_ref() == "volcengine/ark-code-latest"
+
+
+def test_legacy_providers_active_migrates_to_defaults_provider(tmp_path: Path) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "providers": {"active": "volcengine"},
+                "agents": {"defaults": {"model": "ark-code-latest"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config.agents.defaults.provider == "volcengine"
+    assert config.agents.defaults.model == "ark-code-latest"
+    cleaned_path = tmp_path / "cleaned.json"
+    save_config(config, cleaned_path)
+    cleaned = json.loads(cleaned_path.read_text(encoding="utf-8"))
+    assert "active" not in cleaned["providers"]
+    assert cleaned["agents"]["defaults"]["provider"] == "volcengine"
+
+
+def test_parse_model_ref_supports_bare_and_provider_prefixed_forms() -> None:
+    assert parse_model_ref("deepseek-v4-pro", default_provider="anthropic") == (
+        "anthropic",
+        "deepseek-v4-pro",
+    )
+    assert parse_model_ref(
+        "volcengine/ark-code-latest",
+        default_provider="anthropic",
+    ) == ("volcengine", "ark-code-latest")
+    assert parse_model_ref(
+        "org/custom-model",
+        default_provider="anthropic",
+    ) == ("anthropic", "org/custom-model")
 
 
 def test_config_init_routes_credentials_to_selected_provider(
@@ -212,7 +253,38 @@ def test_config_init_routes_credentials_to_selected_provider(
     )
 
     payload = json.loads(path.read_text(encoding="utf-8"))
-    assert payload["providers"]["active"] == "volcengine"
+    assert "active" not in payload["providers"]
+    assert payload["agents"]["defaults"]["provider"] == "volcengine"
     assert payload["providers"]["volcengine"]["api_key"] == "ark-config-key"
     assert payload["providers"]["anthropic"]["api_key"] == "no-key"
+    assert payload["agents"]["defaults"]["model"] == "ark-code-latest"
+
+
+def test_config_set_model_accepts_provider_model_ref(tmp_path: Path) -> None:
+    path = tmp_path / "config.json"
+    main(
+        [
+            "config",
+            "init",
+            "--config",
+            str(path),
+            "--provider",
+            "anthropic",
+            "--model",
+            "claude-sonnet-4-6",
+        ]
+    )
+    main(
+        [
+            "config",
+            "set",
+            "--config",
+            str(path),
+            "model",
+            "volcengine/ark-code-latest",
+        ]
+    )
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["agents"]["defaults"]["provider"] == "volcengine"
     assert payload["agents"]["defaults"]["model"] == "ark-code-latest"

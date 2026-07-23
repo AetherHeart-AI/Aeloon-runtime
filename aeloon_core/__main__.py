@@ -26,7 +26,7 @@ CHAT_ONLY_OPTIONS = {
 CONFIG_SETTERS = {
     "workspace": ("workspace",),
     "data-dir": ("data_dir",),
-    "provider": ("providers", "active"),
+    "provider": ("agents", "defaults", "provider"),
     "prompt-caching": ("providers", "anthropic", "prompt_caching"),
     "model": ("agents", "defaults", "model"),
     "master-model": ("agents", "routing", "master"),
@@ -220,9 +220,21 @@ def _add_config_write_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Model provider.",
     )
-    parser.add_argument("--api-key", default=None, help="Active provider API key.")
-    parser.add_argument("--base-url", default=None, help="Active provider API base URL.")
-    parser.add_argument("--model", default=None, help="Default model.")
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help="API key for the default provider (agents.defaults.provider).",
+    )
+    parser.add_argument(
+        "--base-url",
+        default=None,
+        help="API base URL for the default provider (agents.defaults.provider).",
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="Default model (bare name or provider/model).",
+    )
 
 
 class _PlainTextProgressSink:
@@ -331,10 +343,13 @@ def _run_config(args: argparse.Namespace) -> None:
     if args.config_command == "set":
         config = load_config(args.config)
         data = config.model_dump(mode="json")
+        value = _coerce_config_value(args.key, args.value)
+        if args.key == "model":
+            value = _normalize_default_model_value(data, value)
         _set_nested_value(
             data,
             _config_setter_path(data, args.key),
-            _coerce_config_value(args.key, args.value),
+            value,
         )
         written = save_config(Config.model_validate(data), args.config)
         print(f"Updated {args.key} in {written}")
@@ -377,22 +392,43 @@ def _config_with_write_args(config: Config, args: argparse.Namespace) -> Config:
         raw = getattr(args, attr, None)
         if raw is None:
             continue
+        value = _coerce_config_value(key, str(raw))
+        if key == "model":
+            value = _normalize_default_model_value(data, value)
         _set_nested_value(
             data,
             _config_setter_path(data, key),
-            _coerce_config_value(key, str(raw)),
+            value,
         )
     return Config.model_validate(data)
 
 
 def _config_setter_path(data: dict[str, Any], key: str) -> tuple[str, ...]:
     if field := DYNAMIC_PROVIDER_SETTERS.get(key):
-        providers = data.get("providers")
-        active = providers.get("active") if isinstance(providers, dict) else None
-        if active not in {"anthropic", "volcengine"}:
-            raise SystemExit(f"Unknown active provider: {active!r}")
-        return ("providers", active, field)
+        provider = _default_provider_from_data(data)
+        return ("providers", provider, field)
     return CONFIG_SETTERS[key]
+
+
+def _default_provider_from_data(data: dict[str, Any]) -> str:
+    agents = data.get("agents")
+    defaults = agents.get("defaults") if isinstance(agents, dict) else None
+    provider = defaults.get("provider") if isinstance(defaults, dict) else None
+    if provider not in {"anthropic", "volcengine"}:
+        raise SystemExit(f"Unknown default provider: {provider!r}")
+    return provider
+
+
+def _normalize_default_model_value(data: dict[str, Any], value: Any) -> Any:
+    """Accept `provider/model` for defaults and split it into provider + model."""
+
+    if not isinstance(value, str) or "/" not in value:
+        return value
+    provider_candidate, _, model = value.partition("/")
+    if provider_candidate not in {"anthropic", "volcengine"} or not model.strip():
+        return value
+    _set_nested_value(data, CONFIG_SETTERS["provider"], provider_candidate)
+    return model.strip()
 
 
 def _config_dump(config: Config, *, show_secrets: bool) -> dict[str, Any]:

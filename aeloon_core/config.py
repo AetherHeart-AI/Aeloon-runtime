@@ -9,6 +9,9 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+ProviderName = Literal["anthropic", "volcengine"]
+KNOWN_PROVIDERS: frozenset[str] = frozenset({"anthropic", "volcengine"})
+
 _REMOVED_V1_AGENT_DEFAULTS = frozenset(
     {"base_profile_id", "profile_id", "max_handoffs"}
 )
@@ -34,9 +37,8 @@ class VolcengineProviderConfig(BaseModel):
 
 
 class ProvidersConfig(BaseModel):
-    """Provider namespace."""
+    """Provider credential namespace (no global active switch)."""
 
-    active: Literal["anthropic", "volcengine"] = "anthropic"
     anthropic: AnthropicProviderConfig = Field(default_factory=AnthropicProviderConfig)
     volcengine: VolcengineProviderConfig = Field(default_factory=VolcengineProviderConfig)
 
@@ -60,10 +62,11 @@ class AgentRuntimePolicy(BaseModel):
 
 
 class AgentDefaultsConfig(BaseModel):
-    """Default generation settings."""
+    """Default generation settings, including the default provider/model pair."""
 
     model_config = ConfigDict(extra="forbid")
 
+    provider: ProviderName = "anthropic"
     model: str = "claude-sonnet-4-6"
     temperature: float = 0.7
     reasoning_effort: str | None = None
@@ -78,14 +81,34 @@ class AgentDefaultsConfig(BaseModel):
     )
     runtime: AgentRuntimePolicy = Field(default_factory=AgentRuntimePolicy)
 
+    def model_ref(self) -> str:
+        """Return the default selection as `provider/model`."""
+
+        return format_model_ref(self.provider, self.model)
+
 
 class AgentRoutingConfig(BaseModel):
-    """Optional model-name overrides for Master and Worker responsibilities."""
+    """Optional provider/model overrides for Master and Worker roles.
+
+    Values may be bare model names (inherit `agents.defaults.provider`) or
+    explicit `provider/model` refs. The model router falls back to the config
+    default pair when an override cannot be used.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     master: str | None = Field(default=None, min_length=1)
     workers: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("master")
+    @classmethod
+    def _master_route_is_nonempty(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("master model route requires a nonempty model ref")
+        return normalized
 
     @field_validator("workers")
     @classmethod
@@ -197,6 +220,42 @@ def resolve_config_path(path: Path | str | None = None) -> Path:
     return Path(path).expanduser() if path is not None else default_config_path()
 
 
+def parse_model_ref(
+    value: str,
+    *,
+    default_provider: ProviderName,
+) -> tuple[ProviderName, str]:
+    """Parse a bare model name or explicit `provider/model` ref.
+
+    Only the first path segment is treated as a provider when it is a known
+    provider id. Other slashes remain part of the model name.
+    """
+
+    text = value.strip()
+    if not text:
+        raise ValueError("model ref must be nonempty")
+    provider_candidate, separator, remainder = text.partition("/")
+    if separator and provider_candidate in KNOWN_PROVIDERS:
+        model = remainder.strip()
+        if not model:
+            raise ValueError(f"model ref {value!r} is missing a model name")
+        return provider_candidate, model  # type: ignore[return-value]
+    if default_provider not in KNOWN_PROVIDERS:
+        raise ValueError(f"unknown default provider: {default_provider!r}")
+    return default_provider, text  # type: ignore[return-value]
+
+
+def format_model_ref(provider: ProviderName | str, model: str) -> str:
+    """Format a provider/model pair for config and display."""
+
+    normalized_model = model.strip()
+    if not normalized_model:
+        raise ValueError("model name must be nonempty")
+    if provider not in KNOWN_PROVIDERS:
+        raise ValueError(f"unknown provider: {provider!r}")
+    return f"{provider}/{normalized_model}"
+
+
 def load_config(path: Path | str | None = None) -> Config:
     """Load config from JSON and environment overrides."""
 
@@ -207,38 +266,46 @@ def load_config(path: Path | str | None = None) -> Config:
         _drop_removed_v1_settings(data)
         _migrate_agent_runtime_settings(data)
         _migrate_provider_settings(data)
+        _migrate_active_provider(data)
 
     config = Config.model_validate(data)
     updates: dict[str, Any] = {}
 
-    active_provider = os.environ.get("AELOON_CORE_PROVIDER", config.providers.active)
-    if active_provider not in {"anthropic", "volcengine"}:
+    default_provider = os.environ.get(
+        "AELOON_CORE_PROVIDER",
+        config.agents.defaults.provider,
+    )
+    if default_provider not in KNOWN_PROVIDERS:
         raise ValueError(
             "AELOON_CORE_PROVIDER must be 'anthropic' or 'volcengine', "
-            f"got {active_provider!r}"
+            f"got {default_provider!r}"
         )
-    updates.setdefault("providers", {})["active"] = active_provider
+    updates.setdefault("agents", {}).setdefault("defaults", {})[
+        "provider"
+    ] = default_provider
 
-    if active_provider == "volcengine":
-        if api_key := os.environ.get("ARK_API_KEY"):
-            updates.setdefault("providers", {}).setdefault("volcengine", {})[
-                "api_key"
-            ] = api_key
-        if base_url := os.environ.get("ARK_BASE_URL"):
-            updates.setdefault("providers", {}).setdefault("volcengine", {})[
-                "base_url"
-            ] = base_url
+    # Credential env vars apply to their own provider independently of the default.
+    if api_key := os.environ.get("ARK_API_KEY"):
+        updates.setdefault("providers", {}).setdefault("volcengine", {})[
+            "api_key"
+        ] = api_key
+    if base_url := os.environ.get("ARK_BASE_URL"):
+        updates.setdefault("providers", {}).setdefault("volcengine", {})[
+            "base_url"
+        ] = base_url
+    if api_key := os.environ.get("ANTHROPIC_API_KEY"):
+        updates.setdefault("providers", {}).setdefault("anthropic", {})[
+            "api_key"
+        ] = api_key
+    if base_url := os.environ.get("ANTHROPIC_BASE_URL"):
+        updates.setdefault("providers", {}).setdefault("anthropic", {})[
+            "base_url"
+        ] = base_url
+
+    if default_provider == "volcengine":
         if model := os.environ.get("ARK_MODEL"):
             updates.setdefault("agents", {}).setdefault("defaults", {})["model"] = model
     else:
-        if api_key := os.environ.get("ANTHROPIC_API_KEY"):
-            updates.setdefault("providers", {}).setdefault("anthropic", {})[
-                "api_key"
-            ] = api_key
-        if base_url := os.environ.get("ANTHROPIC_BASE_URL"):
-            updates.setdefault("providers", {}).setdefault("anthropic", {})[
-                "base_url"
-            ] = base_url
         if model := os.environ.get("ANTHROPIC_MODEL"):
             updates.setdefault("agents", {}).setdefault("defaults", {})[
                 "model"
@@ -358,6 +425,27 @@ def _migrate_provider_settings(data: Any) -> None:
     if "api_base" in migrated and "base_url" not in migrated:
         migrated["base_url"] = migrated.pop("api_base")
     providers["anthropic"] = migrated
+
+
+def _migrate_active_provider(data: Any) -> None:
+    """Move the removed `providers.active` switch onto `agents.defaults.provider`."""
+
+    if not isinstance(data, dict):
+        return
+    providers = data.get("providers")
+    if not isinstance(providers, dict):
+        return
+    active = providers.pop("active", None)
+    if active not in KNOWN_PROVIDERS:
+        return
+    agents = data.setdefault("agents", {})
+    if not isinstance(agents, dict):
+        return
+    defaults = agents.setdefault("defaults", {})
+    if not isinstance(defaults, dict):
+        return
+    if "provider" not in defaults:
+        defaults["provider"] = active
 
 
 def _migrate_agent_runtime_settings(data: Any) -> None:

@@ -9,7 +9,13 @@ from typing import Literal
 from pydantic_ai.models import Model
 from pydantic_ai.settings import ModelSettings
 
-from aeloon_core.config import Config
+from aeloon_core.config import (
+    KNOWN_PROVIDERS,
+    Config,
+    ProviderName,
+    format_model_ref,
+    parse_model_ref,
+)
 from aeloon_core.pydantic_model import (
     PromptCacheState,
     PydanticModelBundle,
@@ -23,22 +29,32 @@ _OFFICIAL_ANTHROPIC_URLS = {
     "https://api.anthropic.com/v1",
 }
 _FAST_WORKER_TYPES = frozenset({"explorer", "researcher"})
+RouteKind = Literal["fast", "strong", "override", "fallback", "injected"]
 
 
 @dataclass(frozen=True, slots=True)
 class ModelBinding:
     """One resolved model and its process-owned provider state."""
 
+    provider: ProviderName | Literal["injected"]
     model_name: str
-    route: Literal["fast", "strong", "override", "injected"]
+    route: RouteKind
     model: Model
     settings: ModelSettings
     prompt_cache: PromptCacheState | None
     bundle: PydanticModelBundle | None = None
 
+    @property
+    def model_ref(self) -> str:
+        """Return the resolved selection as `provider/model` when applicable."""
+
+        if self.provider == "injected":
+            return self.model_name
+        return format_model_ref(self.provider, self.model_name)
+
 
 class ModelRouter:
-    """Resolve roles to models and reuse one bundle per provider/model pair."""
+    """Resolve roles to provider/model pairs and reuse one bundle per pair."""
 
     def __init__(
         self,
@@ -65,24 +81,16 @@ class ModelRouter:
             self._injected_settings = dict(settings)
 
     def resolve_master(self) -> ModelBinding:
-        override = self.config.agents.routing.master
-        return self._resolve(
-            model_name=override or self._default_fast_model(),
-            route="override" if override else self._default_fast_route(),
+        return self._resolve_role(
+            override=self.config.agents.routing.master,
+            prefer_fast=True,
         )
 
     def resolve_worker(self, worker_type_id: str) -> ModelBinding:
         override = self.config.agents.routing.workers.get(worker_type_id)
-        if override is not None:
-            return self._resolve(model_name=override, route="override")
-        if worker_type_id in _FAST_WORKER_TYPES:
-            return self._resolve(
-                model_name=self._default_fast_model(),
-                route=self._default_fast_route(),
-            )
-        return self._resolve(
-            model_name=self.config.agents.defaults.model,
-            route="strong",
+        return self._resolve_role(
+            override=override,
+            prefer_fast=worker_type_id in _FAST_WORKER_TYPES,
         )
 
     def resolved_model_name(
@@ -104,14 +112,59 @@ class ModelRouter:
         if bundles:
             await asyncio.gather(*(bundle.close() for bundle in bundles))
 
+    def _resolve_role(
+        self,
+        *,
+        override: str | None,
+        prefer_fast: bool,
+    ) -> ModelBinding:
+        defaults = self.config.agents.defaults
+        if override is not None:
+            try:
+                provider, model_name = parse_model_ref(
+                    override,
+                    default_provider=defaults.provider,
+                )
+            except ValueError:
+                return self._resolve(
+                    provider=defaults.provider,
+                    model_name=defaults.model,
+                    route="fallback",
+                )
+            if self._is_usable(provider, model_name):
+                return self._resolve(
+                    provider=provider,
+                    model_name=model_name,
+                    route="override",
+                )
+            return self._resolve(
+                provider=defaults.provider,
+                model_name=defaults.model,
+                route="fallback",
+            )
+
+        if prefer_fast and self._uses_official_anthropic():
+            return self._resolve(
+                provider="anthropic",
+                model_name=FAST_ANTHROPIC_MODEL,
+                route="fast",
+            )
+        return self._resolve(
+            provider=defaults.provider,
+            model_name=defaults.model,
+            route="strong",
+        )
+
     def _resolve(
         self,
         *,
+        provider: ProviderName,
         model_name: str,
-        route: Literal["fast", "strong", "override"],
+        route: RouteKind,
     ) -> ModelBinding:
         if self._injected_model is not None:
             return ModelBinding(
+                provider="injected",
                 model_name=str(
                     getattr(self._injected_model, "model_name", None) or "<injected>"
                 ),
@@ -120,12 +173,11 @@ class ModelRouter:
                 settings=dict(self._injected_settings),
                 prompt_cache=None,
             )
-        provider_name = self.config.providers.active
-        key = (provider_name, model_name)
+        key = (provider, model_name)
         bundle = self._bundles.get(key)
         if bundle is None:
             defaults = self.config.agents.defaults
-            if provider_name == "volcengine":
+            if provider == "volcengine":
                 bundle = build_volcengine_model(
                     provider=self.config.providers.volcengine,
                     model_name=model_name,
@@ -143,6 +195,7 @@ class ModelRouter:
                 )
             self._bundles[key] = bundle
         return ModelBinding(
+            provider=provider,
             model_name=model_name,
             route=route,
             model=bundle.model,
@@ -151,20 +204,30 @@ class ModelRouter:
             bundle=bundle,
         )
 
-    def _default_fast_model(self) -> str:
-        if self._uses_official_anthropic():
-            return FAST_ANTHROPIC_MODEL
-        return self.config.agents.defaults.model
-
-    def _default_fast_route(self) -> Literal["fast", "strong"]:
-        return "fast" if self._uses_official_anthropic() else "strong"
+    def _is_usable(self, provider: str, model_name: str) -> bool:
+        if provider not in KNOWN_PROVIDERS:
+            return False
+        if not model_name.strip():
+            return False
+        # The built-in Anthropic fast model only works on the official endpoint.
+        if (
+            model_name == FAST_ANTHROPIC_MODEL
+            and provider == "anthropic"
+            and not self._uses_official_anthropic_endpoint()
+        ):
+            return False
+        return True
 
     def _uses_official_anthropic(self) -> bool:
         return (
-            self.config.providers.active == "anthropic"
-            and self.config.providers.anthropic.base_url.rstrip("/")
-            in {url.rstrip("/") for url in _OFFICIAL_ANTHROPIC_URLS}
+            self.config.agents.defaults.provider == "anthropic"
+            and self._uses_official_anthropic_endpoint()
         )
+
+    def _uses_official_anthropic_endpoint(self) -> bool:
+        return self.config.providers.anthropic.base_url.rstrip("/") in {
+            url.rstrip("/") for url in _OFFICIAL_ANTHROPIC_URLS
+        }
 
 
 __all__ = [

@@ -23,9 +23,11 @@ async def test_official_anthropic_routes_coordination_and_read_only_workers_fast
     custom = router.resolve_worker("custom")
 
     assert master.model_name == FAST_ANTHROPIC_MODEL
+    assert master.provider == "anthropic"
     assert explorer.model is master.model
     assert researcher.model is master.model
     assert builder.model_name == config.agents.defaults.model
+    assert builder.provider == config.agents.defaults.provider
     assert reviewer.model is builder.model
     assert custom.model is builder.model
     await router.close()
@@ -45,11 +47,12 @@ async def test_nonofficial_gateway_falls_back_to_default_model() -> None:
 @pytest.mark.asyncio
 async def test_volcengine_falls_back_to_the_configured_default_model() -> None:
     config = Config()
-    config.providers.active = "volcengine"
+    config.agents.defaults.provider = "volcengine"
     config.agents.defaults.model = "ark-code-latest"
     router = ModelRouter(config)
 
     assert router.resolve_master().model_name == "ark-code-latest"
+    assert router.resolve_master().provider == "volcengine"
     assert router.resolve_worker("researcher").model_name == "ark-code-latest"
     assert router.resolve_worker("reviewer").model_name == "ark-code-latest"
     await router.close()
@@ -70,6 +73,43 @@ async def test_explicit_routes_override_provider_defaults() -> None:
     assert router.resolve_master().model_name == "master-model"
     assert router.resolve_worker("explorer").model_name == "search-model"
     assert router.resolve_worker("builder").model_name == "build-model"
+    await router.close()
+
+
+@pytest.mark.asyncio
+async def test_routing_profile_can_override_provider_and_model() -> None:
+    config = Config(
+        agents=AgentsConfig(
+            routing=AgentRoutingConfig(
+                master="volcengine/ark-code-latest",
+                workers={"builder": "anthropic/claude-sonnet-4-6"},
+            )
+        )
+    )
+    router = ModelRouter(config)
+
+    master = router.resolve_master()
+    builder = router.resolve_worker("builder")
+    assert master.provider == "volcengine"
+    assert master.model_name == "ark-code-latest"
+    assert master.route == "override"
+    assert builder.provider == "anthropic"
+    assert builder.model_name == "claude-sonnet-4-6"
+    await router.close()
+
+
+@pytest.mark.asyncio
+async def test_unusable_routing_override_falls_back_to_config_default() -> None:
+    config = Config()
+    config.providers.anthropic.base_url = "https://api.deepseek.com/anthropic"
+    config.agents.defaults.model = "deepseek-v4-pro"
+    config.agents.routing.master = f"anthropic/{FAST_ANTHROPIC_MODEL}"
+    router = ModelRouter(config)
+
+    master = router.resolve_master()
+    assert master.route == "fallback"
+    assert master.provider == "anthropic"
+    assert master.model_name == "deepseek-v4-pro"
     await router.close()
 
 

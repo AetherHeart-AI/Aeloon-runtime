@@ -102,7 +102,7 @@ class TerminalEventRenderer:
         table.add_column(justify="right")
         table.add_row(
             Text("Aeloon Core", style=SEMANTIC_STYLES["assistant"]),
-            Text(str(config.agents.defaults.model), style=SEMANTIC_STYLES["tool"]),
+            Text(config.agents.defaults.model_ref(), style=SEMANTIC_STYLES["tool"]),
         )
         table.add_row(
             Text(str(config.workspace), style=SEMANTIC_STYLES["muted"]),

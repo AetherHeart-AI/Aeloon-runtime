@@ -41,7 +41,7 @@ The Volcano Engine provider uses Ark Agent Plan's OpenAI-compatible Responses AP
 which is the protocol recommended by the official OpenCode integration guide:
 
 ```bash
-export AELOON_CORE_PROVIDER="volcengine"
+export AELOON_CORE_PROVIDER="volcengine"   # sets agents.defaults.provider
 export ARK_API_KEY="你的火山方舟 API Key"
 export ARK_MODEL="ark-code-latest"
 
@@ -345,11 +345,15 @@ masked by this compatibility fallback.
 
 ## Model routing and telemetry
 
-Model selection is process-scoped and role-aware. On the official Anthropic endpoint,
-Master, explorer, and researcher default to `claude-haiku-4-5-20251001`; builder,
-reviewer, and unknown custom Worker types use `agents.defaults.model`. Compatible
-gateways and Volcengine safely use the default model unless a role is explicitly
-overridden. Provider/model bundles are reused while each bundle keeps its own prompt
+Model selection is process-scoped and role-aware. The default pair lives under
+`agents.defaults.provider` + `agents.defaults.model` (there is no global
+`providers.active` switch). On the official Anthropic endpoint with that default
+provider, Master, explorer, and researcher use `claude-haiku-4-5-20251001`; builder,
+reviewer, and unknown custom Worker types use the default pair. Compatible
+gateways and Volcengine safely use the default pair unless a role is explicitly
+overridden via `agents.routing` (bare model name or `provider/model`). When an
+override cannot be used, the router falls back to the config default pair.
+Provider/model bundles are reused while each bundle keeps its own prompt
 cache state. Constructor-level `model` and `model_settings` injection remains an all-role
 override for tests and embeddings.
 
@@ -446,19 +450,28 @@ uv run aeloon-core config init \
 
 When loading a v1 config, v2 ignores the removed `base_profile_id`, `profile_id`,
 and `max_handoffs` settings. The next `config set` or `config init --force` writes
-the file back without them. Legacy `uasm` trace/stuck settings migrate to `runtime`;
+the file back without them. Legacy `providers.active` migrates to
+`agents.defaults.provider`. Legacy `uasm` trace/stuck settings migrate to `runtime`;
 removed `tool_error_guard_threshold`, `budget_auto_continues`, and per-round
 minimal-context settings are ignored. Unrelated unknown agent-default settings remain
 validation errors.
 
-Equivalent routing and role-budget settings can be written directly:
+Equivalent default provider/model, routing, and role-budget settings can be written
+directly:
 
 ```json
 {
   "agents": {
+    "defaults": {
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-6"
+    },
     "routing": {
-      "master": "fast-model",
-      "workers": {"explorer": "fast-model", "reviewer": "strong-model"}
+      "master": "anthropic/claude-haiku-4-5-20251001",
+      "workers": {
+        "explorer": "fast-model",
+        "reviewer": "volcengine/ark-code-latest"
+      }
     },
     "budgets": {
       "master": 20,
@@ -470,7 +483,7 @@ Equivalent routing and role-budget settings can be written directly:
 
 Common environment overrides are:
 
-- `AELOON_CORE_PROVIDER` (`anthropic` or `volcengine`)
+- `AELOON_CORE_PROVIDER` (`anthropic` or `volcengine`; sets `agents.defaults.provider`)
 - `ANTHROPIC_API_KEY`
 - `ANTHROPIC_BASE_URL`
 - `ANTHROPIC_MODEL`

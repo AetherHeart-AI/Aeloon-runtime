@@ -143,7 +143,7 @@ class TUIBridge:
         workers = self.orchestrator.worker_control.list_workers(resolved_session_id)
         return {
             "workspace": str(self.config.workspace),
-            "model": self.config.agents.defaults.model,
+            "model": self.config.agents.defaults.model_ref(),
             "session": resolved_session_id,
             # ``session_id`` is kept as a protocol alias because live runtime
             # events use that spelling for correlation.
