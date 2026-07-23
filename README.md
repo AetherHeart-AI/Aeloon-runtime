@@ -76,6 +76,11 @@ Useful TUI commands include:
 Independent Workers run concurrently. Runs in one WorkerSession retain a single
 private context lineage and are continued explicitly.
 
+The TUI renders streaming Master responses as concealed Markdown. Concurrent Workers
+remain visible as live inline blocks in the Master transcript; use the right-hand
+catalog or `Tab` to expand a Worker's full phase, todo, timeline, and result detail.
+Set `AELOON_CORE_TUI_ASCII=1` when the terminal needs ASCII-only status glyphs.
+
 ## Master and Worker boundary
 
 | Actor | Tools |
@@ -483,9 +488,10 @@ Common environment overrides are:
 
 `write` atomically creates or overwrites a complete UTF-8 file. Use `str_replace`
 for exact edits; an empty `old_str` creates a missing file, while non-empty matches
-must be unique unless `replace_all=true`. Both enforce the model-aware per-call
-character limit, reject symlink/protected paths, recheck the target before commit,
-and use an atomic same-directory replacement.
+must be unique unless `replace_all=true`. Both advertise model-aware per-call
+character guidance (soft preference only), reject symlink/protected paths, recheck
+the target before commit, and use an atomic same-directory replacement. The only
+hard size ceiling is the 16 MiB UTF-8 file limit.
 
 ## Development
 
