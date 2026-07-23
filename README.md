@@ -10,9 +10,9 @@ receives one outcome-oriented node objective, chooses its own tools and Skills,
 completes the work, and returns a bounded report. Selecting a Worker type is only an
 executor-binding detail inside that larger Flow.
 
-There is one agent loop for both actors. Its nodes are always
-`router → model → tool/guard → done`; responsibility and tool configuration vary,
-not the execution engine.
+Master and Worker both use PydanticAI Core for the model–tool loop. Aeloon remains
+the control plane for Flow scheduling, WorkerSession identity, Namespace/Skill
+capabilities, permissions, cancellation, persistence, and commit ordering.
 
 ## Quick start
 
@@ -29,11 +29,29 @@ export CLAUDE_CODE_MAX_CONTEXT_TOKENS=1048576
 uv run aeloon-core
 ```
 
-The model gateway now uses Anthropic Messages format end to end. With the Kimi
-base URL above, the SDK sends requests to
+The model gateway uses PydanticAI's official Anthropic integration. With the Kimi
+base URL above, the Anthropic SDK sends requests to
 `https://api.kimi.com/coding/v1/messages`; tool definitions and history use
 Claude `tool_use` / `tool_result` content blocks. Aeloon accepts Claude Code's
 `k3[1m]` environment value and automatically sends Kimi's API model ID `k3`.
+
+### Volcano Engine Ark Agent Plan
+
+The Volcano Engine provider uses Ark Agent Plan's OpenAI-compatible Responses API,
+which is the protocol recommended by the official OpenCode integration guide:
+
+```bash
+export AELOON_CORE_PROVIDER="volcengine"
+export ARK_API_KEY="你的火山方舟 API Key"
+export ARK_MODEL="ark-code-latest"
+
+uv run aeloon-core
+```
+
+The provider defaults to the Agent Plan endpoint
+`https://ark.cn-beijing.volces.com/api/plan/v3`. Do not replace it with the regular
+pay-as-you-go `/api/v3` endpoint when you intend to consume an Agent Plan subscription.
+Set `ARK_BASE_URL` only when you intentionally need a different Ark endpoint.
 
 Run one non-interactive turn with:
 
@@ -84,16 +102,18 @@ plan
 
 The Master creates semantic nodes with `objective`, `worker_type_id`, and
 `depends_on`. A node may also set `worker_session_policy` to `auto` (the default) or
-`fresh`. Each `advance_flow` executes exactly one ready frontier: it launches all
-independent nodes as distinct WorkerSessions, joins their Runs, synchronizes bounded
-results, and returns control to Master. It deliberately does not start the next
-frontier in the same call, so Master can evaluate results and dynamically choose one
-of:
+`fresh`, plus up to four explicit `context_refs`. Each `advance_flow` executes exactly
+one ready frontier: it launches all independent nodes as distinct WorkerSessions,
+joins their Runs, synchronizes bounded results, and returns control to Master. It
+deliberately does not start the next frontier in the same call, so Master can evaluate
+results and dynamically choose one of:
 
 - `add_flow_nodes` to expand or replan the graph;
 - `revise_flow_node` to create a new generation and rerun only affected descendants;
-- `retry_flow_node` for a technical/non-successful Run outcome;
-- `resume_flow_node` for an exact `waiting_for_context` continuation;
+- `retry_flow_node` for a technical/non-successful Run outcome; a reusable `partial`
+  checkpoint requires a Master-authored `budget_increase`;
+- `resume_flow_node` for an exact `waiting_for_context` continuation, optionally with
+  a Master-authored `budget_increase`;
 - `complete_flow` for an explicit completed, partial, or blocked outcome.
 
 WorkerSession selection follows a durable, inspectable policy:
@@ -112,7 +132,7 @@ invariant for `waiting_for_context`. Lost or unknown Worker state automatically 
 back to a new WorkerSession. When Master judges a context polluted, it passes
 `fresh_worker=true` and a concrete `fresh_reason` to `revise_flow_node` or
 `retry_flow_node`. Flow inspection exposes the requested policy, the resolved
-`new`/`reuse`/`resume` action, and its reason.
+`new`/`reuse`/`resume` action, its reason, and the pending/last Run budget.
 
 Dependencies are scheduling edges, not implicit data pipes. Upstream reports remain
 untrusted task data and are never silently appended to a downstream authoritative
@@ -121,10 +141,21 @@ the planner first and then dynamically authors the build nodes from its own synt
 Static downstream nodes are appropriate when their inputs already live as durable
 shared-workspace artifacts or their objectives are known in advance.
 
+For a fresh follow-up Worker that needs evidence from related work, Master opts in
+with `context_refs`. A `flow_node` reference may target an ancestor in the same Flow;
+a `worker_run` reference may target a settled Run owned by the same Master session,
+including a prior Flow. Each reference records a relation and selects bounded
+`objective`, `summary`, `artifacts`, `evidence`, or `unresolved` sections. The packet is
+sent separately as untrusted reference material: it neither changes the authoritative
+objective nor creates WorkerSession lineage. Flow inspection exposes these durable
+associations and each WorkerRun's resolved reference ids.
+
 Only `completed` and explicitly `skipped` dependencies unlock the default join.
 `partial`, `failed`, `cancelled`, `waiting_for_context`, `queued`, and `running` are
-never mistaken for success. A node may opt into `all_terminal` when its purpose is to
-diagnose failed branches.
+never mistaken for success. A partial node cannot be converted to `skipped`: Master
+must increase its request/output/token/time/tool target, revise it, or finish the Flow
+as partial. A node may opt into `all_terminal` when its purpose is to diagnose failed
+branches.
 
 Review approval is not inferred from words in a free-form Worker report. Master reads
 the report and explicitly completes or revises the Flow. Revision increments the
@@ -182,7 +213,7 @@ with their stored snapshot and digest.
 
 ## Completion and continuation
 
-A WorkerRun must end with exactly one terminal tool call:
+A WorkerRun must end with exactly one typed PydanticAI output:
 
 ```text
 complete_work(summary, artifacts=[], evidence=[])
@@ -191,7 +222,7 @@ request_master(summary, question)
 
 A terminal call mixed with any other tool call—or multiple terminal calls in one
 response—is rejected before any tool executes. Plain Worker text cannot complete a
-Run; it enters the normal correction and Guard path.
+Run; PydanticAI requests a corrected typed output within the request budget.
 
 Run states are:
 
@@ -206,16 +237,16 @@ that Run's checkpoint. The waiting Run is never reopened.
 
 Checkpoint, structured question, result, and waiting status are committed in one
 SQLite transaction. Reuse and resume inherit the prior permission domain; the host
-rejects permission expansion and idempotency conflicts. Each continuation receives
-the current Run budget instead of inheriting an obsolete cap.
+rejects permission expansion and idempotency conflicts. Workers cannot extend their
+own limits. Master may provide a `budget_increase` with strictly higher target limits;
+the resolved grant is durably attached to the next exact-checkpoint Run.
 
-WorkerRuns have no cumulative token or tool-call cap by default. The model context
+WorkerRuns use the configured request limit and have no cumulative token or tool-call
+cap by default. The model context
 window is a separate per-request concern. A new Worker starts from the minimal dispatch
 envelope—its objective, permission domain, and budget—rather than a copy of the Master
-transcript. After dispatch, Master and Worker use the same context-view pipeline:
-canonical history remains append-only until an explicit context-window compaction
-checkpoint, and provider-only projections are applied in one place. There is no rolling
-minimal-context rewrite on every model round. A finite internal grant remains a hard Run
+transcript. PydanticAI `ProcessHistory` applies Aeloon's client-side compaction policy
+when history approaches the configured context window. A finite internal grant remains a hard Run
 bound when an embedding host explicitly supplies one, and the wall-clock timeout plus
 `cancel_worker` remain the liveness controls.
 
@@ -237,19 +268,20 @@ side effects stopped or rolled back. A cancelling Flow containing such a Run bec
 and instructs the Master to inspect side effects; only cancellation with no uncertain in-flight
 tool work becomes cleanly `cancelled`.
 
-## Loop liveness and prompt caching
+## Runtime limits and prompt caching
 
 The loop deterministically detects an identical successful read-only tool action and
 observation repeated across four distinct model steps. It keeps at most 20 complete
 exchanges, compares canonical digests rather than raw large results, and never treats
-mutating, failed, incomplete, or same-batch calls as stuck. A match enters Guard with
-bounded evidence and requires either a materially different retry or finalization.
+mutating, failed, incomplete, or same-batch calls as stuck. Before another identical
+call executes, the runtime returns `ModelRetry` and requires a different strategy.
+`UsageLimits.request_limit` remains the final liveness boundary. Raising it requires a
+Master-authored continuation; there is no model Guard, automatic budget continuation,
+or tool-error reviewer.
 
-Guard first resolves unambiguous cases locally: a terminal-protocol correction and one
-safe transient-provider retry do not spend another model call, while non-transient
-provider failures finalize locally. Semantic decisions such as stuck recovery and a
-spent iteration budget still go to the reviewer model. Host-owned per-signature and
-per-run recovery caps prevent Guard itself from becoming a loop.
+Finite Worker token grants are checked before every request. The runtime counts the next
+input when supported, otherwise uses a conservative estimate, and lowers that request's
+`max_tokens` so an over-budget response cannot reach tool execution.
 
 Anthropic prompt caching is enabled by default. The Master instruction block and Worker
 type metadata form a stable system prefix; volatile Worker/Flow state is appended at the
@@ -291,7 +323,7 @@ Host-discovered Worker definitions and Skill contents are trusted workflow
 configuration. Workspace files, tool output, web content, and data referenced by a
 Skill remain untrusted task data.
 
-## Persistence and v2 migration
+## Persistence and PydanticAI migration
 
 Master turns remain JSONL projections. Flow state, idempotent graph decisions, turn
 leases, and terminal-response commits use the independent `flow-control.sqlite3` store
@@ -307,17 +339,11 @@ inherited by such a fork.
 Worker control state uses `worker-control.sqlite3` at schema version 5; private
 Worker transcripts are stored below `worker-sessions/` and are never exposed to Master.
 
-The architecture-v2 upgrade is intentionally destructive only for legacy Worker schema
-v1. On first startup it locks the database, drops v1 Worker UI/checkpoint/run/session
-tables, creates the current schema, and deletes old `worker-sessions/` transcripts.
-Subsequent v2-to-v5 migrations preserve Worker data while adding activation, execution,
-and process-owner fences. A migrated v4 in-flight marker without an owner epoch fails
-closed and requires the old runner to finish or operator intervention; ownership is never
-fabricated from elapsed time. Existing Master sessions and ordinary transition traces
-remain. Old external definition/artifact directories are not read and are not deleted.
-
-Stop any old detached runner before upgrading. A migration or transcript-cleanup
-failure aborts startup instead of running against a half-migrated store.
+New Master turns, Flow commits, Worker transcripts, and checkpoints use
+`schema_version: 2`, `message_format: "pydantic-ai-v1"`, and PydanticAI's
+`ModelMessagesTypeAdapter`. Legacy JSONL, Flow payloads, and checkpoints remain listable
+and auditable but cannot be resumed; execution raises `LegacySessionError` and requires a
+new session. Migration never deletes or overwrites those records.
 
 ## Config
 
@@ -333,21 +359,34 @@ uv run aeloon-core config show
 uv run aeloon-core config set max-iterations 25
 uv run aeloon-core config set context-compaction-enabled true
 uv run aeloon-core config set prompt-caching true
-uv run aeloon-core config set uasm-stuck-detection-threshold 4
+uv run aeloon-core config set runtime-stuck-detection-threshold 4
+```
+
+Alternatively, initialize a Volcano Engine Agent Plan configuration:
+
+```bash
+uv run aeloon-core config init \
+  --provider volcengine \
+  --api-key ark-... \
+  --model ark-code-latest
 ```
 
 When loading a v1 config, v2 ignores the removed `base_profile_id`, `profile_id`,
 and `max_handoffs` settings. The next `config set` or `config init --force` writes
-the file back without them. The former per-round
-`uasm.minimal_context_recent_turns` and `uasm.minimal_context_tool_result_chars`
-settings are likewise discarded because the rolling minimal-context layer no longer
-exists; unrelated unknown agent-default settings remain validation errors.
+the file back without them. Legacy `uasm` trace/stuck settings migrate to `runtime`;
+removed `tool_error_guard_threshold`, `budget_auto_continues`, and per-round
+minimal-context settings are ignored. Unrelated unknown agent-default settings remain
+validation errors.
 
 Common environment overrides are:
 
+- `AELOON_CORE_PROVIDER` (`anthropic` or `volcengine`)
 - `ANTHROPIC_API_KEY`
 - `ANTHROPIC_BASE_URL`
 - `ANTHROPIC_MODEL`
+- `ARK_API_KEY`
+- `ARK_BASE_URL`
+- `ARK_MODEL`
 - `CLAUDE_CODE_AUTO_COMPACT_WINDOW`
 - `CLAUDE_CODE_MAX_CONTEXT_TOKENS`
 - `AELOON_CORE_WORKSPACE`
