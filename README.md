@@ -88,6 +88,25 @@ The Master handles tiny observations itself. It should not create a Worker just 
 perform an `ls -la`-sized action, and it should not send command lists or prescribed
 steps. A delegated request has one field: `objective`.
 
+### Internal module boundaries
+
+The control plane separates pure state contracts from persistence and execution:
+
+| Concern | Module |
+|---|---|
+| Flow DAG models and state transitions | `aeloon_core.flow_state` |
+| Flow runtime projections and WorkerRun bindings | `aeloon_core.flow_runtime` |
+| Flow SQLite authority and turn commits | `aeloon_core.flows` |
+| Flow orchestration and frontier execution | `aeloon_core.flow_control` |
+| Worker lifecycle models and bounded envelopes | `aeloon_core.worker_state` |
+| Worker SQLite authority and execution fencing | `aeloon_core.worker_sessions` |
+| Live Worker task scheduling and heartbeats | `aeloon_core.worker_manager` |
+
+`aeloon_core.flows` and `aeloon_core.worker_sessions` continue to re-export their
+historical domain types so existing integrations can migrate without a flag day.
+New control-plane code should import domain contracts from `flow_state` or
+`worker_state` and persistence stores from `flows` or `worker_sessions`.
+
 ## Dynamic Flows
 
 Multi-stage work is represented as a first-class, appendable DAG rather than an
@@ -102,11 +121,17 @@ plan
 
 The Master creates semantic nodes with `objective`, `worker_type_id`, and
 `depends_on`. A node may also set `worker_session_policy` to `auto` (the default) or
-`fresh`, plus up to four explicit `context_refs`. Each `advance_flow` executes exactly
-one ready frontier: it launches all independent nodes as distinct WorkerSessions,
-joins their Runs, synchronizes bounded results, and returns control to Master. It
-deliberately does not start the next frontier in the same call, so Master can evaluate
-results and dynamically choose one of:
+`fresh`, plus up to four explicit `context_refs`. Flows default to
+`advance_mode: "checkpointed"`, where each `advance_flow` launches and joins one ready
+frontier before returning control to Master. When every downstream objective is already
+complete and its inputs live in the shared workspace, Master may explicitly choose
+`advance_mode: "auto"` and a limit of at most four frontiers. Auto mode continues only
+after an entirely completed frontier and stops after executing a reviewer frontier, at
+the configured limit, or on any partial, failed, cancelled, waiting, timeout, launch
+error, active Run, round limit, or lack of ready work. It never revises, retries, skips,
+or completes a Flow on Master's behalf.
+
+After any checkpoint, Master can evaluate results and dynamically choose one of:
 
 - `add_flow_nodes` to expand or replan the graph;
 - `revise_flow_node` to create a new generation and rerun only affected descendants;
@@ -217,12 +242,33 @@ A WorkerRun must end with exactly one typed PydanticAI output:
 
 ```text
 complete_work(summary, artifacts=[], evidence=[])
-request_master(summary, question)
+request_master(summary, question, artifacts=[], evidence=[])
 ```
 
 A terminal call mixed with any other tool call—or multiple terminal calls in one
 response—is rejected before any tool executes. Plain Worker text cannot complete a
 Run; PydanticAI requests a corrected typed output within the request budget.
+
+Evidence is structured and host-validated:
+
+```json
+{
+  "kind": "file | test | typecheck | lint | runtime | source",
+  "locator": "file:line, test node, URL, or runtime object",
+  "claim": "what the evidence proves",
+  "status": "passed | failed | observed | not_applicable",
+  "method": "actual command or observation method",
+  "finding_id": "optional reviewer finding ID"
+}
+```
+
+A passed executable check must match a command actually run in the current WorkerRun
+with exit code zero, and file locators must resolve to valid workspace lines. A builder
+that used mutation tools cannot complete without test, typecheck, and lint accounting
+plus at least one successful executable check. A reviewer must run a relevant test or
+runtime reproduction, and every reported finding ID must link to evidence. Invalid
+terminal output receives `ModelRetry`; the Run is not marked completed. Historical
+string evidence remains readable as `legacy` evidence but cannot be emitted by new Runs.
 
 Run states are:
 
@@ -279,15 +325,34 @@ call executes, the runtime returns `ModelRetry` and requires a different strateg
 Master-authored continuation; there is no model Guard, automatic budget continuation,
 or tool-error reviewer.
 
-Finite Worker token grants are checked before every request. The runtime counts the next
-input when supported, otherwise uses a conservative estimate, and lowers that request's
-`max_tokens` so an over-budget response cannot reach tool execution.
+Each model request sets `max_tokens` from `agents.defaults.max_output_tokens` (default
+`32768`). Without an explicit value, Anthropic-compatible providers silently use `4096`,
+which thinking models often exhaust before emitting tools or text. Finite Worker cumulative
+token grants are checked before every request. The runtime counts the next input when
+supported, otherwise uses a conservative estimate, and lowers that request's `max_tokens`
+so an over-budget response cannot reach tool execution.
 
 Anthropic prompt caching is enabled by default. The Master instruction block and Worker
 type metadata form a stable system prefix; volatile Worker/Flow state is appended at the
 user tail. Anthropic-compatible gateways that clearly reject `cache_control` are retried
 once without it and remembered for later requests; unrelated provider errors are not
 masked by this compatibility fallback.
+
+## Model routing and telemetry
+
+Model selection is process-scoped and role-aware. On the official Anthropic endpoint,
+Master, explorer, and researcher default to `claude-haiku-4-5-20251001`; builder,
+reviewer, and unknown custom Worker types use `agents.defaults.model`. Compatible
+gateways and Volcengine safely use the default model unless a role is explicitly
+overridden. Provider/model bundles are reused while each bundle keeps its own prompt
+cache state. Constructor-level `model` and `model_settings` injection remains an all-role
+override for tests and embeddings.
+
+Each Worker result records its resolved model, role, request and tool counts, tokens,
+duration, budget utilization, partial reason, and budget-increase count. Flow state
+records frontier widths, auto-advanced frontier count, revision count, and stop reason.
+The global `max_iterations` default remains 25; optional per-role request budgets allow
+telemetry-driven tuning without changing the default policy.
 
 ## Skills
 
@@ -357,6 +422,9 @@ uv run aeloon-core config init \
 
 uv run aeloon-core config show
 uv run aeloon-core config set max-iterations 25
+uv run aeloon-core config set master-model claude-haiku-4-5-20251001
+uv run aeloon-core config set reviewer-model claude-sonnet-4-6
+uv run aeloon-core config set explorer-max-iterations 12
 uv run aeloon-core config set context-compaction-enabled true
 uv run aeloon-core config set prompt-caching true
 uv run aeloon-core config set runtime-stuck-detection-threshold 4
@@ -377,6 +445,23 @@ the file back without them. Legacy `uasm` trace/stuck settings migrate to `runti
 removed `tool_error_guard_threshold`, `budget_auto_continues`, and per-round
 minimal-context settings are ignored. Unrelated unknown agent-default settings remain
 validation errors.
+
+Equivalent routing and role-budget settings can be written directly:
+
+```json
+{
+  "agents": {
+    "routing": {
+      "master": "fast-model",
+      "workers": {"explorer": "fast-model", "reviewer": "strong-model"}
+    },
+    "budgets": {
+      "master": 20,
+      "workers": {"explorer": 12, "reviewer": 30}
+    }
+  }
+}
+```
 
 Common environment overrides are:
 
@@ -410,4 +495,14 @@ uv run ruff check .
 uv build
 (cd aeloon_core/tui && bun run check)
 git diff --check
+```
+
+The representative control-plane evaluation manifest is
+`benchmarks/master_worker_eval_cases.json`. It covers single-node delivery, parallel
+DAGs, research-gated graph construction, review-driven revision, budget continuation,
+and `request_master`, with stable quality and latency metrics for before/after runs.
+After recording one result ledger from each version, compare them with:
+
+```bash
+uv run python -m benchmarks.compare_master_worker_eval before.json after.json
 ```

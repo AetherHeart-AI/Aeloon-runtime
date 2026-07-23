@@ -47,6 +47,69 @@ def test_load_config_discards_removed_v1_profile_settings(tmp_path: Path) -> Non
     assert "max_handoffs" not in cleaned_defaults
 
 
+def test_model_routing_config_supports_master_and_worker_overrides(tmp_path: Path) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "agents": {
+                    "routing": {
+                        "master": "fast-model",
+                        "workers": {
+                            "explorer": "search-model",
+                            "reviewer": "strong-model",
+                        },
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config.agents.routing.master == "fast-model"
+    assert config.agents.routing.workers == {
+        "explorer": "search-model",
+        "reviewer": "strong-model",
+    }
+
+
+def test_request_budgets_support_master_and_worker_overrides(tmp_path: Path) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "agents": {
+                    "budgets": {
+                        "master": 12,
+                        "workers": {"explorer": 8, "reviewer": 30},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config.agents.budgets.master == 12
+    assert config.agents.budgets.workers == {"explorer": 8, "reviewer": 30}
+
+
+def test_config_set_writes_role_specific_model_and_budget_routes(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.json"
+
+    main(["config", "set", "--config", str(path), "master-model", "fast-model"])
+    main(["config", "set", "--config", str(path), "reviewer-max-iterations", "31"])
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["agents"]["routing"]["master"] == "fast-model"
+    assert payload["agents"]["budgets"]["workers"]["reviewer"] == 31
+
+
 def test_load_config_still_rejects_unknown_agent_defaults(tmp_path: Path) -> None:
     path = tmp_path / "config.json"
     _write_config(

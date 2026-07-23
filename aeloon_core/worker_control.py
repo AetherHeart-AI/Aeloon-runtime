@@ -6,10 +6,11 @@ from collections.abc import Sequence
 from typing import Any, Literal
 
 from aeloon_core.worker_manager import WorkerSessionManager
-from aeloon_core.worker_sessions import (
+from aeloon_core.worker_state import (
     BudgetGrant,
     BudgetIncrease,
     ContextEnvelope,
+    EvidenceItem,
     PermissionSnapshot,
     RelatedContextSection,
     RelatedWorkerContext,
@@ -30,12 +31,19 @@ class WorkerControlService:
         worker_tool_names: tuple[str, ...] = (),
         skills_enabled: bool = True,
         default_budget: BudgetGrant | None = None,
+        default_budgets: dict[str, BudgetGrant] | None = None,
     ) -> None:
         self.manager = manager
         self.worker_types = worker_types
         self.worker_tool_names = tuple(sorted(set(worker_tool_names)))
         self.skills_enabled = bool(skills_enabled)
         self.default_budget = default_budget or BudgetGrant()
+        self.default_budgets = dict(default_budgets or {})
+
+    def default_budget_for(self, worker_type_id: str) -> BudgetGrant:
+        """Resolve the host grant for one Worker responsibility."""
+
+        return self.default_budgets.get(worker_type_id, self.default_budget)
 
     def discover_worker_types(self) -> list[dict[str, str]]:
         """Return bounded descriptors; prompts remain private to Worker execution."""
@@ -109,7 +117,7 @@ class WorkerControlService:
                 tool_names=self.worker_tool_names,
                 skills_enabled=self.skills_enabled,
             ),
-            budget=budget or self.default_budget,
+            budget=budget or self.default_budget_for(worker_type_id),
             related_contexts=tuple(related_contexts),
         )
         worker, run, created = await self.manager.spawn_worker(
@@ -163,7 +171,7 @@ class WorkerControlService:
         budget = (
             budget_increase.apply(latest.context.budget)
             if budget_increase is not None
-            else self.default_budget
+            else self.default_budget_for(worker.snapshot.id)
         )
         context = ContextEnvelope(
             objective=objective,
@@ -171,6 +179,10 @@ class WorkerControlService:
             # Each Run receives the current host grant. In particular, a v2
             # continuation must not inherit the old context-window-as-budget cap.
             budget=budget,
+            budget_increase_count=(
+                latest.context.budget_increase_count
+                + (1 if budget_increase is not None else 0)
+            ),
             related_contexts=latest.context.related_contexts,
         )
         run, created = await self.manager.reuse_worker(
@@ -222,7 +234,11 @@ class WorkerControlService:
             budget=(
                 budget_increase.apply(source.context.budget)
                 if budget_increase is not None
-                else self.default_budget
+                else self.default_budget_for(worker.snapshot.id)
+            ),
+            budget_increase_count=(
+                source.context.budget_increase_count
+                + (1 if budget_increase is not None else 0)
             ),
             related_contexts=source.context.related_contexts,
         )
@@ -266,7 +282,11 @@ class WorkerControlService:
             budget=(
                 budget_increase.apply(source.context.budget)
                 if budget_increase is not None
-                else self.default_budget
+                else self.default_budget_for(worker.snapshot.id)
+            ),
+            budget_increase_count=(
+                source.context.budget_increase_count
+                + (1 if budget_increase is not None else 0)
             ),
             related_contexts=source.context.related_contexts,
         )
@@ -363,7 +383,15 @@ class WorkerControlService:
         context = ContextEnvelope(
             objective=objective,
             permissions=source.context.permissions,
-            budget=budget or self.default_budget,
+            budget=budget or self.default_budget_for(worker_type_id),
+            budget_increase_count=(
+                source.context.budget_increase_count
+                + (
+                    1
+                    if budget is not None and budget != source.context.budget
+                    else 0
+                )
+            ),
             related_contexts=tuple(related_contexts),
         )
         continuation, created = await self.manager.reuse_worker(
@@ -541,7 +569,7 @@ class WorkerControlService:
                 else ()
             ),
             evidence=(
-                _bounded_context_items(report.evidence, limit=8)
+                _bounded_context_evidence(report.evidence, limit=8)
                 if report is not None and "evidence" in sections
                 else ()
             ),
@@ -647,10 +675,14 @@ class WorkerControlService:
             raise ValueError("cannot access a Worker owned by another Master session")
         return run
 
-    @staticmethod
-    def _run_summary(run: Any) -> dict[str, Any]:
+    def _run_summary(self, run: Any) -> dict[str, Any]:
         result = run.result
         report = result.report if result is not None else None
+        role = (
+            result.role
+            if result is not None and result.role is not None
+            else self.manager.store.get_worker(run.worker_id).snapshot.id
+        )
         return {
             "run_id": run.run_id,
             "run_sequence": run.run_sequence,
@@ -660,17 +692,24 @@ class WorkerControlService:
             "cancel_requested": run.cancel_requested_at is not None,
             "objective_preview": run.context.objective[:240],
             "budget": run.context.budget.model_dump(mode="json"),
+            "budget_increase_count": run.context.budget_increase_count,
             "summary": report.summary[:400] if report is not None else None,
+            "role": role,
+            "resolved_model": result.resolved_model if result is not None else None,
             "related_context_refs": _related_context_refs(run.context.related_contexts),
             "waiting_question": (
                 run.waiting_request.question if run.waiting_request is not None else None
             ),
         }
 
-    @staticmethod
-    def _run_view(run: Any) -> dict[str, Any]:
+    def _run_view(self, run: Any) -> dict[str, Any]:
         result = run.result
         report = result.report if result is not None else None
+        role = (
+            result.role
+            if result is not None and result.role is not None
+            else self.manager.store.get_worker(run.worker_id).snapshot.id
+        )
         return {
             "run_id": run.run_id,
             "worker_id": run.worker_id,
@@ -681,10 +720,11 @@ class WorkerControlService:
             "cancel_requested": run.cancel_requested_at is not None,
             "objective": run.context.objective[:2_000],
             "budget": run.context.budget.model_dump(mode="json"),
+            "budget_increase_count": run.context.budget_increase_count,
             "related_context_refs": _related_context_refs(run.context.related_contexts),
             "summary": report.summary[:4_000] if report is not None else None,
             "artifacts": _bounded_items(report.artifacts) if report is not None else [],
-            "evidence": _bounded_items(report.evidence) if report is not None else [],
+            "evidence": _bounded_evidence(report.evidence) if report is not None else [],
             "unresolved": _bounded_items(report.unresolved, limit=10)
             if report is not None
             else [],
@@ -695,6 +735,20 @@ class WorkerControlService:
             ),
             "tool_outcome": result.tool_outcome if result is not None else None,
             "usage": result.usage if result is not None else {},
+            "telemetry": (
+                {
+                    "role": role,
+                    "resolved_model": result.resolved_model,
+                    "request_count": result.request_count,
+                    "tool_call_count": result.tool_call_count,
+                    "duration_ms": result.duration_ms,
+                    "budget_request_limit": result.budget_request_limit,
+                    "budget_request_utilization": result.budget_request_utilization,
+                    "partial_reason": result.partial_reason,
+                }
+                if result is not None
+                else {}
+            ),
         }
 
 
@@ -704,6 +758,34 @@ def _bounded_items(items: tuple[str, ...], *, limit: int = 20) -> list[str]:
 
 def _bounded_context_items(items: tuple[str, ...], *, limit: int) -> tuple[str, ...]:
     return tuple(item[:500] for item in items[:limit])
+
+
+def _bounded_evidence(
+    items: tuple[EvidenceItem, ...],
+    *,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    return [_bounded_evidence_item(item) for item in items[:limit]]
+
+
+def _bounded_context_evidence(
+    items: tuple[EvidenceItem, ...],
+    *,
+    limit: int,
+) -> tuple[EvidenceItem, ...]:
+    return tuple(
+        EvidenceItem.model_validate(_bounded_evidence_item(item))
+        for item in items[:limit]
+    )
+
+
+def _bounded_evidence_item(item: EvidenceItem) -> dict[str, Any]:
+    payload = item.model_dump(mode="json")
+    payload["locator"] = str(payload["locator"])[:500]
+    payload["claim"] = str(payload["claim"])[:500]
+    if payload.get("method") is not None:
+        payload["method"] = str(payload["method"])[:1_000]
+    return payload
 
 
 def _related_context_refs(items: tuple[RelatedWorkerContext, ...]) -> list[dict[str, str]]:

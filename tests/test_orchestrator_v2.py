@@ -157,6 +157,33 @@ def _config(tmp_path: Path, *, skills: bool = False) -> Config:
 
 
 @pytest.mark.asyncio
+async def test_file_tool_limits_are_cached_per_resolved_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    async def resolve(model_name: str) -> int:
+        calls.append(model_name)
+        return {"fast-model": 1_000, "strong-model": 4_000}[model_name]
+
+    monkeypatch.setattr(
+        "aeloon_core.orchestrator.resolve_max_output_tokens",
+        resolve,
+    )
+    app = AeloonCoreOrchestrator(_config(tmp_path))
+
+    fast = await app._ensure_file_tool_limit("fast-model")
+    strong = await app._ensure_file_tool_limit("strong-model")
+    repeated = await app._ensure_file_tool_limit("fast-model")
+    await app.close()
+
+    assert fast == repeated == 4_000
+    assert strong == 16_000
+    assert calls == ["fast-model", "strong-model"]
+
+
+@pytest.mark.asyncio
 async def test_worker_prompt_requires_batched_reads_and_early_completion(
     tmp_path: Path,
 ) -> None:
@@ -176,6 +203,9 @@ async def test_worker_prompt_requires_batched_reads_and_early_completion(
     assert "Keep intermediate narration concise" in prompt
     assert "call complete_work immediately" in prompt
     assert "Never include complete_work or request_master in a batch" in prompt
+    assert "Use this delivery loop" in prompt
+    assert "Every evidence item is an object" in prompt
+    assert "request_master(summary, question, artifacts, evidence)" in prompt
 
 
 @pytest.mark.asyncio
@@ -312,20 +342,22 @@ async def test_master_can_raise_output_budget_for_known_partial_checkpoint(
     assert first_model.call_count == 2
     assert partial["status"] == "partial"
     assert partial["tool_outcome"] == "known"
-    assert "provider default" in partial["summary"]
+    assert "token limit" in partial["summary"].lower()
+    assert str(app.config.agents.defaults.max_output_tokens) in partial["summary"]
 
     app.model = ScriptedModel(
         [("complete_work", {"summary": "finished with a larger output grant"})]
     )
+    higher_output = app.config.agents.defaults.max_output_tokens * 2
     reused = await app.worker_control.reuse_worker(
         base_session_id="master",
         worker_id=spawned["worker_id"],
         objective="continue from the exact checkpoint",
         idempotency_key="provider-output-limit-continuation",
-        budget_increase=BudgetIncrease(max_output_tokens=16_384),
+        budget_increase=BudgetIncrease(max_output_tokens=higher_output),
     )
     assert reused["source_run_id"] == spawned["run_id"]
-    assert reused["budget"]["max_output_tokens"] == 16_384
+    assert reused["budget"]["max_output_tokens"] == higher_output
 
     completed = (
         await app.worker_control.await_workers(
@@ -495,9 +527,16 @@ async def test_worker_waits_then_resumes_from_exact_checkpoint(tmp_path: Path) -
             (
                 "complete_work",
                 {
-                    "summary": "implemented the selected behavior",
-                    "artifacts": ["src/result.py"],
-                    "evidence": ["tests pass"],
+                        "summary": "implemented the selected behavior",
+                        "artifacts": ["src/result.py"],
+                        "evidence": [
+                            {
+                                "kind": "source",
+                                "locator": "master-response",
+                                "claim": "selected behavior was supplied",
+                                "status": "observed",
+                            }
+                        ],
                 },
             ),
         ]
@@ -545,9 +584,16 @@ async def test_worker_waits_then_resumes_from_exact_checkpoint(tmp_path: Path) -
     assert "Which behavior wins?" in serialized
     assert "Use behavior A" in serialized
     assert app.worker_control.default_budget.max_requests == 25
+    assert (
+        app.worker_control.default_budget.max_output_tokens
+        == app.config.agents.defaults.max_output_tokens
+    )
     assert app.worker_control.default_budget.max_tokens is None
     assert app.worker_control.default_budget.max_tool_calls is None
-    assert model.max_token_limits == [None, None]
+    assert model.max_token_limits == [
+        app.config.agents.defaults.max_output_tokens,
+        app.config.agents.defaults.max_output_tokens,
+    ]
 
 
 @pytest.mark.asyncio
@@ -575,7 +621,10 @@ async def test_worker_cumulative_usage_does_not_consume_context_window(
     assert completed["summary"] == "finished after multiple model rounds"
     assert completed["usage"]["total_tokens"] > 128_000
     assert model.call_count == 2
-    assert model.max_token_limits == [None, None]
+    assert model.max_token_limits == [
+        app.config.agents.defaults.max_output_tokens,
+        app.config.agents.defaults.max_output_tokens,
+    ]
 
 
 @pytest.mark.asyncio

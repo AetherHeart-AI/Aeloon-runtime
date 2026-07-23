@@ -25,7 +25,8 @@ from typing import Any
 from loguru import logger
 
 from aeloon_core.operator_output import sanitize_operator_output
-from aeloon_core.worker_sessions import WorkerRunRecord, WorkerRunStatus, WorkerStore
+from aeloon_core.worker_sessions import WorkerStore
+from aeloon_core.worker_state import WorkerRunRecord, WorkerRunStatus
 
 _MAX_EVENTS_PER_RUN = 500
 _MAX_TOTAL_EVENTS = 50_000

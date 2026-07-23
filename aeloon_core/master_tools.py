@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from aeloon_core.tools.base import FunctionTool
 from aeloon_core.tools.registry import ToolRegistry
 from aeloon_core.worker_control import WorkerControlService
-from aeloon_core.worker_sessions import BudgetIncrease
+from aeloon_core.worker_state import BudgetIncrease
 
 if TYPE_CHECKING:
     from aeloon_core.flow_control import FlowControlService

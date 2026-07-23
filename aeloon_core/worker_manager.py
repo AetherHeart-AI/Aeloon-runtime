@@ -17,7 +17,8 @@ from typing import Any, Literal
 
 from loguru import logger
 
-from aeloon_core.worker_sessions import (
+from aeloon_core.worker_sessions import WorkerStore
+from aeloon_core.worker_state import (
     ContextEnvelope,
     ResultEnvelope,
     WaitingRequest,
@@ -25,7 +26,6 @@ from aeloon_core.worker_sessions import (
     WorkerRunRecord,
     WorkerRunStatus,
     WorkerSessionRecord,
-    WorkerStore,
 )
 from aeloon_core.worker_ui import WorkerUiJournal
 from aeloon_core.workers import WorkerSnapshot
@@ -43,6 +43,8 @@ class WorkerExecutionOutcome:
     usage: dict[str, Any] = field(default_factory=dict)
     checkpoint: dict[str, Any] | None = None
     waiting_request: WaitingRequest | None = None
+    resolved_model: str | None = None
+    tool_call_count: int = 0
 
     def __post_init__(self) -> None:
         if self.status not in {
@@ -68,6 +70,7 @@ class WorkerExecutionOutcome:
             raise ValueError(f"{self.status.value} requires a checkpoint")
         object.__setattr__(self, "usage", copy.deepcopy(self.usage))
         object.__setattr__(self, "checkpoint", copy.deepcopy(self.checkpoint))
+        object.__setattr__(self, "tool_call_count", max(0, int(self.tool_call_count)))
 
 
 WorkerExecutor = Callable[
@@ -404,6 +407,20 @@ class WorkerSessionManager:
                 tool_outcome=execution.tool_outcome,
                 usage=execution.usage,
                 duration_ms=max(0, int((perf_counter() - started) * 1_000)),
+                role=session.snapshot.id,
+                resolved_model=execution.resolved_model,
+                request_count=_request_count(execution.usage),
+                tool_call_count=execution.tool_call_count,
+                budget_request_limit=running.context.budget.max_requests,
+                budget_request_utilization=_request_utilization(
+                    execution.usage,
+                    running.context.budget.max_requests,
+                ),
+                partial_reason=(
+                    execution.report.summary[:2_000]
+                    if execution.status is WorkerRunStatus.PARTIAL
+                    else None
+                ),
             )
             finalized, changed = self.store.try_finalize_run(
                 run_id,
@@ -618,6 +635,18 @@ def _safe_failure_summary(exc: Exception) -> str:
     """Describe host failure without copying potentially sensitive exception text."""
 
     return f"Worker execution failed ({type(exc).__name__})."
+
+
+def _request_count(usage: dict[str, Any]) -> int:
+    for key in ("requests", "request_count"):
+        value = usage.get(key)
+        if isinstance(value, int | float) and not isinstance(value, bool):
+            return max(0, int(value))
+    return 0
+
+
+def _request_utilization(usage: dict[str, Any], limit: int) -> float:
+    return min(1.0, _request_count(usage) / max(1, limit))
 
 
 def _lifecycle_event(status: WorkerRunStatus) -> str:

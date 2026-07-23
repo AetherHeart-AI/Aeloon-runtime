@@ -8,10 +8,10 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from aeloon_core.flow_control import FlowControlService
-from aeloon_core.flows import FlowCompletion, FlowNodeSpec
+from aeloon_core.flow_state import FlowAdvanceMode, FlowCompletion, FlowNodeSpec
 from aeloon_core.tools.base import FunctionTool
 from aeloon_core.tools.registry import ToolRegistry
-from aeloon_core.worker_sessions import BudgetIncrease
+from aeloon_core.worker_state import BudgetIncrease
 
 
 class _Args(BaseModel):
@@ -36,6 +36,8 @@ class _CreateFlowArgs(_Args):
     idempotency_key: str = Field(min_length=1, max_length=256)
     max_nodes: int = Field(default=64, ge=1, le=256)
     max_rounds: int = Field(default=12, ge=1, le=64)
+    advance_mode: FlowAdvanceMode = FlowAdvanceMode.CHECKPOINTED
+    auto_advance_max_frontiers: int = Field(default=4, ge=1, le=4)
 
 
 class _ListFlowsArgs(_Args):
@@ -119,6 +121,8 @@ def build_master_flow_tools(
         idempotency_key: str,
         max_nodes: int = 64,
         max_rounds: int = 12,
+        advance_mode: FlowAdvanceMode = FlowAdvanceMode.CHECKPOINTED,
+        auto_advance_max_frontiers: int = 4,
     ) -> str:
         return _json(
             control.create_flow(
@@ -128,6 +132,8 @@ def build_master_flow_tools(
                 idempotency_key=idempotency_key,
                 max_nodes=max_nodes,
                 max_rounds=max_rounds,
+                advance_mode=advance_mode,
+                auto_advance_max_frontiers=auto_advance_max_frontiers,
                 turn_id=base_turn_id,
             )
         )
@@ -335,7 +341,8 @@ def build_master_flow_tools(
             "semantic objectives, dependencies, soft Worker responsibilities, and an "
             "optional worker_session_policy of auto or fresh. context_refs explicitly "
             "associate bounded untrusted context from an ancestor flow_node or a settled "
-            "same-session worker_run.",
+            "same-session worker_run. Set advance_mode=auto only for a predictable DAG "
+            "whose downstream objectives are already complete.",
             _CreateFlowArgs,
             create_flow,
             "mutating",
@@ -366,8 +373,8 @@ def build_master_flow_tools(
         ),
         (
             "advance_flow",
-            "Execute exactly one ready frontier: launch all independent nodes in "
-            "parallel, optionally wait, synchronize results, then return to Master.",
+            "Execute one ready frontier, or a bounded predictable chain when the Flow "
+            "uses advance_mode=auto. Auto mode stops for review or any non-success state.",
             _AdvanceArgs,
             advance_flow,
             "mutating",

@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "metrics": [
+    "acceptance_passed",
+    "master_request_count",
+    "end_to_end_duration_ms",
+    "input_tokens",
+    "output_tokens",
+    "revision_count"
+  ],
+  "cases": [
+    {
+      "id": "single_builder_fix",
+      "category": "single_node",
+      "request": "Fix boolean parsing for `config set`, preserve every other coercion, and add regression tests for true, false, and invalid input.",
+      "expected": {
+        "initial_worker_types": ["builder"],
+        "advance_mode": "checkpointed",
+        "minimum_frontier_width": 1,
+        "requires_completed_evidence_gate": true
+      }
+    },
+    {
+      "id": "parallel_independent_adapters",
+      "category": "parallel_dag",
+      "request": "Implement the three fully specified, non-overlapping provider adapters in fixtures/eval/providers.md and independently review the combined change.",
+      "expected": {
+        "initial_worker_types": ["builder", "builder", "builder", "reviewer"],
+        "advance_mode": "auto",
+        "minimum_frontier_width": 3,
+        "reviewer_checkpoint_required": true
+      }
+    },
+    {
+      "id": "unknown_api_research_then_build",
+      "category": "research_dynamic_graph",
+      "request": "Research the current upload limits and retry contract for the external API named in fixtures/eval/upload-api.md, then implement the compatible client.",
+      "expected": {
+        "initial_worker_types": ["researcher"],
+        "advance_mode": "checkpointed",
+        "downstream_objective_authored_after_research": true,
+        "requires_source_evidence": true
+      }
+    },
+    {
+      "id": "review_driven_revision",
+      "category": "review_revision",
+      "request": "Implement the cache invalidation change in fixtures/eval/cache.md, run an independent review, and fix any reproducible acceptance or data-integrity findings.",
+      "expected": {
+        "initial_worker_types": ["builder", "reviewer"],
+        "reviewer_checkpoint_required": true,
+        "maximum_review_driven_revisions": 2,
+        "requires_finding_evidence_links": true
+      }
+    },
+    {
+      "id": "budget_partial_continuation",
+      "category": "budget_partial",
+      "request": "Complete the bounded migration audit in fixtures/eval/migration.md; if the initial Worker exhausts its request grant, continue only from the exact checkpoint with an explicit larger grant.",
+      "expected": {
+        "initial_worker_types": ["reviewer"],
+        "partial_requires_budget_increase": true,
+        "exact_checkpoint_continuation": true,
+        "budget_increase_count_minimum": 1
+      }
+    },
+    {
+      "id": "missing_authoritative_input",
+      "category": "request_master",
+      "request": "Update the signing integration using the private endpoint contract referenced, but not included, in fixtures/eval/signing.md.",
+      "expected": {
+        "initial_worker_types": ["builder"],
+        "worker_terminal_status": "waiting_for_context",
+        "request_master_reason": "missing_upstream_input",
+        "must_not_claim_completion": true
+      }
+    }
+  ]
+}

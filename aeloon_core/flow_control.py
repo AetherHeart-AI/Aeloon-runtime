@@ -4,35 +4,51 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
-from datetime import UTC, datetime
 from functools import partial
 from typing import Any
 
 from aeloon_core.flow_activation_fence import flow_activation_fence
-from aeloon_core.flows import (
+from aeloon_core.flow_runtime import (
+    _annotate_recovered_session_decision,
+    _attach_run_to_flow,
+    _claim_ready_frontier,
+    _fail_node_for_binding_limit,
+    _fail_nodes_with_missing_runs,
+    _flow_summary,
+    _flow_turn_id,
+    _missing_run_view,
+    _node_run_key,
+    _node_status,
+    _requested_fresh_reason,
+    _resume_run_key,
+    _reuse_session_reason,
+    _unique,
+    _worker_run_exists,
+)
+from aeloon_core.flow_state import (
     MAX_FLOW_RUN_BINDINGS,
+    FlowAdvanceMode,
     FlowCompletion,
     FlowNode,
     FlowNodeSpec,
     FlowNodeStatus,
-    FlowRunBinding,
     FlowStatus,
-    FlowStore,
     MasterFlow,
     WorkerSessionAction,
-    WorkerSessionPolicy,
     add_flow_nodes,
     cancel_flow_state,
     finish_flow,
     flow_node_spec_payload,
+    flow_run_telemetry_payload,
     pause_flow,
     reopen_flow,
     retry_flow_node,
     revise_flow_node,
     skip_flow_node,
 )
+from aeloon_core.flows import FlowStore
 from aeloon_core.worker_control import WorkerControlService
-from aeloon_core.worker_sessions import (
+from aeloon_core.worker_state import (
     BudgetGrant,
     BudgetIncrease,
     RelatedWorkerContext,
@@ -62,6 +78,8 @@ class FlowControlService:
         idempotency_key: str,
         max_nodes: int = 64,
         max_rounds: int = 12,
+        advance_mode: FlowAdvanceMode = FlowAdvanceMode.CHECKPOINTED,
+        auto_advance_max_frontiers: int = 4,
         turn_id: str | None = None,
     ) -> dict[str, Any]:
         self._validate_worker_types(nodes)
@@ -76,6 +94,8 @@ class FlowControlService:
             idempotency_key=idempotency_key,
             max_nodes=max_nodes,
             max_rounds=max_rounds,
+            advance_mode=advance_mode,
+            auto_advance_max_frontiers=auto_advance_max_frontiers,
             turn_id=turn_id,
         )
         return {**flow.to_view(), "created": created}
@@ -149,64 +169,151 @@ class FlowControlService:
         timeout_seconds: float | None = None,
         progress: Any | None = None,
     ) -> dict[str, Any]:
-        """Dispatch and optionally await exactly one ready frontier."""
+        """Dispatch one frontier or a bounded predictable auto-advance chain."""
 
         async with self._lock(flow_id):
-            flow = await self._sync(
-                flow_id,
-                base_session_id=base_session_id,
-                turn_id=base_turn_id,
+            loop = asyncio.get_running_loop()
+            deadline = (
+                loop.time() + timeout_seconds
+                if timeout_seconds is not None
+                else None
             )
-            if flow.status is FlowStatus.PAUSED:
-                raise ValueError("resume the paused Flow before advancing it")
-            if flow.status.terminal:
-                return flow.to_view()
+            frontiers_executed: list[list[str]] = []
+            all_launch_errors: list[dict[str, str]] = []
+            stop_reason = "no_ready_frontier"
 
-            frontier = flow.starting_nodes()
-            if not frontier:
-                flow = self.store.update_runtime(
-                    flow_id,
-                    base_session_id=base_session_id,
-                    mutation=_claim_ready_frontier,
-                    turn_id=base_turn_id,
-                )
-                if flow.status.terminal:
-                    return flow.to_view()
-                frontier = flow.starting_nodes()
-
-            launch_errors = await self._launch_frontier(
-                flow,
-                frontier,
-                base_session_id=base_session_id,
-                turn_id=base_turn_id,
-                progress=progress,
-            )
-            flow = await self._sync(
-                flow_id,
-                base_session_id=base_session_id,
-                turn_id=base_turn_id,
-            )
-            run_ids = _unique(
-                node.current_run_id
-                for node in flow.active_nodes()
-                if node.current_run_id is not None
-            )
-            if run_ids:
-                await self.workers.await_workers(
-                    run_ids,
-                    timeout=timeout_seconds,
-                    base_session_id=base_session_id,
-                )
+            while True:
                 flow = await self._sync(
                     flow_id,
                     base_session_id=base_session_id,
                     turn_id=base_turn_id,
                 )
+                if flow.status is FlowStatus.PAUSED:
+                    raise ValueError("resume the paused Flow before advancing it")
+                if flow.status.terminal:
+                    stop_reason = (
+                        "max_rounds"
+                        if flow.termination_reason == "Flow execution round limit reached"
+                        else "flow_terminal"
+                    )
+                    break
+
+                frontier = flow.starting_nodes()
+                if not frontier:
+                    flow = self.store.update_runtime(
+                        flow_id,
+                        base_session_id=base_session_id,
+                        mutation=_claim_ready_frontier,
+                        turn_id=base_turn_id,
+                    )
+                    if flow.status.terminal:
+                        stop_reason = (
+                            "max_rounds"
+                            if flow.termination_reason
+                            == "Flow execution round limit reached"
+                            else "flow_terminal"
+                        )
+                        break
+                    frontier = flow.starting_nodes()
+                if not frontier:
+                    stop_reason = "no_ready_frontier"
+                    break
+
+                frontier_ids = [node.node_id for node in frontier]
+                frontiers_executed.append(frontier_ids)
+                launch_errors = await self._launch_frontier(
+                    flow,
+                    frontier,
+                    base_session_id=base_session_id,
+                    turn_id=base_turn_id,
+                    progress=progress,
+                )
+                all_launch_errors.extend(launch_errors)
+                flow = await self._sync(
+                    flow_id,
+                    base_session_id=base_session_id,
+                    turn_id=base_turn_id,
+                )
+                run_ids = _unique(
+                    node.current_run_id
+                    for node in flow.active_nodes()
+                    if node.current_run_id is not None
+                )
+                if run_ids:
+                    remaining_timeout = (
+                        max(0.0, deadline - loop.time())
+                        if deadline is not None
+                        else None
+                    )
+                    await self.workers.await_workers(
+                        run_ids,
+                        timeout=remaining_timeout,
+                        base_session_id=base_session_id,
+                    )
+                    flow = await self._sync(
+                        flow_id,
+                        base_session_id=base_session_id,
+                        turn_id=base_turn_id,
+                    )
+
+                current_frontier = [flow.node(node_id) for node_id in frontier_ids]
+                if launch_errors:
+                    stop_reason = "launch_error"
+                    break
+                if any(node.status.active for node in current_frontier):
+                    stop_reason = "active_or_timeout"
+                    break
+                if any(
+                    node.status is FlowNodeStatus.WAITING_FOR_CONTEXT
+                    for node in current_frontier
+                ):
+                    stop_reason = "waiting_for_context"
+                    break
+                if any(
+                    node.status is not FlowNodeStatus.COMPLETED
+                    for node in current_frontier
+                ):
+                    stop_reason = "frontier_non_success"
+                    break
+                if any(node.worker_type_id == "reviewer" for node in current_frontier):
+                    stop_reason = "reviewer_frontier"
+                    break
+                if flow.advance_mode is FlowAdvanceMode.CHECKPOINTED:
+                    stop_reason = "checkpointed"
+                    break
+                if len(frontiers_executed) >= flow.auto_advance_max_frontiers:
+                    stop_reason = "auto_advance_limit"
+                    break
+                if deadline is not None and loop.time() >= deadline:
+                    stop_reason = "active_or_timeout"
+                    break
+
+            auto_advanced_count = (
+                max(0, len(frontiers_executed) - 1)
+                if flow.advance_mode is FlowAdvanceMode.AUTO
+                else 0
+            )
+            if flow.last_stop_reason != stop_reason or auto_advanced_count:
+                flow = self.store.update_runtime(
+                    flow_id,
+                    base_session_id=base_session_id,
+                    mutation=partial(
+                        _record_advance_telemetry,
+                        stop_reason=stop_reason,
+                        auto_advanced_count=auto_advanced_count,
+                    ),
+                    turn_id=base_turn_id,
+                )
 
             view = flow.to_view()
-            view["frontier_node_ids"] = [node.node_id for node in frontier]
-            if launch_errors:
-                view["launch_errors"] = launch_errors
+            view["frontier_node_ids"] = (
+                frontiers_executed[-1] if frontiers_executed else []
+            )
+            view["frontiers_executed"] = frontiers_executed
+            view["auto_advanced_count"] = auto_advanced_count
+            view["stop_reason"] = stop_reason
+            if all_launch_errors:
+                view["launch_errors"] = all_launch_errors
             return view
 
     async def revise_node(
@@ -374,7 +481,7 @@ class FlowControlService:
                     base_session_id=base_session_id,
                 )
                 if budget_increase is not None
-                else self.workers.default_budget
+                else self.workers.default_budget_for(node.worker_type_id)
             )
             worker_key = _resume_run_key(flow_id, node_id, source_run_id)
             related_contexts = self.workers.related_contexts_for_run(
@@ -906,7 +1013,9 @@ class FlowControlService:
         async def launch(node: FlowNode) -> tuple[FlowNode, dict[str, Any]]:
             idempotency_key = _node_run_key(flow.flow_id, node)
             source_run_id = node.reuse_source_run_id
-            budget = node.pending_budget or self.workers.default_budget
+            budget = node.pending_budget or self.workers.default_budget_for(
+                node.worker_type_id
+            )
             related_contexts = self._resolve_related_contexts(
                 flow,
                 node,
@@ -1214,6 +1323,7 @@ class FlowControlService:
                 node.status = _node_status(str(view["status"]))
                 node.result = dict(view)
                 binding.status = str(view["status"])
+                binding.telemetry = flow_run_telemetry_payload(view)
 
         return self.store.update_runtime(
             flow_id,
@@ -1286,6 +1396,7 @@ class FlowControlService:
                 for binding in reversed(node.runs):
                     if binding.run_id == node.current_run_id:
                         binding.status = str(view["status"])
+                        binding.telemetry = flow_run_telemetry_payload(view)
                         break
             unseen_tracked = set(current.cancellation_run_ids) - set(by_run_id)
             tracked_unsettled = bool(unseen_tracked) or any(
@@ -1617,352 +1728,14 @@ class FlowControlService:
         return self._locks.setdefault(flow_id, asyncio.Lock())
 
 
-def _claim_ready_frontier(flow: MasterFlow) -> None:
-    if flow.status is not FlowStatus.OPEN:
-        return
-    if flow.starting_nodes():
-        return
-    ready = flow.ready_nodes()
-    if not ready:
-        return
-    if flow.rounds_started >= flow.max_rounds:
-        # Do not declare a terminal Flow while an earlier timeout=0 frontier is
-        # still mutating the workspace. The current advance will join it first.
-        if flow.active_nodes():
-            return
-        flow.status = FlowStatus.BLOCKED
-        flow.completion_summary = (
-            f"Flow stopped before starting another frontier because max_rounds="
-            f"{flow.max_rounds} was reached."
-        )
-        flow.termination_reason = "Flow execution round limit reached"
-        return
-    generations = {node.node_id: node.generation for node in flow.nodes}
-    claimed = 0
-    for node in ready:
-        if len(node.runs) >= MAX_FLOW_RUN_BINDINGS:
-            node.status = FlowNodeStatus.FAILED
-            node.reuse_source_run_id = None
-            node.pending_fresh_reason = None
-            node.pending_budget = None
-            node.worker_id = None
-            node.current_run_id = None
-            node.result = {
-                "status": FlowNodeStatus.FAILED.value,
-                "summary": (
-                    "Flow node Run history limit reached; no additional WorkerRun "
-                    "was created. Finish this Flow or author a replacement node."
-                ),
-                "tool_outcome": "none",
-            }
-            continue
-        node.status = FlowNodeStatus.STARTING
-        node.attempt += 1
-        node.input_generations = {
-            dependency: generations[dependency] for dependency in node.depends_on
-        }
-        node.worker_id = None
-        node.current_run_id = None
-        node.result = None
-        claimed += 1
-    if claimed:
-        flow.rounds_started += 1
-
-
-def _fail_nodes_with_missing_runs(
+def _record_advance_telemetry(
     flow: MasterFlow,
     *,
-    missing_run_ids: frozenset[str],
+    stop_reason: str,
+    auto_advanced_count: int,
 ) -> None:
-    """Project lost active/waiting Worker records into retryable unknown failures."""
-
-    if flow.status is not FlowStatus.OPEN:
-        return
-    for node in flow.nodes:
-        if node.current_run_id not in missing_run_ids or node.status not in {
-            FlowNodeStatus.STARTING,
-            FlowNodeStatus.RUNNING,
-            FlowNodeStatus.WAITING_FOR_CONTEXT,
-        }:
-            continue
-        node.status = FlowNodeStatus.FAILED
-        node.result = _missing_run_view(node.current_run_id)
-        for binding in reversed(node.runs):
-            if binding.run_id == node.current_run_id:
-                binding.status = WorkerRunStatus.FAILED.value
-                break
-
-
-def _missing_run_view(run_id: str) -> dict[str, Any]:
-    return {
-        "run_id": run_id,
-        "status": WorkerRunStatus.FAILED.value,
-        "summary": (
-            "The bound WorkerRun record is missing, so its execution and private "
-            "context outcome are unknown. Retry with a fresh WorkerSession only after "
-            "checking possible side effects."
-        ),
-        "artifacts": [],
-        "evidence": [],
-        "unresolved": ["The exact WorkerSession context can no longer be resumed."],
-        "waiting_request": None,
-        "tool_outcome": "unknown",
-        "usage": {},
-    }
-
-
-def _worker_run_exists(workers: WorkerControlService, run_id: str) -> bool:
-    try:
-        workers.manager.store.get_run(run_id)
-    except (KeyError, ValueError):
-        return False
-    return True
-
-
-def _fail_node_for_binding_limit(
-    flow: MasterFlow,
-    *,
-    node_id: str,
-    source_run_id: str,
-) -> None:
-    if flow.status is not FlowStatus.OPEN:
-        return
-    node = flow.node(node_id)
-    if (
-        node.status is not FlowNodeStatus.WAITING_FOR_CONTEXT
-        or node.current_run_id != source_run_id
-        or len(node.runs) < MAX_FLOW_RUN_BINDINGS
-    ):
-        return
-    node.status = FlowNodeStatus.FAILED
-    node.reuse_source_run_id = None
-    node.pending_fresh_reason = None
-    node.pending_budget = None
-    node.worker_id = None
-    node.current_run_id = None
-    node.result = {
-        "status": FlowNodeStatus.FAILED.value,
-        "summary": (
-            "Flow node Run history limit reached while adopting an external "
-            "continuation. The continuation was cancelled; finish this Flow or "
-            "author a replacement node."
-        ),
-        "tool_outcome": "unknown",
-    }
-
-
-def _node_status(worker_status: str) -> FlowNodeStatus:
-    if worker_status in {"queued", "running"}:
-        return FlowNodeStatus.RUNNING
-    mapping = {
-        "completed": FlowNodeStatus.COMPLETED,
-        "partial": FlowNodeStatus.PARTIAL,
-        "waiting_for_context": FlowNodeStatus.WAITING_FOR_CONTEXT,
-        "failed": FlowNodeStatus.FAILED,
-        "cancelled": FlowNodeStatus.CANCELLED,
-    }
-    try:
-        return mapping[worker_status]
-    except KeyError as exc:
-        raise ValueError(f"unknown WorkerRun status: {worker_status}") from exc
-
-
-def _node_run_key(flow_id: str, node: FlowNode) -> str:
-    return (
-        f"flow:{flow_id}:node:{node.node_id}:generation:{node.generation}:"
-        f"attempt:{node.attempt}"
-    )
-
-
-def _requested_fresh_reason(node: FlowNode) -> str | None:
-    if node.pending_fresh_reason is not None:
-        return node.pending_fresh_reason
-    if node.worker_session_policy is WorkerSessionPolicy.FRESH:
-        return "policy_fresh"
-    return None
-
-
-def _reuse_session_reason(node: FlowNode) -> str:
-    source_run_id = node.reuse_source_run_id
-    source = next(
-        (
-            binding
-            for binding in reversed(node.runs)
-            if binding.run_id == source_run_id
-        ),
-        None,
-    )
-    if source is not None and node.generation > source.generation:
-        return "same_node_revision"
-    return "same_node_retry"
-
-
-def _annotate_recovered_session_decision(
-    node: FlowNode,
-    run_view: dict[str, Any],
-    *,
-    fallback_reason: str | None = None,
-) -> None:
-    source_run_id = run_view.get("source_run_id")
-    if (
-        node.reuse_source_run_id is not None
-        and source_run_id == node.reuse_source_run_id
-    ):
-        run_view["worker_session_action"] = WorkerSessionAction.REUSE.value
-        run_view["worker_session_reason"] = _reuse_session_reason(node)
-        return
-    run_view["worker_session_action"] = WorkerSessionAction.NEW.value
-    run_view["worker_session_reason"] = (
-        _requested_fresh_reason(node)
-        or fallback_reason
-        or ("first_run" if not node.runs else "reuse_unavailable")
-    )
-
-
-def _resume_run_key(flow_id: str, node_id: str, source_run_id: str) -> str:
-    return f"flow:{flow_id}:node:{node_id}:resume:{source_run_id}"
-
-
-def _flow_turn_id(flow_id: str) -> str:
-    """Stable Worker ownership key for a Flow that may outlive one Master turn."""
-
-    return f"flow:{flow_id}"
-
-
-def _flow_summary(flow: MasterFlow) -> dict[str, Any]:
-    counts: dict[str, int] = {}
-    for node in flow.nodes:
-        counts[node.status.value] = counts.get(node.status.value, 0) + 1
-    return {
-        "flow_id": flow.flow_id,
-        "goal": flow.goal[:1_000],
-        "status": flow.status.value,
-        "revision": flow.revision,
-        "rounds": {"started": flow.rounds_started, "maximum": flow.max_rounds},
-        "node_counts": counts,
-        "ready_node_ids": [node.node_id for node in flow.ready_nodes()],
-        "active_node_ids": [node.node_id for node in flow.active_nodes()],
-        "fresh_worker_node_ids": [
-            node.node_id
-            for node in flow.nodes
-            if node.worker_session_policy is WorkerSessionPolicy.FRESH
-        ],
-        "completion_summary": flow.completion_summary,
-    }
-
-
-def _attach_run_to_flow(
-    flow: MasterFlow,
-    *,
-    node_id: str,
-    generation: int,
-    attempt: int,
-    run_view: dict[str, Any],
-) -> None:
-    """Compare-and-set one durable Worker binding into an open Flow."""
-
-    node = flow.node(node_id)
-    run_id = str(run_view["run_id"])
-    source_run_id = run_view.get("source_run_id")
-    if flow.status is not FlowStatus.OPEN:
-        raise ValueError("cannot attach a WorkerRun to a non-open Flow")
-    existing = next(
-        (binding for binding in node.runs if binding.run_id == run_id),
-        None,
-    )
-    if existing is not None:
-        if (
-            existing.generation != generation
-            or existing.attempt != attempt
-            or existing.worker_id != str(run_view["worker_id"])
-            or node.generation != generation
-            or node.attempt != attempt
-        ):
-            raise ValueError("stale WorkerRun binding cannot replace the current node epoch")
-        if node.current_run_id == run_id:
-            return
-        if node.current_run_id is not None or node.status not in {
-            FlowNodeStatus.STARTING,
-            FlowNodeStatus.WAITING_FOR_CONTEXT,
-        }:
-            raise ValueError("existing WorkerRun binding is not attachable in this state")
-        node.current_run_id = run_id
-        node.worker_id = str(run_view["worker_id"])
-        node.status = _node_status(str(run_view.get("status") or "queued"))
-        node.reuse_source_run_id = None
-        node.pending_fresh_reason = None
-        node.pending_budget = None
-        return
-    raw_action = run_view.get("worker_session_action")
-    if raw_action is None:
-        if node.status is FlowNodeStatus.WAITING_FOR_CONTEXT and source_run_id is not None:
-            action = WorkerSessionAction.RESUME
-        elif (
-            node.reuse_source_run_id is not None
-            and source_run_id == node.reuse_source_run_id
-        ):
-            action = WorkerSessionAction.REUSE
-        else:
-            action = WorkerSessionAction.NEW
-    else:
-        action = WorkerSessionAction(str(raw_action))
-    if action is WorkerSessionAction.REUSE and source_run_id != node.reuse_source_run_id:
-        raise ValueError("reused WorkerRun does not match the node's exact source Run")
-    if (
-        action is WorkerSessionAction.RESUME
-        and node.status is not FlowNodeStatus.WAITING_FOR_CONTEXT
-    ):
-        raise ValueError("a resumed WorkerRun can only attach to its waiting Flow node")
-    session_reason = str(
-        run_view.get("worker_session_reason")
-        or (
-            "waiting_exact_resume"
-            if action is WorkerSessionAction.RESUME
-            else _reuse_session_reason(node)
-            if action is WorkerSessionAction.REUSE
-            else _requested_fresh_reason(node)
-            or ("first_run" if not node.runs else "reuse_unavailable")
-        )
-    )[:1_000]
-    if node.generation != generation or node.attempt != attempt:
-        raise ValueError("Flow node changed while its WorkerRun was being created")
-    if node.status not in {
-        FlowNodeStatus.STARTING,
-        FlowNodeStatus.WAITING_FOR_CONTEXT,
-    }:
-        raise ValueError(f"cannot attach a WorkerRun while node is {node.status.value}")
-    if len(node.runs) >= MAX_FLOW_RUN_BINDINGS:
-        raise ValueError(f"Flow node Run history limit reached ({MAX_FLOW_RUN_BINDINGS})")
-    node.worker_id = str(run_view["worker_id"])
-    node.current_run_id = run_id
-    node.status = _node_status(str(run_view.get("status") or "queued"))
-    node.runs = [
-        *node.runs,
-        FlowRunBinding(
-            generation=generation,
-            attempt=attempt,
-            worker_id=node.worker_id,
-            run_id=run_id,
-            source_run_id=source_run_id,
-            requested_session_policy=node.worker_session_policy,
-            session_action=action,
-            session_reason=session_reason,
-            budget=BudgetGrant.model_validate(run_view["budget"]),
-            status=str(run_view.get("status") or "queued"),
-            created_at=str(run_view.get("created_at") or _now()),
-        ),
-    ]
-    node.reuse_source_run_id = None
-    node.pending_fresh_reason = None
-    node.pending_budget = None
-
-
-def _unique(values: Sequence[str | None] | Any) -> list[str]:
-    return list(dict.fromkeys(str(value) for value in values if value is not None))
-
-
-def _now() -> str:
-    return datetime.now(UTC).isoformat()
+    flow.last_stop_reason = stop_reason[:128]
+    flow.auto_advanced_frontiers += max(0, auto_advanced_count)
 
 
 __all__ = ["FlowControlService"]

@@ -33,6 +33,7 @@ from aeloon_core.flow_control import FlowControlService
 from aeloon_core.flows import (
     MAX_FLOW_RUN_BINDINGS,
     DependencyPolicy,
+    FlowAdvanceMode,
     FlowCompletion,
     FlowContextRef,
     FlowNodeSpec,
@@ -49,6 +50,7 @@ from aeloon_core.session import SessionStore
 from aeloon_core.worker_control import WorkerControlService
 from aeloon_core.worker_manager import WorkerExecutionOutcome, WorkerSessionManager
 from aeloon_core.worker_sessions import (
+    BudgetGrant,
     WaitingRequest,
     WorkerReport,
     WorkerRunStatus,
@@ -84,6 +86,12 @@ class RecordingExecutor:
                 status=WorkerRunStatus.PARTIAL,
                 report=WorkerReport(summary="partial result"),
                 checkpoint=message_checkpoint("partial"),
+            )
+        if run.context.objective == "return failed":
+            return WorkerExecutionOutcome(
+                status=WorkerRunStatus.FAILED,
+                report=WorkerReport(summary="failed result"),
+                tool_outcome="known",
             )
         return WorkerExecutionOutcome(
             status=WorkerRunStatus.COMPLETED,
@@ -351,6 +359,301 @@ async def test_plan_parallel_builds_and_review_execute_one_frontier_at_a_time(
 
 
 @pytest.mark.asyncio
+async def test_auto_advance_runs_predictable_chain_and_stops_after_review(
+    tmp_path: Path,
+) -> None:
+    control, executor = _flow_control(tmp_path)
+    created = control.create_flow(
+        base_session_id="master",
+        goal="build and review a predictable graph",
+        idempotency_key="create-auto",
+        advance_mode=FlowAdvanceMode.AUTO,
+        nodes=[
+            _node("inspect", "inspect", worker_type_id="explorer"),
+            _node("build_1", "build one", depends_on=("inspect",)),
+            _node("build_2", "build two", depends_on=("inspect",)),
+            _node(
+                "review",
+                "review both",
+                worker_type_id="reviewer",
+                depends_on=("build_1", "build_2"),
+            ),
+        ],
+    )
+
+    result = await control.advance_flow(
+        created["flow_id"],
+        base_session_id="master",
+        base_turn_id="turn",
+        timeout_seconds=2,
+    )
+
+    assert result["frontiers_executed"] == [
+        ["inspect"],
+        ["build_1", "build_2"],
+        ["review"],
+    ]
+    assert result["auto_advanced_count"] == 2
+    assert result["stop_reason"] == "reviewer_frontier"
+    assert result["execution"]["auto_advanced_frontiers"] == 2
+    assert executor.max_active >= 2
+    assert {node["status"] for node in result["nodes"]} == {"completed"}
+
+
+@pytest.mark.asyncio
+async def test_auto_advance_honors_frontier_limit(tmp_path: Path) -> None:
+    control, _ = _flow_control(tmp_path)
+    created = control.create_flow(
+        base_session_id="master",
+        goal="run a bounded chain",
+        idempotency_key="create-auto-limit",
+        advance_mode=FlowAdvanceMode.AUTO,
+        auto_advance_max_frontiers=2,
+        nodes=[
+            _node("one", "one"),
+            _node("two", "two", depends_on=("one",)),
+            _node("three", "three", depends_on=("two",)),
+        ],
+    )
+
+    result = await control.advance_flow(
+        created["flow_id"],
+        base_session_id="master",
+        base_turn_id="turn",
+        timeout_seconds=2,
+    )
+
+    assert result["frontiers_executed"] == [["one"], ["two"]]
+    assert result["ready_node_ids"] == ["three"]
+    assert result["auto_advanced_count"] == 1
+    assert result["stop_reason"] == "auto_advance_limit"
+
+
+@pytest.mark.asyncio
+async def test_auto_advance_stops_on_partial_frontier(tmp_path: Path) -> None:
+    control, _ = _flow_control(tmp_path)
+    created = control.create_flow(
+        base_session_id="master",
+        goal="stop when a node is partial",
+        idempotency_key="create-auto-partial",
+        advance_mode=FlowAdvanceMode.AUTO,
+        nodes=[
+            _node("partial", "return partial"),
+            _node("downstream", "must not run", depends_on=("partial",)),
+        ],
+    )
+
+    result = await control.advance_flow(
+        created["flow_id"],
+        base_session_id="master",
+        base_turn_id="turn",
+        timeout_seconds=2,
+    )
+
+    assert result["frontiers_executed"] == [["partial"]]
+    assert result["stop_reason"] == "frontier_non_success"
+    assert result["nodes"][1]["status"] == "pending"
+
+
+@pytest.mark.parametrize(
+    ("objective", "expected_status", "expected_reason"),
+    [
+        ("wait for Master", "waiting_for_context", "waiting_for_context"),
+        ("return failed", "failed", "frontier_non_success"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_auto_advance_stops_on_waiting_or_failed_frontier(
+    tmp_path: Path,
+    objective: str,
+    expected_status: str,
+    expected_reason: str,
+) -> None:
+    control, executor = _flow_control(tmp_path)
+    created = control.create_flow(
+        base_session_id="master",
+        goal="stop a predictable chain safely",
+        idempotency_key=f"create-auto-{expected_status}",
+        advance_mode=FlowAdvanceMode.AUTO,
+        nodes=[
+            _node("first", objective),
+            _node("downstream", "must not run", depends_on=("first",)),
+        ],
+    )
+
+    result = await control.advance_flow(
+        created["flow_id"],
+        base_session_id="master",
+        base_turn_id="turn",
+        timeout_seconds=2,
+    )
+
+    assert result["nodes"][0]["status"] == expected_status
+    assert result["nodes"][1]["status"] == "pending"
+    assert result["stop_reason"] == expected_reason
+    assert "must not run" not in executor.objectives
+
+
+@pytest.mark.asyncio
+async def test_auto_advance_stops_at_default_four_frontiers_and_max_rounds(
+    tmp_path: Path,
+) -> None:
+    control, _ = _flow_control(tmp_path)
+    chain = [
+        _node(
+            f"step_{index}",
+            f"step {index}",
+            depends_on=((f"step_{index - 1}",) if index else ()),
+        )
+        for index in range(5)
+    ]
+    created = control.create_flow(
+        base_session_id="master",
+        goal="enforce the structural auto limit",
+        idempotency_key="create-auto-four",
+        advance_mode=FlowAdvanceMode.AUTO,
+        nodes=chain,
+    )
+
+    limited = await control.advance_flow(
+        created["flow_id"],
+        base_session_id="master",
+        base_turn_id="turn",
+        timeout_seconds=2,
+    )
+
+    assert len(limited["frontiers_executed"]) == 4
+    assert limited["ready_node_ids"] == ["step_4"]
+    assert limited["stop_reason"] == "auto_advance_limit"
+
+    round_limited = control.create_flow(
+        base_session_id="master",
+        goal="enforce max rounds during auto advance",
+        idempotency_key="create-auto-round-limit",
+        advance_mode=FlowAdvanceMode.AUTO,
+        max_rounds=2,
+        nodes=chain[:3],
+    )
+    blocked = await control.advance_flow(
+        round_limited["flow_id"],
+        base_session_id="master",
+        base_turn_id="turn",
+        timeout_seconds=2,
+    )
+    assert blocked["status"] == "blocked"
+    assert blocked["stop_reason"] == "max_rounds"
+    assert len(blocked["frontiers_executed"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_auto_advance_timeout_returns_without_starting_downstream(
+    tmp_path: Path,
+) -> None:
+    control, executor = _flow_control(tmp_path)
+    created = control.create_flow(
+        base_session_id="master",
+        goal="honor the caller timeout",
+        idempotency_key="create-auto-timeout",
+        advance_mode=FlowAdvanceMode.AUTO,
+        nodes=[
+            _node("first", "slow first"),
+            _node("downstream", "must not run", depends_on=("first",)),
+        ],
+    )
+
+    timed_out = await control.advance_flow(
+        created["flow_id"],
+        base_session_id="master",
+        base_turn_id="turn",
+        timeout_seconds=0,
+    )
+
+    assert timed_out["stop_reason"] == "active_or_timeout"
+    assert timed_out["nodes"][1]["status"] == "pending"
+    assert "must not run" not in executor.objectives
+    run_id = timed_out["nodes"][0]["run_id"]
+    await control.workers.await_workers([run_id], timeout=1, base_session_id="master")
+
+
+@pytest.mark.asyncio
+async def test_auto_advance_replays_a_crash_after_worker_reservation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control, _ = _flow_control(tmp_path)
+    created = control.create_flow(
+        base_session_id="master",
+        goal="recover and continue a predictable chain",
+        idempotency_key="create-auto-replay",
+        advance_mode=FlowAdvanceMode.AUTO,
+        nodes=[
+            _node("first", "first"),
+            _node("second", "second", depends_on=("first",)),
+        ],
+    )
+    original_attach = control._attach_run
+
+    def crash_attach(*args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        raise RuntimeError("crash after durable Worker reservation")
+
+    monkeypatch.setattr(control, "_attach_run", crash_attach)
+    with pytest.raises(RuntimeError, match="durable Worker reservation"):
+        await control.advance_flow(
+            created["flow_id"],
+            base_session_id="master",
+            base_turn_id="turn-one",
+            timeout_seconds=2,
+        )
+    monkeypatch.setattr(control, "_attach_run", original_attach)
+
+    recovered = await control.advance_flow(
+        created["flow_id"],
+        base_session_id="master",
+        base_turn_id="turn-two",
+        timeout_seconds=2,
+    )
+
+    assert recovered["frontiers_executed"] == [["first"], ["second"]]
+    assert {node["status"] for node in recovered["nodes"]} == {"completed"}
+    assert len(control.workers.manager.store.list_workers("master")) == 2
+
+
+@pytest.mark.asyncio
+async def test_flow_uses_role_budget_overrides_and_exposes_telemetry(
+    tmp_path: Path,
+) -> None:
+    control, _ = _flow_control(tmp_path)
+    control.workers.default_budgets["explorer"] = BudgetGrant(max_requests=7)
+    created = control.create_flow(
+        base_session_id="master",
+        goal="compare role budgets",
+        idempotency_key="create-role-budgets",
+        nodes=[
+            _node("inspect", "inspect budget", worker_type_id="explorer"),
+            _node("build", "build budget", worker_type_id="builder"),
+        ],
+    )
+
+    result = await control.advance_flow(
+        created["flow_id"],
+        base_session_id="master",
+        base_turn_id="turn",
+        timeout_seconds=2,
+    )
+
+    by_id = {node["node_id"]: node for node in result["nodes"]}
+    assert by_id["inspect"]["budget"]["last"]["max_requests"] == 7
+    assert (
+        by_id["build"]["budget"]["last"]["max_requests"]
+        == control.workers.default_budget.max_requests
+    )
+    assert by_id["inspect"]["result"]["telemetry"]["role"] == "explorer"
+    assert result["telemetry"]["roles"] == {"explorer": 1, "builder": 1}
+    assert result["telemetry"]["frontier_widths"] == [2]
+
+
+@pytest.mark.asyncio
 async def test_fresh_follow_up_receives_explicit_prior_run_context(tmp_path: Path) -> None:
     control, _ = _flow_control(tmp_path)
     original = control.create_flow(
@@ -406,7 +709,9 @@ async def test_fresh_follow_up_receives_explicit_prior_run_context(tmp_path: Pat
     assert related.included_sections == ("summary", "evidence")
     assert related.objective is None
     assert related.summary == "completed: build original"
-    assert related.evidence == ("verified",)
+    assert len(related.evidence) == 1
+    assert related.evidence[0].kind == "legacy"
+    assert related.evidence[0].locator == "verified"
 
     with pytest.raises(ValueError, match="another Master session"):
         control.create_flow(

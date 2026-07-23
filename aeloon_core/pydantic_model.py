@@ -108,7 +108,7 @@ def build_anthropic_model(
     reasoning_effort: str | None,
     timeout: int,
 ) -> PydanticModelBundle:
-    """Build the sole production model used by Master and Worker runs."""
+    """Build one reusable provider/model bundle for the process model router."""
 
     http_client = httpx.AsyncClient(
         proxy=provider.proxy,

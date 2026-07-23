@@ -13,6 +13,7 @@ import pytest
 
 from aeloon_core.flow_control import FlowControlService
 from aeloon_core.flows import (
+    FLOW_STATE_VERSION,
     FlowCompletion,
     FlowIdempotencyConflictError,
     FlowNodeSpec,
@@ -204,7 +205,8 @@ async def test_completed_revision_reuses_worker_with_new_sourced_run(
         base_session_id="master",
         idempotency_key="revise",
     )
-    second = _view_node(await _advance(control, flow_id, turn_id="turn-2"), "build")
+    second_advance = await _advance(control, flow_id, turn_id="turn-2")
+    second = _view_node(second_advance, "build")
     binding = _stored_node(control, flow_id, "build").runs[-1]
 
     assert second["worker_id"] == first["worker_id"]
@@ -252,7 +254,8 @@ async def test_partial_retry_reuses_worker_session(tmp_path: Path) -> None:
         budget_increase=BudgetIncrease(max_requests=50),
     )
     assert _view_node(increased, "build")["budget"]["pending"]["max_requests"] == 50
-    second = _view_node(await _advance(control, flow_id, turn_id="turn-2"), "build")
+    second_advance = await _advance(control, flow_id, turn_id="turn-2")
+    second = _view_node(second_advance, "build")
     binding = _stored_node(control, flow_id, "build").runs[-1]
     second_run = control.workers.manager.store.get_run(second["run_id"])
 
@@ -264,6 +267,8 @@ async def test_partial_retry_reuses_worker_session(tmp_path: Path) -> None:
     assert binding.budget is not None
     assert binding.budget.max_requests == 50
     assert second_run.context.budget.max_requests == 50
+    assert second_advance["telemetry"]["roles"] == {"builder": 2}
+    assert second_advance["telemetry"]["budget_increase_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -659,7 +664,9 @@ async def test_v1_flow_state_migrates_without_breaking_create_replay(
             }
         )
         state["schema_version"] = 1
+        state["auto_advance_max_frontiers"] = 64
         for node in state["nodes"]:
+            node["result"]["evidence"] = ["legacy Flow evidence"]
             node.pop("worker_session_policy", None)
             node.pop("reuse_source_run_id", None)
             node.pop("pending_fresh_reason", None)
@@ -674,10 +681,21 @@ async def test_v1_flow_state_migrates_without_breaking_create_replay(
 
     migrated = control.store.get_flow(flow_id, base_session_id="master")
     binding = migrated.node("work").runs[-1]
-    assert migrated.schema_version == 3
+    assert migrated.schema_version == FLOW_STATE_VERSION
     assert migrated.node("work").worker_session_policy.value == "auto"
     assert binding.session_action.value == "new"
     assert binding.session_reason == "legacy_binding"
+    assert binding.telemetry["role"] == "builder"
+    assert migrated.auto_advance_max_frontiers == 4
+    legacy_evidence = migrated.to_view()["nodes"][0]["result"]["evidence"][0]
+    assert legacy_evidence == {
+        "kind": "legacy",
+        "locator": "legacy Flow evidence",
+        "claim": "legacy Flow evidence",
+        "status": "observed",
+        "method": None,
+        "finding_id": None,
+    }
 
     replayed = control.create_flow(
         base_session_id="master",
@@ -772,6 +790,15 @@ def test_master_tool_schema_exposes_session_policy_fresh_override_and_budget_inc
         node = schema["$defs"]["FlowNodeSpec"]
         assert policy["enum"] == ["auto", "fresh"]
         assert node["properties"]["worker_session_policy"]["default"] == "auto"
+    create_schema = definitions["create_flow"]
+    assert create_schema["properties"]["advance_mode"]["$ref"].endswith(
+        "/FlowAdvanceMode"
+    )
+    max_frontiers = create_schema["properties"]["auto_advance_max_frontiers"]
+    assert max_frontiers["default"] == 4
+    assert max_frontiers["minimum"] == 1
+    assert max_frontiers["maximum"] == 4
+    assert max_frontiers["type"] == "integer"
     for tool_name in ("revise_flow_node", "retry_flow_node", "resume_flow_node"):
         schema = definitions[tool_name]
         properties = schema["properties"]

@@ -72,7 +72,7 @@ from aeloon_core.tools.registry import ToolRegistry
 from aeloon_core.transitions import NodeKind, TransitionRecord
 
 AgentRole = Literal["master", "worker"]
-OutputValidator = Callable[[Any], Awaitable[Any] | Any]
+OutputValidator = Callable[..., Awaitable[Any] | Any]
 HistoryProcessor = Callable[
     [RunContext["AeloonRunDeps"], list[ModelMessage]],
     Awaitable[list[ModelMessage]] | list[ModelMessage],
@@ -129,6 +129,7 @@ class AeloonRunDeps:
     stuck_detection_threshold: int = 4
     prompt_cache: PromptCacheState | None = None
     tools_used: list[str] = field(default_factory=list)
+    tool_observations: list[ToolObservation] = field(default_factory=list)
     transitions: list[TransitionRecord] = field(default_factory=list)
     tool_calls: dict[str, ToolCallView] = field(default_factory=dict)
     progress_call_ids: set[str] = field(default_factory=set)
@@ -143,6 +144,15 @@ class AeloonRunDeps:
             for definition in self.tools.get_definitions()
             if self.tools.get(str(definition["name"])) is not None
         }
+
+
+@dataclass(frozen=True, slots=True)
+class ToolObservation:
+    """One host tool result retained for deterministic terminal validation."""
+
+    name: str
+    arguments: dict[str, Any]
+    result: str
 
 
 @dataclass(slots=True)
@@ -212,6 +222,13 @@ class AeloonToolset(FunctionToolset[AeloonRunDeps]):
         async def call(ctx: RunContext[AeloonRunDeps], **kwargs: Any) -> str:
             result = await self.registry.execute(name, kwargs)
             ctx.deps.tools_used.append(name)
+            ctx.deps.tool_observations.append(
+                ToolObservation(
+                    name=name,
+                    arguments=dict(kwargs),
+                    result=result,
+                )
+            )
             return result
 
         return call
@@ -276,7 +293,7 @@ class PydanticAgentRuntime:
             async def validate_output(
                 _ctx: RunContext[AeloonRunDeps], output: Any
             ) -> Any:
-                validated = validator(output)
+                validated = _invoke_output_validator(validator, _ctx, output)
                 if inspect.isawaitable(validated):
                     return await validated
                 return validated
@@ -771,6 +788,20 @@ def _usage_dict(usage: Any) -> dict[str, int]:
     if isinstance(total, int | float):
         normalized["total_tokens"] = max(0, int(total))
     return normalized
+
+
+def _invoke_output_validator(
+    validator: OutputValidator,
+    ctx: RunContext[AeloonRunDeps],
+    output: Any,
+) -> Any:
+    """Call new context-aware validators without breaking one-argument callers."""
+
+    try:
+        inspect.signature(validator).bind(ctx, output)
+    except (TypeError, ValueError):
+        return validator(output)
+    return validator(ctx, output)
 
 
 async def _emit_progress(progress: Any, name: str, *args: Any, **kwargs: Any) -> None:

@@ -74,7 +74,18 @@ async def test_runtime_executes_host_tool_and_returns_typed_output() -> None:
             parts=[
                 ToolCallPart(
                     "complete_work",
-                    {"summary": "done", "artifacts": [], "evidence": ["README.md"]},
+                    {
+                        "summary": "done",
+                        "artifacts": [],
+                        "evidence": [
+                            {
+                                "kind": "file",
+                                "locator": "README.md:1",
+                                "claim": "README was inspected",
+                                "status": "observed",
+                            }
+                        ],
+                    },
                     "done-1",
                 )
             ]

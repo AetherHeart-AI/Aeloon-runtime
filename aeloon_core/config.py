@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 _REMOVED_V1_AGENT_DEFAULTS = frozenset(
     {"base_profile_id", "profile_id", "max_handoffs"}
@@ -69,6 +69,9 @@ class AgentDefaultsConfig(BaseModel):
     reasoning_effort: str | None = None
     chat_timeout: int = 3600
     context_window_tokens: int = 128_000
+    # Per-request completion ceiling. Anthropic-compatible SDKs default to 4096
+    # when unset, which thinking models routinely exhaust before tool output.
+    max_output_tokens: int = Field(default=32_768, ge=256)
     max_iterations: int = 25
     context_compaction: ContextCompactionConfig = Field(
         default_factory=ContextCompactionConfig
@@ -76,10 +79,55 @@ class AgentDefaultsConfig(BaseModel):
     runtime: AgentRuntimePolicy = Field(default_factory=AgentRuntimePolicy)
 
 
+class AgentRoutingConfig(BaseModel):
+    """Optional model-name overrides for Master and Worker responsibilities."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    master: str | None = Field(default=None, min_length=1)
+    workers: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("workers")
+    @classmethod
+    def _worker_routes_are_nonempty(cls, value: dict[str, str]) -> dict[str, str]:
+        normalized: dict[str, str] = {}
+        for worker_type_id, model_name in value.items():
+            worker_id = worker_type_id.strip()
+            model = model_name.strip()
+            if not worker_id or not model:
+                raise ValueError("worker model routes require nonempty ids and model names")
+            normalized[worker_id] = model
+        return normalized
+
+
+class AgentBudgetConfig(BaseModel):
+    """Optional request-budget overrides by orchestration responsibility."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    master: int | None = Field(default=None, ge=1)
+    workers: dict[str, int] = Field(default_factory=dict)
+
+    @field_validator("workers")
+    @classmethod
+    def _worker_budgets_are_positive(cls, value: dict[str, int]) -> dict[str, int]:
+        normalized: dict[str, int] = {}
+        for worker_type_id, max_iterations in value.items():
+            worker_id = worker_type_id.strip()
+            if not worker_id:
+                raise ValueError("worker budget overrides require nonempty ids")
+            if max_iterations < 1:
+                raise ValueError("worker budget overrides must be positive")
+            normalized[worker_id] = max_iterations
+        return normalized
+
+
 class AgentsConfig(BaseModel):
     """Agent namespace."""
 
     defaults: AgentDefaultsConfig = Field(default_factory=AgentDefaultsConfig)
+    routing: AgentRoutingConfig = Field(default_factory=AgentRoutingConfig)
+    budgets: AgentBudgetConfig = Field(default_factory=AgentBudgetConfig)
 
 
 class ExecToolConfig(BaseModel):

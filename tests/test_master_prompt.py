@@ -71,3 +71,22 @@ def test_legacy_master_prompt_keywords_remain_compatible() -> None:
     assert MASTER_RUNTIME_MARKER in prompt
     assert "worker-1" in prompt
     assert "flow-1" in prompt
+
+
+def test_master_prompt_contains_decision_handbook_and_cost_rubrics() -> None:
+    prompt = master_system_prompt(
+        worker_types=[
+            {"id": "builder"},
+            {"id": "researcher"},
+            {"id": "reviewer"},
+        ]
+    )
+
+    assert "DECISION HANDBOOK" in prompt
+    assert "One node is one coherent deliverable" in prompt
+    assert "Fan-out width" in prompt
+    assert "Every frontier costs at least one additional model round trip" in prompt
+    assert "Objective writing rubric" in prompt
+    assert "User asks to fix one config parsing defect" in prompt
+    assert "Allow at most two review-driven revisions" in prompt
+    assert "advance_mode=auto" in prompt

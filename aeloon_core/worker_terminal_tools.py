@@ -6,7 +6,13 @@ from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
-from aeloon_core.worker_sessions import WaitingRequest, WorkerReport, WorkerRunStatus
+from aeloon_core.worker_state import (
+    EvidenceItem,
+    TerminalEvidenceItem,
+    WaitingRequest,
+    WorkerReport,
+    WorkerRunStatus,
+)
 
 TerminalItem = Annotated[
     str,
@@ -21,12 +27,14 @@ class _TerminalArgs(BaseModel):
 class CompleteWorkArgs(_TerminalArgs):
     summary: str = Field(min_length=1, max_length=8_000)
     artifacts: list[TerminalItem] = Field(default_factory=list, max_length=32)
-    evidence: list[TerminalItem] = Field(default_factory=list, max_length=32)
+    evidence: list[TerminalEvidenceItem] = Field(default_factory=list, max_length=32)
 
 
 class RequestMasterArgs(_TerminalArgs):
     summary: str = Field(min_length=1, max_length=8_000)
     question: str = Field(min_length=1, max_length=1_000)
+    artifacts: list[TerminalItem] = Field(default_factory=list, max_length=32)
+    evidence: list[TerminalEvidenceItem] = Field(default_factory=list, max_length=32)
 
 
 def worker_terminal_result(
@@ -40,14 +48,25 @@ def worker_terminal_result(
             WorkerReport(
                 summary=output.summary,
                 artifacts=tuple(output.artifacts),
-                evidence=tuple(output.evidence),
+                evidence=tuple(
+                    EvidenceItem.model_validate(item.model_dump(mode="json"))
+                    for item in output.evidence
+                ),
             ),
             None,
         )
     request = WaitingRequest(summary=output.summary, question=output.question)
     return (
         WorkerRunStatus.WAITING_FOR_CONTEXT,
-        WorkerReport(summary=output.summary, unresolved=(output.question,)),
+        WorkerReport(
+            summary=output.summary,
+            artifacts=tuple(output.artifacts),
+            evidence=tuple(
+                EvidenceItem.model_validate(item.model_dump(mode="json"))
+                for item in output.evidence
+            ),
+            unresolved=(output.question,),
+        ),
         request,
     )
 
