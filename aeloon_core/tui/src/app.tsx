@@ -5,7 +5,7 @@ import {
   type ThemeMode,
 } from "@opentui/core"
 import { useKeyboard, useRenderer, useSelectionHandler } from "@opentui/solid"
-import { createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js"
+import { Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js"
 import { createMutable } from "solid-js/store"
 import {
   BridgeClient,
@@ -13,7 +13,7 @@ import {
   type BridgeClientOptions,
 } from "./bridge-client"
 import { COMMANDS, commandSuggestions, parseCommand } from "./commands"
-import { Composer, Header, StatusBar, TranscriptPane, WorkerStrip } from "./components"
+import { Composer, Header, StatusBar, TranscriptPane, WorkerCatalog } from "./components"
 import {
   type AppState,
   type View,
@@ -43,7 +43,7 @@ import {
 } from "./model"
 import { PromptQueue } from "./prompt-queue"
 import type { BridgeEnvelope, JsonObject, ReadySnapshot } from "./protocol"
-import { DARK, LIGHT } from "./theme"
+import { DARK, LIGHT, createMarkdownSyntaxStyle } from "./theme"
 
 export interface RuntimeBridge {
   close: () => Promise<void>
@@ -67,10 +67,14 @@ export function App(props: AppProps) {
   applyStartupPreferences(initial)
 
   const state = createMutable<AppState>(initial)
-  const [palette, setPalette] = createSignal(renderer.themeMode === "light" ? LIGHT : DARK)
+  const initialPalette = renderer.themeMode === "light" ? LIGHT : DARK
+  const [palette, setPalette] = createSignal(initialPalette)
+  let currentMarkdownStyle = createMarkdownSyntaxStyle(initialPalette)
+  const [markdownStyle, setMarkdownStyle] = createSignal(currentMarkdownStyle)
   const [composerValue, setComposerValue] = createSignal("")
   const [inputHistory, setInputHistory] = createSignal<string[]>([])
   const [expandedReport, setExpandedReport] = createSignal(false)
+  const [revealedMarkdownId, setRevealedMarkdownId] = createSignal<string>()
   const [now, setNow] = createSignal(Date.now())
   const [clipboardStatus, setClipboardStatus] = createSignal("")
   const suggestions = createMemo(() => commandSuggestions(composerValue()))
@@ -78,6 +82,7 @@ export function App(props: AppProps) {
   let bridge: RuntimeBridge | undefined
   let scrollbox: ScrollBoxRenderable | undefined
   let clipboardTimer: ReturnType<typeof setTimeout> | undefined
+  let revealTimer: ReturnType<typeof setTimeout> | undefined
   let exiting = false
   let queueHeldForSessionSwitch = false
   let sessionTransition: Promise<void> | undefined
@@ -520,6 +525,12 @@ export function App(props: AppProps) {
     if (pin) queueMicrotask(() => scrollbox?.scrollTo({ x: 0, y: scrollbox.scrollHeight }))
   }
 
+  const revealMarkdown = (itemId: string) => {
+    setRevealedMarkdownId(itemId)
+    if (revealTimer) clearTimeout(revealTimer)
+    revealTimer = setTimeout(() => setRevealedMarkdownId(undefined), 4_000)
+  }
+
   const exitApp = async () => {
     if (exiting) return
     exiting = true
@@ -611,16 +622,24 @@ export function App(props: AppProps) {
 
   useSelectionHandler((selection: Selection) => {
     const text = selection.getSelectedText()
-    if (!text) return
-    const copied = renderer.copyToClipboardOSC52(text)
-    setClipboardStatus(copied ? `copied ${text.length}` : "selected")
-    if (clipboardTimer) clearTimeout(clipboardTimer)
-    clipboardTimer = setTimeout(() => setClipboardStatus(""), 1_500)
+    if (text) {
+      const copied = renderer.copyToClipboardOSC52(text)
+      setClipboardStatus(copied ? `copied ${text.length}` : "selected")
+      if (clipboardTimer) clearTimeout(clipboardTimer)
+      clipboardTimer = setTimeout(() => setClipboardStatus(""), 1_500)
+    }
+    queueMicrotask(() => setRevealedMarkdownId(undefined))
   })
 
   const applyTheme = (mode: ThemeMode | null) => {
     const next = mode === "light" ? LIGHT : DARK
-    setPalette(next)
+    if (next !== palette()) {
+      const previousStyle = currentMarkdownStyle
+      currentMarkdownStyle = createMarkdownSyntaxStyle(next)
+      setMarkdownStyle(currentMarkdownStyle)
+      setPalette(next)
+      queueMicrotask(() => previousStyle.destroy())
+    }
     renderer.setBackgroundColor(next.background)
   }
   const themeHandler = (mode: ThemeMode) => applyTheme(mode)
@@ -649,6 +668,8 @@ export function App(props: AppProps) {
   onCleanup(() => {
     renderer.off(CliRenderEvents.THEME_MODE, themeHandler)
     if (clipboardTimer) clearTimeout(clipboardTimer)
+    if (revealTimer) clearTimeout(revealTimer)
+    currentMarkdownStyle.destroy()
     promptQueue.stop()
     if (!exiting) void bridge?.close()
   })
@@ -661,19 +682,33 @@ export function App(props: AppProps) {
       backgroundColor={palette().background}
     >
       <Header palette={palette()} state={state} />
-      <TranscriptPane
-        expandedReport={expandedReport()}
-        focus={state.focus === "transcript"}
-        onFocus={() => mutate((draft) => setFocus(draft, "transcript"))}
-        onPinChange={(pinned) => mutate((draft) => setPinned(draft, pinned))}
-        onScrollRef={(value) => (scrollbox = value)}
-        onToggleReport={() => setExpandedReport((value) => !value)}
-        onToggleTimelineItem={(itemId) => mutate((draft) => toggleTimelineItem(draft, itemId))}
-        onToggleTurnProcess={(turnId) => mutate((draft) => toggleTurnProcess(draft, turnId))}
-        palette={palette()}
-        state={state}
-      />
-      <WorkerStrip onSelect={chooseView} palette={palette()} state={state} />
+      <box
+        width="100%"
+        height="100%"
+        minHeight={0}
+        flexDirection="row"
+        flexGrow={1}
+      >
+        <TranscriptPane
+          expandedReport={expandedReport()}
+          focus={state.focus === "transcript"}
+          markdownStyle={markdownStyle()}
+          onFocus={() => mutate((draft) => setFocus(draft, "transcript"))}
+          onPinChange={(pinned) => mutate((draft) => setPinned(draft, pinned))}
+          onRevealMarkdown={revealMarkdown}
+          onSelectWorker={openWorker}
+          onScrollRef={(value) => (scrollbox = value)}
+          onToggleReport={() => setExpandedReport((value) => !value)}
+          onToggleTimelineItem={(itemId) => mutate((draft) => toggleTimelineItem(draft, itemId))}
+          onToggleTurnProcess={(turnId) => mutate((draft) => toggleTurnProcess(draft, turnId))}
+          palette={palette()}
+          revealedMarkdownId={revealedMarkdownId()}
+          state={state}
+        />
+        <Show when={state.workerOrder.length} fallback={<box width={0} height={0} />}>
+          <WorkerCatalog onSelect={chooseView} palette={palette()} state={state} />
+        </Show>
+      </box>
       <StatusBar
         clipboardStatus={clipboardStatus()}
         now={now()}

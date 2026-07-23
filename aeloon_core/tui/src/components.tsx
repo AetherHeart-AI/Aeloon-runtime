@@ -1,5 +1,20 @@
-import type { KeyEvent, KeyBinding, ScrollBoxRenderable, TextareaRenderable } from "@opentui/core"
-import { For, Show, createEffect, createMemo, createSignal } from "solid-js"
+import type {
+  ColorInput,
+  KeyEvent,
+  KeyBinding,
+  ScrollBoxRenderable,
+  SyntaxStyle,
+  TextareaRenderable,
+} from "@opentui/core"
+import {
+  For,
+  Show,
+  createEffect,
+  createMemo,
+  createSignal,
+  onCleanup,
+  onMount,
+} from "solid-js"
 import type { CommandDefinition } from "./commands"
 import type {
   AppState,
@@ -15,10 +30,60 @@ import {
   visibleWorkerItems,
   waitingSummary,
 } from "./model"
-import type { Palette } from "./theme"
+import { blend, type Palette } from "./theme"
 
 function EmptySlot() {
   return <box height={0} width={0} flexShrink={0} />
+}
+
+const MARKDOWN_BOOTSTRAP_MS = 250
+
+interface StreamingMarkdownProps {
+  background: ColorInput
+  content: string
+  id: string
+  onReveal: () => void
+  palette: Palette
+  revealed: boolean
+  streaming: boolean
+  syntaxStyle: SyntaxStyle
+}
+
+function StreamingMarkdown(props: StreamingMarkdownProps) {
+  const [bootstrapping, setBootstrapping] = createSignal(true)
+  let bootstrapTimer: ReturnType<typeof setTimeout> | undefined
+  onMount(() => {
+    // Keep the synchronous styled fallback for the first frame, then finalize
+    // completed Markdown once the asynchronous highlighter has started.
+    bootstrapTimer = setTimeout(() => setBootstrapping(false), MARKDOWN_BOOTSTRAP_MS)
+  })
+  onCleanup(() => {
+    if (bootstrapTimer) clearTimeout(bootstrapTimer)
+  })
+  return (
+    <markdown
+      id={props.id}
+      width="100%"
+      content={props.content}
+      syntaxStyle={props.syntaxStyle}
+      fg={props.palette.foreground}
+      bg={props.background}
+      conceal={!props.revealed}
+      streaming={props.streaming || bootstrapping()}
+      internalBlockMode="top-level"
+      tableOptions={{
+        borderColor: props.palette.borderSubtle,
+        borders: false,
+        cellPaddingX: 1,
+        selectable: true,
+        style: "columns",
+        widthMode: "content",
+        wrapMode: "word",
+      }}
+      onMouseDown={props.onReveal}
+      flexShrink={0}
+    />
+  )
 }
 
 export interface HeaderProps {
@@ -45,7 +110,7 @@ export function Header(props: HeaderProps) {
       backgroundColor={props.palette.panel}
       flexShrink={0}
     >
-      <text fg={props.palette.accent} width={12} selectable={false}>
+      <text fg={props.palette.assistant} width={12} selectable={false}>
         <strong>AELOON</strong>
       </text>
       <text fg={props.palette.foreground} flexGrow={1} overflow="hidden" wrapMode="none">
@@ -61,22 +126,22 @@ export function Header(props: HeaderProps) {
 interface TranscriptPaneProps {
   expandedReport: boolean
   focus: boolean
+  markdownStyle: SyntaxStyle
   onFocus: () => void
   onPinChange: (pinned: boolean) => void
+  onRevealMarkdown: (itemId: string) => void
+  onSelectWorker: (worker: WorkerInfo) => void
   onScrollRef: (renderable: ScrollBoxRenderable) => void
   onToggleReport: () => void
   onToggleTimelineItem: (itemId: string) => void
   onToggleTurnProcess: (turnId: string) => void
   palette: Palette
+  revealedMarkdownId?: string
   state: AppState
 }
 
 export function TranscriptPane(props: TranscriptPaneProps) {
   const masterTurns = createMemo(() => visibleMasterTurns(props.state))
-  const selectedWorker = createMemo(() => {
-    const view = props.state.view
-    return view.kind === "worker" ? props.state.workers[view.workerId] : undefined
-  })
   return (
     <scrollbox
       ref={props.onScrollRef}
@@ -96,19 +161,22 @@ export function TranscriptPane(props: TranscriptPaneProps) {
         scrollbarOptions: {
           showArrows: false,
           trackOptions: {
-            foregroundColor: props.palette.border,
+            foregroundColor: props.palette.borderSubtle,
             backgroundColor: props.palette.background,
           },
         },
       }}
     >
-      <Show when={props.state.view.kind === "master"} fallback={<EmptySlot />}>
+      <Show when={props.state.view.kind !== "logs"} fallback={<EmptySlot />}>
         <For each={masterTurns()} fallback={<EmptySlot />}>
           {(turn) => (
             <TurnView
+              markdownStyle={props.markdownStyle}
               onToggleItem={props.onToggleTimelineItem}
               onToggleProcess={props.onToggleTurnProcess}
+              onRevealMarkdown={props.onRevealMarkdown}
               palette={props.palette}
+              revealedMarkdownId={props.revealedMarkdownId}
               showRaw={props.state.verbosity === "verbose"}
               turn={turn}
             />
@@ -118,23 +186,35 @@ export function TranscriptPane(props: TranscriptPaneProps) {
           {(summary) => (
             <box marginBottom={1} flexShrink={0}>
               <text fg={props.palette.warning} selectable selectionBg={props.palette.selection}>
-                ◌ {summary()}
+                {uiGlyph("◌", "o")} {summary()}
               </text>
             </box>
           )}
         </Show>
-      </Show>
-      <Show when={selectedWorker()} fallback={<EmptySlot />}>
-        {(worker) => (
-          <WorkerDetail
-            expandedReport={props.expandedReport}
-            onToggleReport={props.onToggleReport}
-            onToggleTimelineItem={props.onToggleTimelineItem}
-            palette={props.palette}
-            state={props.state}
-            worker={worker()}
-          />
-        )}
+        <For each={props.state.workerOrder} fallback={<EmptySlot />}>
+          {(workerId) => (
+            <Show when={props.state.workers[workerId]} fallback={<EmptySlot />}>
+              {(worker) => (
+                <WorkerInlineBlock
+                  expanded={
+                    props.state.view.kind === "worker"
+                    && props.state.view.workerId === worker().id
+                  }
+                  expandedReport={props.expandedReport}
+                  markdownStyle={props.markdownStyle}
+                  onRevealMarkdown={props.onRevealMarkdown}
+                  onSelect={() => props.onSelectWorker(worker())}
+                  onToggleReport={props.onToggleReport}
+                  onToggleTimelineItem={props.onToggleTimelineItem}
+                  palette={props.palette}
+                  revealedMarkdownId={props.revealedMarkdownId}
+                  state={props.state}
+                  worker={worker()}
+                />
+              )}
+            </Show>
+          )}
+        </For>
       </Show>
       <Show when={props.state.view.kind === "logs"} fallback={<EmptySlot />}>
         <LogsView logs={props.state.gatewayLogs} logDetail={props.state.logDetail} palette={props.palette} />
@@ -145,8 +225,11 @@ export function TranscriptPane(props: TranscriptPaneProps) {
 
 interface TimelineRowProps {
   item: TimelineItem
+  markdownStyle: SyntaxStyle
+  onRevealMarkdown: (itemId: string) => void
   onToggle?: (itemId: string) => void
   palette: Palette
+  revealedMarkdownId?: string
   showRaw?: boolean
 }
 
@@ -170,17 +253,56 @@ export function TimelineRow(props: TimelineRowProps) {
       || props.item.kind === "thinking"
       || (props.item.resultDetail && props.item.resultDetail !== props.item.resultPreview),
   ))
-  if (props.item.kind === "aggregate") {
+  if (props.item.kind === "user") {
     return (
-      <text
-        fg={props.palette.muted}
-        selectable
-        selectionBg={props.palette.selection}
-        wrapMode="word"
+      <box
+        width="100%"
+        flexDirection="column"
+        paddingLeft={1}
+        paddingRight={1}
+        marginBottom={1}
+        border={["left"]}
+        borderColor={blend(props.palette.background, props.palette.warning, 0.62)}
+        backgroundColor={props.palette.userBand}
         flexShrink={0}
       >
-        ⋯ {props.item.body}
-      </text>
+        <text fg={props.palette.muted} selectable={false}>
+          {icon()} <strong>{heading()}</strong>
+        </text>
+        <Show when={props.item.body} fallback={<EmptySlot />}>
+          {(body) => (
+            <text
+              fg={props.palette.foreground}
+              selectable
+              selectionBg={props.palette.selection}
+              selectionFg={props.palette.foreground}
+              wrapMode="word"
+            >
+              {body()}
+            </text>
+          )}
+        </Show>
+      </box>
+    )
+  }
+  if (props.item.kind === "aggregate") {
+    return (
+      <box
+        width="100%"
+        paddingLeft={1}
+        border={["left"]}
+        borderColor={props.palette.borderSubtle}
+        flexShrink={0}
+      >
+        <text
+          fg={props.palette.muted}
+          selectable
+          selectionBg={props.palette.selection}
+          wrapMode="word"
+        >
+          ⋯ {props.item.body}
+        </text>
+      </box>
     )
   }
   if (props.item.kind === "tool") {
@@ -188,7 +310,9 @@ export function TimelineRow(props: TimelineRowProps) {
       <box
         width="100%"
         flexDirection="column"
-        marginBottom={expanded() || result() ? 1 : 0}
+        paddingLeft={1}
+        border={["left"]}
+        borderColor={blend(props.palette.background, color(), 0.58)}
         flexShrink={0}
       >
         <text
@@ -203,7 +327,7 @@ export function TimelineRow(props: TimelineRowProps) {
           {props.item.primary || props.item.body ? ` ${props.item.primary ?? props.item.body}` : ""}
           {props.item.metrics ? ` · ${props.item.metrics}` : ""}
           {props.item.workerLabel ? ` · ${props.item.workerLabel}` : ""}
-          {canExpand() ? ` ${expanded() ? "▾" : "▸"}` : ""}
+          {canExpand() ? ` ${expanded() ? uiGlyph("▾", "v") : uiGlyph("▸", ">")}` : ""}
         </text>
         <Show when={result()} fallback={<EmptySlot />}>
           {(detail) => (
@@ -224,14 +348,22 @@ export function TimelineRow(props: TimelineRowProps) {
   }
   if (props.item.kind === "thinking") {
     return (
-      <box width="100%" flexDirection="column" marginBottom={expanded() ? 1 : 0} flexShrink={0}>
+      <box
+        width="100%"
+        flexDirection="column"
+        paddingLeft={1}
+        border={["left"]}
+        borderColor={props.palette.borderSubtle}
+        flexShrink={0}
+      >
         <text
           fg={props.palette.muted}
           selectable
           selectionBg={props.palette.selection}
           onMouseDown={() => props.onToggle?.(props.item.id)}
         >
-          {expanded() ? "▾" : "▸"} thinking{props.item.metrics ? ` · ${props.item.metrics}` : ""}
+          {expanded() ? uiGlyph("▾", "v") : uiGlyph("▸", ">")} thinking
+          {props.item.metrics ? ` · ${props.item.metrics}` : ""}
         </text>
         <Show when={expanded() && props.item.body} fallback={<EmptySlot />}>
           {(body) => (
@@ -244,7 +376,14 @@ export function TimelineRow(props: TimelineRowProps) {
     )
   }
   return (
-    <box width="100%" flexDirection="column" marginBottom={1} flexShrink={0}>
+    <box
+      width="100%"
+      flexDirection="column"
+      paddingLeft={1}
+      border={["left"]}
+      borderColor={blend(props.palette.background, color(), 0.62)}
+      flexShrink={0}
+    >
       <text
         fg={color()}
         selectable
@@ -256,15 +395,31 @@ export function TimelineRow(props: TimelineRowProps) {
       </text>
       <Show when={props.item.body} fallback={<EmptySlot />}>
         {(body) => (
-          <text
-            fg={props.item.kind === "summary" || props.item.kind === "aggregate" ? props.palette.muted : props.palette.foreground}
-            selectable
-            selectionBg={props.palette.selection}
-            selectionFg={props.palette.foreground}
-            wrapMode="word"
+          <Show
+            when={props.item.kind === "assistant"}
+            fallback={
+              <text
+                fg={props.item.kind === "summary" ? props.palette.muted : props.palette.foreground}
+                selectable
+                selectionBg={props.palette.selection}
+                selectionFg={props.palette.foreground}
+                wrapMode="word"
+              >
+                {body()}
+              </text>
+            }
           >
-            {body()}
-          </text>
+            <StreamingMarkdown
+              background={props.palette.background}
+              content={body()}
+              id={`markdown-${props.item.id}`}
+              onReveal={() => props.onRevealMarkdown(props.item.id)}
+              palette={props.palette}
+              revealed={props.revealedMarkdownId === props.item.id}
+              streaming={props.item.status === "running"}
+              syntaxStyle={props.markdownStyle}
+            />
+          </Show>
         )}
       </Show>
       <Show when={props.item.detail} fallback={<EmptySlot />}>
@@ -286,9 +441,12 @@ export function TimelineRow(props: TimelineRowProps) {
 }
 
 interface TurnViewProps {
+  markdownStyle: SyntaxStyle
+  onRevealMarkdown: (itemId: string) => void
   onToggleItem: (itemId: string) => void
   onToggleProcess: (turnId: string) => void
   palette: Palette
+  revealedMarkdownId?: string
   showRaw: boolean
   turn: TurnGroup
 }
@@ -297,7 +455,16 @@ function TurnView(props: TurnViewProps) {
   return (
     <box width="100%" flexDirection="column" marginBottom={1} flexShrink={0}>
       <Show when={props.turn.user} fallback={<EmptySlot />}>
-        {(item) => <TimelineRow item={item()} palette={props.palette} showRaw={props.showRaw} />}
+        {(item) => (
+          <TimelineRow
+            item={item()}
+            markdownStyle={props.markdownStyle}
+            onRevealMarkdown={props.onRevealMarkdown}
+            palette={props.palette}
+            revealedMarkdownId={props.revealedMarkdownId}
+            showRaw={props.showRaw}
+          />
+        )}
       </Show>
       <Show when={props.turn.process.length} fallback={<EmptySlot />}>
         <box width="100%" flexDirection="column" flexShrink={0}>
@@ -306,15 +473,18 @@ function TurnView(props: TurnViewProps) {
             selectable={false}
             onMouseDown={() => props.onToggleProcess(props.turn.id)}
           >
-            {props.turn.collapsed ? "▸" : "▾"} PROCESS · {props.turn.processSummary}
+            {props.turn.collapsed ? uiGlyph("▸", ">") : uiGlyph("▾", "v")} PROCESS · {props.turn.processSummary}
           </text>
           <Show when={!props.turn.collapsed} fallback={<EmptySlot />}>
             <For each={props.turn.process} fallback={<EmptySlot />}>
               {(item) => (
                 <TimelineRow
                   item={item}
+                  markdownStyle={props.markdownStyle}
+                  onRevealMarkdown={props.onRevealMarkdown}
                   onToggle={props.onToggleItem}
                   palette={props.palette}
+                  revealedMarkdownId={props.revealedMarkdownId}
                   showRaw={props.showRaw}
                 />
               )}
@@ -323,10 +493,28 @@ function TurnView(props: TurnViewProps) {
         </box>
       </Show>
       <Show when={props.turn.answer} fallback={<EmptySlot />}>
-        {(item) => <TimelineRow item={item()} palette={props.palette} showRaw={props.showRaw} />}
+        {(item) => (
+          <TimelineRow
+            item={item()}
+            markdownStyle={props.markdownStyle}
+            onRevealMarkdown={props.onRevealMarkdown}
+            palette={props.palette}
+            revealedMarkdownId={props.revealedMarkdownId}
+            showRaw={props.showRaw}
+          />
+        )}
       </Show>
       <Show when={props.turn.summary} fallback={<EmptySlot />}>
-        {(item) => <TimelineRow item={item()} palette={props.palette} showRaw={props.showRaw} />}
+        {(item) => (
+          <TimelineRow
+            item={item()}
+            markdownStyle={props.markdownStyle}
+            onRevealMarkdown={props.onRevealMarkdown}
+            palette={props.palette}
+            revealedMarkdownId={props.revealedMarkdownId}
+            showRaw={props.showRaw}
+          />
+        )}
       </Show>
     </box>
   )
@@ -334,11 +522,90 @@ function TurnView(props: TurnViewProps) {
 
 interface WorkerDetailProps {
   expandedReport: boolean
+  markdownStyle: SyntaxStyle
+  onRevealMarkdown: (itemId: string) => void
   onToggleReport: () => void
   onToggleTimelineItem: (itemId: string) => void
   palette: Palette
+  revealedMarkdownId?: string
   state: AppState
   worker: WorkerInfo
+}
+
+interface WorkerInlineBlockProps extends WorkerDetailProps {
+  expanded: boolean
+  onSelect: () => void
+}
+
+function WorkerInlineBlock(props: WorkerInlineBlockProps) {
+  const status = createMemo(() => workerStatusColor(props.worker.status, props.palette))
+  return (
+    <box
+      width="100%"
+      flexDirection="column"
+      marginBottom={1}
+      paddingLeft={1}
+      paddingRight={props.expanded ? 1 : 0}
+      border={["left"]}
+      borderColor={blend(props.palette.background, status(), props.expanded ? 0.82 : 0.56)}
+      backgroundColor={props.expanded ? props.palette.panel : props.palette.background}
+      flexShrink={0}
+    >
+      <box
+        width="100%"
+        flexDirection="row"
+        gap={1}
+        onMouseDown={props.onSelect}
+        flexShrink={0}
+      >
+        <text fg={status()} flexShrink={0} selectable={false}>
+          {statusDot(props.worker.status)} <strong>{props.worker.label}</strong>
+        </text>
+        <text
+          fg={props.palette.muted}
+          flexGrow={1}
+          minWidth={0}
+          overflow="hidden"
+          wrapMode="none"
+          selectable={false}
+        >
+          {workerProgress(props.worker)}
+        </text>
+        <text fg={props.palette.borderFocus} flexShrink={0} selectable={false}>
+          {props.expanded ? `${uiGlyph("▾", "v")} DETAIL` : `${uiGlyph("▸", ">")} DETAIL`}
+        </text>
+      </box>
+      <Show
+        when={props.expanded}
+        fallback={
+          <Show when={props.worker.currentStep || props.worker.objective} fallback={<EmptySlot />}>
+            {(value) => (
+              <text
+                fg={props.palette.foreground}
+                overflow="hidden"
+                wrapMode="none"
+                selectable={false}
+              >
+                {singleLine(value(), 140)}
+              </text>
+            )}
+          </Show>
+        }
+      >
+        <WorkerDetail
+          expandedReport={props.expandedReport}
+          markdownStyle={props.markdownStyle}
+          onRevealMarkdown={props.onRevealMarkdown}
+          onToggleReport={props.onToggleReport}
+          onToggleTimelineItem={props.onToggleTimelineItem}
+          palette={props.palette}
+          revealedMarkdownId={props.revealedMarkdownId}
+          state={props.state}
+          worker={props.worker}
+        />
+      </Show>
+    </box>
+  )
 }
 
 export function WorkerDetail(props: WorkerDetailProps) {
@@ -355,7 +622,7 @@ export function WorkerDetail(props: WorkerDetailProps) {
   return (
     <box width="100%" flexDirection="column" flexShrink={0}>
       <box width="100%" flexDirection="column" marginBottom={1} flexShrink={0}>
-        <text fg={props.palette.accent} selectable selectionBg={props.palette.selection}>
+        <text fg={workerStatusColor(props.worker.status, props.palette)} selectable selectionBg={props.palette.selection}>
           <strong>{props.worker.label}</strong> · {props.worker.workerTypeId} · {workerStatusLabel(props.worker.status)}
           {props.worker.durationMs !== undefined ? ` · ${formatElapsed(props.worker.durationMs)}` : ""}
         </text>
@@ -409,7 +676,9 @@ export function WorkerDetail(props: WorkerDetailProps) {
           PHASE
         </text>
         <text fg={props.palette.foreground} selectable selectionBg={props.palette.selection} wrapMode="word">
-          {props.worker.phases.length ? props.worker.phases.join(" → ") : props.worker.phase || "queued"}
+          {props.worker.phases.length
+            ? props.worker.phases.join(uiGlyph(" → ", " -> "))
+            : props.worker.phase || "queued"}
         </text>
       </box>
 
@@ -445,8 +714,11 @@ export function WorkerDetail(props: WorkerDetailProps) {
         {(item) => (
           <TimelineRow
             item={item}
+            markdownStyle={props.markdownStyle}
+            onRevealMarkdown={props.onRevealMarkdown}
             onToggle={props.onToggleTimelineItem}
             palette={props.palette}
+            revealedMarkdownId={props.revealedMarkdownId}
             showRaw={props.state.verbosity === "verbose"}
           />
         )}
@@ -460,18 +732,30 @@ export function WorkerDetail(props: WorkerDetailProps) {
             marginBottom={1}
             padding={1}
             border
-            borderColor={props.palette.border}
-            onMouseDown={props.onToggleReport}
+            borderColor={props.palette.borderStrong}
             flexShrink={0}
           >
-            <text fg={statusColor({ ...({} as TimelineItem), status: workerTimelineStatus(props.worker.status) }, props.palette)}>
+            <text
+              fg={workerStatusColor(props.worker.status, props.palette)}
+              onMouseDown={props.onToggleReport}
+            >
               <strong>RESULT · {workerStatusLabel(props.worker.status)}</strong>
             </text>
-            <text fg={props.palette.foreground} selectable selectionBg={props.palette.selection} wrapMode="word">
+            <text
+              fg={props.palette.foreground}
+              selectable
+              selectionBg={props.palette.selection}
+              selectionFg={props.palette.foreground}
+              wrapMode="word"
+            >
               {value()}
             </text>
             <Show when={(props.worker.report?.length ?? 0) > 700} fallback={<EmptySlot />}>
-              <text fg={props.palette.muted} selectable={false}>
+              <text
+                fg={props.palette.muted}
+                selectable={false}
+                onMouseDown={props.onToggleReport}
+              >
                 click or press e to {props.expandedReport ? "collapse" : "expand"}
               </text>
             </Show>
@@ -517,58 +801,91 @@ export function LogsView(props: LogsViewProps) {
   )
 }
 
-interface WorkerStripProps {
+interface WorkerCatalogProps {
   onSelect: (view: View) => void
   palette: Palette
   state: AppState
 }
 
-export function WorkerStrip(props: WorkerStripProps) {
+export function WorkerCatalog(props: WorkerCatalogProps) {
+  const activeCount = createMemo(() =>
+    props.state.workerOrder.filter((workerId) => {
+      const status = props.state.workers[workerId]?.status
+      return status && !["archived", "cancelled", "completed", "failed", "partial"].includes(status)
+    }).length,
+  )
   return (
-    <scrollbox
-      height={2}
-      width="100%"
-      scrollX
-      scrollY={false}
+    <box
+      height="100%"
+      width={29}
+      flexDirection="column"
+      paddingLeft={1}
+      paddingRight={1}
+      border={["left"]}
+      borderColor={props.palette.borderSubtle}
+      backgroundColor={props.palette.panel}
       flexShrink={0}
-      style={{
-        contentOptions: { flexDirection: "row", alignItems: "center", gap: 1 },
-        scrollbarOptions: { showArrows: false },
-      }}
     >
-      <WorkerTab
-        active={props.state.view.kind === "master"}
-        label="MASTER"
-        meta={props.state.running ? "running" : "transcript"}
-        onSelect={() => props.onSelect({ kind: "master" })}
-        palette={props.palette}
-        status={props.state.running ? "running" : "idle"}
-      />
-      <For each={props.state.workerOrder} fallback={<EmptySlot />}>
-        {(workerId) => {
-          const worker = () => props.state.workers[workerId]
-          return (
-            <Show when={worker()} fallback={<EmptySlot />}>
-              {(item) => (
-                <WorkerTab
-                  active={props.state.view.kind === "worker" && props.state.view.workerId === item().id}
-                  label={item().label}
-                  meta={workerProgress(item())}
-                  onSelect={() => props.onSelect({ kind: "worker", workerId: item().id })}
-                  palette={props.palette}
-                  status={item().status}
-                  unread={item().unread}
-                />
-              )}
-            </Show>
-          )
+      <box height={2} width="100%" flexDirection="column" flexShrink={0}>
+        <text fg={props.palette.foreground} selectable={false}>
+          <strong>WORKERS</strong> · {activeCount()} active
+        </text>
+        <text fg={props.palette.muted} selectable={false}>
+          live catalog
+        </text>
+      </box>
+      <scrollbox
+        height="100%"
+        width="100%"
+        flexGrow={1}
+        style={{
+          contentOptions: { flexDirection: "column" },
+          scrollbarOptions: {
+            showArrows: false,
+            trackOptions: {
+              foregroundColor: props.palette.borderSubtle,
+              backgroundColor: props.palette.panel,
+            },
+          },
         }}
-      </For>
-    </scrollbox>
+      >
+        <WorkerCatalogRow
+          active={props.state.view.kind === "master"}
+          label="MASTER"
+          meta={props.state.running ? "running" : "transcript"}
+          onSelect={() => props.onSelect({ kind: "master" })}
+          palette={props.palette}
+          status={props.state.running ? "running" : "idle"}
+        />
+        <For each={props.state.workerOrder} fallback={<EmptySlot />}>
+          {(workerId) => {
+            const worker = () => props.state.workers[workerId]
+            return (
+              <Show when={worker()} fallback={<EmptySlot />}>
+                {(item) => (
+                  <WorkerCatalogRow
+                    active={
+                      props.state.view.kind === "worker"
+                      && props.state.view.workerId === item().id
+                    }
+                    label={item().label}
+                    meta={workerProgress(item())}
+                    onSelect={() => props.onSelect({ kind: "worker", workerId: item().id })}
+                    palette={props.palette}
+                    status={item().status}
+                    unread={item().unread}
+                  />
+                )}
+              </Show>
+            )
+          }}
+        </For>
+      </scrollbox>
+    </box>
   )
 }
 
-interface WorkerTabProps {
+interface WorkerCatalogRowProps {
   active: boolean
   label: string
   meta: string
@@ -578,21 +895,26 @@ interface WorkerTabProps {
   unread?: number
 }
 
-function WorkerTab(props: WorkerTabProps) {
+function WorkerCatalogRow(props: WorkerCatalogRowProps) {
   return (
     <box
-      height={2}
-      minWidth={18}
-      maxWidth={32}
+      width="100%"
+      minHeight={2}
       paddingLeft={1}
       paddingRight={1}
       flexDirection="column"
       flexShrink={0}
-      backgroundColor={props.active ? props.palette.panel : props.palette.background}
+      border={["left"]}
+      borderColor={props.active ? props.palette.borderFocus : props.palette.borderSubtle}
+      backgroundColor={
+        props.active
+          ? blend(props.palette.panel, props.palette.foreground, 0.07)
+          : props.palette.panel
+      }
       onMouseDown={props.onSelect}
     >
       <text fg={workerStatusColor(props.status, props.palette)} overflow="hidden" wrapMode="none" selectable={false}>
-        {props.active ? "▸" : statusDot(props.status)} <strong>{props.label}</strong>
+        {statusDot(props.status)} <strong>{props.label}</strong>
         {props.unread ? ` •${props.unread > 9 ? "9+" : props.unread}` : ""}
       </text>
       <text fg={props.palette.muted} overflow="hidden" wrapMode="none" selectable={false}>
@@ -633,6 +955,12 @@ export function StatusBar(props: StatusBarProps) {
     if (props.clipboardStatus) parts.push(props.clipboardStatus)
     return parts.join(" · ")
   })
+  const statusTone = createMemo(() => {
+    if (props.state.bridgeError) return props.palette.error
+    if (!props.state.running) return props.palette.muted
+    const breath = 0.5 + ((Math.sin(props.now / 360) + 1) / 2) * 0.18
+    return blend(props.palette.background, props.palette.warning, breath)
+  })
   return (
     <box
       height={1}
@@ -645,7 +973,7 @@ export function StatusBar(props: StatusBarProps) {
       flexShrink={0}
     >
       <text
-        fg={props.state.bridgeError ? props.palette.error : props.state.running ? props.palette.warning : props.palette.muted}
+        fg={statusTone()}
         flexGrow={1}
         flexShrink={1}
         minWidth={0}
@@ -662,7 +990,7 @@ export function StatusBar(props: StatusBarProps) {
         wrapMode="none"
         selectable={false}
       >
-          Tab views · Esc focus · /help
+          Tab workers · Esc focus · /help
       </text>
     </box>
   )
@@ -803,7 +1131,7 @@ export function Composer(props: ComposerProps) {
                   selectSuggestion()
                 }}
               >
-                <text fg={index() === selectedSuggestion() ? props.palette.accent : props.palette.foreground} width={30}>
+                <text fg={index() === selectedSuggestion() ? props.palette.system : props.palette.foreground} width={30}>
                   {suggestion.usage}
                 </text>
                 <text fg={props.palette.muted} overflow="hidden" wrapMode="none">
@@ -820,7 +1148,7 @@ export function Composer(props: ComposerProps) {
         paddingLeft={1}
         paddingRight={1}
         border
-        borderColor={props.focused ? props.palette.accent : props.palette.border}
+        borderColor={props.focused ? props.palette.borderFocus : props.palette.border}
         backgroundColor={props.palette.background}
         flexShrink={0}
         onMouseDown={props.onFocus}
@@ -837,7 +1165,7 @@ export function Composer(props: ComposerProps) {
           focusedTextColor={props.palette.foreground}
           backgroundColor={props.palette.background}
           focusedBackgroundColor={props.palette.background}
-          cursorColor={props.palette.accent}
+          cursorColor={props.palette.system}
           selectionBg={props.palette.selection}
           selectionFg={props.palette.foreground}
           wrapMode="word"
@@ -862,40 +1190,42 @@ export function Composer(props: ComposerProps) {
 }
 
 function statusIcon(item: TimelineItem): string {
-  if (item.kind === "user") return "›"
+  if (item.kind === "user") return uiGlyph("›", ">")
   if (item.kind === "assistant") return "A"
-  if (item.kind === "aggregate") return "⋯"
-  if (item.status === "done") return "✓"
-  if (item.status === "failed") return "✕"
+  if (item.kind === "aggregate") return uiGlyph("⋯", "...")
+  if (item.status === "done") return uiGlyph("✓", "+")
+  if (item.status === "failed") return uiGlyph("✕", "x")
   if (item.status === "cancelled") return "−"
   if (item.status === "partial") return "!"
-  return "◆"
+  return uiGlyph("◆", "*")
 }
 
-function statusColor(item: TimelineItem, palette: Palette): string {
+function statusColor(item: TimelineItem, palette: Palette): ColorInput {
   if (item.status === "failed" || item.kind === "error") return palette.error
+  if (item.kind === "assistant" || item.kind === "narration") return palette.assistant
+  if (item.kind === "system" || item.kind === "lifecycle") return palette.system
   if (item.status === "done") return palette.success
   if (item.status === "partial") return palette.warning
   if (item.status === "cancelled") return palette.cancelled
   if (item.kind === "user") return palette.warning
   if (item.kind === "summary" || item.kind === "aggregate" || item.kind === "log") return palette.muted
-  return palette.accent
+  return palette.system
 }
 
-function workerStatusColor(status: string, palette: Palette): string {
+function workerStatusColor(status: string, palette: Palette): ColorInput {
   if (status === "completed") return palette.success
   if (status === "failed") return palette.error
   if (status === "cancelled" || status === "archived") return palette.cancelled
   if (status === "partial" || status === "waiting_for_context") return palette.warning
-  return palette.accent
+  return palette.system
 }
 
 function statusDot(status: string): string {
-  if (status === "completed") return "●"
-  if (status === "failed") return "●"
-  if (status === "cancelled" || status === "archived") return "○"
-  if (status === "partial" || status === "waiting_for_context") return "◐"
-  return "◒"
+  if (status === "completed") return uiGlyph("●", "*")
+  if (status === "failed") return uiGlyph("●", "x")
+  if (status === "cancelled" || status === "archived") return uiGlyph("○", "o")
+  if (status === "partial" || status === "waiting_for_context") return uiGlyph("◐", "~")
+  return uiGlyph("◒", "*")
 }
 
 function workerProgress(worker: WorkerInfo): string {
@@ -929,19 +1259,11 @@ function workerStatusLabel(status: string): string {
   )
 }
 
-function workerTimelineStatus(status: string): TimelineItem["status"] {
-  if (status === "completed") return "done"
-  if (status === "cancelled") return "cancelled"
-  if (status === "partial" || status === "waiting_for_context") return "partial"
-  if (status === "failed") return "failed"
-  return "running"
-}
-
-function logLevelColor(level: string, palette: Palette): string {
+function logLevelColor(level: string, palette: Palette): ColorInput {
   if (["ERROR", "CRITICAL"].includes(level)) return palette.error
   if (level === "WARNING") return palette.warning
   if (level === "SUCCESS") return palette.success
-  return palette.accent
+  return palette.system
 }
 
 function usageLabel(usage: Record<string, unknown>): string {
@@ -951,7 +1273,18 @@ function usageLabel(usage: Record<string, unknown>): string {
 }
 
 function spinner(now: number): string {
-  return ["◐", "◓", "◑", "◒"][Math.floor(now / 120) % 4] ?? "◐"
+  const unicode = ["◐", "◓", "◑", "◒"]
+  const ascii = ["|", "/", "-", "\\"]
+  const index = Math.floor(now / 120) % unicode.length
+  return uiGlyph(unicode[index] ?? "◐", ascii[index] ?? "|")
+}
+
+const USE_ASCII_GLYPHS =
+  process.env.AELOON_CORE_TUI_ASCII === "1"
+  || (process.env.TERM === "dumb" && Boolean(process.stdout.isTTY))
+
+function uiGlyph(unicode: string, ascii: string): string {
+  return USE_ASCII_GLYPHS ? ascii : unicode
 }
 
 function formatElapsed(milliseconds: number): string {

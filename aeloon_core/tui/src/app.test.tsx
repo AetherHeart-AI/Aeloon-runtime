@@ -7,14 +7,7 @@ import { BridgeRequestError, type BridgeClientOptions } from "./bridge-client"
 import type { BridgeEnvelope, JsonObject, ReadySnapshot } from "./protocol"
 
 const snapshot: ReadySnapshot = {
-  history: [
-    {
-      final_content: "I have mapped the existing event flow and started the refactor.",
-      tools_used: ["read", "grep"],
-      usage: { completion_tokens: 84, prompt_tokens: 210, total_tokens: 294 },
-      user_prompt: "Refactor the terminal UI into a quiet operator console.",
-    },
-  ],
+  history: [],
   model: "gpt-5",
   session_id: "session-internal-uuid",
   workers: [
@@ -217,6 +210,84 @@ test("compact Master renders the command deck without implementation noise", asy
   setup.renderer.destroy()
 })
 
+test("Master renders concealed Markdown beside simultaneous inline Workers", async () => {
+  const richSnapshot: ReadySnapshot = {
+    ...snapshot,
+    history: [
+      {
+        final_content: [
+          "# Result",
+          "",
+          "Ship **bold output** with:",
+          "",
+          "- streaming Markdown",
+          "- concealed syntax",
+        ].join("\n"),
+        tools_used: [],
+        usage: {},
+        user_prompt: "Polish the **terminal** response.",
+      },
+    ],
+    workers: [
+      ...(snapshot.workers ?? []),
+      {
+        latest_run: {
+          objective: "Review the streaming renderer while the builder remains visible.",
+          run_id: "review-run-internal-uuid",
+          run_sequence: 1,
+          status: "running",
+        },
+        worker_type_id: "review",
+        status: "running",
+        worker_id: "cd34-worker-internal-uuid",
+      },
+    ],
+  }
+  const workerEvents: BridgeEnvelope[] = [
+    {
+      type: "event",
+      event: "chat.worker.activity",
+      payload: {
+        current_step: "Implement the inline Worker block",
+        phase: "using_tool",
+        revision: 1,
+        run_id: "run-internal-uuid",
+        worker_type_id: "coding",
+        worker_id: "ab12-worker-internal-uuid",
+      },
+    },
+    {
+      type: "event",
+      event: "chat.worker.activity",
+      payload: {
+        current_step: "Review Markdown concealment",
+        phase: "reviewing",
+        revision: 1,
+        run_id: "review-run-internal-uuid",
+        worker_type_id: "review",
+        worker_id: "cd34-worker-internal-uuid",
+      },
+    },
+  ]
+  const setup = await testRender(
+    () => <App connect={false} initialEnvelopes={workerEvents} initialSnapshot={richSnapshot} />,
+    { height: 38, width: 120 },
+  )
+  await setup.waitFor(() => setup.captureCharFrame().includes("bold output"))
+  await Bun.sleep(300)
+  await setup.flush()
+  const frame = setup.captureCharFrame()
+
+  expect(frame).toContain("Result")
+  expect(frame).toContain("bold output")
+  expect(frame).not.toContain("**bold output**")
+  expect(frame).toContain("WORKERS · 2 active")
+  expect(frame).toContain("Implement the inline Worker block")
+  expect(frame).toContain("Review Markdown concealment")
+
+  setup.renderer.destroy()
+})
+
 test("completed turns collapse process rows and t restores the live timeline", async () => {
   const completedEvents: BridgeEnvelope[] = [
     { type: "event", event: "chat.turn.start", payload: {} },
@@ -292,12 +363,12 @@ test("status and shortcuts stay legible at eighty columns", async () => {
   await setup.flush()
   const frame = setup.captureCharFrame()
   expect(frame).toContain("idle · compact · pin:on · focus:composer")
-  expect(frame).toContain("Tab views · Esc focus · /help")
+  expect(frame).toContain("Tab workers · Esc focus · /help")
   expect(frame).not.toContain("composTab")
   setup.renderer.destroy()
 })
 
-test("Tab opens the Worker workbench without stealing composer focus on updates", async () => {
+test("Tab expands inline Worker detail without stealing composer focus on updates", async () => {
   const setup = await testRender(
     () => <App connect={false} initialEnvelopes={events} initialSnapshot={snapshot} />,
     { height: 40, width: 110 },
