@@ -236,6 +236,23 @@ describe("TUI event projection", () => {
     })
   })
 
+  test("uses turn-end final content instead of promoting earlier narration", () => {
+    const state = createAppState()
+    appendUserPrompt(state, "fix the reported issue")
+    applyEnvelope(state, event("chat.turn.start", {}))
+    applyEnvelope(state, event("chat.block.add", {
+      block: { content: "I will start a fresh builder.", id: "narration", type: "text" },
+    }))
+    applyEnvelope(state, event("chat.turn.end", {
+      duration_ms: 42,
+      final: "The issue is fixed and verified.",
+    }))
+
+    const turn = visibleMasterTurns(state)[0]
+    expect(turn?.answer?.body).toBe("The issue is fixed and verified.")
+    expect(turn?.process.some((item) => item.body === "I will start a fresh builder.")).toBeTrue()
+  })
+
   test("keeps command output through the detail bound and exposes a short preview", () => {
     const state = createAppState()
     const output = `first line\n${"x".repeat(17_000)}\nlast line\nExit code: 0`
@@ -496,7 +513,6 @@ describe("TUI event projection", () => {
           status: "done",
           tool_name: "str_replace",
         },
-        { action: "retry", event: "tests need one repair", kind: "guard", source: "guard" },
       ],
       todo_completed: 3,
       todo_total: 4,
@@ -514,7 +530,6 @@ describe("TUI event projection", () => {
       "lifecycle",
       "step",
       "tool",
-      "guard",
     ])
     expect(JSON.stringify(visibleWorkerItems(state, "ab12ffff"))).not.toContain(
       "run-private-control-id",
@@ -526,7 +541,6 @@ describe("TUI event projection", () => {
       "step",
       "aggregate",
       "tool",
-      "guard",
     ])
     expect(verbose[2]?.body).toBe("read ×4 · grep ×2")
   })

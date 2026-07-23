@@ -161,11 +161,6 @@ const events: BridgeEnvelope[] = [
   },
   {
     type: "event",
-    event: "chat.guard.decision",
-    payload: { action: "retry", event: "test failed once", source: "quality_guard" },
-  },
-  {
-    type: "event",
     event: "log.entry",
     payload: { level: "DEBUG", message: "gateway HTTP detail", source: "gateway" },
   },
@@ -207,7 +202,6 @@ test("compact Master renders the command deck without implementation noise", asy
   expect(frame).toContain("MASTER")
   expect(frame).toContain("coding#ab12")
   expect(frame).toContain("2/5")
-  expect(frame).toContain("GUARD")
   expect(frame).toContain("WROTE")
   expect(frame).toContain("REPLACED")
   expect(frame).toContain("running")

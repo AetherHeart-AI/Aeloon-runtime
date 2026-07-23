@@ -865,7 +865,6 @@ function statusIcon(item: TimelineItem): string {
   if (item.kind === "user") return "›"
   if (item.kind === "assistant") return "A"
   if (item.kind === "aggregate") return "⋯"
-  if (item.kind === "guard") return "↻"
   if (item.status === "done") return "✓"
   if (item.status === "failed") return "✕"
   if (item.status === "cancelled") return "−"
@@ -876,7 +875,7 @@ function statusIcon(item: TimelineItem): string {
 function statusColor(item: TimelineItem, palette: Palette): string {
   if (item.status === "failed" || item.kind === "error") return palette.error
   if (item.status === "done") return palette.success
-  if (item.status === "partial" || item.kind === "guard") return palette.warning
+  if (item.status === "partial") return palette.warning
   if (item.status === "cancelled") return palette.cancelled
   if (item.kind === "user") return palette.warning
   if (item.kind === "summary" || item.kind === "aggregate" || item.kind === "log") return palette.muted

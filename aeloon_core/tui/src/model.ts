@@ -19,7 +19,6 @@ export type TimelineKind =
   | "aggregate"
   | "assistant"
   | "error"
-  | "guard"
   | "lifecycle"
   | "log"
   | "narration"
@@ -264,14 +263,6 @@ export function applyEvent(state: AppState, event: string, payload: JsonObject):
         : payload.aggregate_usage ?? payload.usage,
     )
     if (usage) state.usage = { ...usage }
-    return
-  }
-  if (event === "chat.guard.decision") {
-    addGuard(state, payload)
-    return
-  }
-  if (event === "chat.worker.guard") {
-    addWorkerGuard(state, payload)
     return
   }
   if (event === "chat.worker.lifecycle") {
@@ -760,38 +751,6 @@ function onBlockUpdate(state: AppState, payload: JsonObject): void {
   }
 }
 
-function addGuard(state: AppState, payload: JsonObject): void {
-  const action = stringValue(payload.action) || "decision"
-  const source = stringValue(payload.source) || "guard"
-  const reason = stringValue(payload.event)
-  addMasterItem(state, {
-    body: [guardActionLabel(action), reason].filter(Boolean).join(" · "),
-    kind: "guard",
-    signal: "high",
-    status: action === "finalize" ? "failed" : "partial",
-    title: `GUARD · ${source}`,
-    ts: stringValue(payload.ts),
-  })
-}
-
-function addWorkerGuard(state: AppState, payload: JsonObject): void {
-  const worker = ensureWorker(state, payload)
-  if (!workerEventMatchesCurrentRun(worker, payload)) return
-  const action = stringValue(payload.action) || "decision"
-  const reason = stringValue(payload.event)
-  const item: Omit<TimelineItem, "id"> = {
-    body: [guardActionLabel(action), reason].filter(Boolean).join(" · "),
-    kind: "guard",
-    signal: "high",
-    status: action === "finalize" ? "failed" : "partial",
-    title: "GUARD",
-    ts: stringValue(payload.ts),
-  }
-  appendWorkerItem(state, worker, item)
-  addMasterItem(state, { ...item, workerLabel: worker.label })
-  markWorkerUnread(state, worker)
-}
-
 function onWorkerLifecycle(state: AppState, payload: JsonObject): void {
   const worker = ensureWorker(state, payload)
   if (
@@ -955,10 +914,29 @@ function onTurnEnd(state: AppState, payload: JsonObject): void {
       if (item) item.status = "done"
     }
   }
-  const finalTextBlock = pending.filter((block) => block.type === "text" && block.itemId).at(-1)
-  const finalText = finalTextBlock?.itemId ? findMasterItem(state, finalTextBlock.itemId) : undefined
+  const textItems = pending
+    .filter((block) => block.type === "text" && block.itemId)
+    .map((block) => findMasterItem(state, block.itemId!))
+    .filter((item): item is TimelineItem => item !== undefined)
+  const canonicalFinal = stringValue(payload.final)
+  let finalText = canonicalFinal
+    ? [...textItems].reverse().find(
+        (item) => (item.body ?? "").trim() === canonicalFinal.trim(),
+      )
+    : textItems.at(-1)
+  if (canonicalFinal && !finalText) {
+    finalText = addMasterItem(state, {
+      body: canonicalFinal,
+      kind: "assistant",
+      signal: "high",
+      status: "done",
+      title: "AELOON",
+      ts: stringValue(payload.ts),
+    })
+  }
   if (finalText) {
     finalText.kind = "assistant"
+    finalText.status = "done"
     finalText.title = "AELOON"
   }
   addMasterItem(state, {
@@ -1106,20 +1084,6 @@ function projectWorkerJournalRow(state: AppState, row: JsonObject): TimelineItem
       signal: "high",
       status: "running",
       title: step ? "CURRENT" : "PHASE",
-      ts,
-    }
-  }
-  if (kind === "guard") {
-    const action = stringValue(row.action) || "decision"
-    const source = stringValue(row.source)
-    const reason = oneLine(stringValue(row.event), 160)
-    return {
-      body: [guardActionLabel(action), reason].filter(Boolean).join(" · "),
-      id: nextId(state, "worker-journal"),
-      kind: "guard",
-      signal: "high",
-      status: action === "finalize" ? "failed" : "partial",
-      title: source ? `GUARD · ${source}` : "GUARD",
       ts,
     }
   }
@@ -1576,10 +1540,6 @@ function timelineStatus(status: string): TimelineStatus {
   if (status === "cancelled") return "cancelled"
   if (status === "failed") return "failed"
   return "running"
-}
-
-function guardActionLabel(action: string): string {
-  return { continue: "Continue", finalize: "Stopped", retry: "Retrying" }[action] ?? action
 }
 
 function workerLabel(workerTypeId: string, workerId: string): string {
