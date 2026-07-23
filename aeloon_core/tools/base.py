@@ -86,7 +86,11 @@ class WorkspaceTool(Tool):
         )
 
     def _resolve(self, path: str | None) -> Path:
-        """Resolve a path against the workspace; empty/None resolves to the root."""
+        """Resolve a path against the workspace; empty/None resolves to the root.
+
+        Absolute paths and parent traversal are allowed. Paths that fall under
+        ``denied_paths`` (for example runtime session data) remain blocked.
+        """
 
         if not path:
             return self.workspace
@@ -94,8 +98,6 @@ class WorkspaceTool(Tool):
         if not candidate.is_absolute():
             candidate = self.workspace / candidate
         resolved = candidate.resolve(strict=False)
-        if self.denied_paths and not resolved.is_relative_to(self.workspace):
-            raise ValueError(f"path escapes workspace: {path}")
         if self._is_denied(resolved):
             raise PermissionError(f"path is protected from agent tools: {path}")
         return resolved

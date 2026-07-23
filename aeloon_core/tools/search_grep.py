@@ -95,16 +95,18 @@ class GlobTool(WorkspaceTool):
         limit: int = 200,
     ) -> str:
         pattern_path = Path(pattern)
-        if pattern_path.is_absolute() or ".." in pattern_path.parts:
-            return "Error: glob pattern must stay inside the workspace"
-        base = self._resolve(root)
-        matches = sorted(
-            path
-            for path in base.glob(pattern)
-            if path.exists()
-            and _is_under(path.resolve(strict=False), self.workspace)
-            and not self._is_denied(path)
-        )
+        try:
+            if pattern_path.is_absolute():
+                raw_matches = (Path(match) for match in globlib.glob(pattern, recursive=True))
+            else:
+                raw_matches = self._resolve(root).glob(pattern)
+            matches = sorted(
+                path
+                for path in raw_matches
+                if path.exists() and not self._is_denied(path)
+            )
+        except ValueError as exc:
+            return f"Error: invalid glob pattern: {exc}"
         limited = matches[:limit]
         if not limited:
             return "(no matches)"
@@ -197,10 +199,7 @@ class GrepTool(WorkspaceTool):
         files = [target] if target.is_file() else [p for p in target.rglob("*") if p.is_file()]
         matches: list[str] = []
         for file_path in files:
-            if (
-                not _is_under(file_path.resolve(strict=False), self.workspace)
-                or self._is_denied(file_path)
-            ):
+            if self._is_denied(file_path):
                 continue
             if include and not fnmatch.fnmatch(file_path.name, include):
                 continue

@@ -210,14 +210,14 @@ def _read_snapshot(path: Path, *, display_path: str) -> tuple[bytes, _FileBaseli
             "PATH_SYMLINK",
             "Symbolic links are not valid mutation targets.",
             path=display_path,
-            next_action="Choose a regular file path inside the workspace.",
+            next_action="Choose a regular file path, or the real target path of a symlink.",
         )
     if not stat.S_ISREG(initial.st_mode):
         raise _ToolFailure(
             "NOT_FILE",
             "Mutation target is not a regular file.",
             path=display_path,
-            next_action="Choose a regular file path inside the workspace.",
+            next_action="Choose a regular file path.",
         )
     try:
         raw = path.read_bytes()
@@ -347,20 +347,29 @@ def _atomic_replace(
                 temp_path.unlink()
 
 
+def _display_path(tool: WorkspaceTool, target: Path) -> str:
+    """Prefer a workspace-relative path; fall back to the absolute path."""
+
+    resolved = target.resolve(strict=False)
+    if resolved.is_relative_to(tool.workspace):
+        return resolved.relative_to(tool.workspace).as_posix()
+    return str(resolved)
+
+
 def _validate_mutation_path(tool: WorkspaceTool, path: str) -> Path:
     if not path or path == ".":
         raise _ToolFailure(
             "PATH_INVALID",
-            "A non-empty workspace-relative file path is required.",
+            "A non-empty file path is required.",
             path=path,
-            next_action="Provide a relative path to a file inside the workspace.",
+            next_action="Provide a relative path from the workspace or an absolute file path.",
         )
     if "\x00" in path:
         raise _ToolFailure(
             "PATH_INVALID",
             "File paths cannot contain NUL bytes.",
             path=path,
-            next_action="Remove the NUL byte and provide a workspace-relative path.",
+            next_action="Remove the NUL byte and provide a valid file path.",
         )
     try:
         path.encode("utf-8")
@@ -372,33 +381,33 @@ def _validate_mutation_path(tool: WorkspaceTool, path: str) -> Path:
             next_action="Remove invalid surrogate characters from the path and retry.",
         ) from exc
 
-    relative = Path(path)
-    if relative.is_absolute():
-        raise _ToolFailure(
-            "PATH_INVALID",
-            "Absolute paths are not allowed for file mutations.",
-            path=path,
-            next_action="Provide a path relative to the workspace root.",
-        )
-    if ".." in relative.parts:
-        raise _ToolFailure(
-            "PATH_INVALID",
-            "Parent-directory traversal is not allowed for file mutations.",
-            path=path,
-            next_action="Provide a path that stays inside the workspace.",
-        )
+    candidate = Path(path).expanduser()
+    if candidate.is_absolute():
+        target = candidate
+        parts = list(candidate.parts)
+        # On POSIX the first part is the root ("/"); on Windows it is the drive.
+        if len(parts) <= 1:
+            raise _ToolFailure(
+                "PATH_INVALID",
+                "A file path is required, not a filesystem root.",
+                path=path,
+                next_action="Provide a path to a file, not a root directory.",
+            )
+        current = Path(parts[0])
+        walk_parts = parts[1:]
+    else:
+        target = tool.workspace.joinpath(candidate)
+        current = tool.workspace
+        walk_parts = [part for part in candidate.parts if part not in {"", "."}]
+        if not walk_parts:
+            raise _ToolFailure(
+                "PATH_INVALID",
+                "A file path is required, not the workspace root.",
+                path=path,
+                next_action="Provide a relative path to a file or an absolute file path.",
+            )
 
-    target = tool.workspace.joinpath(relative)
-    current = tool.workspace
-    meaningful_parts = [part for part in relative.parts if part not in {"", "."}]
-    if not meaningful_parts:
-        raise _ToolFailure(
-            "PATH_INVALID",
-            "A file path is required, not the workspace root.",
-            path=path,
-            next_action="Provide a relative path to a file inside the workspace.",
-        )
-    for index, part in enumerate(meaningful_parts):
+    for index, part in enumerate(walk_parts):
         current = current / part
         try:
             entry = current.lstat()
@@ -409,15 +418,15 @@ def _validate_mutation_path(tool: WorkspaceTool, path: str) -> Path:
                 "PATH_SYMLINK",
                 "Symbolic links are not allowed in mutation paths.",
                 path=path,
-                next_action="Choose a path containing only real workspace directories.",
+                next_action="Choose a path containing only real directories, or the real target path.",
             )
-        is_target = index == len(meaningful_parts) - 1
+        is_target = index == len(walk_parts) - 1
         if is_target and not stat.S_ISREG(entry.st_mode):
             raise _ToolFailure(
                 "NOT_FILE",
                 "Mutation target is not a regular file.",
                 path=path,
-                next_action="Choose a regular file path inside the workspace.",
+                next_action="Choose a regular file path.",
             )
         if not is_target and not stat.S_ISDIR(entry.st_mode):
             raise _ToolFailure(
@@ -428,20 +437,13 @@ def _validate_mutation_path(tool: WorkspaceTool, path: str) -> Path:
             )
 
     resolved = target.resolve(strict=False)
-    if not resolved.is_relative_to(tool.workspace):
-        raise _ToolFailure(
-            "PATH_INVALID",
-            "Mutation path escapes the workspace.",
-            path=path,
-            next_action="Provide a path that stays inside the workspace.",
-        )
     for denied in tool.denied_paths:
         if resolved == denied or resolved.is_relative_to(denied):
             raise _ToolFailure(
                 "PATH_PROTECTED",
                 "Mutation path is protected from agent tools.",
                 path=path,
-                next_action="Choose an unprotected path inside the workspace.",
+                next_action="Choose an unprotected path.",
             )
     return target
 
@@ -559,10 +561,10 @@ class WriteTool(WorkspaceTool):
                 baseline=baseline,
                 revalidate_path=lambda: _validate_mutation_path(self, path),
             )
-            relative_path = target.relative_to(self.workspace).as_posix()
+            display_path = _display_path(self, target)
             return (
                 "Successfully wrote file; "
-                f"path={relative_path!r}; chars={len(content)}; bytes={len(chunk)}; "
+                f"path={display_path!r}; chars={len(content)}; bytes={len(chunk)}; "
                 f"total_bytes={commit.total_bytes}; sha256={commit.sha256}"
             )
         except _ToolFailure as exc:
@@ -811,10 +813,10 @@ class StrReplaceTool(WorkspaceTool):
                     baseline=None,
                     revalidate_path=lambda: _validate_mutation_path(self, path),
                 )
-                relative_path = target.relative_to(self.workspace).as_posix()
+                display_path = _display_path(self, target)
                 return (
                     "Successfully created file; "
-                    f"path={relative_path!r}; chars={len(new_str)}; bytes={len(encoded_new)}; "
+                    f"path={display_path!r}; chars={len(new_str)}; bytes={len(encoded_new)}; "
                     f"total_bytes={commit.total_bytes}; sha256={commit.sha256}"
                 )
 
@@ -887,10 +889,10 @@ class StrReplaceTool(WorkspaceTool):
                 baseline=baseline,
                 revalidate_path=lambda: _validate_mutation_path(self, path),
             )
-            relative_path = target.relative_to(self.workspace).as_posix()
+            display_path = _display_path(self, target)
             return (
                 "Successfully replaced text; "
-                f"path={relative_path!r}; replacements={match_count if replace_all else 1}; "
+                f"path={display_path!r}; replacements={match_count if replace_all else 1}; "
                 f"total_bytes={commit.total_bytes}; sha256={commit.sha256}"
             )
         except _ToolFailure as exc:
