@@ -94,10 +94,10 @@ class ReadTool(WorkspaceTool):
             return f"Error reading file: {exc}"
 
 
-# Default per-call write/edit budget when model metadata is unavailable. Model
-# metadata reports tokens, while JSON Schema's maxLength and the runtime checks
-# below count characters. Keep a separate host ceiling so capable models are
-# not constrained by the fallback while tool arguments remain resource-bounded.
+# Soft per-call write/edit size guidance when model metadata is unavailable.
+# Model metadata reports tokens; tool descriptions count characters. This value
+# is advertised as a preference only — runtime does not hard-reject on it.
+# The real host ceiling is the independent 16 MiB UTF-8 file size limit.
 DEFAULT_MAX_ARGUMENT_CHARS = 128_000
 ESTIMATED_OUTPUT_CHARS_PER_TOKEN = 4
 _MAX_FILE_BYTES = 16 * 1024 * 1024
@@ -106,11 +106,12 @@ _MAX_ARGUMENT_CHARS = DEFAULT_MAX_ARGUMENT_CHARS  # backward-compatible alias
 
 
 def resolve_max_argument_chars(model_max_output_tokens: int | None = None) -> int:
-    """Return the effective per-call write/edit character budget.
+    """Return soft per-call write/edit character guidance for tool descriptions.
 
     Defaults to 128,000 characters when metadata is unavailable. Otherwise,
     convert the model's token ceiling to an estimated character capacity and
-    constrain it only by the independent host resource ceiling.
+    constrain it only by the independent host resource ceiling. Callers use
+    this for prompting the model, not for runtime rejection.
     """
 
     if model_max_output_tokens is None:
@@ -459,10 +460,17 @@ def _build_write_args_model(max_chars: int) -> type[BaseModel]:
     class WriteArgs(BaseModel):
         model_config = ConfigDict(extra="forbid")
 
-        path: str = Field(description="Workspace-relative path of the file to create or overwrite.")
+        path: str = Field(
+            description=(
+                "File path to create or overwrite. Relative paths resolve from the workspace; "
+                "absolute paths are allowed."
+            ),
+        )
         content: str = Field(
-            json_schema_extra={"maxLength": limit},
-            description=f"Complete UTF-8 file content, limited to {limit:,} characters.",
+            description=(
+                f"Complete UTF-8 file content. Prefer staying near {limit:,} characters when "
+                "practical; larger content is accepted until the 16 MiB file-size limit."
+            ),
         )
 
     WriteArgs.__name__ = "WriteArgs"
@@ -480,8 +488,9 @@ class WriteTool(WorkspaceTool):
     name = "write"
     concurrency_mode = "mutating"
     description = (
-        f"Atomically create or overwrite a complete UTF-8 file with up to "
-        f"{DEFAULT_MAX_ARGUMENT_CHARS:,} characters and 16 MiB. Use str_replace for targeted edits."
+        f"Atomically create or overwrite a complete UTF-8 file (prefer ~"
+        f"{DEFAULT_MAX_ARGUMENT_CHARS:,} characters; hard limit 16 MiB). "
+        "Use str_replace for targeted edits."
     )
     args_model = WriteArgs
 
@@ -498,14 +507,14 @@ class WriteTool(WorkspaceTool):
         )
 
     def configure_max_content_chars(self, max_content_chars: int) -> None:
-        """Update the per-call content budget and the advertised tool schema."""
+        """Update soft per-call size guidance advertised in the tool schema."""
 
         limit = max(1, int(max_content_chars))
         self.max_content_chars = limit
         self.args_model = _build_write_args_model(limit)
         self.description = (
-            f"Atomically create or overwrite a complete UTF-8 file with up to {limit:,} "
-            "characters and 16 MiB. Use str_replace for targeted edits."
+            f"Atomically create or overwrite a complete UTF-8 file (prefer ~{limit:,} "
+            "characters; hard limit 16 MiB). Use str_replace for targeted edits."
         )
 
     async def execute(
@@ -513,18 +522,7 @@ class WriteTool(WorkspaceTool):
         path: str,
         content: str,
     ) -> str:
-        limit = getattr(self, "max_content_chars", DEFAULT_MAX_ARGUMENT_CHARS)
         try:
-            if len(content) > limit:
-                return _error(
-                    "CONTENT_TOO_LARGE",
-                    "write content exceeds the per-call character limit.",
-                    path=path,
-                    field="content",
-                    actual=len(content),
-                    limit=limit,
-                    next_action="Reduce the content or split it across separate files.",
-                )
             try:
                 chunk = content.encode("utf-8")
             except UnicodeEncodeError:
@@ -689,18 +687,23 @@ def _build_str_replace_args_model(max_chars: int) -> type[BaseModel]:
         model_config = ConfigDict(extra="forbid")
 
         path: str = Field(
-            description="Workspace-relative path of the UTF-8 file to edit or create."
+            description=(
+                "UTF-8 file path to edit or create. Relative paths resolve from the workspace; "
+                "absolute paths are allowed."
+            ),
         )
         old_str: str = Field(
-            json_schema_extra={"maxLength": limit},
             description=(
                 "Exact text to replace; CRLF and LF are treated as equivalent. "
-                "Use an empty string to create a file that does not exist."
+                "Use an empty string to create a file that does not exist. "
+                f"Prefer keeping replacements near {limit:,} characters when practical."
             ),
         )
         new_str: str = Field(
-            json_schema_extra={"maxLength": limit},
-            description=f"Replacement text, limited to {limit:,} characters.",
+            description=(
+                f"Replacement text. Prefer staying near {limit:,} characters when practical; "
+                "larger text is accepted until the 16 MiB file-size limit."
+            ),
         )
         replace_all: bool = Field(
             default=False, description="Replace every occurrence instead of just one."
@@ -740,11 +743,18 @@ class StrReplaceTool(WorkspaceTool):
         )
 
     def configure_max_content_chars(self, max_content_chars: int) -> None:
-        """Update the per-call string budget and the advertised tool schema."""
+        """Update soft per-call size guidance advertised in the tool schema."""
 
         limit = max(1, int(max_content_chars))
         self.max_content_chars = limit
         self.args_model = _build_str_replace_args_model(limit)
+        self.description = (
+            "Atomically replace an exact old_str in a UTF-8 file. An empty old_str creates a "
+            "missing file from new_str, but refuses an existing target. For non-empty old_str, "
+            "CRLF and LF are equivalent and existing line endings are preserved. The match must "
+            f"be unique unless replace_all=true. Prefer replacements near {limit:,} characters; "
+            "hard limit is 16 MiB for the resulting file."
+        )
 
     async def execute(
         self,
@@ -753,19 +763,8 @@ class StrReplaceTool(WorkspaceTool):
         new_str: str,
         replace_all: bool = False,
     ) -> str:
-        limit = getattr(self, "max_content_chars", DEFAULT_MAX_ARGUMENT_CHARS)
         try:
             for field_name, value in (("old_str", old_str), ("new_str", new_str)):
-                if len(value) > limit:
-                    return _error(
-                        "CONTENT_TOO_LARGE",
-                        f"{field_name} exceeds the per-call character limit.",
-                        path=path,
-                        field=field_name,
-                        actual=len(value),
-                        limit=limit,
-                        next_action="Use a smaller exact replacement operation.",
-                    )
                 try:
                     value.encode("utf-8")
                 except UnicodeEncodeError:

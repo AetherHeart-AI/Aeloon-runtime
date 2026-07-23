@@ -65,30 +65,39 @@ class WriteToolLimitTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(result.startswith("Successfully wrote"))
             self.assertEqual((workspace / "index.html").read_text(), content)
 
-    async def test_schema_and_runtime_respect_configured_limit(self) -> None:
+    async def test_schema_advertises_soft_guidance_without_hard_reject(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary)
             tool = WriteTool(workspace=workspace, max_content_chars=100)
             schema = tool.to_schema()
             content_schema = schema["input_schema"]["properties"]["content"]
-            self.assertEqual(content_schema.get("maxLength"), 100)
+            self.assertNotIn("maxLength", content_schema)
+            self.assertIn("100", content_schema["description"])
+            self.assertIn("100", schema["description"])
 
-            failed = await tool.execute(path="big.txt", content="x" * 101)
-            self.assertTrue(failed.startswith("Error [CONTENT_TOO_LARGE]"))
-            self.assertIn("limit=100", failed)
+            # Soft guidance only: content past the advertised preference still writes.
+            oversized = "x" * 101
+            ok_big = await tool.execute(path="big.txt", content=oversized)
+            self.assertTrue(ok_big.startswith("Successfully wrote"))
+            self.assertEqual((workspace / "big.txt").read_text(), oversized)
 
             ok = await tool.execute(path="ok.txt", content="hello")
             self.assertTrue(ok.startswith("Successfully wrote"))
             self.assertEqual((workspace / "ok.txt").read_text(), "hello")
 
-    async def test_str_replace_shares_budget(self) -> None:
+    async def test_str_replace_soft_guidance_does_not_hard_reject(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary)
             target = workspace / "file.txt"
             target.write_text("abcdef")
             tool = StrReplaceTool(workspace=workspace, max_content_chars=3)
-            failed = await tool.execute(path="file.txt", old_str="abc", new_str="wxyz")
-            self.assertTrue(failed.startswith("Error [CONTENT_TOO_LARGE]"))
+            schema = tool.to_schema()
+            self.assertNotIn("maxLength", schema["input_schema"]["properties"]["new_str"])
+            self.assertIn("3", schema["input_schema"]["properties"]["new_str"]["description"])
+
+            ok = await tool.execute(path="file.txt", old_str="abc", new_str="wxyz")
+            self.assertTrue(ok.startswith("Successfully"))
+            self.assertEqual(target.read_text(), "wxyzdef")
 
 
 if __name__ == "__main__":
