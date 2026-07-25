@@ -4,6 +4,8 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
+/.test/
+/docs/
 
 web/node_modules/
 web/dist/
