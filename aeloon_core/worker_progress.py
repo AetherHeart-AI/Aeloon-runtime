@@ -37,15 +37,25 @@ _MAX_PENDING_JOURNAL_CALLS = 64
 _MAX_TOOL_RESULT_PREVIEW_CHARS = 4_000
 _MAX_TOOL_FAILURE_PREVIEW_CHARS = 400
 _SAFE_FAILURE_PREVIEW_TOOLS = {
+    "create_directory",
+    "edit_file",
+    "file_info",
+    "find_files",
     "glob",
     "grep",
+    "list_directory",
     "read",
+    "read_file",
+    "run_command",
+    "search_files",
     "skill",
     "str_replace",
     "todowrite",
     "webfetch",
     "websearch",
     "write",
+    "write_file",
+    "write_plan",
 }
 _DISPLAYABLE_COMMANDS = {
     "bun",
@@ -429,7 +439,13 @@ def _safe_tool_projection(
         "result_chars": len(result),
         "result_lines": len(result.splitlines()),
     }
-    if include_result_preview and node.tool_name == "exec":
+    if include_result_preview and node.tool_name in {
+        "check_command",
+        "exec",
+        "run_command",
+        "start_command",
+        "stop_command",
+    }:
         result_preview = _safe_tool_result_preview(result)
         if result_preview:
             metrics["result_preview"] = result_preview
@@ -445,7 +461,7 @@ def _safe_tool_projection(
         )
         if result_preview:
             metrics["result_preview"] = result_preview
-    if node.tool_name == "write":
+    if node.tool_name in {"write", "write_file"}:
         content = arguments.get("content")
         content_text = content if isinstance(content, str) else ""
         metrics["input_chars"] = len(content_text)
@@ -453,27 +469,55 @@ def _safe_tool_projection(
             metrics["input_bytes"] = len(content_text.encode("utf-8"))
         except UnicodeEncodeError:
             pass
-    elif node.tool_name == "str_replace":
-        metrics["old_chars"] = len(str(arguments.get("old_str") or ""))
-        metrics["new_chars"] = len(str(arguments.get("new_str") or ""))
+    elif node.tool_name in {"edit_file", "str_replace"}:
+        old_value = arguments.get(
+            "old_text" if node.tool_name == "edit_file" else "old_str"
+        )
+        new_value = arguments.get(
+            "new_text" if node.tool_name == "edit_file" else "new_str"
+        )
+        metrics["old_chars"] = len(str(old_value or ""))
+        metrics["new_chars"] = len(str(new_value or ""))
         if arguments.get("replace_all") is True:
             metrics["replace_all"] = True
-    elif node.tool_name == "exec":
+    elif node.tool_name in {"exec", "run_command", "start_command"}:
         command = _safe_command_summary(arguments.get("command"))
         if command:
             metrics["command"] = command
         match = re.search(r"(?:Exit code|exit code|exit)\D*(-?\d+)", result)
         if match is not None:
             metrics["exit_code"] = int(match.group(1))
-    elif node.tool_name == "todowrite":
-        todos = arguments.get("todos")
+    elif node.tool_name in {"todowrite", "write_plan"}:
+        todos = arguments.get(
+            "items" if node.tool_name == "write_plan" else "todos"
+        )
         if isinstance(todos, list):
             metrics["item_count"] = len(todos)
             metrics["todo_completed"] = sum(
                 isinstance(item, dict) and item.get("status") == "completed" for item in todos
             )
-    elif node.tool_name in {"glob", "grep", "websearch"}:
+    elif node.tool_name in {
+        "find_files",
+        "glob",
+        "grep",
+        "list_directory",
+        "search_files",
+        "websearch",
+    }:
         metrics["item_count"] = len([line for line in result.splitlines() if line.strip()])
+    if node.tool_name in {
+        "create_directory",
+        "edit_file",
+        "file_info",
+        "find_files",
+        "list_directory",
+        "read_file",
+        "search_files",
+        "write_file",
+    }:
+        resource = _safe_display_text(arguments.get("path"), limit=160)
+        if resource:
+            metrics["resource"] = resource
     return node.tool_name, status, metrics
 
 
@@ -532,7 +576,7 @@ def _safe_tool_result_preview(
 
 def _safe_current_todo(node: ToolExecutionRecord) -> tuple[str, int, int] | None:
     arguments = node.arguments if isinstance(node.arguments, dict) else {}
-    todos = arguments.get("todos")
+    todos = arguments.get("items" if node.tool_name == "write_plan" else "todos")
     if not isinstance(todos, list):
         return None
     active = [

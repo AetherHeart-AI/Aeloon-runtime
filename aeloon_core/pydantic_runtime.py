@@ -183,6 +183,7 @@ class AgentRunSpec:
     stuck_detection_threshold: int = 4
     prompt_cache: PromptCacheState | None = None
     on_transition: Callable[[TransitionRecord], Any] | None = None
+    capabilities: Sequence[Any] = ()
 
 
 @dataclass(slots=True)
@@ -246,8 +247,8 @@ class AeloonToolset(FunctionToolset[AeloonRunDeps]):
         return validate
 
 
-class PydanticAgentRuntime:
-    """Delegate the model/tool loop to PydanticAI while retaining Aeloon policy."""
+class HarnessAgentRuntime:
+    """Compose Pydantic AI with Harness capabilities and Aeloon policy hooks."""
 
     async def run(self, spec: AgentRunSpec) -> AgentRunOutcome:
         request_limit = max(1, int(spec.request_limit))
@@ -272,7 +273,7 @@ class PydanticAgentRuntime:
             transition_digest=_messages_digest(spec.history),
         )
         hooks = self._hooks(spec, deps)
-        capabilities: list[Any] = [hooks]
+        capabilities: list[Any] = [hooks, *spec.capabilities]
         if spec.history_processor is not None:
             capabilities.append(ProcessHistory(spec.history_processor))
 
@@ -489,6 +490,17 @@ class PydanticAgentRuntime:
             result_text = result if isinstance(result, str) else json.dumps(
                 result, ensure_ascii=False, default=str
             )
+            if ctx.deps.tools.get(view.name) is None:
+                # Harness and other capability tools execute outside
+                # AeloonToolset, so account for them here.
+                ctx.deps.tools_used.append(view.name)
+                ctx.deps.tool_observations.append(
+                    ToolObservation(
+                        name=view.name,
+                        arguments=dict(view.arguments),
+                        result=result_text,
+                    )
+                )
             if view.id not in ctx.deps.progress_result_ids:
                 ctx.deps.progress_result_ids.add(view.id)
                 await _emit_progress(
@@ -654,7 +666,9 @@ def _validate_entire_tool_batch(
             tool = deps.tools.get(call.tool_name)
             model = tool.args_model if tool is not None else None
         if model is None:
-            errors.append(f"unknown tool {call.tool_name!r}")
+            # Capability-contributed tools (for example Harness
+            # `run_workflow`) are not part of Aeloon's host ToolRegistry.
+            # Pydantic AI owns their schema validation and execution.
             continue
         try:
             arguments = call.args_as_dict(raise_if_invalid=True)
@@ -893,6 +907,10 @@ def _legacy_detection_messages(messages: Sequence[ModelMessage]) -> list[dict[st
     return projected
 
 
+# Compatibility for callers that imported the pre-Harness runtime name.
+PydanticAgentRuntime = HarnessAgentRuntime
+
+
 __all__ = [
     "AeloonRunDeps",
     "AeloonToolset",
@@ -900,6 +918,7 @@ __all__ = [
     "AgentRunSpec",
     "AgentRunStatus",
     "CapabilityManifest",
+    "HarnessAgentRuntime",
     "MESSAGE_FORMAT",
     "MESSAGE_SCHEMA_VERSION",
     "PydanticAgentRuntime",

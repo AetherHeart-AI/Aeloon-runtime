@@ -11,7 +11,6 @@ import {
   visibleMasterItems,
   visibleMasterTurns,
   visibleWorkerItems,
-  waitingSummary,
 } from "./model"
 
 const event = (name: string, payload: Record<string, unknown>) =>
@@ -352,8 +351,6 @@ describe("TUI event projection", () => {
     expect(state.focus).toBe("composer")
     expect(state.workers.ab12ffff?.label).toBe("coding#ab12")
     expect(state.workers.ab12ffff?.unread).toBe(2)
-    expect(waitingSummary(state)).toContain("Waiting on 1 Worker")
-
     setView(state, { kind: "worker", workerId: "ab12ffff" })
     expect(state.workers.ab12ffff?.unread).toBe(0)
 
@@ -446,6 +443,72 @@ describe("TUI event projection", () => {
 
     setVerbosity(state, "verbose")
     expect(visibleWorkerItems(state, "abcd1234").filter((item) => item.kind === "tool")).toHaveLength(5)
+  })
+
+  test("projects ephemeral Harness agent objective, usage, and result", () => {
+    const state = createAppState()
+    applyEnvelope(state, event("chat.worker.lifecycle", {
+      objective: "Review the provider migration",
+      phase: "started",
+      run_id: "dynamic-run",
+      status: "running",
+      worker_id: "dynamic-run",
+      worker_type_id: "reviewer",
+    }))
+    applyEnvelope(state, event("chat.worker.lifecycle", {
+      duration_ms: 1_240,
+      phase: "completed",
+      run_id: "dynamic-run",
+      status: "completed",
+      summary: "Provider migration is verified.",
+      usage: { input_tokens: 700, output_tokens: 300, total_tokens: 1_000 },
+      worker_id: "dynamic-run",
+      worker_type_id: "reviewer",
+    }))
+
+    expect(state.workers["dynamic-run"]).toMatchObject({
+      durationMs: 1_240,
+      objective: "Review the provider migration",
+      report: "Provider migration is verified.",
+      status: "completed",
+      usage: { input_tokens: 700, output_tokens: 300, total_tokens: 1_000 },
+    })
+  })
+
+  test("renders Harness filesystem and shell tool names with native semantics", () => {
+    const state = createAppState()
+    applyEnvelope(state, event("chat.worker.lifecycle", {
+      phase: "running",
+      worker_id: "dynamic-run",
+      worker_type_id: "builder",
+    }))
+    for (const [toolName, metrics] of [
+      ["read_file", { resource: "src/app.ts", result_chars: 90, result_lines: 4 }],
+      ["edit_file", { resource: "src/app.ts", old_chars: 20, new_chars: 30 }],
+      ["run_command", { command: "bun test", exit_code: 0 }],
+    ] as const) {
+      applyEnvelope(state, event("chat.worker.tool.result", {
+        duration_ms: 25,
+        metrics,
+        status: "done",
+        tool_name: toolName,
+        worker_id: "dynamic-run",
+        worker_type_id: "builder",
+      }))
+    }
+
+    const compact = visibleWorkerItems(state, "dynamic-run")
+    expect(compact.some((item) => item.toolName === "read_file")).toBeFalse()
+    expect(compact.find((item) => item.toolName === "edit_file")).toMatchObject({
+      metrics: "20 → 30 chars · 25ms",
+      primary: "src/app.ts",
+      verb: "EDITED",
+    })
+    expect(compact.find((item) => item.toolName === "run_command")).toMatchObject({
+      metrics: "exit 0 · 25ms",
+      primary: "bun test",
+      verb: "RAN",
+    })
   })
 
   test("hidden routine tools stay unread-silent while their failures remain visible", () => {

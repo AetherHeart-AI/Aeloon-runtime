@@ -139,11 +139,17 @@ export interface AppState {
 
 const LOW_SIGNAL_TOOLS = new Set([
   "discover_worker_types",
+  "file_info",
+  "find_files",
   "glob",
   "grep",
   "inspect_worker",
+  "inventory_agent_context",
+  "list_directory",
   "list_workers",
   "read",
+  "read_file",
+  "search_files",
   "skill",
   "webfetch",
   "websearch",
@@ -476,20 +482,6 @@ export function visibleWorkerItems(state: AppState, workerId: string): TimelineI
   return visible.map((item) => (item.rawDetail ? { ...item, rawDetail: undefined } : item))
 }
 
-export function runningWorkers(state: AppState): WorkerInfo[] {
-  return state.workerOrder
-    .map((workerId) => state.workers[workerId])
-    .filter((worker): worker is WorkerInfo => Boolean(worker) && !SETTLED_WORKER_STATES.has(worker.status))
-}
-
-export function waitingSummary(state: AppState): string {
-  const workers = runningWorkers(state)
-  if (!workers.length) return ""
-  const labels = workers.slice(0, 3).map((worker) => worker.label)
-  const suffix = workers.length > labels.length ? ` +${workers.length - labels.length}` : ""
-  return `Waiting on ${workers.length} Worker${workers.length === 1 ? "" : "s"} · ${labels.join(", ")}${suffix}`
-}
-
 export function applyCommandResult(state: AppState, command: string, result: unknown): void {
   if (command === "new_session" || command === "resume_session") {
     if (isObject(result)) hydrateReady(state, result as ReadySnapshot)
@@ -761,9 +753,17 @@ function onWorkerLifecycle(state: AppState, payload: JsonObject): void {
     )
   ) return
   const phase = stringValue(payload.phase) || stringValue(payload.status) || "running"
-  const status = phase === "created" ? stringValue(payload.status) || "queued" : phase
+  const status = phase === "created" || phase === "started"
+    ? stringValue(payload.status) || (phase === "created" ? "queued" : "running")
+    : phase
   if (!advanceWorkerStatus(worker, normalizeWorkerStatus(status))) return
   worker.durationMs = numberValue(payload.duration_ms) ?? worker.durationMs
+  const objective = stringValue(payload.objective)
+  if (objective) worker.objective = objective
+  const summary = stringValue(payload.summary)
+  if (summary) worker.report = summary
+  const usage = objectValue(payload.usage)
+  if (usage) worker.usage = { ...usage }
   if (worker.status === "running" && !worker.startedAt) worker.startedAt = Date.now()
   if (SETTLED_WORKER_STATES.has(worker.status)) {
     worker.currentStep = undefined
@@ -1326,17 +1326,30 @@ function formatProcessSummary(items: TimelineItem[], summary?: TimelineItem): st
 function toolVerb(name: string): string {
   return ({
     await: "AWAIT",
+    check_command: "CHECKED",
+    create_directory: "CREATED",
+    edit_file: "EDITED",
     exec: "RAN",
+    file_info: "INSPECT",
+    find_files: "INSPECT",
     glob: "INSPECT",
     grep: "INSPECT",
     inspect_worker: "INSPECT",
+    list_directory: "INSPECT",
     read: "READ",
+    read_file: "READ",
+    run_command: "RAN",
+    search_files: "SEARCHED",
     spawn: "SPAWN",
     spawn_worker: "SPAWN",
+    start_command: "STARTED",
+    stop_command: "STOPPED",
     str_replace: "REPLACED",
     webfetch: "FETCHED",
     websearch: "SEARCHED",
     write: "WROTE",
+    write_file: "WROTE",
+    write_plan: "PLANNED",
   } as Record<string, string>)[name] ?? name.replaceAll("_", " ").toUpperCase()
 }
 
@@ -1348,17 +1361,17 @@ function formatAggregate(counts: Record<string, number>): string {
 
 function summarizeToolArguments(name: string, value: unknown): string {
   const args = objectValue(value) ?? {}
-  if (name === "read") return stringValue(args.path) || "Reading file"
-  if (name === "write") {
+  if (name === "read" || name === "read_file") return stringValue(args.path) || "Reading file"
+  if (name === "write" || name === "write_file") {
     const content = stringValue(args.content)
     return [
       stringValue(args.path),
       `${content.length} chars`,
     ].filter(Boolean).join(" · ")
   }
-  if (name === "str_replace") {
-    const oldStr = stringValue(args.old_str)
-    const newStr = stringValue(args.new_str)
+  if (name === "str_replace" || name === "edit_file") {
+    const oldStr = stringValue(name === "edit_file" ? args.old_text : args.old_str)
+    const newStr = stringValue(name === "edit_file" ? args.new_text : args.new_str)
     return [
       stringValue(args.path) || "Replacing file text",
       `${oldStr.length} → ${newStr.length} chars`,
@@ -1366,12 +1379,16 @@ function summarizeToolArguments(name: string, value: unknown): string {
     ].filter(Boolean).join(" · ")
   }
   if (name === "edit") return stringValue(args.path) || "Legacy file change"
-  if (name === "exec") return oneLine(stringValue(args.command), 140) || "Running command"
-  if (name === "todowrite") {
-    const todos = Array.isArray(args.todos) ? args.todos : []
+  if (["exec", "run_command", "start_command"].includes(name)) {
+    return oneLine(stringValue(args.command), 140) || "Running command"
+  }
+  if (name === "todowrite" || name === "write_plan") {
+    const todos = Array.isArray(name === "write_plan" ? args.items : args.todos)
+      ? (name === "write_plan" ? args.items : args.todos) as unknown[]
+      : []
     return `${todos.length} item${todos.length === 1 ? "" : "s"}`
   }
-  if (name === "glob" || name === "grep") {
+  if (["find_files", "glob", "grep", "list_directory", "search_files"].includes(name)) {
     return [stringValue(args.pattern), stringValue(args.path) || stringValue(args.root)]
       .filter(Boolean)
       .join(" · ")
@@ -1390,7 +1407,7 @@ function summarizeToolResult(
   const args = objectValue(argumentsValue) ?? {}
   const duration = formatDuration(durationMs)
   if (failed) return ["Failed", oneLine(text, 160), duration].filter(Boolean).join(" · ")
-  if (name === "write") {
+  if (name === "write" || name === "write_file") {
     return [
       stringValue(args.path),
       `${stringValue(args.content).length} chars written`,
@@ -1399,15 +1416,15 @@ function summarizeToolResult(
       .filter(Boolean)
       .join(" · ")
   }
-  if (name === "str_replace") {
+  if (name === "str_replace" || name === "edit_file") {
     return [stringValue(args.path), "Replaced", duration].filter(Boolean).join(" · ")
   }
-  if (name === "exec") {
+  if (["exec", "run_command", "start_command"].includes(name)) {
     return [exitCode(text), `${text.length} chars / ${lineCount(text)} lines`, duration]
       .filter(Boolean)
       .join(" · ")
   }
-  if (name === "read") {
+  if (name === "read" || name === "read_file") {
     return [stringValue(args.path), `${text.length} chars / ${lineCount(text)} lines`, duration]
       .filter(Boolean)
       .join(" · ")
@@ -1420,20 +1437,23 @@ function workerToolDisplay(
   metrics: JsonObject,
   durationMs?: number,
 ): { metrics: string; primary: string } {
-  const primary = name === "exec"
+  const primary = ["exec", "run_command", "start_command"].includes(name)
     ? oneLine(stringValue(metrics.command), 160) || "exec"
     : stringValue(metrics.resource) || name
   const parts: string[] = []
-  if (name === "write") {
+  if (name === "write" || name === "write_file") {
     const inputChars = numberValue(metrics.input_chars)
     const inputBytes = numberValue(metrics.input_bytes)
     if (inputChars !== undefined) parts.push(`${inputChars} chars written`)
     else if (inputBytes !== undefined) parts.push(`${inputBytes} bytes written`)
-  } else if (name === "str_replace") {
+  } else if (name === "str_replace" || name === "edit_file") {
     const oldChars = numberValue(metrics.old_chars)
     const newChars = numberValue(metrics.new_chars)
     if (oldChars !== undefined && newChars !== undefined) parts.push(`${oldChars} → ${newChars} chars`)
-  } else if (name === "exec" && numberValue(metrics.exit_code) !== undefined) {
+  } else if (
+    ["exec", "run_command", "start_command"].includes(name)
+    && numberValue(metrics.exit_code) !== undefined
+  ) {
     parts.push(`exit ${numberValue(metrics.exit_code)}`)
   } else if (numberValue(metrics.item_count) !== undefined) {
     parts.push(`${numberValue(metrics.item_count)} items`)
@@ -1498,8 +1518,10 @@ function formatProgress(step: string, completed?: number, total?: number): strin
 
 function friendlyPhase(phase: string, tools: string[]): string {
   if (phase === "using_tool") {
-    if (tools.some((name) => name === "write" || name === "str_replace")) return "editing"
-    if (tools.includes("exec")) return "testing"
+    if (tools.some((name) => ["edit_file", "str_replace", "write", "write_file"].includes(name))) {
+      return "editing"
+    }
+    if (tools.some((name) => ["exec", "run_command", "start_command"].includes(name))) return "testing"
     if (tools.some((name) => LOW_SIGNAL_TOOLS.has(name))) return "analyzing"
     return "executing"
   }

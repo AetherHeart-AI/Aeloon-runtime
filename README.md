@@ -1,18 +1,21 @@
 # Aeloon Core
 
-Aeloon Core is a small dynamic agent workflow runtime.
+Aeloon Core is a Pydantic AI Harness master-worker runtime with an optional durable
+control plane.
 
-> **Master 写 Flow、看结果、动态改图；Worker 自己找路、交付节点结果。**
+> **Master 动态编排；Harness Worker 自己找路；需要恢复时再落到 durable Flow。**
 
-The Master owns the conversation and authors a durable dynamic Flow. It decides
-dependencies, parallel frontiers, review-driven revisions, and termination. A Worker
-receives one outcome-oriented node objective, chooses its own tools and Skills,
-completes the work, and returns a bounded report. Selecting a Worker type is only an
-executor-binding detail inside that larger Flow.
+The Master owns the conversation and chooses between two orchestration modes:
 
-Master and Worker both use PydanticAI Core for the model–tool loop. Aeloon remains
-the control plane for Flow scheduling, WorkerSession identity, Namespace/Skill
-capabilities, permissions, cancellation, persistence, and commit ordering.
+- Pydantic AI Harness `DynamicWorkflow` for self-contained fan-out, chaining, voting,
+  and synthesis within one turn;
+- Aeloon's durable Flow DAG for checkpoints, explicit review/revision, human waits,
+  cancellation recovery, leases, idempotency, and cross-turn continuation.
+
+Both modes use Pydantic AI's `Agent` loop and provider abstractions. Harness supplies
+dynamic sub-agents, filesystem, shell, repo context, planning, and sliding-window
+compaction. Aeloon-specific code is limited to domain tools, policy/telemetry adapters,
+and the durable control plane.
 
 ## Quick start
 
@@ -29,16 +32,16 @@ export CLAUDE_CODE_MAX_CONTEXT_TOKENS=1048576
 uv run aeloon-core
 ```
 
-The model gateway uses PydanticAI's official Anthropic integration. With the Kimi
-base URL above, the Anthropic SDK sends requests to
+The model gateway uses Pydantic AI's `AnthropicProvider` and `AnthropicModel`. With
+the Kimi base URL above, the provider sends requests to
 `https://api.kimi.com/coding/v1/messages`; tool definitions and history use
 Claude `tool_use` / `tool_result` content blocks. Aeloon accepts Claude Code's
 `k3[1m]` environment value and automatically sends Kimi's API model ID `k3`.
 
 ### Volcano Engine Ark Agent Plan
 
-The Volcano Engine provider uses Ark Agent Plan's OpenAI-compatible Responses API,
-which is the protocol recommended by the official OpenCode integration guide:
+The Volcano Engine route uses Pydantic AI's `OpenAIProvider` and standard
+`OpenAIResponsesModel` against Ark Agent Plan's OpenAI-compatible Responses API:
 
 ```bash
 export AELOON_CORE_PROVIDER="volcengine"   # sets agents.defaults.provider
@@ -76,18 +79,21 @@ Useful TUI commands include:
 Independent Workers run concurrently. Runs in one WorkerSession retain a single
 private context lineage and are continued explicitly.
 
-The TUI renders streaming Master responses as concealed Markdown. Concurrent Workers
-remain visible as live inline blocks in the Master transcript; use the right-hand
-catalog or `Tab` to expand a Worker's full phase, todo, timeline, and result detail.
+The TUI renders streaming Master responses as concealed Markdown. Inspired by Kimi
+Code's agent-group presentation, concurrent child agents appear inside the transcript
+as one `AGENTS` group with `├─` / `└─` branches, aggregate phase counts, tools, tokens,
+elapsed time, and each agent's latest activity. Use `Tab` or click a branch to expand
+its phase, plan, timeline, and result in place; there is no fixed right sidebar.
 Set `AELOON_CORE_TUI_ASCII=1` when the terminal needs ASCII-only status glyphs.
 
 ## Master and Worker boundary
 
 | Actor | Tools |
 |---|---|
-| Master | `list`, `read`, `glob`, `grep`; create/list/inspect/extend/advance/revise/pause/complete Flow; low-level Worker lifecycle escape hatches |
-| Worker | `list`, `read`, `write`, `str_replace`, `glob`, `grep`, `exec`, `webfetch`, `websearch`, `todowrite`, optional `skill` |
-| Worker terminal | `complete_work`, `request_master` |
+| Master | `list`, `read`, `glob`, `grep`; Harness `run_workflow`; durable Flow and Worker control |
+| Dynamic Harness Worker | `read_file`, `write_file`, `edit_file`, directory/search tools, shell commands, repo context, `write_plan` |
+| Durable Worker | Aeloon fenced filesystem/shell/web/todo tools, optional `skill` |
+| Durable Worker terminal | `complete_work`, `request_master` |
 
 The Master handles tiny observations itself. It should not create a Worker just to
 perform an `ls -la`-sized action, and it should not send command lists or prescribed
@@ -112,7 +118,32 @@ historical domain types so existing integrations can migrate without a flag day.
 New control-plane code should import domain contracts from `flow_state` or
 `worker_state` and persistence stores from `flows` or `worker_sessions`.
 
-## Dynamic Flows
+## Dynamic Workflow or durable Flow?
+
+Use `run_workflow` when every subtask can finish in the current turn. The Master writes
+a small sandboxed Python orchestration program and may call named Worker types in
+parallel:
+
+```python
+import asyncio
+
+build, review = await asyncio.gather(
+    builder(task="Implement the scoped change and verify it"),
+    reviewer(task="Independently inspect the current implementation"),
+)
+{"build": build, "review": review}
+```
+
+Each call is an isolated Pydantic AI agent run and returns a structured
+`WorkerReport`. Dynamic Workers cannot delegate recursively. The workflow has a
+bounded agent-call budget and Monty memory limit, but it is intentionally ephemeral:
+it has no durable WorkerSession, lease, checkpoint, HITL wait, or recovery record.
+
+Use a durable Flow when any of those properties matter. `DynamicWorkflow` therefore
+replaces ad-hoc in-turn master-worker fan-out, but it does not replace Aeloon's
+cross-process durability guarantees.
+
+## Durable dynamic Flows
 
 Multi-stage work is represented as a first-class, appendable DAG rather than an
 implicit sequence of Worker calls. For example:
@@ -208,10 +239,11 @@ owner disappears during tool execution, the Flow becomes `blocked` instead and e
 the unknown outcome for inspection. Tool boundaries re-check Run authority, so a stale
 owner is fenced from issuing new mutations after cancellation wins.
 
-Worker types are soft responsibilities. `explorer`, `builder`, `researcher`, and `reviewer`
-receive the same domain capability set; their definitions only change the
-responsibility prompt. Workers never receive Worker scheduling tools or any nested
-agent capability. The Master never receives mutation, shell, web, or Skill tools.
+Worker types are soft responsibilities. `explorer`, `builder`, `researcher`, and
+`reviewer` receive the same capability class inside their selected execution mode;
+their definitions change the responsibility prompt. Workers never receive scheduling
+tools or a nested agent capability. The Master has no direct mutation, shell, web, or
+Skill tools; it can only ask isolated Harness or durable Workers to perform domain work.
 
 ## Worker definitions
 
@@ -243,7 +275,7 @@ with their stored snapshot and digest.
 
 ## Completion and continuation
 
-A WorkerRun must end with exactly one typed PydanticAI output:
+A durable WorkerRun must end with exactly one typed Pydantic AI output:
 
 ```text
 complete_work(summary, artifacts=[], evidence=[])
@@ -296,9 +328,9 @@ WorkerRuns use the configured request limit and have no cumulative token or tool
 cap by default. The model context
 window is a separate per-request concern. A new Worker starts from the minimal dispatch
 envelope—its objective, permission domain, and budget—rather than a copy of the Master
-transcript. PydanticAI `ProcessHistory` applies Aeloon's client-side compaction policy
-when history approaches the configured context window. A finite internal grant remains a hard Run
-bound when an embedding host explicitly supplies one, and the wall-clock timeout plus
+transcript. Harness `SlidingWindow` applies zero-LLM compaction when history approaches
+the configured context window. A finite internal grant remains a hard Run bound when
+an embedding host explicitly supplies one, and the wall-clock timeout plus
 `cancel_worker` remain the liveness controls.
 
 Cancellation of queued work settles immediately. For a detached running Worker, the
@@ -397,7 +429,7 @@ Host-discovered Worker definitions and Skill contents are trusted workflow
 configuration. Workspace files, tool output, web content, and data referenced by a
 Skill remain untrusted task data.
 
-## Persistence and PydanticAI migration
+## Persistence and Harness boundary
 
 Master turns remain JSONL projections. Flow state, idempotent graph decisions, turn
 leases, and terminal-response commits use the independent `flow-control.sqlite3` store
@@ -476,6 +508,12 @@ directly:
     "budgets": {
       "master": 20,
       "workers": {"explorer": 12, "reviewer": 30}
+    },
+    "harness": {
+      "dynamic_workflow_enabled": true,
+      "max_agent_calls": 16,
+      "workflow_memory_mb": 256,
+      "workflow_cpu_seconds": 10
     }
   }
 }

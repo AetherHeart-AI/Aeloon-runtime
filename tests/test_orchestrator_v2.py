@@ -28,7 +28,6 @@ from aeloon_core.config import (
 )
 from aeloon_core.master_tools import build_master_scheduler_tools
 from aeloon_core.orchestrator import AeloonCoreOrchestrator
-from aeloon_core.pydantic_history import COMPACTION_MARKER
 from aeloon_core.pydantic_runtime import deserialize_messages, serialize_messages
 from aeloon_core.session import LegacySessionError
 from aeloon_core.worker_sessions import BudgetIncrease, RelatedWorkerContext
@@ -628,7 +627,7 @@ async def test_worker_cumulative_usage_does_not_consume_context_window(
 
 
 @pytest.mark.asyncio
-async def test_worker_uses_shared_context_compaction_pipeline(
+async def test_worker_uses_harness_sliding_window_compaction(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -638,7 +637,7 @@ async def test_worker_uses_shared_context_compaction_pipeline(
         data_dir=tmp_path / "data",
         agents=AgentsConfig(
             defaults=AgentDefaultsConfig(
-                context_window_tokens=4_000,
+                context_window_tokens=10,
                 context_compaction=ContextCompactionConfig(
                     trigger_ratio=0.1,
                     preserve_recent_turns=1,
@@ -680,9 +679,14 @@ async def test_worker_uses_shared_context_compaction_pipeline(
 
     assert second_result["status"] == "completed"
     assert model.domain_calls == 2
+    compacted_request = str(serialize_messages(model.seen_messages[1]))
+    assert "completed run 1" not in compacted_request
+    assert "continue from the prior work" in compacted_request
     checkpoint = app.workers.load_checkpoint(second["run_id"])
     assert checkpoint is not None
-    assert COMPACTION_MARKER in str(checkpoint["messages"])
+    checkpoint_messages = str(checkpoint["messages"])
+    assert "completed run 1" not in checkpoint_messages
+    assert "completed run 2" in checkpoint_messages
 
 
 @pytest.mark.asyncio

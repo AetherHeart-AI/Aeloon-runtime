@@ -45,3 +45,53 @@ async def test_finish_turn_does_not_duplicate_matching_streamed_content() -> Non
     assert [block["content"] for block in progress.blocks if block["type"] == "text"] == [
         "Already final."
     ]
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_harness_worker_publishes_bounded_result_metadata() -> None:
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    async def emit(name: str, payload: dict[str, Any]) -> None:
+        events.append((name, payload))
+
+    progress = TurnEventProgress(session_id="master", emit=emit)
+    await progress.on_worker_lifecycle(
+        event="completed",
+        worker_id="dynamic-run",
+        run_id="dynamic-run",
+        worker_type_id="reviewer",
+        status="completed",
+        duration_ms=1_200,
+        objective="Review the provider migration",
+        summary="Verified the provider migration.",
+        usage={"input_tokens": 700, "output_tokens": 300},
+        ephemeral=True,
+    )
+
+    payload = events[0][1]
+    assert payload["objective"] == "Review the provider migration"
+    assert payload["summary"] == "Verified the provider migration."
+    assert payload["usage"] == {"input_tokens": 700, "output_tokens": 300}
+
+
+@pytest.mark.asyncio
+async def test_durable_worker_lifecycle_does_not_publish_private_report() -> None:
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    async def emit(name: str, payload: dict[str, Any]) -> None:
+        events.append((name, payload))
+
+    progress = TurnEventProgress(session_id="master", emit=emit)
+    await progress.on_worker_lifecycle(
+        event="completed",
+        worker_id="durable-worker",
+        run_id="durable-run",
+        worker_type_id="builder",
+        status="completed",
+        summary="Private durable report",
+        usage={"total_tokens": 1_000},
+    )
+
+    payload = events[0][1]
+    assert "summary" not in payload
+    assert "usage" not in payload

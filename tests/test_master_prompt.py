@@ -90,3 +90,6 @@ def test_master_prompt_contains_decision_handbook_and_cost_rubrics() -> None:
     assert "User asks to fix one config parsing defect" in prompt
     assert "Allow at most two review-driven revisions" in prompt
     assert "advance_mode=auto" in prompt
+    assert "run_workflow" in prompt
+    assert "self-contained work that can finish in this turn" in prompt
+    assert "Use a durable Flow when work must survive process or turn boundaries" in prompt

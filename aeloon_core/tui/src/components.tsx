@@ -21,14 +21,12 @@ import type {
   GatewayLog,
   TimelineItem,
   TurnGroup,
-  View,
   WorkerInfo,
 } from "./model"
 import {
   usageCounters,
   visibleMasterTurns,
   visibleWorkerItems,
-  waitingSummary,
 } from "./model"
 import { blend, type Palette } from "./theme"
 
@@ -182,39 +180,19 @@ export function TranscriptPane(props: TranscriptPaneProps) {
             />
           )}
         </For>
-        <Show when={waitingSummary(props.state)} fallback={<EmptySlot />}>
-          {(summary) => (
-            <box marginBottom={1} flexShrink={0}>
-              <text fg={props.palette.warning} selectable selectionBg={props.palette.selection}>
-                {uiGlyph("◌", "o")} {summary()}
-              </text>
-            </box>
-          )}
+        <Show when={props.state.workerOrder.length} fallback={<EmptySlot />}>
+          <WorkerSwarmBlock
+            expandedReport={props.expandedReport}
+            markdownStyle={props.markdownStyle}
+            onRevealMarkdown={props.onRevealMarkdown}
+            onSelectWorker={props.onSelectWorker}
+            onToggleReport={props.onToggleReport}
+            onToggleTimelineItem={props.onToggleTimelineItem}
+            palette={props.palette}
+            revealedMarkdownId={props.revealedMarkdownId}
+            state={props.state}
+          />
         </Show>
-        <For each={props.state.workerOrder} fallback={<EmptySlot />}>
-          {(workerId) => (
-            <Show when={props.state.workers[workerId]} fallback={<EmptySlot />}>
-              {(worker) => (
-                <WorkerInlineBlock
-                  expanded={
-                    props.state.view.kind === "worker"
-                    && props.state.view.workerId === worker().id
-                  }
-                  expandedReport={props.expandedReport}
-                  markdownStyle={props.markdownStyle}
-                  onRevealMarkdown={props.onRevealMarkdown}
-                  onSelect={() => props.onSelectWorker(worker())}
-                  onToggleReport={props.onToggleReport}
-                  onToggleTimelineItem={props.onToggleTimelineItem}
-                  palette={props.palette}
-                  revealedMarkdownId={props.revealedMarkdownId}
-                  state={props.state}
-                  worker={worker()}
-                />
-              )}
-            </Show>
-          )}
-        </For>
       </Show>
       <Show when={props.state.view.kind === "logs"} fallback={<EmptySlot />}>
         <LogsView logs={props.state.gatewayLogs} logDetail={props.state.logDetail} palette={props.palette} />
@@ -534,7 +512,93 @@ interface WorkerDetailProps {
 
 interface WorkerInlineBlockProps extends WorkerDetailProps {
   expanded: boolean
+  branch: string
   onSelect: () => void
+}
+
+interface WorkerSwarmBlockProps {
+  expandedReport: boolean
+  markdownStyle: SyntaxStyle
+  onRevealMarkdown: (itemId: string) => void
+  onSelectWorker: (worker: WorkerInfo) => void
+  onToggleReport: () => void
+  onToggleTimelineItem: (itemId: string) => void
+  palette: Palette
+  revealedMarkdownId?: string
+  state: AppState
+}
+
+function WorkerSwarmBlock(props: WorkerSwarmBlockProps) {
+  const workers = createMemo(() =>
+    props.state.workerOrder
+      .map((workerId) => props.state.workers[workerId])
+      .filter((worker): worker is WorkerInfo => Boolean(worker)),
+  )
+  const active = createMemo(() =>
+    workers().filter((worker) => !workerSettled(worker.status)).length,
+  )
+  const failed = createMemo(() =>
+    workers().filter((worker) => worker.status === "failed").length,
+  )
+  const completed = createMemo(() =>
+    workers().filter((worker) => worker.status === "completed").length,
+  )
+  const headerColor = createMemo(() => {
+    if (failed()) return props.palette.error
+    if (active()) return props.palette.warning
+    return props.palette.success
+  })
+  const header = createMemo(() => {
+    const count = workers().length
+    const parts = [
+      active()
+        ? `${active()} agent${active() === 1 ? "" : "s"} running`
+        : `${count} agent${count === 1 ? "" : "s"} finished`,
+    ]
+    if (completed()) parts.push(`${completed()} done`)
+    if (failed()) parts.push(`${failed()} failed`)
+    const tools = workers().reduce((total, worker) => total + workerToolCount(worker), 0)
+    if (tools) parts.push(`${tools} tool${tools === 1 ? "" : "s"}`)
+    const tokens = workers().reduce((total, worker) => total + workerTokenCount(worker), 0)
+    if (tokens) parts.push(`${formatCount(tokens)} tokens`)
+    return parts.join(" · ")
+  })
+  return (
+    <box
+      width="100%"
+      flexDirection="column"
+      marginBottom={1}
+      paddingLeft={1}
+      border={["left"]}
+      borderColor={blend(props.palette.background, headerColor(), 0.66)}
+      flexShrink={0}
+    >
+      <text fg={headerColor()} selectable={false}>
+        {active() ? uiGlyph("◌", "o") : uiGlyph("✓", "+")} <strong>AGENTS</strong> · {header()}
+      </text>
+      <For each={workers()} fallback={<EmptySlot />}>
+        {(worker, index) => (
+          <WorkerInlineBlock
+            branch={index() === workers().length - 1 ? uiGlyph("└─", "`-") : uiGlyph("├─", "|-")}
+            expanded={
+              props.state.view.kind === "worker"
+              && props.state.view.workerId === worker.id
+            }
+            expandedReport={props.expandedReport}
+            markdownStyle={props.markdownStyle}
+            onRevealMarkdown={props.onRevealMarkdown}
+            onSelect={() => props.onSelectWorker(worker)}
+            onToggleReport={props.onToggleReport}
+            onToggleTimelineItem={props.onToggleTimelineItem}
+            palette={props.palette}
+            revealedMarkdownId={props.revealedMarkdownId}
+            state={props.state}
+            worker={worker}
+          />
+        )}
+      </For>
+    </box>
+  )
 }
 
 function WorkerInlineBlock(props: WorkerInlineBlockProps) {
@@ -543,11 +607,10 @@ function WorkerInlineBlock(props: WorkerInlineBlockProps) {
     <box
       width="100%"
       flexDirection="column"
-      marginBottom={1}
-      paddingLeft={1}
+      marginBottom={props.expanded ? 1 : 0}
       paddingRight={props.expanded ? 1 : 0}
-      border={["left"]}
-      borderColor={blend(props.palette.background, status(), props.expanded ? 0.82 : 0.56)}
+      border={props.expanded ? ["left"] : []}
+      borderColor={blend(props.palette.background, status(), 0.82)}
       backgroundColor={props.expanded ? props.palette.panel : props.palette.background}
       flexShrink={0}
     >
@@ -559,7 +622,8 @@ function WorkerInlineBlock(props: WorkerInlineBlockProps) {
         flexShrink={0}
       >
         <text fg={status()} flexShrink={0} selectable={false}>
-          {statusDot(props.worker.status)} <strong>{props.worker.label}</strong>
+          {props.branch} {statusDot(props.worker.status)} <strong>{props.worker.label}</strong>
+          {props.worker.unread ? ` •${props.worker.unread > 9 ? "9+" : props.worker.unread}` : ""}
         </text>
         <text
           fg={props.palette.muted}
@@ -569,10 +633,10 @@ function WorkerInlineBlock(props: WorkerInlineBlockProps) {
           wrapMode="none"
           selectable={false}
         >
-          {workerProgress(props.worker)}
+          {workerBranchMetrics(props.worker)}
         </text>
         <text fg={props.palette.borderFocus} flexShrink={0} selectable={false}>
-          {props.expanded ? `${uiGlyph("▾", "v")} DETAIL` : `${uiGlyph("▸", ">")} DETAIL`}
+          {props.expanded ? uiGlyph("▾", "v") : uiGlyph("▸", ">")}
         </text>
       </box>
       <Show
@@ -801,129 +865,6 @@ export function LogsView(props: LogsViewProps) {
   )
 }
 
-interface WorkerCatalogProps {
-  onSelect: (view: View) => void
-  palette: Palette
-  state: AppState
-}
-
-export function WorkerCatalog(props: WorkerCatalogProps) {
-  const activeCount = createMemo(() =>
-    props.state.workerOrder.filter((workerId) => {
-      const status = props.state.workers[workerId]?.status
-      return status && !["archived", "cancelled", "completed", "failed", "partial"].includes(status)
-    }).length,
-  )
-  return (
-    <box
-      height="100%"
-      width={29}
-      flexDirection="column"
-      paddingLeft={1}
-      paddingRight={1}
-      border={["left"]}
-      borderColor={props.palette.borderSubtle}
-      backgroundColor={props.palette.panel}
-      flexShrink={0}
-    >
-      <box height={2} width="100%" flexDirection="column" flexShrink={0}>
-        <text fg={props.palette.foreground} selectable={false}>
-          <strong>WORKERS</strong> · {activeCount()} active
-        </text>
-        <text fg={props.palette.muted} selectable={false}>
-          live catalog
-        </text>
-      </box>
-      <scrollbox
-        height="100%"
-        width="100%"
-        flexGrow={1}
-        style={{
-          contentOptions: { flexDirection: "column" },
-          scrollbarOptions: {
-            showArrows: false,
-            trackOptions: {
-              foregroundColor: props.palette.borderSubtle,
-              backgroundColor: props.palette.panel,
-            },
-          },
-        }}
-      >
-        <WorkerCatalogRow
-          active={props.state.view.kind === "master"}
-          label="MASTER"
-          meta={props.state.running ? "running" : "transcript"}
-          onSelect={() => props.onSelect({ kind: "master" })}
-          palette={props.palette}
-          status={props.state.running ? "running" : "idle"}
-        />
-        <For each={props.state.workerOrder} fallback={<EmptySlot />}>
-          {(workerId) => {
-            const worker = () => props.state.workers[workerId]
-            return (
-              <Show when={worker()} fallback={<EmptySlot />}>
-                {(item) => (
-                  <WorkerCatalogRow
-                    active={
-                      props.state.view.kind === "worker"
-                      && props.state.view.workerId === item().id
-                    }
-                    label={item().label}
-                    meta={workerProgress(item())}
-                    onSelect={() => props.onSelect({ kind: "worker", workerId: item().id })}
-                    palette={props.palette}
-                    status={item().status}
-                    unread={item().unread}
-                  />
-                )}
-              </Show>
-            )
-          }}
-        </For>
-      </scrollbox>
-    </box>
-  )
-}
-
-interface WorkerCatalogRowProps {
-  active: boolean
-  label: string
-  meta: string
-  onSelect: () => void
-  palette: Palette
-  status: string
-  unread?: number
-}
-
-function WorkerCatalogRow(props: WorkerCatalogRowProps) {
-  return (
-    <box
-      width="100%"
-      minHeight={2}
-      paddingLeft={1}
-      paddingRight={1}
-      flexDirection="column"
-      flexShrink={0}
-      border={["left"]}
-      borderColor={props.active ? props.palette.borderFocus : props.palette.borderSubtle}
-      backgroundColor={
-        props.active
-          ? blend(props.palette.panel, props.palette.foreground, 0.07)
-          : props.palette.panel
-      }
-      onMouseDown={props.onSelect}
-    >
-      <text fg={workerStatusColor(props.status, props.palette)} overflow="hidden" wrapMode="none" selectable={false}>
-        {statusDot(props.status)} <strong>{props.label}</strong>
-        {props.unread ? ` •${props.unread > 9 ? "9+" : props.unread}` : ""}
-      </text>
-      <text fg={props.palette.muted} overflow="hidden" wrapMode="none" selectable={false}>
-        {props.meta}
-      </text>
-    </box>
-  )
-}
-
 interface StatusBarProps {
   clipboardStatus: string
   now: number
@@ -990,7 +931,7 @@ export function StatusBar(props: StatusBarProps) {
         wrapMode="none"
         selectable={false}
       >
-          Tab workers · Esc focus · /help
+          Tab agents · Esc focus · /help
       </text>
     </box>
   )
@@ -1242,6 +1183,52 @@ function workerProgress(worker: WorkerInfo): string {
   }
   if (worker.currentStep) return worker.currentStep
   return worker.phase || workerStatusLabel(worker.status)
+}
+
+function workerSettled(status: string): boolean {
+  return [
+    "archived",
+    "cancelled",
+    "completed",
+    "failed",
+    "partial",
+    "waiting_for_context",
+  ].includes(status)
+}
+
+function workerToolCount(worker: WorkerInfo): number {
+  return worker.timeline.reduce((total, item) => {
+    if (item.kind === "tool") return total + 1
+    if (item.kind !== "aggregate") return total
+    return total + Object.values(item.aggregateCounts ?? {}).reduce(
+      (count, value) => count + value,
+      0,
+    )
+  }, 0)
+}
+
+function workerTokenCount(worker: WorkerInfo): number {
+  const usage = usageCounters(worker.usage)
+  return usage.total ?? (usage.input ?? 0) + (usage.output ?? 0)
+}
+
+function workerBranchMetrics(worker: WorkerInfo): string {
+  const parts = [workerProgress(worker)]
+  const tools = workerToolCount(worker)
+  if (tools) parts.push(`${tools} tool${tools === 1 ? "" : "s"}`)
+  const tokens = workerTokenCount(worker)
+  if (tokens) parts.push(`${formatCount(tokens)} tok`)
+  return parts.join(" · ")
+}
+
+function formatCount(value: number): string {
+  if (value < 1_000) return String(value)
+  if (value < 1_000_000) {
+    const scaled = value / 1_000
+    return `${scaled >= 10 ? Math.round(scaled) : scaled.toFixed(1).replace(/\.0$/, "")}k`
+  }
+  const scaled = value / 1_000_000
+  return `${scaled >= 10 ? Math.round(scaled) : scaled.toFixed(1).replace(/\.0$/, "")}m`
 }
 
 function workerStatusLabel(status: string): string {

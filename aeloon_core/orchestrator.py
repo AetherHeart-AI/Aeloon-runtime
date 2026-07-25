@@ -1,4 +1,4 @@
-"""Aeloon control-plane orchestration over one PydanticAI runtime."""
+"""Aeloon durable control plane over a Pydantic AI Harness runtime."""
 
 from __future__ import annotations
 
@@ -25,6 +25,10 @@ from aeloon_core.flow_state import (
     FlowTurnConflictError,
 )
 from aeloon_core.flows import FlowStore
+from aeloon_core.harness_runtime import (
+    master_harness_capabilities,
+    worker_harness_capabilities,
+)
 from aeloon_core.master_flow_tools import FinishTurnArgs
 from aeloon_core.master_prompt import (
     MASTER_USER_REQUEST_MARKER,
@@ -34,14 +38,13 @@ from aeloon_core.master_prompt import (
 from aeloon_core.master_tools import build_master_scheduler_tools
 from aeloon_core.model_metadata import resolve_max_output_tokens
 from aeloon_core.model_router import ModelBinding, ModelRouter
-from aeloon_core.pydantic_history import PydanticHistoryCompactor
 from aeloon_core.pydantic_runtime import (
     MESSAGE_FORMAT,
     MESSAGE_SCHEMA_VERSION,
     AgentRunSpec,
     AgentRunStatus,
     CapabilityManifest,
-    PydanticAgentRuntime,
+    HarnessAgentRuntime,
     deserialize_messages,
     output_tools,
     serialize_messages,
@@ -200,7 +203,7 @@ class AeloonCoreOrchestrator:
         self.model_bundle = master_binding.bundle
         self.model_settings = dict(master_binding.settings)
         self.prompt_cache = master_binding.prompt_cache
-        self.agent_runtime = PydanticAgentRuntime()
+        self.agent_runtime = HarnessAgentRuntime()
 
         # Catalogs are process-start snapshots. Existing WorkerSessions additionally
         # pin their complete WorkerSnapshot in SQLite.
@@ -487,7 +490,11 @@ class AeloonCoreOrchestrator:
                     ),
                     progress=fenced_progress,
                     output_validator=completion_gate,
-                    history_processor=self._history_processor(),
+                    capabilities=master_harness_capabilities(
+                        config=self.config,
+                        model_router=self.model_router,
+                        worker_types=self.worker_types,
+                    ),
                     prompt_cache=master_binding.prompt_cache,
                 )
             )
@@ -795,8 +802,10 @@ class AeloonCoreOrchestrator:
                 turn_id=run.run_id,
                 progress=worker_progress,
                 output_validator=completion_gate,
-                history_processor=self._history_processor(
-                    allow_compaction=run.context.budget.max_tokens is None
+                capabilities=(
+                    worker_harness_capabilities(self.config)
+                    if run.context.budget.max_tokens is None
+                    else ()
                 ),
                 prompt_cache=model_binding.prompt_cache,
             )
@@ -831,7 +840,7 @@ class AeloonCoreOrchestrator:
                 unresolved=("Worker terminal protocol was not completed.",),
             )
             waiting_request = None
-            # PydanticAgentRuntime only returns here after every dispatched host tool
+            # HarnessAgentRuntime only returns here after every dispatched host tool
             # has settled.  Truly indeterminate execution failures (process loss,
             # cancellation, timeout, or an uncaught tool exception) escape the
             # runtime and are fenced as ``unknown`` by WorkerSessionManager.
@@ -870,19 +879,6 @@ class AeloonCoreOrchestrator:
             waiting_request=waiting_request,
             resolved_model=model_binding.model_name,
             tool_call_count=len(outcome.tools_used),
-        )
-
-    def _history_processor(
-        self,
-        *,
-        allow_compaction: bool = True,
-    ) -> PydanticHistoryCompactor | None:
-        config = self.config.agents.defaults.context_compaction
-        if not allow_compaction or not config.enabled:
-            return None
-        return PydanticHistoryCompactor(
-            config=config,
-            context_window_tokens=self.config.agents.defaults.context_window_tokens,
         )
 
     async def _build_worker_tools(

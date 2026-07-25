@@ -232,10 +232,31 @@ class TurnEventProgress:
         run_sequence: int = 1,
         duration_ms: int | None = None,
         summary: str | None = None,
+        usage: dict[str, Any] | None = None,
+        objective: str | None = None,
+        ephemeral: bool = False,
     ) -> None:
-        """Publish host-owned lifecycle only; never publish a Worker report."""
+        """Publish lifecycle plus a bounded result for non-durable Harness agents."""
 
-        del summary
+        ephemeral_summary = (
+            _safe_worker_activity_text(summary, limit=1_000)
+            if ephemeral and summary
+            else ""
+        )
+        ephemeral_usage = (
+            {
+                str(key): max(0, int(value))
+                for key, value in (usage or {}).items()
+                if isinstance(value, int | float) and not isinstance(value, bool)
+            }
+            if ephemeral
+            else {}
+        )
+        ephemeral_objective = (
+            _safe_worker_activity_text(objective, limit=500)
+            if ephemeral and objective
+            else ""
+        )
         await self.emit(
             "chat.worker.lifecycle",
             self._payload(
@@ -246,6 +267,9 @@ class TurnEventProgress:
                 worker_type_id=worker_type_id,
                 status=status,
                 duration_ms=duration_ms,
+                **({"summary": ephemeral_summary} if ephemeral_summary else {}),
+                **({"usage": ephemeral_usage} if ephemeral_usage else {}),
+                **({"objective": ephemeral_objective} if ephemeral_objective else {}),
                 ts=_now(),
             ),
         )

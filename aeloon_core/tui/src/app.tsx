@@ -13,7 +13,7 @@ import {
   type BridgeClientOptions,
 } from "./bridge-client"
 import { COMMANDS, commandSuggestions, parseCommand } from "./commands"
-import { Composer, Header, StatusBar, TranscriptPane, WorkerCatalog } from "./components"
+import { Composer, Header, StatusBar, TranscriptPane } from "./components"
 import {
   type AppState,
   type View,
@@ -682,13 +682,7 @@ export function App(props: AppProps) {
       backgroundColor={palette().background}
     >
       <Header palette={palette()} state={state} />
-      <box
-        width="100%"
-        height="100%"
-        minHeight={0}
-        flexDirection="row"
-        flexGrow={1}
-      >
+      <box width="100%" height="100%" minHeight={0} flexGrow={1}>
         <TranscriptPane
           expandedReport={expandedReport()}
           focus={state.focus === "transcript"}
@@ -705,9 +699,6 @@ export function App(props: AppProps) {
           revealedMarkdownId={revealedMarkdownId()}
           state={state}
         />
-        <Show when={state.workerOrder.length} fallback={<box width={0} height={0} />}>
-          <WorkerCatalog onSelect={chooseView} palette={palette()} state={state} />
-        </Show>
       </box>
       <StatusBar
         clipboardStatus={clipboardStatus()}

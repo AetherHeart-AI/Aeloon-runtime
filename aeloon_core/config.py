@@ -145,12 +145,24 @@ class AgentBudgetConfig(BaseModel):
         return normalized
 
 
+class AgentHarnessConfig(BaseModel):
+    """Pydantic AI Harness orchestration settings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    dynamic_workflow_enabled: bool = True
+    max_agent_calls: int = Field(default=16, ge=1, le=128)
+    workflow_memory_mb: int = Field(default=256, ge=32, le=2_048)
+    workflow_cpu_seconds: float = Field(default=10.0, ge=1.0, le=60.0)
+
+
 class AgentsConfig(BaseModel):
     """Agent namespace."""
 
     defaults: AgentDefaultsConfig = Field(default_factory=AgentDefaultsConfig)
     routing: AgentRoutingConfig = Field(default_factory=AgentRoutingConfig)
     budgets: AgentBudgetConfig = Field(default_factory=AgentBudgetConfig)
+    harness: AgentHarnessConfig = Field(default_factory=AgentHarnessConfig)
 
 
 class ExecToolConfig(BaseModel):

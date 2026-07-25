@@ -1,22 +1,15 @@
-"""PydanticAI production model construction for Aeloon Core."""
+"""Pydantic AI-native provider and model construction for Aeloon Core."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Self
+from typing import Any
 
 import httpx
-from anthropic import AsyncAnthropic
-from openai import AsyncOpenAI, AsyncStream
-from openai.types import responses
-from pydantic_ai.models import Model, ModelRequestParameters
-from pydantic_ai.models.anthropic import AnthropicModel, AnthropicModelSettings
-from pydantic_ai.models.openai import (
-    OpenAIModelName,
-    OpenAIResponsesModel,
-    OpenAIResponsesModelSettings,
-    OpenAIResponsesStreamedResponse,
-)
+from pydantic_ai.models import Model
+from pydantic_ai.models.anthropic import AnthropicModel
+from pydantic_ai.models.openai import OpenAIResponsesModel
+from pydantic_ai.providers import Provider
 from pydantic_ai.providers.anthropic import AnthropicProvider
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.settings import ModelSettings
@@ -29,52 +22,6 @@ _OFFICIAL_ANTHROPIC_URLS = {
 }
 
 
-class _VolcengineResponsesEventStream:
-    """Drop empty reasoning frames emitted by Ark's Responses-compatible stream."""
-
-    def __init__(self, source: AsyncStream[responses.ResponseStreamEvent]) -> None:
-        self.source = source
-
-    def __aiter__(self) -> Self:
-        return self
-
-    async def __anext__(self) -> responses.ResponseStreamEvent:
-        while True:
-            event = await self.source.__anext__()
-            if not _is_empty_reasoning_event(event):
-                return event
-
-    async def close(self) -> None:
-        await self.source.close()
-
-
-def _is_empty_reasoning_event(event: responses.ResponseStreamEvent) -> bool:
-    if isinstance(event, responses.ResponseReasoningSummaryPartAddedEvent):
-        return not event.part.text
-    if isinstance(event, responses.ResponseReasoningSummaryTextDeltaEvent):
-        return not event.delta
-    return False
-
-
-class VolcengineResponsesModel(OpenAIResponsesModel):
-    """OpenAI Responses model with Ark's empty reasoning frames normalized."""
-
-    async def _process_streamed_response(
-        self,
-        response: AsyncStream[responses.ResponseStreamEvent],
-        model_settings: OpenAIResponsesModelSettings,
-        model_request_parameters: ModelRequestParameters,
-        *,
-        expected_model_name: OpenAIModelName | None = None,
-    ) -> OpenAIResponsesStreamedResponse:
-        return await super()._process_streamed_response(
-            _VolcengineResponsesEventStream(response),  # type: ignore[arg-type]
-            model_settings,
-            model_request_parameters,
-            expected_model_name=expected_model_name,
-        )
-
-
 @dataclass(slots=True)
 class PromptCacheState:
     """Process-local compatibility memory for one provider endpoint."""
@@ -84,20 +31,53 @@ class PromptCacheState:
 
 @dataclass(slots=True)
 class PydanticModelBundle:
-    """A configured model plus the resources and settings it owns."""
+    """A Pydantic AI model, its provider, and the transport owned by Aeloon."""
 
     model: Model
+    provider: Provider[Any]
     settings: ModelSettings
     http_client: httpx.AsyncClient
     prompt_cache: PromptCacheState | None = None
-    anthropic_client: AsyncAnthropic | None = None
-    openai_client: AsyncOpenAI | None = None
 
     async def close(self) -> None:
-        if self.anthropic_client is not None:
-            await self.anthropic_client.close()
-        elif self.openai_client is not None:
-            await self.openai_client.close()
+        """Close the single transport shared by the Pydantic AI provider."""
+
+        await self.http_client.aclose()
+
+
+def _http_client(
+    *,
+    proxy: str | None,
+    timeout: int,
+    extra_headers: dict[str, str],
+) -> httpx.AsyncClient:
+    """Build the transport injected into a Pydantic AI provider."""
+
+    return httpx.AsyncClient(
+        proxy=proxy,
+        timeout=httpx.Timeout(timeout),
+        headers=extra_headers or None,
+    )
+
+
+def _base_settings(
+    *,
+    temperature: float,
+    reasoning_effort: str | None,
+    timeout: int,
+    extra_headers: dict[str, str],
+) -> ModelSettings:
+    """Use Pydantic AI's provider-neutral settings wherever possible."""
+
+    settings: ModelSettings = {
+        "temperature": temperature,
+        "timeout": timeout,
+    }
+    if reasoning_effort:
+        settings["thinking"] = reasoning_effort  # type: ignore[typeddict-item]
+    if extra_headers:
+        settings["extra_headers"] = dict(extra_headers)
+    return settings
 
 
 def build_anthropic_model(
@@ -108,41 +88,38 @@ def build_anthropic_model(
     reasoning_effort: str | None,
     timeout: int,
 ) -> PydanticModelBundle:
-    """Build one reusable provider/model bundle for the process model router."""
+    """Build Anthropic Messages through Pydantic AI's provider abstraction."""
 
-    http_client = httpx.AsyncClient(
+    http_client = _http_client(
         proxy=provider.proxy,
-        timeout=httpx.Timeout(timeout),
+        timeout=timeout,
+        extra_headers=provider.extra_headers,
     )
-    anthropic_client = AsyncAnthropic(
+    pydantic_provider = AnthropicProvider(
         api_key=provider.api_key,
         base_url=provider.base_url,
-        default_headers=provider.extra_headers or None,
         http_client=http_client,
-        timeout=timeout,
     )
-    pydantic_provider = AnthropicProvider(anthropic_client=anthropic_client)
     model = AnthropicModel(_api_model_id(model_name), provider=pydantic_provider)
-
-    settings: AnthropicModelSettings = {
-        "temperature": temperature,
-        "timeout": timeout,
-    }
-    if reasoning_effort:
-        settings["anthropic_effort"] = reasoning_effort
+    settings = _base_settings(
+        temperature=temperature,
+        reasoning_effort=reasoning_effort,
+        timeout=timeout,
+        extra_headers=provider.extra_headers,
+    )
     if provider.prompt_caching:
         normalized_url = provider.base_url.rstrip("/")
         if normalized_url in _OFFICIAL_ANTHROPIC_URLS:
-            settings["anthropic_cache"] = True
+            settings["anthropic_cache"] = True  # type: ignore[typeddict-unknown-key]
         else:
-            settings["anthropic_cache_messages"] = True
+            settings["anthropic_cache_messages"] = True  # type: ignore[typeddict-unknown-key]
 
     return PydanticModelBundle(
         model=model,
+        provider=pydantic_provider,
         settings=settings,
         http_client=http_client,
         prompt_cache=PromptCacheState(),
-        anthropic_client=anthropic_client,
     )
 
 
@@ -154,34 +131,30 @@ def build_volcengine_model(
     reasoning_effort: str | None,
     timeout: int,
 ) -> PydanticModelBundle:
-    """Build a Volcano Engine Ark Agent Plan model using the Responses API."""
+    """Build Ark Agent Plan with Pydantic AI's OpenAI Responses provider."""
 
-    http_client = httpx.AsyncClient(
+    http_client = _http_client(
         proxy=provider.proxy,
-        timeout=httpx.Timeout(timeout),
+        timeout=timeout,
+        extra_headers=provider.extra_headers,
     )
-    openai_client = AsyncOpenAI(
+    pydantic_provider = OpenAIProvider(
         api_key=provider.api_key,
         base_url=provider.base_url,
-        default_headers=provider.extra_headers or None,
         http_client=http_client,
-        timeout=timeout,
     )
-    pydantic_provider = OpenAIProvider(openai_client=openai_client)
-    model = VolcengineResponsesModel(model_name, provider=pydantic_provider)
-
-    settings: OpenAIResponsesModelSettings = {
-        "temperature": temperature,
-        "timeout": timeout,
-    }
-    if reasoning_effort:
-        settings["openai_reasoning_effort"] = reasoning_effort  # type: ignore[typeddict-item]
-
+    model = OpenAIResponsesModel(model_name, provider=pydantic_provider)
+    settings = _base_settings(
+        temperature=temperature,
+        reasoning_effort=reasoning_effort,
+        timeout=timeout,
+        extra_headers=provider.extra_headers,
+    )
     return PydanticModelBundle(
         model=model,
+        provider=pydantic_provider,
         settings=settings,
         http_client=http_client,
-        openai_client=openai_client,
     )
 
 
@@ -246,7 +219,6 @@ def _api_model_id(model_name: str) -> str:
 __all__ = [
     "PromptCacheState",
     "PydanticModelBundle",
-    "VolcengineResponsesModel",
     "build_anthropic_model",
     "build_volcengine_model",
     "is_prompt_caching_unsupported_error",

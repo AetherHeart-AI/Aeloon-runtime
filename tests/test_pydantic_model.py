@@ -4,15 +4,14 @@ from typing import Any
 
 import httpx
 import pytest
-from openai.types import responses
 from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.models.anthropic import AnthropicModel
 from pydantic_ai.models.openai import OpenAIResponsesModel
+from pydantic_ai.providers.anthropic import AnthropicProvider
+from pydantic_ai.providers.openai import OpenAIProvider
 
 from aeloon_core.config import AnthropicProviderConfig, VolcengineProviderConfig
 from aeloon_core.pydantic_model import (
-    VolcengineResponsesModel,
-    _VolcengineResponsesEventStream,
     build_anthropic_model,
     build_volcengine_model,
     is_prompt_caching_unsupported_error,
@@ -58,12 +57,13 @@ async def test_builds_official_anthropic_model_and_endpoint_cache_mode(
     )
     try:
         assert isinstance(bundle.model, AnthropicModel)
-        assert str(bundle.anthropic_client.base_url).rstrip("/") == base_url.rstrip("/")
-        assert bundle.anthropic_client.default_headers["x-routing-key"] == "tenant-a"
+        assert isinstance(bundle.provider, AnthropicProvider)
+        assert str(bundle.provider.client.base_url).rstrip("/") == base_url.rstrip("/")
         assert captured["proxy"] == "http://127.0.0.1:7890"
         assert bundle.settings["temperature"] == 0.2
         assert bundle.settings["timeout"] == 17
-        assert bundle.settings["anthropic_effort"] == "high"
+        assert bundle.settings["thinking"] == "high"
+        assert bundle.settings["extra_headers"] == {"x-routing-key": "tenant-a"}
         assert bundle.settings[cache_key] is True
         other = {
             "anthropic_cache",
@@ -134,76 +134,20 @@ async def test_builds_volcengine_agent_plan_responses_model(
         timeout=17,
     )
     try:
-        assert isinstance(bundle.model, VolcengineResponsesModel)
         assert isinstance(bundle.model, OpenAIResponsesModel)
-        assert bundle.openai_client is not None
+        assert isinstance(bundle.provider, OpenAIProvider)
         assert (
-            str(bundle.openai_client.base_url).rstrip("/")
+            str(bundle.provider.client.base_url).rstrip("/")
             == "https://ark.cn-beijing.volces.com/api/plan/v3"
         )
-        assert bundle.openai_client.default_headers["x-routing-key"] == "tenant-a"
         assert captured["proxy"] == "http://127.0.0.1:7890"
         assert bundle.settings["temperature"] == 0.2
         assert bundle.settings["timeout"] == 17
-        assert bundle.settings["openai_reasoning_effort"] == "high"
+        assert bundle.settings["thinking"] == "high"
+        assert bundle.settings["extra_headers"] == {"x-routing-key": "tenant-a"}
         assert bundle.prompt_cache is None
     finally:
         await bundle.close()
-
-
-@pytest.mark.asyncio
-async def test_volcengine_stream_drops_empty_reasoning_frames() -> None:
-    part_type = responses.ResponseReasoningSummaryPartAddedEvent.model_fields[
-        "part"
-    ].annotation
-    empty_part = part_type.model_construct(text=None, type="summary_text")
-    empty_added = responses.ResponseReasoningSummaryPartAddedEvent.model_construct(
-        item_id="reasoning-1",
-        output_index=0,
-        part=empty_part,
-        sequence_number=1,
-        summary_index=0,
-        type="response.reasoning_summary_part.added",
-    )
-    empty_delta = responses.ResponseReasoningSummaryTextDeltaEvent.model_construct(
-        delta=None,
-        item_id="reasoning-1",
-        output_index=0,
-        sequence_number=2,
-        summary_index=0,
-        type="response.reasoning_summary_text.delta",
-    )
-    valid_delta = responses.ResponseReasoningSummaryTextDeltaEvent.model_construct(
-        delta="use the finish tool",
-        item_id="reasoning-1",
-        output_index=0,
-        sequence_number=3,
-        summary_index=0,
-        type="response.reasoning_summary_text.delta",
-    )
-
-    class FakeStream:
-        def __init__(self) -> None:
-            self.events = iter((empty_added, empty_delta, valid_delta))
-            self.closed = False
-
-        async def __anext__(self) -> responses.ResponseStreamEvent:
-            try:
-                return next(self.events)
-            except StopIteration as exc:
-                raise StopAsyncIteration from exc
-
-        async def close(self) -> None:
-            self.closed = True
-
-    source = FakeStream()
-    stream = _VolcengineResponsesEventStream(source)  # type: ignore[arg-type]
-
-    assert await anext(stream) is valid_delta
-    with pytest.raises(StopAsyncIteration):
-        await anext(stream)
-    await stream.close()
-    assert source.closed is True
 
 
 @pytest.mark.parametrize(
