@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from aeloon_core.session import SessionStore
+from aeloon_core.conversation import SessionStore
 from tests.message_helpers import checkpoint as message_checkpoint
 
 

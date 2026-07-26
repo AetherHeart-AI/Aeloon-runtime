@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from aeloon_core.customization.catalog import Catalog
-from aeloon_core.customization.workflows import (
+from aeloon_core.harness.catalog import Catalog
+from aeloon_core.harness.workflow.base import (
     OutputCondition,
     WorkflowDefinitionError,
     WorkflowNode,
@@ -68,7 +68,7 @@ def test_conditional_template_validates_referenced_role_output(
     catalog_path.parent.mkdir(parents=True)
     catalog_path.write_text(
         """
-from aeloon_core.customization.roles import Role
+from aeloon_core.harness.agent import Role
 
 class ProjectReviewer(Role):
     id = "reviewer"
@@ -176,7 +176,7 @@ def test_project_workflow_is_loaded_and_can_override_builtin(tmp_path: Path) -> 
     catalog_path.write_text(
         """
 from pydantic import BaseModel
-from aeloon_core.customization.workflows import (
+from aeloon_core.harness.workflow import (
     WorkflowNode,
     WorkflowPlan,
     WorkflowTemplate,

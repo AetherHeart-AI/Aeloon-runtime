@@ -11,26 +11,34 @@ from pydantic_ai.models import Model
 from pydantic_ai.settings import ModelSettings
 
 from aeloon_core.config import Config
-from aeloon_core.context import SYSTEM_PROMPT
-from aeloon_core.customization.catalog import Catalog
-from aeloon_core.harness import (
+from aeloon_core.conversation import SessionStore
+from aeloon_core.harness.agent import (
+    RoleAgentFactory,
+    master_harness_capabilities,
+)
+from aeloon_core.harness.agent.prompt import (
+    MASTER_USER_REQUEST_MARKER,
+    SYSTEM_PROMPT,
+    master_system_prompt,
+)
+from aeloon_core.harness.catalog import Catalog
+from aeloon_core.harness.execution import (
     AgentRunSpec,
     AgentRunStatus,
     CapabilityManifest,
     HarnessAgentRuntime,
-    ModelRouter,
-    RoleAgentFactory,
-    WorkflowRunner,
     deserialize_messages,
-    master_harness_capabilities,
     serialize_messages,
-    workflow_tools,
 )
-from aeloon_core.master_prompt import MASTER_USER_REQUEST_MARKER, master_system_prompt
-from aeloon_core.session import SessionStore
-from aeloon_core.tools.filesystem import ReadTool
-from aeloon_core.tools.registry import ToolRegistry
-from aeloon_core.tools.search_grep import GlobTool, GrepTool, ListTool
+from aeloon_core.harness.model import ModelRouter
+from aeloon_core.harness.tool import (
+    GlobTool,
+    GrepTool,
+    ListTool,
+    ReadTool,
+    ToolRegistry,
+)
+from aeloon_core.harness.workflow import WorkflowRunner, workflow_tools
 
 
 @dataclass
@@ -69,7 +77,7 @@ class AeloonCoreOrchestrator:
         self.model_settings = dict(master_binding.settings)
         self.agent_runtime = HarnessAgentRuntime()
         self.catalog = Catalog.discover(config.workspace)
-        self.worker_types = self.catalog.roles
+        self.roles = self.catalog.roles
         self.sessions = SessionStore(data_dir=config.data_dir)
         self.master_observation_tools = self._build_master_observation_tools()
 
@@ -112,7 +120,7 @@ class AeloonCoreOrchestrator:
             actual_session_id,
         )
         history = deserialize_messages(stored_messages)
-        worker_types = [snapshot.descriptor() for snapshot in self.worker_types.list()]
+        role_descriptors = [snapshot.descriptor() for snapshot in self.roles.list()]
         template_config = self.config.agents.templates
         workflow_candidates = (
             list(
@@ -128,7 +136,7 @@ class AeloonCoreOrchestrator:
             SYSTEM_PROMPT.strip()
             + f"\n\nWorkspace: {self.config.workspace}\n\n"
             + master_system_prompt(
-                worker_types=worker_types,
+                role_descriptors=role_descriptors,
                 workflow_candidates=workflow_candidates,
                 workflow_templates_enabled=template_config.enabled,
                 worker_request_limit=self.config.agents.harness.sub_agent_request_limit,
@@ -145,7 +153,7 @@ class AeloonCoreOrchestrator:
         role_factory = RoleAgentFactory(
             config=self.config,
             model_router=self.model_router,
-            roles=self.worker_types,
+            roles=self.roles,
             progress=on_progress,
             session_id=actual_session_id,
             turn_id=turn_id,
@@ -153,12 +161,12 @@ class AeloonCoreOrchestrator:
         if template_config.enabled:
             workflow_runner = WorkflowRunner(
                 config=self.config,
-                roles=self.worker_types,
+                roles=self.roles,
                 role_factory=role_factory,
             )
             for tool in workflow_tools(
                 config=self.config,
-                roles=self.worker_types,
+                roles=self.roles,
                 workflows=self.catalog.workflows,
                 runner=workflow_runner,
             ):
@@ -193,7 +201,7 @@ class AeloonCoreOrchestrator:
                 capabilities=master_harness_capabilities(
                     config=self.config,
                     model_router=self.model_router,
-                    worker_types=self.worker_types,
+                    roles=self.roles,
                     role_factory=role_factory,
                 ),
                 prompt_cache=binding.prompt_cache,

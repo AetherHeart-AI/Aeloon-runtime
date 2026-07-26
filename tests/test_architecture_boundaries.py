@@ -3,50 +3,68 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-from aeloon_core.customization import Role, WorkflowTemplate
-from aeloon_core.harness import HarnessAgentRuntime, ModelRouter
-from aeloon_core.model_router import ModelRouter as CompatibilityModelRouter
-from aeloon_core.pydantic_runtime import (
-    HarnessAgentRuntime as CompatibilityHarnessAgentRuntime,
-)
-from aeloon_core.roles import Role as CompatibilityRole
-from aeloon_core.workflow_templates import (
-    WorkflowTemplate as CompatibilityWorkflowTemplate,
-)
-
 PACKAGE_ROOT = Path(__file__).resolve().parents[1] / "aeloon_core"
-LEGACY_IMPLEMENTATION_MODULES = {
-    "aeloon_core.catalog",
-    "aeloon_core.harness_runtime",
-    "aeloon_core.model_router",
-    "aeloon_core.pydantic_model",
-    "aeloon_core.pydantic_runtime",
-    "aeloon_core.roles",
-    "aeloon_core.tools.workflows",
-    "aeloon_core.workflow_runtime",
-    "aeloon_core.workflow_templates",
+EXPECTED_ROOT_MODULES = {
+    "__init__.py",
+    "__main__.py",
+    "config.py",
+    "orchestrator.py",
+}
+EXPECTED_HARNESS_MODULES = {"__init__.py", "catalog.py"}
+EXPECTED_HARNESS_FEATURES = {
+    "agent": {"__init__.py", "base.py", "factory.py", "presets.py", "prompt.py"},
+    "execution": {
+        "__init__.py",
+        "engine.py",
+        "events.py",
+        "stuck.py",
+        "transitions.py",
+    },
+    "model": {"__init__.py", "router.py"},
+    "provider": {"__init__.py", "anthropic.py", "base.py", "volcengine.py"},
+    "tool": {"__init__.py", "base.py", "filesystem.py", "registry.py", "search.py"},
+    "workflow": {"__init__.py", "base.py", "presets.py", "runner.py", "tools.py"},
+}
+EXPECTED_SUPPORT_FEATURES = {
+    "conversation": {"__init__.py", "history.py", "session.py"},
+    "web": {"__init__.py", "bridge.py", "events.py", "launcher.py", "output.py"},
 }
 
 
-def test_customization_layer_does_not_depend_on_harness_runtime() -> None:
-    imports = _imports_under(PACKAGE_ROOT / "customization")
+def test_harness_is_grouped_by_feature() -> None:
+    harness_root = PACKAGE_ROOT / "harness"
+
+    assert {path.name for path in harness_root.glob("*.py")} == EXPECTED_HARNESS_MODULES
+    assert {
+        path.name
+        for path in harness_root.iterdir()
+        if path.is_dir() and not path.name.startswith("__")
+    } == set(EXPECTED_HARNESS_FEATURES)
+    for feature, expected_files in EXPECTED_HARNESS_FEATURES.items():
+        assert {
+            path.name for path in (harness_root / feature).glob("*.py")
+        } == expected_files
+
+
+def test_support_code_is_grouped_by_feature() -> None:
+    for feature, expected_files in EXPECTED_SUPPORT_FEATURES.items():
+        assert {
+            path.name for path in (PACKAGE_ROOT / feature).glob("*.py")
+        } == expected_files
+
+
+def test_feature_packages_do_not_import_removed_horizontal_layers() -> None:
+    imports = _imports_under(PACKAGE_ROOT / "harness")
 
     assert not {
-        module for module in imports if module.startswith("aeloon_core.harness")
+        module
+        for module in imports
+        if module.startswith(("aeloon_core.customization", "aeloon_core.tools"))
     }
 
 
-def test_harness_layer_uses_canonical_modules_instead_of_compatibility_facades() -> None:
-    imports = _imports_under(PACKAGE_ROOT / "harness")
-
-    assert not (imports & LEGACY_IMPLEMENTATION_MODULES)
-
-
-def test_legacy_public_imports_remain_identity_compatible() -> None:
-    assert CompatibilityRole is Role
-    assert CompatibilityWorkflowTemplate is WorkflowTemplate
-    assert CompatibilityModelRouter is ModelRouter
-    assert CompatibilityHarnessAgentRuntime is HarnessAgentRuntime
+def test_package_root_contains_only_entrypoints_and_composition_modules() -> None:
+    assert {path.name for path in PACKAGE_ROOT.glob("*.py")} == EXPECTED_ROOT_MODULES
 
 
 def _imports_under(root: Path) -> set[str]:

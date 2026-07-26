@@ -6,8 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from aeloon_core.tools.filesystem import ReadTool
-from aeloon_core.tools.search_grep import GlobTool, GrepTool
+from aeloon_core.harness.tool import GlobTool, GrepTool, ReadTool
 
 
 @pytest.mark.asyncio
@@ -54,7 +53,7 @@ async def test_python_grep_fallback_follows_symlinks_outside_workspace(
     outside.write_text("outside-secret-value", encoding="utf-8")
     (workspace / "outside-link.txt").symlink_to(outside)
     (workspace / "inside.txt").write_text("inside-public-value", encoding="utf-8")
-    monkeypatch.setattr("aeloon_core.tools.search_grep.shutil.which", lambda _: None)
+    monkeypatch.setattr("aeloon_core.harness.tool.search.shutil.which", lambda _: None)
     tool = GrepTool(workspace=workspace, denied_paths=(tmp_path / "runtime",))
 
     secret = await tool.execute("outside-secret-value", path=".")

@@ -11,8 +11,8 @@ from typing import Any
 
 from aeloon_core.config import Config, load_config, resolve_config_path, save_config
 from aeloon_core.orchestrator import AeloonCoreOrchestrator
-from aeloon_core.turn_events import TurnEventProgress
-from aeloon_core.web_launcher import WebLaunchError, run_web_ui
+from aeloon_core.web.events import TurnEventProgress
+from aeloon_core.web.launcher import WebLaunchError, run_web_ui
 
 LOG_LEVELS = {"TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"}
 COMMANDS = {"run", "serve", "web", "config"}

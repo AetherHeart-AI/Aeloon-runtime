@@ -17,7 +17,7 @@ if (!allowedHosts.has(host)) {
   throw new Error("The Web UI only binds to the local loopback interface");
 }
 
-const bridge = Bun.spawn([python, "-m", "aeloon_core.web_bridge"], {
+const bridge = Bun.spawn([python, "-m", "aeloon_core.web.bridge"], {
   cwd: workspace,
   env: process.env,
   stdin: "pipe",

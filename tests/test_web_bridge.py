@@ -7,8 +7,8 @@ from typing import Any
 import pytest
 
 from aeloon_core.config import Config
-from aeloon_core.web_bridge import WebBridge, _history_turn_view
-from aeloon_core.web_launcher import (
+from aeloon_core.web.bridge import WebBridge, _history_turn_view
+from aeloon_core.web.launcher import (
     WEB_HOST_ENV,
     WEB_PORT_ENV,
     WEB_TOKEN_ENV,
@@ -122,6 +122,9 @@ def test_web_environment_keeps_token_and_config_out_of_argv(tmp_path: Path) -> N
     assert environment[WEB_TOKEN_ENV] == "one-time-token"
     assert json.loads(environment["AELOON_CORE_WEB_CONFIG_JSON"])["workspace"] == str(
         tmp_path
+    )
+    assert environment["PYTHONPATH"].split(":", 1)[0] == str(
+        Path(__file__).resolve().parents[1]
     )
     assert environment["PYTHONPATH"].endswith(":/existing")
 

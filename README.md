@@ -104,12 +104,13 @@ a child agent waiting across turns.
 
 ## Python Roles and Workflow Templates
 
-Project-facing definitions live under `aeloon_core.customization`. Roles configure
-prompts, output types, model tiers, capabilities, and concurrency. The Host still
-owns agent construction, budgets, lifecycle events, and execution:
+Project-facing definitions use the stable bases in
+`aeloon_core.harness.agent` and `aeloon_core.harness.workflow`. Roles configure
+prompts, output types, model tiers, capabilities, and concurrency. The Harness
+still owns agent construction, budgets, lifecycle events, and execution:
 
 ```python
-from aeloon_core.customization import Role
+from aeloon_core.harness.agent import Role
 
 class ProjectReviewer(Role):
     id = "reviewer"
@@ -127,7 +128,7 @@ Workflow Templates compile Pydantic inputs into finite validated plans:
 
 ```python
 from pydantic import BaseModel
-from aeloon_core.customization import WorkflowNode, WorkflowPlan, WorkflowTemplate
+from aeloon_core.harness.workflow import WorkflowNode, WorkflowPlan, WorkflowTemplate
 
 class Inputs(BaseModel):
     task: str
@@ -154,36 +155,33 @@ WORKFLOWS = (ProjectWorkflow,)
 ```
 
 Definitions are loaded once at process startup; restart after changes. Project IDs
-override built-ins. Legacy `.aeloon-core/workers/*.md` files cause an actionable
-startup error instead of being silently ignored.
+override built-ins.
 
 ## Module boundaries
 
-The package has one customization layer and one host-owned execution layer:
+The Harness is one system organized by cohesive feature packages. Each feature
+keeps its base contracts, presets, and runtime implementation together:
 
 ```text
 aeloon_core/
-├── customization/          # public extension surface
-│   ├── roles.py            # Role contracts and structured outputs
-│   ├── workflows.py        # WorkflowTemplate contracts and finite plans
-│   ├── catalog.py          # project definition discovery
-│   └── builtins/           # default Roles and templates
-├── harness/                # execution kernel
-│   ├── models.py           # provider/model construction
-│   ├── routing.py          # model-tier routing
-│   ├── runtime.py          # shared Pydantic AI run loop
-│   ├── agents.py           # Role agent factory and DynamicWorkflow fallback
-│   ├── runner.py           # fixed-plan execution
-│   └── workflow_tools.py   # workflow search/describe/execute tools
-└── orchestrator.py         # application composition root
+├── harness/
+│   ├── agent/              # Role base, presets, prompts, and agent factory
+│   ├── model/              # model bindings and routing
+│   ├── provider/           # provider construction and shared transport policy
+│   ├── tool/               # tool base, registry, filesystem, and search tools
+│   ├── workflow/           # template base, presets, runner, and Master tools
+│   ├── execution/          # run engine, events, traces, and stuck detection
+│   └── catalog.py          # built-in and project definition discovery
+├── conversation/           # message serialization and session persistence
+├── web/                    # bridge, event projection, launcher, and UI assets
+├── orchestrator.py         # application composition root
+└── config.py               # configuration schema and persistence
 ```
 
-The dependency direction is `harness → customization contracts`, never
-`customization → harness`: project definitions describe behavior but cannot own
-budgets, execution, lifecycle, or model construction. `orchestrator.py` is the
-composition root that assembles both sides. Previous flat import paths remain as
-thin compatibility facades; new integrations should import from
-`aeloon_core.customization` or `aeloon_core.harness`.
+Project definitions subclass only the `agent` and `workflow` base contracts.
+They describe behavior but cannot own budgets, execution, lifecycle, or model
+construction. `orchestrator.py` remains the composition root and imports explicit
+feature APIs instead of relying on a flat compatibility layer.
 
 ## Persistence boundary
 
@@ -198,13 +196,13 @@ This is deliberate in Phase 1.
 
 | Concern | Module |
 |---|---|
-| Master turn and conversation persistence | `aeloon_core.orchestrator`, `aeloon_core.session` |
-| Harness capabilities and unified Role construction | `aeloon_core.harness.agents` |
-| Python Role and Workflow catalogs | `aeloon_core.customization` |
-| Fixed-plan execution and Master tools | `aeloon_core.harness.runner`, `aeloon_core.harness.workflow_tools` |
-| Provider/model routing | `aeloon_core.harness.routing`, `aeloon_core.harness.models` |
-| Pydantic AI policy and event adapter | `aeloon_core.harness.runtime` |
-| Web transport and live projections | `aeloon_core.web_bridge`, `aeloon_core.turn_events` |
+| Master turn and conversation persistence | `aeloon_core.orchestrator`, `aeloon_core.conversation` |
+| Role contracts, presets, prompts, and construction | `aeloon_core.harness.agent` |
+| Workflow contracts, presets, execution, and tools | `aeloon_core.harness.workflow` |
+| Tool contracts and built-in tools | `aeloon_core.harness.tool` |
+| Provider construction and model routing | `aeloon_core.harness.provider`, `aeloon_core.harness.model` |
+| Pydantic AI execution, events, and runtime safeguards | `aeloon_core.harness.execution` |
+| Web transport and live projections | `aeloon_core.web` |
 
 ## Configuration
 

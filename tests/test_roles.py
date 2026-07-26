@@ -5,14 +5,14 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel, ValidationError
 
-from aeloon_core.customization.catalog import Catalog, CatalogDefinitionError
-from aeloon_core.customization.roles import (
+from aeloon_core.harness.agent.base import (
     ReviewReport,
     Role,
     RoleDefinitionError,
     RoleRegistry,
     snapshot_role,
 )
+from aeloon_core.harness.catalog import Catalog, CatalogDefinitionError
 
 
 class CustomOutput(BaseModel):
@@ -113,7 +113,7 @@ def test_project_catalog_overrides_builtin_and_requires_restart(tmp_path: Path) 
     catalog_path = _write_catalog(
         tmp_path,
         """
-from aeloon_core.customization.roles import Role
+from aeloon_core.harness.agent import Role
 
 class ProjectBuilder(Role):
     id = "builder"
@@ -144,7 +144,7 @@ def test_project_catalog_rejects_duplicate_ids(tmp_path: Path) -> None:
     _write_catalog(
         tmp_path,
         """
-from aeloon_core.customization.roles import Role
+from aeloon_core.harness.agent import Role
 
 class One(Role):
     id = "duplicate"
@@ -162,17 +162,6 @@ WORKFLOWS = ()
     )
 
     with pytest.raises(CatalogDefinitionError, match="duplicate project role id"):
-        Catalog.discover(tmp_path)
-
-
-def test_legacy_markdown_definitions_fail_with_migration_message(
-    tmp_path: Path,
-) -> None:
-    worker_root = tmp_path / ".aeloon-core" / "workers"
-    worker_root.mkdir(parents=True)
-    (worker_root / "builder.md").write_text("---\nid: builder\n---\nold\n")
-
-    with pytest.raises(CatalogDefinitionError, match="catalog.py"):
         Catalog.discover(tmp_path)
 
 

@@ -7,7 +7,7 @@ from pydantic_ai.messages import ModelResponse, TextPart
 from pydantic_ai.models.function import FunctionModel
 
 from aeloon_core.config import AgentRoutingConfig, AgentsConfig, Config
-from aeloon_core.harness.routing import FAST_ANTHROPIC_MODEL, ModelRouter
+from aeloon_core.harness.model import FAST_ANTHROPIC_MODEL, ModelRouter
 
 
 @pytest.mark.asyncio
@@ -162,7 +162,7 @@ async def test_router_closes_each_reused_bundle_exactly_once(
         )
 
     monkeypatch.setattr(
-        "aeloon_core.harness.routing.build_anthropic_model",
+        "aeloon_core.harness.model.router.build_anthropic_model",
         build_bundle,
     )
     router = ModelRouter(Config())
