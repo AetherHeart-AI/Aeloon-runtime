@@ -44,13 +44,11 @@ class ProvidersConfig(BaseModel):
 
 
 class ContextCompactionConfig(BaseModel):
-    """Automatic model-context compaction settings."""
+    """Harness sliding-window settings."""
 
     enabled: bool = True
     trigger_ratio: float = Field(default=0.9, ge=0.1, le=1.0)
-    preserve_recent_turns: int = Field(default=2, ge=1)
     preserve_recent_tokens: int | None = Field(default=None, ge=1)
-    summary_max_tokens: int = Field(default=4096, ge=256)
 
 
 class AgentRuntimePolicy(BaseModel):
@@ -123,36 +121,13 @@ class AgentRoutingConfig(BaseModel):
         return normalized
 
 
-class AgentBudgetConfig(BaseModel):
-    """Optional request-budget overrides by orchestration responsibility."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    master: int | None = Field(default=None, ge=1)
-    workers: dict[str, int] = Field(default_factory=dict)
-
-    @field_validator("workers")
-    @classmethod
-    def _worker_budgets_are_positive(cls, value: dict[str, int]) -> dict[str, int]:
-        normalized: dict[str, int] = {}
-        for worker_type_id, max_iterations in value.items():
-            worker_id = worker_type_id.strip()
-            if not worker_id:
-                raise ValueError("worker budget overrides require nonempty ids")
-            if max_iterations < 1:
-                raise ValueError("worker budget overrides must be positive")
-            normalized[worker_id] = max_iterations
-        return normalized
-
-
 class AgentHarnessConfig(BaseModel):
-    """Pydantic AI Harness orchestration settings."""
+    """Settings for the in-turn Pydantic AI Harness workflow."""
 
     model_config = ConfigDict(extra="forbid")
 
-    dynamic_workflow_enabled: bool = True
     max_agent_calls: int = Field(default=16, ge=1, le=128)
-    workflow_memory_mb: int = Field(default=256, ge=32, le=2_048)
+    sub_agent_request_limit: int = Field(default=25, ge=1, le=100)
     workflow_cpu_seconds: float = Field(default=10.0, ge=1.0, le=60.0)
 
 
@@ -161,7 +136,6 @@ class AgentsConfig(BaseModel):
 
     defaults: AgentDefaultsConfig = Field(default_factory=AgentDefaultsConfig)
     routing: AgentRoutingConfig = Field(default_factory=AgentRoutingConfig)
-    budgets: AgentBudgetConfig = Field(default_factory=AgentBudgetConfig)
     harness: AgentHarnessConfig = Field(default_factory=AgentHarnessConfig)
 
 
@@ -171,29 +145,10 @@ class ExecToolConfig(BaseModel):
     timeout: int = 60
 
 
-class WebToolConfig(BaseModel):
-    """Web fetch and web search settings."""
-
-    fetch_timeout: int = 20
-    search_api_url: str | None = None
-    search_api_key: str | None = None
-    max_results: int = 5
-
-
 class ToolsConfig(BaseModel):
     """Tool namespace."""
 
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
-    web: WebToolConfig = Field(default_factory=WebToolConfig)
-
-
-class SkillsConfig(BaseModel):
-    """Skill discovery settings."""
-
-    enabled: bool = True
-    external: bool = True
-    claude_code: bool = True
-    paths: list[str] = Field(default_factory=list)
 
 
 class Config(BaseModel):
@@ -202,7 +157,6 @@ class Config(BaseModel):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
-    skills: SkillsConfig = Field(default_factory=SkillsConfig)
     workspace: Path = Field(default_factory=Path.cwd)
     data_dir: Path = Field(default_factory=lambda: Path("~/.aeloon-core").expanduser())
 
@@ -276,6 +230,7 @@ def load_config(path: Path | str | None = None) -> Config:
     if config_path.exists():
         data = json.loads(config_path.read_text(encoding="utf-8"))
         _drop_removed_v1_settings(data)
+        _drop_removed_orchestration_settings(data)
         _migrate_agent_runtime_settings(data)
         _migrate_provider_settings(data)
         _migrate_active_provider(data)
@@ -356,15 +311,6 @@ def load_config(path: Path | str | None = None) -> Config:
         updates["workspace"] = workspace
     if data_dir := os.environ.get("AELOON_CORE_DATA_DIR"):
         updates["data_dir"] = data_dir
-    if skills_enabled := os.environ.get("AELOON_CORE_SKILLS_ENABLED"):
-        updates.setdefault("skills", {})["enabled"] = _parse_bool(skills_enabled)
-    if disable_external := os.environ.get("AELOON_CORE_DISABLE_EXTERNAL_SKILLS"):
-        updates.setdefault("skills", {})["external"] = not _parse_bool(disable_external)
-    if disable_claude := os.environ.get("AELOON_CORE_DISABLE_CLAUDE_CODE_SKILLS"):
-        updates.setdefault("skills", {})["claude_code"] = not _parse_bool(disable_claude)
-    if skill_paths := os.environ.get("AELOON_CORE_SKILL_PATHS"):
-        updates.setdefault("skills", {})["paths"] = _split_env_list(skill_paths)
-
     if updates:
         merged = config.model_dump(mode="json")
         _deep_update(merged, updates)
@@ -384,19 +330,6 @@ def save_config(config: Config, path: Path | str | None = None) -> Path:
         encoding="utf-8",
     )
     return config_path
-
-
-def _parse_bool(value: str) -> bool:
-    normalized = value.strip().lower()
-    if normalized in {"1", "true", "yes", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "off"}:
-        return False
-    raise ValueError(f"invalid boolean value: {value!r}")
-
-
-def _split_env_list(value: str) -> list[str]:
-    return [item.strip() for item in value.split(os.pathsep) if item.strip()]
 
 
 def _parse_positive_int(value: str, *, name: str) -> int:
@@ -420,6 +353,22 @@ def _drop_removed_v1_settings(data: Any) -> None:
         return
     for key in _REMOVED_V1_AGENT_DEFAULTS:
         defaults.pop(key, None)
+
+
+def _drop_removed_orchestration_settings(data: Any) -> None:
+    """Discard configuration for the removed durable child-agent control plane."""
+
+    if not isinstance(data, dict):
+        return
+    data.pop("skills", None)
+    agents = data.get("agents")
+    if not isinstance(agents, dict):
+        return
+    agents.pop("budgets", None)
+    harness = agents.get("harness")
+    if isinstance(harness, dict):
+        harness.pop("dynamic_workflow_enabled", None)
+        harness.pop("workflow_memory_mb", None)
 
 
 def _migrate_provider_settings(data: Any) -> None:

@@ -7,11 +7,7 @@ __pycache__/
 /.test/
 /docs/
 
-web/node_modules/
-web/dist/
-web/tsconfig.tsbuildinfo
-aeloon_core/tui/node_modules/
-aeloon_core/tui/build/
+aeloon_core/web/node_modules/
 
 .DS_Store
 .env

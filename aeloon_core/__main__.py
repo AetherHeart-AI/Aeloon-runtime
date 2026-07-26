@@ -11,16 +11,15 @@ from typing import Any
 
 from aeloon_core.config import Config, load_config, resolve_config_path, save_config
 from aeloon_core.orchestrator import AeloonCoreOrchestrator
-from aeloon_core.runner import run_worker_runner
-from aeloon_core.terminal_cli import LOG_LEVELS, run_terminal_cli
 from aeloon_core.turn_events import TurnEventProgress
+from aeloon_core.web_launcher import WebLaunchError, run_web_ui
 
-COMMANDS = {"run", "chat", "tui", "config", "runner"}
-REMOVED_COMMANDS = {"profile", "webui"}
-CHAT_ONLY_OPTIONS = {
-    "--show-gateway-logs",
-    "--hide-gateway-logs",
-    "--gateway-log-detail",
+LOG_LEVELS = {"TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"}
+COMMANDS = {"run", "serve", "web", "config"}
+REMOVED_COMMANDS = {"profile", "webui", "chat", "tui"}
+WEB_ONLY_OPTIONS = {
+    "--no-open",
+    "--port",
     "--gateway-log-level",
 }
 CONFIG_SETTERS = {
@@ -37,11 +36,13 @@ CONFIG_SETTERS = {
     "reasoning-effort": ("agents", "defaults", "reasoning_effort"),
     "max-output-tokens": ("agents", "defaults", "max_output_tokens"),
     "max-iterations": ("agents", "defaults", "max_iterations"),
-    "master-max-iterations": ("agents", "budgets", "master"),
-    "builder-max-iterations": ("agents", "budgets", "workers", "builder"),
-    "explorer-max-iterations": ("agents", "budgets", "workers", "explorer"),
-    "researcher-max-iterations": ("agents", "budgets", "workers", "researcher"),
-    "reviewer-max-iterations": ("agents", "budgets", "workers", "reviewer"),
+    "harness-max-agent-calls": ("agents", "harness", "max_agent_calls"),
+    "harness-sub-agent-request-limit": (
+        "agents",
+        "harness",
+        "sub_agent_request_limit",
+    ),
+    "harness-workflow-cpu-seconds": ("agents", "harness", "workflow_cpu_seconds"),
     "context-compaction-enabled": ("agents", "defaults", "context_compaction", "enabled"),
     "context-compaction-trigger-ratio": (
         "agents",
@@ -49,23 +50,11 @@ CONFIG_SETTERS = {
         "context_compaction",
         "trigger_ratio",
     ),
-    "context-compaction-preserve-recent-turns": (
-        "agents",
-        "defaults",
-        "context_compaction",
-        "preserve_recent_turns",
-    ),
     "context-compaction-preserve-recent-tokens": (
         "agents",
         "defaults",
         "context_compaction",
         "preserve_recent_tokens",
-    ),
-    "context-compaction-summary-max-tokens": (
-        "agents",
-        "defaults",
-        "context_compaction",
-        "summary_max_tokens",
     ),
     "runtime-transition-trace-enabled": (
         "agents",
@@ -85,10 +74,6 @@ CONFIG_SETTERS = {
         "runtime",
         "stuck_detection_threshold",
     ),
-    "skills-enabled": ("skills", "enabled"),
-    "skills-external": ("skills", "external"),
-    "skills-claude-code": ("skills", "claude_code"),
-    "skills-paths": ("skills", "paths"),
 }
 DYNAMIC_PROVIDER_SETTERS = {
     "api-key": "api_key",
@@ -107,11 +92,11 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser = subparsers.add_parser("run", help="Run one agent turn.")
     _add_run_args(run_parser)
 
-    chat_parser = subparsers.add_parser("chat", help="Start the interactive terminal CLI.")
-    _add_chat_args(chat_parser)
+    serve_parser = subparsers.add_parser("serve", help="Start the local Web UI.")
+    _add_web_args(serve_parser)
 
-    tui_parser = subparsers.add_parser("tui", help="Alias for chat.")
-    _add_chat_args(tui_parser)
+    web_parser = subparsers.add_parser("web", help="Alias for serve.")
+    _add_web_args(web_parser)
 
     config_parser = subparsers.add_parser("config", help="Manage persistent config.")
     config_subparsers = config_parser.add_subparsers(dest="config_command", required=True)
@@ -149,15 +134,6 @@ def build_parser() -> argparse.ArgumentParser:
     config_set_parser.add_argument("key", choices=sorted(CONFIG_KEYS))
     config_set_parser.add_argument("value")
 
-    runner_parser = subparsers.add_parser("runner", help="Run queued Worker sessions.")
-    runner_parser.add_argument(
-        "--once",
-        action="store_true",
-        help="Drain the current queue and exit.",
-    )
-    runner_parser.add_argument("--poll-seconds", type=float, default=0.5)
-    _add_path_args(runner_parser)
-
     return parser
 
 
@@ -182,33 +158,19 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
     _add_path_args(parser, session=True)
 
 
-def _add_chat_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "prompt",
-        nargs="*",
-        help="Optional prompt to run once. Omit it for interactive chat.",
-    )
+def _add_web_args(parser: argparse.ArgumentParser) -> None:
     _add_path_args(parser, session=True)
     parser.add_argument(
-        "--show-gateway-logs",
+        "--no-open",
         action="store_true",
-        help="Show compact gateway log lines.",
+        help="Do not open the browser automatically.",
     )
-    parser.add_argument(
-        "--hide-gateway-logs",
-        action="store_true",
-        help="Hide gateway log lines, overriding other gateway log options.",
-    )
+    parser.add_argument("--port", type=int, default=7331, help="Local port (default: 7331).")
     parser.add_argument(
         "--gateway-log-level",
         choices=sorted(LOG_LEVELS),
-        default=None,
-        help="Minimum gateway log level to display (default: INFO); also enables logs.",
-    )
-    parser.add_argument(
-        "--gateway-log-detail",
-        action="store_true",
-        help="Print gateway log detail JSON; also enables logs.",
+        default="INFO",
+        help="Minimum level retained by the Web diagnostics view.",
     )
 
 
@@ -303,25 +265,22 @@ async def _run_prompt(args: argparse.Namespace) -> None:
         await orchestrator.close()
 
 
-async def _run_chat(args: argparse.Namespace) -> None:
+async def _run_web(args: argparse.Namespace) -> None:
     config = _load_with_path_overrides(
         args.config,
         workspace=getattr(args, "workspace", None),
         data_dir=getattr(args, "data_dir", None),
     )
-    prompt = " ".join(args.prompt).strip() or None
-    gateway_log_level = args.gateway_log_level or "INFO"
-    show_gateway_logs = not args.hide_gateway_logs and (
-        args.show_gateway_logs or args.gateway_log_level is not None or args.gateway_log_detail
-    )
-    await run_terminal_cli(
-        config,
-        prompt=prompt,
-        session_id=args.session,
-        show_gateway_logs=show_gateway_logs,
-        gateway_log_level=gateway_log_level,
-        gateway_log_detail=args.gateway_log_detail,
-    )
+    try:
+        await run_web_ui(
+            config,
+            session_id=args.session,
+            port=args.port,
+            open_browser=not args.no_open,
+            gateway_log_level=args.gateway_log_level,
+        )
+    except WebLaunchError as exc:
+        raise SystemExit(str(exc)) from None
 
 
 def _run_config(args: argparse.Namespace) -> None:
@@ -477,30 +436,20 @@ def _coerce_config_value(key: str, value: str) -> Any:
     if key in {
         "max-iterations",
         "max-output-tokens",
-        "master-max-iterations",
-        "builder-max-iterations",
-        "explorer-max-iterations",
-        "researcher-max-iterations",
-        "reviewer-max-iterations",
-        "context-compaction-preserve-recent-turns",
-        "context-compaction-summary-max-tokens",
+        "harness-max-agent-calls",
+        "harness-sub-agent-request-limit",
         "runtime-stuck-detection-threshold",
     }:
         return int(value)
-    if key == "context-compaction-trigger-ratio":
+    if key in {"context-compaction-trigger-ratio", "harness-workflow-cpu-seconds"}:
         return float(value)
     if key in {
-        "skills-enabled",
-        "skills-external",
-        "skills-claude-code",
         "context-compaction-enabled",
         "runtime-transition-trace-enabled",
         "runtime-stuck-detection-enabled",
         "prompt-caching",
     }:
         return _parse_bool(value)
-    if key == "skills-paths":
-        return [item.strip() for item in value.split(",") if item.strip()]
     return value
 
 
@@ -524,7 +473,14 @@ def _first_positional(argv: list[str]) -> str | None:
         if skip_next:
             skip_next = False
             continue
-        if token in {"--config", "--session", "--workspace", "--data-dir", "--gateway-log-level"}:
+        if token in {
+            "--config",
+            "--session",
+            "--workspace",
+            "--data-dir",
+            "--gateway-log-level",
+            "--port",
+        }:
             skip_next = True
             continue
         if token.startswith("-"):
@@ -533,7 +489,7 @@ def _first_positional(argv: list[str]) -> str | None:
     return None
 
 
-def _looks_like_implicit_chat(argv: list[str]) -> bool:
+def _looks_like_implicit_web(argv: list[str]) -> bool:
     if any(token in {"-h", "--help"} for token in argv):
         return False
     first = _first_positional(argv)
@@ -541,12 +497,12 @@ def _looks_like_implicit_chat(argv: list[str]) -> bool:
         return True
     if first in COMMANDS or first in REMOVED_COMMANDS:
         return False
-    return any(_is_chat_only_option(token) for token in argv)
+    return any(_is_web_only_option(token) for token in argv)
 
 
-def _is_chat_only_option(token: str) -> bool:
-    return token in CHAT_ONLY_OPTIONS or any(
-        token.startswith(f"{option}=") for option in CHAT_ONLY_OPTIONS
+def _is_web_only_option(token: str) -> bool:
+    return token in WEB_ONLY_OPTIONS or any(
+        token.startswith(f"{option}=") for option in WEB_ONLY_OPTIONS
     )
 
 
@@ -555,45 +511,35 @@ def main(argv: list[str] | None = None) -> None:
 
     raw_args = list(sys.argv[1:] if argv is None else argv)
     if not raw_args:
-        asyncio.run(_run_chat(build_parser().parse_args(["chat"])))
+        _run_async(_run_web(build_parser().parse_args(["serve"])))
         return
-    if _looks_like_implicit_chat(raw_args):
-        asyncio.run(_run_chat(build_parser().parse_args(["chat", *raw_args])))
+    if _looks_like_implicit_web(raw_args):
+        _run_async(_run_web(build_parser().parse_args(["serve", *raw_args])))
         return
     if _looks_like_legacy_run(raw_args):
-        asyncio.run(_run_prompt(build_legacy_run_parser().parse_args(raw_args)))
+        _run_async(_run_prompt(build_legacy_run_parser().parse_args(raw_args)))
         return
 
     args = build_parser().parse_args(raw_args)
     if args.command == "run":
-        asyncio.run(_run_prompt(args))
+        _run_async(_run_prompt(args))
         return
-    if args.command in {"chat", "tui"}:
-        asyncio.run(_run_chat(args))
+    if args.command in {"serve", "web"}:
+        _run_async(_run_web(args))
         return
     if args.command == "config":
         _run_config(args)
         return
-    if args.command == "runner":
-        config = _load_with_path_overrides(
-            args.config,
-            workspace=args.workspace,
-            data_dir=args.data_dir,
-        )
-        async def run() -> None:
-            orchestrator = AeloonCoreOrchestrator(config)
-            try:
-                await run_worker_runner(
-                    orchestrator,
-                    once=args.once,
-                    poll_seconds=args.poll_seconds,
-                )
-            finally:
-                await orchestrator.close()
-
-        asyncio.run(run())
-        return
     raise SystemExit(f"Unknown command: {args.command}")
+
+
+def _run_async(awaitable: Any) -> None:
+    """Run one CLI coroutine without printing a traceback for Ctrl-C."""
+
+    try:
+        asyncio.run(awaitable)
+    except KeyboardInterrupt:
+        return
 
 
 if __name__ == "__main__":

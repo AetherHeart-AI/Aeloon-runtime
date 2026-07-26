@@ -10,7 +10,7 @@ from tests.message_helpers import checkpoint as message_checkpoint
 
 
 def _store(tmp_path: Path) -> SessionStore:
-    return SessionStore(data_dir=tmp_path / "data", workspace=tmp_path)
+    return SessionStore(data_dir=tmp_path / "data")
 
 
 def _turn_record(
@@ -52,38 +52,22 @@ def test_unsafe_session_ids_use_distinct_contained_paths(tmp_path: Path) -> None
     traversal = "../../outside"
 
     assert store.session_path(unsafe) != store.session_path(formerly_colliding)
-    assert store.trace_path(unsafe) != store.trace_path(formerly_colliding)
     assert store.session_path(traversal).parent == store.sessions_dir
-    assert store.trace_path(traversal).parent == store.traces_dir
     assert "/" not in store.session_path(unsafe).name
 
     assert _append_once(store, unsafe, "same-turn") is True
     assert _append_once(store, formerly_colliding, "same-turn") is True
-    store.append_transition(
-        session_id=unsafe,
-        turn_id="same-turn",
-        transition={"state": "unsafe"},
-    )
-    store.append_transition(
-        session_id=formerly_colliding,
-        turn_id="same-turn",
-        transition={"state": "safe"},
-    )
 
     assert [record["session_id"] for record in store.history(unsafe)] == [unsafe]
     assert [record["session_id"] for record in store.history(formerly_colliding)] == [
         formerly_colliding
     ]
-    assert "message for team/a" in str(store.load_messages(unsafe))
-    assert store.transition_history(unsafe)[0]["state"] == "unsafe"
-    assert store.transition_history(formerly_colliding)[0]["state"] == "safe"
 
 
 def test_existing_safe_names_stay_stable_and_empty_has_own_namespace(tmp_path: Path) -> None:
     store = _store(tmp_path)
 
     assert store.session_path("master-1_a").name == "master-1_a.jsonl"
-    assert store.trace_path("master-1_a").name == "master-1_a.jsonl"
     assert store.session_path("") != store.session_path("default")
     assert store.session_path("").name.startswith("~")
 
@@ -99,7 +83,6 @@ def test_case_variants_are_isolated_on_case_insensitive_filesystems(tmp_path: Pa
     store = _store(tmp_path)
 
     assert store.session_path("TeamA") != store.session_path("teama")
-    assert store.trace_path("TeamA") != store.trace_path("teama")
 
     assert _append_once(store, "TeamA", "upper-turn") is True
     assert _append_once(store, "teama", "lower-turn") is True

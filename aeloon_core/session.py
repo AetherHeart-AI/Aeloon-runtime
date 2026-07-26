@@ -13,7 +13,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from aeloon_core.context import build_initial_messages
 from aeloon_core.message_history import (
     MESSAGE_FORMAT,
     MESSAGE_SCHEMA_VERSION,
@@ -40,13 +39,10 @@ class SessionSummary:
 class SessionStore:
     """Persist session turns as one JSON object per line."""
 
-    def __init__(self, *, data_dir: Path, workspace: Path) -> None:
+    def __init__(self, *, data_dir: Path) -> None:
         self.data_dir = data_dir
-        self.workspace = workspace
         self.sessions_dir = data_dir / "sessions"
-        self.traces_dir = data_dir / "traces"
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
-        self.traces_dir.mkdir(parents=True, exist_ok=True)
 
     def new_session(self) -> str:
         """Create a session id."""
@@ -59,26 +55,6 @@ class SessionStore:
         """Return the JSONL path for a session."""
 
         return self._canonical_path(self.sessions_dir, session_id)
-
-    def trace_path(self, session_id: str) -> Path:
-        """Return the independent transition-trace JSONL path for a session."""
-
-        return self._canonical_path(self.traces_dir, session_id)
-
-    def load_messages(
-        self,
-        session_id: str,
-        *,
-        initial_messages: list[dict[str, Any]] | None = None,
-    ) -> list[dict[str, Any]]:
-        """Load the latest message array for a session."""
-
-        records = self._read_records(session_id)
-        for record in reversed(records):
-            messages = record.get("messages")
-            if isinstance(messages, list):
-                return messages
-        return initial_messages or build_initial_messages(workspace=self.workspace)
 
     def load_pydantic_messages(self, session_id: str) -> list[dict[str, Any]]:
         """Load executable v2 history, rejecting but never altering legacy data."""
@@ -100,40 +76,6 @@ class SessionStore:
             raise ValueError("PydanticAI session record has no message array")
         return messages
 
-    def append_turn(
-        self,
-        *,
-        session_id: str,
-        user_prompt: str,
-        final_content: str | None,
-        tools_used: list[str],
-        messages: list[dict[str, Any]],
-        blocks: list[dict[str, Any]] | None = None,
-        usage: dict[str, Any] | None = None,
-        turn_id: str | None = None,
-    ) -> None:
-        """Append one completed turn."""
-
-        deserialize_messages(messages)
-        path = self._writable_path(self.sessions_dir, session_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        record = {
-            "type": "turn",
-            "schema_version": MESSAGE_SCHEMA_VERSION,
-            "message_format": MESSAGE_FORMAT,
-            "session_id": session_id,
-            "turn_id": turn_id,
-            "created_at": datetime.now(UTC).isoformat(),
-            "user_prompt": user_prompt,
-            "final_content": final_content,
-            "tools_used": tools_used,
-            "messages": messages,
-            "blocks": blocks or [],
-            "usage": usage or {},
-        }
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-
     def append_turn_once(
         self,
         *,
@@ -144,15 +86,10 @@ class SessionStore:
         messages: list[dict[str, Any]],
         blocks: list[dict[str, Any]] | None = None,
         usage: dict[str, Any] | None = None,
+        duration_ms: int | None = None,
         turn_id: str,
     ) -> bool:
-        """Durably append one turn once, repairing a crash-truncated tail.
-
-        The per-session file lock is intentionally independent of FlowStore's
-        SQLite writer lock. A crash after a partial write leaves no newline; the
-        next recovery truncates that fragment, writes the canonical record, and
-        fsyncs it before the caller marks the durable commit as projected.
-        """
+        """Append one Master turn once, repairing a crash-truncated JSONL tail."""
 
         deserialize_messages(messages)
         path = self._writable_path(self.sessions_dir, session_id)
@@ -169,6 +106,7 @@ class SessionStore:
             "messages": messages,
             "blocks": blocks or [],
             "usage": usage or {},
+            "duration_ms": duration_ms,
         }
         with self._locked_session_file(path) as handle:
             self._repair_partial_tail(handle)
@@ -181,7 +119,7 @@ class SessionStore:
                 persisted = matching[-1]
                 fields = tuple(expected)
                 if any(persisted.get(field) != expected[field] for field in fields):
-                    raise ValueError("persisted Master turn differs from its durable commit")
+                    raise ValueError("persisted Master turn differs from the current result")
                 return False
 
             record = {
@@ -194,36 +132,10 @@ class SessionStore:
             os.fsync(handle.fileno())
             return True
 
-    def append_transition(
-        self,
-        *,
-        session_id: str,
-        turn_id: str,
-        transition: dict[str, Any],
-    ) -> None:
-        """Append one transition to the session's independent trace stream."""
-
-        path = self._writable_path(self.traces_dir, session_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        record = {
-            "type": "transition",
-            "schema_version": 1,
-            "session_id": session_id,
-            "turn_id": turn_id,
-            **transition,
-        }
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
-
     def history(self, session_id: str) -> list[dict[str, Any]]:
         """Return persisted turn records for a session."""
 
         return self._read_records(session_id)
-
-    def transition_history(self, session_id: str) -> list[dict[str, Any]]:
-        """Return persisted transition records without affecting turn history."""
-
-        return self._read_scoped_records(self.traces_dir, session_id)
 
     def list_sessions(self) -> list[SessionSummary]:
         """List persisted sessions, newest first."""

@@ -12,6 +12,6 @@ Investigate through this workflow:
 4. Separate observed facts, inferences, and unresolved uncertainty. Return exact `file:line`
    or runtime evidence for consequential conclusions.
 
-Remain read-only: report a required change rather than making it. Request Master only when
-ambiguity, missing permission, or missing upstream information prevents a correct answer;
-do not ask for internal-method guidance.
+Remain read-only: report a required change rather than making it. Record ambiguity, missing
+permission, or missing upstream information as unresolved; do not ask for internal-method
+guidance.

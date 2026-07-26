@@ -1,4 +1,4 @@
-"""NDJSON transport between the Python runtime and the OpenTUI application.
+"""NDJSON transport between the Python runtime and the local Web UI.
 
 The bridge deliberately contains no presentation policy.  It forwards live
 ``TurnEventProgress`` events unchanged inside a small transport envelope while
@@ -29,12 +29,11 @@ from pydantic import BaseModel, ValidationError
 from aeloon_core.config import Config, load_config
 from aeloon_core.operator_output import redact_sensitive_text as _redact_sensitive_text
 from aeloon_core.orchestrator import AeloonCoreOrchestrator
-from aeloon_core.turn_events import TurnEventProgress
-from aeloon_core.worker_ui import WorkerUiQueryService
+from aeloon_core.turn_events import WEB_TOOL_RESULT_CHARS, TurnEventProgress
 
-TUI_CONFIG_ENV = "AELOON_CORE_TUI_CONFIG_JSON"
-TUI_SESSION_ENV = "AELOON_CORE_TUI_SESSION_ID"
-TUI_LOG_LEVEL_ENV = "AELOON_CORE_TUI_LOG_LEVEL"
+WEB_CONFIG_ENV = "AELOON_CORE_WEB_CONFIG_JSON"
+WEB_SESSION_ENV = "AELOON_CORE_WEB_SESSION_ID"
+WEB_LOG_LEVEL_ENV = "AELOON_CORE_WEB_LOG_LEVEL"
 _LOG_LEVELS = {"TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"}
 _MAX_ERROR_CHARS = 1_000
 _MAX_PENDING_LOG_EVENTS = 256
@@ -44,7 +43,7 @@ RecordSink = Callable[[dict[str, Any]], Awaitable[None]]
 
 
 class BridgeCommandError(ValueError):
-    """A readable protocol error that is safe to return to the TUI."""
+    """A readable protocol error that is safe to return to the Web UI."""
 
     def __init__(self, message: str, *, code: str = "invalid_command") -> None:
         super().__init__(message)
@@ -101,7 +100,7 @@ class _QueuedPrompt:
     session_id: str
 
 
-class TUIBridge:
+class WebBridge:
     """Serve asynchronous commands without blocking the active agent turn."""
 
     def __init__(
@@ -136,11 +135,10 @@ class TUIBridge:
         await self.sink({"type": "event", "event": event, "payload": payload})
 
     def snapshot(self, *, session_id: str | None = None) -> dict[str, Any]:
-        """Return the current session context needed to hydrate the TUI."""
+        """Return the current session context needed to hydrate the Web UI."""
 
         resolved_session_id = session_id or self.session_id
         history = self.orchestrator.sessions.history(resolved_session_id)
-        workers = self.orchestrator.worker_control.list_workers(resolved_session_id)
         return {
             "workspace": str(self.config.workspace),
             "model": self.config.agents.defaults.model_ref(),
@@ -149,7 +147,6 @@ class TUIBridge:
             # events use that spelling for correlation.
             "session_id": resolved_session_id,
             "history": [_history_turn_view(record) for record in history],
-            "workers": [_worker_summary_view(worker) for worker in workers],
         }
 
     async def dispatch(self, message: dict[str, Any]) -> None:
@@ -173,7 +170,7 @@ class TUIBridge:
                 await self._enqueue_prompt(request_id, payload)
                 return
 
-            result = await self._execute_control(command, payload, request_id=request_id)
+            result = await self._execute_control(command, payload)
             await self._respond_ok(request_id, command, result)
             if command == "shutdown":
                 self._shutdown_requested = True
@@ -281,7 +278,6 @@ class TUIBridge:
             progress = TurnEventProgress(
                 session_id=queued.session_id,
                 emit=self.emit_event,
-                allow_worker_tool_output=True,
             )
             await self.emit_event(
                 "bridge.prompt.started",
@@ -334,12 +330,11 @@ class TUIBridge:
         self,
         command: str,
         payload: dict[str, Any],
-        *,
-        request_id: str,
     ) -> Any:
         sessions = self.orchestrator.sessions
-        workers = self.orchestrator.worker_control
 
+        if command == "refresh_snapshot":
+            return self.snapshot()
         if command == "new_session":
             session_id = sessions.new_session()
             snapshot = self.snapshot(session_id=session_id)
@@ -352,59 +347,6 @@ class TUIBridge:
             return snapshot
         if command == "list_sessions":
             return [_session_summary_view(item) for item in sessions.list_sessions()]
-        if command == "list_workers":
-            session_id = _optional_text(payload, "session_id") or self.session_id
-            return [
-                _worker_summary_view(item)
-                for item in workers.list_workers(session_id)
-            ]
-        if command == "inspect_worker":
-            worker_id = _required_text(payload, "worker_id")
-            return _inspect_worker_detail(workers, worker_id)
-        if command == "discover_worker_types":
-            return [
-                _worker_type_view(item)
-                for item in workers.discover_worker_types()
-            ]
-        if command == "spawn_worker":
-            session_id = _optional_text(payload, "session_id") or self.session_id
-            worker_type_id = _required_text(
-                payload,
-                "worker_type_id",
-                aliases=("worker_type",),
-            )
-            objective = _required_text(payload, "objective")
-            idempotency_key = _optional_text(payload, "idempotency_key")
-            result = await workers.spawn_worker(
-                base_session_id=session_id,
-                worker_type_id=worker_type_id,
-                objective=objective,
-                idempotency_key=idempotency_key or f"tui:{uuid.uuid4().hex}",
-                base_turn_id=_optional_text(payload, "base_turn_id"),
-                progress=TurnEventProgress(
-                    session_id=session_id,
-                    emit=self.emit_event,
-                    allow_worker_tool_output=True,
-                ),
-            )
-            return _spawn_worker_view(result)
-        if command == "cancel_worker":
-            run_id = _required_text(payload, "run_id")
-            return _worker_run_view(await workers.cancel_worker(run_id))
-        if command == "resume_worker":
-            run_id = _required_text(payload, "run_id")
-            result = await workers.resume_worker(
-                run_id,
-                response=_required_text(payload, "response"),
-                idempotency_key=f"tui:resume:{request_id}",
-                base_session_id=self.session_id,
-                progress=TurnEventProgress(
-                    session_id=self.session_id,
-                    emit=self.emit_event,
-                    allow_worker_tool_output=True,
-                ),
-            )
-            return _resume_worker_view(result)
         if command == "cancel_turn":
             active = self._active_turn_task
             active_prompt = self._active_prompt
@@ -451,18 +393,14 @@ class TUIBridge:
         )
 
 
-# Backwards-compatible spelling for callers that prefer title-case initialism.
-TuiBridge = TUIBridge
-
-
-def load_tui_config(environ: Mapping[str, str] | None = None) -> Config:
+def load_web_config(environ: Mapping[str, str] | None = None) -> Config:
     """Load the launcher's serialized config, falling back to normal config loading."""
 
     values = os.environ if environ is None else environ
     raw = (
-        os.environ.pop(TUI_CONFIG_ENV, None)
+        os.environ.pop(WEB_CONFIG_ENV, None)
         if environ is None
-        else values.get(TUI_CONFIG_ENV)
+        else values.get(WEB_CONFIG_ENV)
     )
     if raw is None or not raw.strip():
         return load_config()
@@ -470,7 +408,7 @@ def load_tui_config(environ: Mapping[str, str] | None = None) -> Config:
         return Config.model_validate_json(raw).normalized()
     except (ValidationError, ValueError, json.JSONDecodeError):
         raise BridgeCommandError(
-            f"invalid {TUI_CONFIG_ENV}: expected a valid Config JSON object",
+            f"invalid {WEB_CONFIG_ENV}: expected a valid Config JSON object",
             code="invalid_config",
         ) from None
 
@@ -486,21 +424,21 @@ async def run_bridge(
 ) -> None:
     """Run one bridge process with injectable streams for tests and launchers."""
 
-    # The TUI consumes structured ``log.entry`` events.  The default Loguru
+    # The Web UI consumes structured ``log.entry`` events.  The default Loguru
     # stderr sink can otherwise leak raw exception tracebacks into the normal UI
     # through the subprocess stderr watcher.
     logger.remove()
-    resolved_config = config or load_tui_config()
-    os.environ.pop(TUI_CONFIG_ENV, None)
-    bridge = TUIBridge(
+    resolved_config = config or load_web_config()
+    os.environ.pop(WEB_CONFIG_ENV, None)
+    bridge = WebBridge(
         resolved_config,
         sink=sink or NDJSONWriter(output_stream),
-        session_id=session_id or os.environ.get(TUI_SESSION_ENV) or None,
+        session_id=session_id or os.environ.get(WEB_SESSION_ENV) or None,
     )
     log_level = (
-        load_tui_log_level()
+        load_web_log_level()
         if gateway_log_level is None
-        else load_tui_log_level({TUI_LOG_LEVEL_ENV: gateway_log_level})
+        else load_web_log_level({WEB_LOG_LEVEL_ENV: gateway_log_level})
     )
     sink_id = _install_bridge_log_sink(bridge, level=log_level)
     try:
@@ -510,7 +448,7 @@ async def run_bridge(
 
 
 def main() -> None:
-    """Module entry point used by the OpenTUI subprocess."""
+    """Module entry point used by the local Web server subprocess."""
 
     try:
         asyncio.run(run_bridge())
@@ -530,16 +468,16 @@ def main() -> None:
         }
         sys.stdout.write(json.dumps(record, ensure_ascii=False, default=_json_default) + "\n")
         sys.stdout.flush()
-        sys.stderr.write(f"Aeloon TUI bridge failed: {message}\n")
+        sys.stderr.write(f"Aeloon Web bridge failed: {message}\n")
         sys.stderr.flush()
         raise SystemExit(1) from None
 
 
-def load_tui_log_level(environ: Mapping[str, str] | None = None) -> str:
+def load_web_log_level(environ: Mapping[str, str] | None = None) -> str:
     """Return a validated minimum level for structured gateway log events."""
 
     values = os.environ if environ is None else environ
-    level = values.get(TUI_LOG_LEVEL_ENV, "INFO").strip().upper()
+    level = values.get(WEB_LOG_LEVEL_ENV, "INFO").strip().upper()
     return level if level in _LOG_LEVELS else "INFO"
 
 
@@ -557,7 +495,7 @@ def _bridge_request_id() -> str:
     return f"bridge-{uuid.uuid4().hex[:10]}"
 
 
-def _install_bridge_log_sink(bridge: TUIBridge, *, level: str = "INFO") -> int:
+def _install_bridge_log_sink(bridge: WebBridge, *, level: str = "INFO") -> int:
     """Route general runtime logs into the structured verbose event stream."""
 
     loop = asyncio.get_running_loop()
@@ -604,7 +542,7 @@ def _install_bridge_log_sink(bridge: TUIBridge, *, level: str = "INFO") -> int:
             payload = {
                 "level": record["level"].name,
                 "message": _redact_sensitive_text(record["message"]),
-                "source": "loguru",
+                "source": str(record["name"]),
                 "ts": record["time"].isoformat(),
                 "detail": detail,
             }
@@ -650,7 +588,7 @@ def _command_payload(message: dict[str, Any], *, command: str) -> dict[str, Any]
     if not isinstance(raw, dict):
         raise BridgeCommandError("command payload must be a JSON object")
 
-    # Accept top-level arguments as a compatibility convenience while the TUI
+    # Accept top-level arguments as a compatibility convenience while the Web UI
     # always uses the explicit payload envelope.
     payload = dict(raw)
     for key, value in message.items():
@@ -682,15 +620,6 @@ def _required_prompt(payload: Mapping[str, Any]) -> str:
     raise BridgeCommandError("prompt is required")
 
 
-def _optional_text(payload: Mapping[str, Any], name: str) -> str | None:
-    value = payload.get(name)
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        raise BridgeCommandError(f"{name} must be a string")
-    return value.strip() or None
-
-
 async def _readline(stream: Any) -> str:
     readline = getattr(stream, "readline", None)
     if readline is None:
@@ -715,8 +644,31 @@ def _history_turn_view(record: Any) -> dict[str, Any]:
         "user_prompt": raw.get("user_prompt"),
         "final_content": raw.get("final_content"),
         "tools_used": list(raw.get("tools_used") or []),
+        "blocks": [
+            _bounded_web_block(block)
+            for block in raw.get("blocks", [])
+            if isinstance(block, dict)
+        ],
         "usage": raw.get("usage") or {},
+        "duration_ms": raw.get("duration_ms"),
     }
+
+
+def _bounded_web_block(block: Mapping[str, Any]) -> dict[str, Any]:
+    view = dict(block)
+    if view.get("type") != "tool_call" or view.get("result") is None:
+        return view
+    result = str(view["result"])
+    limit = WEB_TOOL_RESULT_CHARS
+    if len(result) <= limit:
+        return view
+    marker = f"\n… {len(result) - limit} characters omitted …\n"
+    available = limit - len(marker)
+    head = available // 2
+    tail = available - head
+    view["result"] = f"{result[:head]}{marker}{result[-tail:]}"
+    view["result_truncated"] = True
+    return view
 
 
 def _session_summary_view(item: Any) -> dict[str, Any]:
@@ -726,182 +678,6 @@ def _session_summary_view(item: Any) -> dict[str, Any]:
         "title": raw.get("title"),
         "updated_at": raw.get("updated_at"),
         "turns": raw.get("turns", 0),
-    }
-
-
-def _worker_summary_view(item: Any) -> dict[str, Any]:
-    raw = _mapping(item)
-    worker_id = str(raw.get("worker_id") or "")
-    snapshot = _mapping(raw.get("snapshot"))
-    worker_type_id = str(snapshot.get("id") or raw.get("worker_type_id") or "worker")
-    latest = raw.get("latest_run")
-    latest_view = _worker_run_view(latest) if isinstance(latest, dict) else None
-    return {
-        "worker_id": worker_id,
-        "label": f"{worker_type_id}#{worker_id[:4]}",
-        "worker_type_id": worker_type_id,
-        "definition": _worker_definition_view(snapshot),
-        "status": raw.get("status"),
-        "created_at": raw.get("created_at"),
-        "reusable": bool(raw.get("reusable", False)),
-        "recommended_action": raw.get("recommended_action"),
-        "run_count": raw.get("run_count", 0),
-        "latest_run": latest_view,
-    }
-
-
-def _worker_detail_view(item: Any) -> dict[str, Any]:
-    raw = _mapping(item)
-    worker_id = str(raw.get("worker_id") or "")
-    snapshot = _mapping(raw.get("snapshot"))
-    worker_type_id = str(snapshot.get("id") or raw.get("worker_type_id") or "worker")
-    runs = [
-        _worker_run_view(run)
-        for run in raw.get("runs", [])
-        if isinstance(run, dict)
-    ]
-    return {
-        "worker_id": worker_id,
-        "label": f"{worker_type_id}#{worker_id[:4]}",
-        "worker_type_id": worker_type_id,
-        "definition": _worker_definition_view(snapshot),
-        "status": raw.get("status"),
-        "created_at": raw.get("created_at"),
-        "runs": runs,
-        # Worker progress is live and intentionally not persisted as a private
-        # raw transcript.  The UI can state this limitation instead of implying
-        # that a reconstructed timeline is complete.
-        "timeline": [],
-        "timeline_available": False,
-    }
-
-
-def _inspect_worker_detail(control: Any, worker_id: str) -> dict[str, Any]:
-    """Build a TUI-only safe detail view without exposing Worker transcripts."""
-
-    manager = getattr(control, "manager", None)
-    journal = getattr(manager, "ui_journal", None)
-    if manager is not None and journal is not None:
-        return WorkerUiQueryService(manager=manager, journal=journal).inspect_worker(
-            worker_id
-        )
-
-    detail = _worker_detail_view(control.inspect_worker(worker_id))
-    if manager is None:
-        return detail
-    worker, runs = manager.inspect_worker(worker_id)
-    detail["created_at"] = getattr(worker, "created_at", None)
-    detail["runs"] = [_worker_record_view(run) for run in runs]
-    return detail
-
-
-def _worker_record_view(item: Any) -> dict[str, Any]:
-    raw = _mapping(item)
-    context = _mapping(raw.get("context"))
-    result_envelope = _mapping(raw.get("result"))
-    report = _mapping(result_envelope.get("report"))
-    status = _enum_value(raw.get("status"))
-    summary = report.get("summary")
-    result = {
-        "run_id": raw.get("run_id"),
-        "worker_id": raw.get("worker_id"),
-        "run_sequence": raw.get("run_sequence"),
-        "status": status,
-        "cancel_requested": bool(raw.get("cancel_requested_at")),
-        "objective": context.get("objective"),
-        "source_run_id": raw.get("source_run_id"),
-        "created_at": raw.get("created_at"),
-        "summary": summary,
-        "duration_ms": result_envelope.get("duration_ms"),
-        "tool_outcome": result_envelope.get("tool_outcome"),
-        "usage": result_envelope.get("usage") or {},
-    }
-    waiting_request = _mapping(raw.get("waiting_request"))
-    question = waiting_request.get("question") or _first_unresolved(report)
-    if question:
-        result["waiting_question"] = question
-    if status == "failed" and summary:
-        result["error_summary"] = summary
-    return result
-
-
-def _worker_run_view(item: Any) -> dict[str, Any]:
-    raw = _mapping(item)
-    context = _mapping(raw.get("context"))
-    result_envelope = _mapping(raw.get("result"))
-    report = _mapping(raw.get("report")) or _mapping(result_envelope.get("report"))
-    status = _enum_value(raw.get("status"))
-    summary = raw.get("summary") or report.get("summary")
-    result = {
-        "run_id": raw.get("run_id"),
-        "worker_id": raw.get("worker_id"),
-        "run_sequence": raw.get("run_sequence"),
-        "created_at": raw.get("created_at"),
-        "status": status,
-        "cancel_requested": bool(raw.get("cancel_requested", False)),
-        "action": raw.get("action"),
-        "objective": (
-            raw.get("objective")
-            or raw.get("objective_preview")
-            or context.get("objective")
-        ),
-        "source_run_id": raw.get("source_run_id"),
-        "summary": summary,
-        "duration_ms": raw.get("duration_ms") or result_envelope.get("duration_ms"),
-        "tool_outcome": raw.get("tool_outcome") or result_envelope.get("tool_outcome"),
-        "usage": raw.get("usage") or result_envelope.get("usage") or {},
-    }
-    waiting_request = _mapping(raw.get("waiting_request"))
-    question = raw.get("waiting_question") or waiting_request.get("question")
-    question = question or _first_unresolved(report)
-    if question:
-        result["waiting_question"] = question
-    if status == "failed" and summary:
-        result["error_summary"] = summary
-    return result
-
-
-def _resume_worker_view(item: Any) -> dict[str, Any]:
-    raw = _mapping(item)
-    run = raw.get("run") if isinstance(raw.get("run"), dict) else raw
-    return {
-        **_worker_run_view(run),
-        "action": raw.get("action"),
-        "source_status": _enum_value(raw.get("source_status")),
-        "created": bool(raw.get("created", False)),
-    }
-
-
-def _worker_type_view(item: Any) -> dict[str, Any]:
-    raw = _mapping(item)
-    return {
-        "id": raw.get("id"),
-        "description": raw.get("description"),
-        "source": _enum_value(raw.get("source")),
-        "digest": raw.get("digest"),
-    }
-
-
-def _spawn_worker_view(item: Any) -> dict[str, Any]:
-    raw = _mapping(item)
-    snapshot = _mapping(raw.get("snapshot"))
-    worker_id = raw.get("worker_id")
-    run_id = raw.get("run_id")
-    run_sequence = raw.get("run_sequence")
-    created_at = raw.get("created_at")
-    return {
-        "worker_id": worker_id,
-        "created_at": created_at,
-        "created": bool(raw.get("created", False)),
-        "worker_type_id": snapshot.get("id") or raw.get("worker_type_id"),
-        "definition": _worker_definition_view(snapshot),
-        "latest_run": {
-            "worker_id": worker_id,
-            "run_id": run_id,
-            "run_sequence": run_sequence,
-            "created_at": created_at,
-            "status": _enum_value(raw.get("status")) or "queued",
-        },
     }
 
 
@@ -915,26 +691,6 @@ def _turn_result_view(item: Any) -> dict[str, Any]:
         "tools_used": list(raw.get("tools_used") or []),
         "usage": raw.get("usage") or {},
     }
-
-
-def _worker_definition_view(value: Mapping[str, Any]) -> dict[str, Any]:
-    return {
-        "id": value.get("id"),
-        "description": value.get("description"),
-        "source": _enum_value(value.get("source")),
-        "digest": value.get("digest"),
-    }
-
-
-def _first_unresolved(report: Mapping[str, Any]) -> Any:
-    unresolved = report.get("unresolved")
-    if isinstance(unresolved, list) and unresolved:
-        return unresolved[0]
-    return None
-
-
-def _enum_value(value: Any) -> Any:
-    return value.value if isinstance(value, Enum) else value
 
 
 def _mapping(value: Any) -> dict[str, Any]:

@@ -16,6 +16,6 @@ Perform independent review through this workflow:
 5. If there are no actionable findings, say so explicitly and still report the tests/runtime
    checks performed plus material residual risks or verification gaps.
 
-Call `request_master` only when objective ambiguity, missing permission, missing upstream
-material, or an out-of-scope decision prevents a defensible review. Avoid speculative and
-purely stylistic findings; never claim a reproduction or passing check that was not executed.
+Record objective ambiguity, missing permission, missing upstream material, or an out-of-scope
+decision as unresolved when it prevents a defensible review. Avoid speculative and purely
+stylistic findings; never claim a reproduction or passing check that was not executed.

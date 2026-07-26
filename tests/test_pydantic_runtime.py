@@ -21,7 +21,7 @@ from aeloon_core.pydantic_runtime import (
 )
 from aeloon_core.tools.base import FunctionTool, Tool
 from aeloon_core.tools.registry import ToolRegistry
-from aeloon_core.worker_terminal_tools import CompleteWorkArgs
+from aeloon_core.workers import WorkerReport as CompleteWorkArgs
 
 
 class _ReadArgs(BaseModel):

@@ -1,8 +1,8 @@
 """Strict, startup-scoped Worker definition discovery.
 
 Worker definitions are prompt configuration, not executable agent graphs. A registry
-loads the built-in definitions and project overrides once, then exposes immutable
-snapshots suitable for persisting with a WorkerSession.
+loads built-ins and project overrides once, then exposes immutable snapshots to the
+current-turn Harness workflow.
 """
 
 from __future__ import annotations
@@ -14,10 +14,17 @@ from collections.abc import Mapping
 from importlib.resources import files
 from pathlib import Path
 from types import MappingProxyType
-from typing import Annotated, Any, Self
+from typing import Annotated, Any, Literal, Self
 
 import yaml
-from pydantic import BaseModel, ConfigDict, StringConstraints, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    ValidationError,
+    model_validator,
+)
 from yaml.constructor import ConstructorError
 from yaml.events import AliasEvent
 from yaml.nodes import MappingNode
@@ -83,7 +90,7 @@ class _WorkerHeader(_FrozenStrictModel):
 
 
 class WorkerSnapshot(_FrozenStrictModel):
-    """An immutable, persistence-ready copy of one Worker definition."""
+    """An immutable startup snapshot of one Worker definition."""
 
     id: WorkerIdentifier
     description: WorkerDescription
@@ -111,6 +118,35 @@ class WorkerSnapshot(_FrozenStrictModel):
             "source": self.source,
             "digest": self.digest,
         }
+
+
+class WorkerEvidence(BaseModel):
+    """One bounded evidence item returned by an ephemeral Harness agent."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, str_strip_whitespace=True)
+
+    kind: Literal["file", "test", "typecheck", "lint", "runtime", "source"]
+    locator: str = Field(min_length=1, max_length=1_000)
+    claim: str = Field(min_length=1, max_length=1_000)
+    status: Literal["passed", "failed", "observed", "not_applicable"]
+    method: str | None = Field(default=None, min_length=1, max_length=2_000)
+    finding_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
+    )
+
+
+class WorkerReport(BaseModel):
+    """Structured result returned directly to the Master within one turn."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, str_strip_whitespace=True)
+
+    summary: str = Field(min_length=1, max_length=8_000)
+    artifacts: tuple[str, ...] = Field(default=(), max_length=32)
+    evidence: tuple[WorkerEvidence, ...] = Field(default=(), max_length=32)
+    unresolved: tuple[str, ...] = Field(default=(), max_length=32)
 
 
 class _UniqueKeySafeLoader(yaml.SafeLoader):
@@ -313,6 +349,8 @@ __all__ = [
     "MAX_WORKER_SOURCE_METADATA_CHARS",
     "WORKER_ID_PATTERN",
     "WorkerDefinitionError",
+    "WorkerEvidence",
+    "WorkerReport",
     "WorkerRegistry",
     "WorkerSnapshot",
     "parse_worker",

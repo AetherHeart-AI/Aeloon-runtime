@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from aeloon_core.tools.filesystem import ReadTool, WriteTool
+from aeloon_core.tools.filesystem import ReadTool
 from aeloon_core.tools.search_grep import GlobTool, GrepTool
 
 
@@ -106,19 +106,6 @@ async def test_read_allows_parent_traversal_outside_workspace(tmp_path: Path) ->
     result = await tool.execute(path="../outside.txt")
 
     assert "via parent" in result
-
-
-@pytest.mark.asyncio
-async def test_write_allows_absolute_path_outside_workspace(tmp_path: Path) -> None:
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    outside = tmp_path / "created-outside.txt"
-    tool = WriteTool(workspace=workspace, denied_paths=(tmp_path / "runtime",))
-
-    result = await tool.execute(path=str(outside), content="written outside\n")
-
-    assert result.startswith("Successfully wrote")
-    assert outside.read_text(encoding="utf-8") == "written outside\n"
 
 
 @pytest.mark.asyncio

@@ -76,15 +76,15 @@ def test_model_routing_config_supports_master_and_worker_overrides(tmp_path: Pat
     }
 
 
-def test_request_budgets_support_master_and_worker_overrides(tmp_path: Path) -> None:
+def test_harness_limits_are_first_class_config(tmp_path: Path) -> None:
     path = tmp_path / "config.json"
     path.write_text(
         json.dumps(
             {
                 "agents": {
-                    "budgets": {
-                        "master": 12,
-                        "workers": {"explorer": 8, "reviewer": 30},
+                    "harness": {
+                        "max_agent_calls": 12,
+                        "sub_agent_request_limit": 8,
                     }
                 }
             }
@@ -94,21 +94,50 @@ def test_request_budgets_support_master_and_worker_overrides(tmp_path: Path) -> 
 
     config = load_config(path)
 
-    assert config.agents.budgets.master == 12
-    assert config.agents.budgets.workers == {"explorer": 8, "reviewer": 30}
+    assert config.agents.harness.max_agent_calls == 12
+    assert config.agents.harness.sub_agent_request_limit == 8
 
 
-def test_config_set_writes_role_specific_model_and_budget_routes(
+def test_removed_durable_settings_are_dropped_during_config_load(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "skills": {"enabled": True},
+                "agents": {
+                    "budgets": {"master": 12, "workers": {"reviewer": 30}},
+                    "harness": {
+                        "dynamic_workflow_enabled": False,
+                        "workflow_memory_mb": 512,
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    dumped = config.model_dump(mode="json")
+    assert "skills" not in dumped
+    assert "budgets" not in dumped["agents"]
+    assert "dynamic_workflow_enabled" not in dumped["agents"]["harness"]
+    assert "workflow_memory_mb" not in dumped["agents"]["harness"]
+
+
+def test_config_set_writes_role_specific_model_and_harness_limits(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "config.json"
 
     main(["config", "set", "--config", str(path), "master-model", "fast-model"])
-    main(["config", "set", "--config", str(path), "reviewer-max-iterations", "31"])
+    main(["config", "set", "--config", str(path), "harness-max-agent-calls", "31"])
 
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["agents"]["routing"]["master"] == "fast-model"
-    assert payload["agents"]["budgets"]["workers"]["reviewer"] == 31
+    assert payload["agents"]["harness"]["max_agent_calls"] == 31
 
 
 def test_load_config_still_rejects_unknown_agent_defaults(tmp_path: Path) -> None:

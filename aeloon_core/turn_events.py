@@ -1,10 +1,9 @@
-"""Bridge kernel progress callbacks into terminal event streams."""
+"""Bridge kernel progress callbacks into structured UI event streams."""
 
 from __future__ import annotations
 
 import json
 import re
-import unicodedata
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -19,16 +18,7 @@ from aeloon_core.transitions import accumulate_usage
 
 Emit = Callable[[str, dict[str, Any]], Awaitable[None]]
 LOG_TEXT_PREVIEW_CHARS = 240
-_WORKER_ACTIVITY_PHASES = {
-    "analyzing",
-    "planning",
-    "drafting",
-    "using_tool",
-    "processing",
-    "working_step",
-    "finalizing",
-}
-_WORKER_ACTIVITY_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
+WEB_TOOL_RESULT_CHARS = 16_000
 _WORKER_ACTIVITY_ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|[@-_])")
 
 
@@ -40,13 +30,10 @@ class TurnEventProgress:
         *,
         session_id: str,
         emit: Emit,
-        allow_worker_tool_output: bool = False,
     ) -> None:
         self.session_id = session_id
         self.turn_id = uuid.uuid4().hex[:12]
         self.emit = emit
-        # Only the local OpenTUI bridge enables this operator capability.
-        self.allow_worker_tool_output = allow_worker_tool_output
         self.blocks: list[dict[str, Any]] = []
         self._text_block_id: str | None = None
         self._reasoning_block_id: str | None = None
@@ -54,6 +41,7 @@ class TurnEventProgress:
         self._started = False
         self._turn_started_at: str | None = None
         self.usage: dict[str, int] = {}
+        self.duration_ms: int | None = None
         self.usage_by_node_kind: dict[str, dict[str, int]] = {}
         self.usage_by_component: dict[str, dict[str, int]] = {}
 
@@ -88,7 +76,7 @@ class TurnEventProgress:
         )
 
     async def on_llm_delta(self, delta: str) -> None:
-        block = await self._ensure_text_block()
+        block = await self._ensure_text_block(role="narration")
         block["content"] = str(block.get("content") or "") + delta
         payload = self._payload(
             block_id=block["id"],
@@ -234,28 +222,23 @@ class TurnEventProgress:
         summary: str | None = None,
         usage: dict[str, Any] | None = None,
         objective: str | None = None,
-        ephemeral: bool = False,
     ) -> None:
-        """Publish lifecycle plus a bounded result for non-durable Harness agents."""
+        """Publish bounded lifecycle data for an ephemeral Harness agent."""
 
-        ephemeral_summary = (
-            _safe_worker_activity_text(summary, limit=1_000)
-            if ephemeral and summary
-            else ""
+        safe_summary = (
+            _safe_worker_activity_text(summary, limit=1_000) if summary else ""
         )
-        ephemeral_usage = (
+        safe_usage = (
             {
                 str(key): max(0, int(value))
                 for key, value in (usage or {}).items()
                 if isinstance(value, int | float) and not isinstance(value, bool)
             }
-            if ephemeral
+            if usage
             else {}
         )
-        ephemeral_objective = (
-            _safe_worker_activity_text(objective, limit=500)
-            if ephemeral and objective
-            else ""
+        safe_objective = (
+            _safe_worker_activity_text(objective, limit=500) if objective else ""
         )
         await self.emit(
             "chat.worker.lifecycle",
@@ -266,116 +249,11 @@ class TurnEventProgress:
                 run_sequence=max(1, int(run_sequence)),
                 worker_type_id=worker_type_id,
                 status=status,
+                ephemeral=True,
                 duration_ms=duration_ms,
-                **({"summary": ephemeral_summary} if ephemeral_summary else {}),
-                **({"usage": ephemeral_usage} if ephemeral_usage else {}),
-                **({"objective": ephemeral_objective} if ephemeral_objective else {}),
-                ts=_now(),
-            ),
-        )
-
-    async def on_worker_heartbeat(
-        self,
-        *,
-        worker_id: str,
-        run_id: str,
-        worker_type_id: str,
-        status: str,
-        elapsed_ms: int,
-        run_sequence: int = 1,
-    ) -> None:
-        await self.emit(
-            "chat.worker.heartbeat",
-            self._payload(
-                worker_id=worker_id,
-                run_id=run_id,
-                run_sequence=max(1, int(run_sequence)),
-                worker_type_id=worker_type_id,
-                status=status,
-                elapsed_ms=max(0, elapsed_ms),
-                ts=_now(),
-            ),
-        )
-
-    async def on_worker_activity(
-        self,
-        *,
-        worker_id: str,
-        run_id: str,
-        worker_type_id: str,
-        label: str,
-        revision: int,
-        phase: str,
-        run_sequence: int = 1,
-        tool_names: tuple[str, ...] = (),
-        current_step: str | None = None,
-        todo_completed: int | None = None,
-        todo_total: int | None = None,
-        detail_source: str = "host",
-    ) -> None:
-        """Publish one display-only Worker activity snapshot outside Master history."""
-
-        if phase not in _WORKER_ACTIVITY_PHASES:
-            return
-        safe_tools = tuple(
-            name
-            for name in tool_names[:4]
-            if _WORKER_ACTIVITY_IDENTIFIER.fullmatch(name)
-        )
-        safe_step = _safe_worker_activity_text(current_step)
-        await self.emit(
-            "chat.worker.activity",
-            self._payload(
-                worker_id=worker_id,
-                run_id=run_id,
-                run_sequence=max(1, int(run_sequence)),
-                worker_type_id=worker_type_id,
-                label=label,
-                revision=max(1, int(revision)),
-                phase=phase,
-                tool_names=safe_tools,
-                current_step=safe_step or None,
-                todo_completed=(
-                    max(0, int(todo_completed)) if todo_completed is not None else None
-                ),
-                todo_total=max(0, int(todo_total)) if todo_total is not None else None,
-                detail_source=(
-                    "worker_declared" if detail_source == "worker_declared" else "host"
-                ),
-                ts=_now(),
-            ),
-        )
-
-    async def on_worker_tool_result(
-        self,
-        *,
-        worker_id: str,
-        run_id: str,
-        worker_type_id: str,
-        label: str,
-        tool_name: str,
-        status: str,
-        metrics: dict[str, Any],
-        duration_ms: int | None,
-        run_sequence: int = 1,
-    ) -> None:
-        """Emit metrics plus bounded exec output or a failure preview for operators."""
-
-        safe_metrics = dict(metrics)
-        if not self.allow_worker_tool_output:
-            safe_metrics.pop("result_preview", None)
-        await self.emit(
-            "chat.worker.tool.result",
-            self._payload(
-                worker_id=worker_id,
-                run_id=run_id,
-                run_sequence=max(1, int(run_sequence)),
-                worker_type_id=worker_type_id,
-                label=label,
-                tool_name=tool_name,
-                status=status,
-                duration_ms=duration_ms,
-                metrics=safe_metrics,
+                **({"summary": safe_summary} if safe_summary else {}),
+                **({"usage": safe_usage} if safe_usage else {}),
+                **({"objective": safe_objective} if safe_objective else {}),
                 ts=_now(),
             ),
         )
@@ -461,9 +339,11 @@ class TurnEventProgress:
                     "summary": f"{node.tool_name} returned {len(result)} characters",
                 },
             )
+        bounded_result = _bounded_web_tool_result(block["result"])
         ui_patch = {
             "status": block["status"],
-            "result": block["result"],
+            "result": bounded_result,
+            "result_truncated": len(block["result"]) > WEB_TOOL_RESULT_CHARS,
             "completed_at": block["completed_at"],
             "duration_ms": duration_ms,
         }
@@ -521,28 +401,52 @@ class TurnEventProgress:
             block = self._find_block(self._text_block_id)
         current_content = str((block or {}).get("content") or "")
         if block is None or not current_content.strip():
-            block = await self._ensure_text_block()
+            block = await self._ensure_text_block(role="final")
             block["content"] = content
+            block["role"] = "final"
             await self.emit(
                 "chat.block.update",
-                self._payload(block_id=block["id"], patch={"content": content}, ts=_now()),
+                self._payload(
+                    block_id=block["id"],
+                    patch={"content": content, "role": "final"},
+                    ts=_now(),
+                ),
             )
         elif current_content.strip() != content.strip():
             # Streaming text may be process narration from an earlier Master model
-            # round. Preserve it, but project finish_turn(final_content) as a distinct
-            # canonical answer block for both the live UI and persisted session record.
-            block = await self._ensure_block(None, "text")
+            # round. Preserve it, but project the final answer as a distinct canonical
+            # block for both the live UI and persisted session record.
+            block = await self._ensure_block(
+                None,
+                "text",
+                extra_fields={"role": "final"},
+            )
             self._text_block_id = block["id"]
             block["content"] = content
             await self.emit(
                 "chat.block.update",
-                self._payload(block_id=block["id"], patch={"content": content}, ts=_now()),
+                self._payload(
+                    block_id=block["id"],
+                    patch={"content": content, "role": "final"},
+                    ts=_now(),
+                ),
+            )
+        else:
+            block["role"] = "final"
+            await self.emit(
+                "chat.block.update",
+                self._payload(
+                    block_id=block["id"],
+                    patch={"role": "final"},
+                    ts=_now(),
+                ),
             )
         completed_at = _now()
         duration_ms = _duration_ms(self._turn_started_at, completed_at)
+        self.duration_ms = duration_ms
         payload = self._payload(
             final=content,
-            blocks=self.blocks,
+            blocks=[_web_block_view(block) for block in self.blocks],
             duration_ms=duration_ms,
             ts=completed_at,
         )
@@ -596,8 +500,12 @@ class TurnEventProgress:
         )
         return block
 
-    async def _ensure_text_block(self) -> dict[str, Any]:
-        block = await self._ensure_block(self._text_block_id, "text")
+    async def _ensure_text_block(self, *, role: str) -> dict[str, Any]:
+        block = await self._ensure_block(
+            self._text_block_id,
+            "text",
+            extra_fields={"role": role},
+        )
         self._text_block_id = block["id"]
         return block
 
@@ -613,8 +521,7 @@ class TurnEventProgress:
             return
         block = await self._ensure_reasoning_block()
         entry = _json_safe({"text": clean, **(data or {})}) if data else {"text": clean}
-        rendered = json.dumps(entry, ensure_ascii=False) if data else clean
-        line = f"{_now()} [{kind}] {rendered}"
+        line = clean
         current = str(block.get("content") or "")
         separator = "\n" if current else ""
         block["content"] = f"{current}{separator}{line}"
@@ -694,15 +601,33 @@ def _tool_call_detail(tool_call: ToolCallView) -> dict[str, Any]:
     }
 
 
+def _bounded_web_tool_result(value: Any) -> str:
+    text = str(value or "")
+    if len(text) <= WEB_TOOL_RESULT_CHARS:
+        return text
+    omitted = len(text) - WEB_TOOL_RESULT_CHARS
+    marker = f"\n… {omitted} characters omitted …\n"
+    available = WEB_TOOL_RESULT_CHARS - len(marker)
+    head = available // 2
+    tail = available - head
+    return f"{text[:head]}{marker}{text[-tail:]}"
+
+
+def _web_block_view(block: dict[str, Any]) -> dict[str, Any]:
+    view = dict(block)
+    if view.get("type") == "tool_call" and view.get("result") is not None:
+        result = str(view["result"])
+        view["result"] = _bounded_web_tool_result(result)
+        view["result_truncated"] = len(result) > WEB_TOOL_RESULT_CHARS
+    return view
+
+
 def _safe_worker_activity_text(value: Any, *, limit: int = 100) -> str:
     text = _WORKER_ACTIVITY_ANSI.sub("", str(value or ""))
     text = "".join(
-        " "
-        if char.isspace()
-        else ""
-        if unicodedata.category(char).startswith("C")
-        else char
+        " " if char.isspace() else char
         for char in text
+        if char.isprintable() or char.isspace()
     )
     return " ".join(text.split())[:limit]
 
