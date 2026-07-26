@@ -42,6 +42,11 @@ CONFIG_SETTERS = {
         "harness",
         "sub_agent_request_limit",
     ),
+    "harness-max-worker-continuations": (
+        "agents",
+        "harness",
+        "max_worker_continuations",
+    ),
     "harness-workflow-cpu-seconds": ("agents", "harness", "workflow_cpu_seconds"),
     "context-compaction-enabled": ("agents", "defaults", "context_compaction", "enabled"),
     "context-compaction-trigger-ratio": (
@@ -437,6 +442,7 @@ def _coerce_config_value(key: str, value: str) -> Any:
         "max-iterations",
         "max-output-tokens",
         "harness-max-agent-calls",
+        "harness-max-worker-continuations",
         "harness-sub-agent-request-limit",
         "runtime-stuck-detection-threshold",
     }:

@@ -154,6 +154,7 @@ Configuration is JSON. The relevant agent section is:
     "harness": {
       "max_agent_calls": 16,
       "sub_agent_request_limit": 25,
+      "max_worker_continuations": 4,
       "workflow_cpu_seconds": 10.0
     }
   }

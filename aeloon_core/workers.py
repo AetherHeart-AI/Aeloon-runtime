@@ -143,10 +143,12 @@ class WorkerReport(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, str_strip_whitespace=True)
 
+    status: Literal["completed", "partial", "blocked"] = "completed"
     summary: str = Field(min_length=1, max_length=8_000)
     artifacts: tuple[str, ...] = Field(default=(), max_length=32)
     evidence: tuple[WorkerEvidence, ...] = Field(default=(), max_length=32)
     unresolved: tuple[str, ...] = Field(default=(), max_length=32)
+    next_steps: tuple[str, ...] = Field(default=(), max_length=32)
 
 
 class _UniqueKeySafeLoader(yaml.SafeLoader):

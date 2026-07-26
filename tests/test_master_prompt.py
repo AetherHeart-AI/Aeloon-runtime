@@ -22,6 +22,9 @@ def test_prompt_describes_one_ephemeral_harness_path() -> None:
     assert "run_workflow" in prompt
     assert "asyncio.gather" in prompt
     assert "plain text" in prompt
+    assert "Each Worker segment has at most 25 model requests" in prompt
+    assert "At most 4 continuations (5 total segments)" in prompt
+    assert "you—not the Worker—must decide" in prompt
     assert "durable WorkerSessions" in prompt
     assert "create_flow" not in prompt
     assert "resume_worker" not in prompt

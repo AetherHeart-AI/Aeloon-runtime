@@ -112,7 +112,13 @@ class AeloonCoreOrchestrator:
         instructions = (
             SYSTEM_PROMPT.strip()
             + f"\n\nWorkspace: {self.config.workspace}\n\n"
-            + master_system_prompt(worker_types=worker_types)
+            + master_system_prompt(
+                worker_types=worker_types,
+                worker_request_limit=self.config.agents.harness.sub_agent_request_limit,
+                max_worker_continuations=(
+                    self.config.agents.harness.max_worker_continuations
+                ),
+            )
         )
         tools = ToolRegistry()
         for name in ("list", "read", "glob", "grep"):

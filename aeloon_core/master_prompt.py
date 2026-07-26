@@ -9,9 +9,15 @@ MASTER_SYSTEM_MARKER = "[aeloon-core:master-system]"
 MASTER_USER_REQUEST_MARKER = "\nUSER REQUEST (authoritative):\n"
 
 
-def master_system_prompt(*, worker_types: list[dict[str, Any]]) -> str:
+def master_system_prompt(
+    *,
+    worker_types: list[dict[str, Any]],
+    worker_request_limit: int = 25,
+    max_worker_continuations: int = 4,
+) -> str:
     """Describe outcomes and boundaries without reimplementing orchestration."""
 
+    max_worker_segments = max_worker_continuations + 1
     return (
         f"{MASTER_SYSTEM_MARKER}\n"
         "You are the Master for the current user conversation. Own the request, "
@@ -30,6 +36,21 @@ def master_system_prompt(*, worker_types: list[dict[str, Any]]) -> str:
         "or an independent review. Pass an outcome-oriented `task` describing WHAT must "
         "be true, scope, constraints, and acceptance evidence—not shell commands or a "
         "step-by-step method.\n\n"
+        f"Master and Workers have independent request counters. Each Worker segment has "
+        f"at most {worker_request_limit} model requests. On its final request the Worker "
+        "must stop using tools and return a progress report with `status`, `summary`, "
+        "`artifacts`, `evidence`, `unresolved`, and `next_steps`. After a `partial` report, "
+        "you—not the Worker—must decide whether another segment is likely to make material "
+        "progress. If continuing, make a new call to the same Worker type and include the "
+        "previous report as continuation context so it resumes from the workspace state "
+        f"instead of repeating work. At most {max_worker_continuations} continuations "
+        f"({max_worker_segments} total segments) are allowed for one Worker type in this "
+        "turn, and the Host enforces that ceiling. Never run sequential continuation "
+        "segments for the same Worker inside one workflow script: return each segment's "
+        "report to your context, judge it, then start the next workflow call only if "
+        "warranted. A `completed` or irrecoverably `blocked` report must not be expanded. "
+        "Do not continue merely because the Worker asks; base the decision on verified "
+        "progress, remaining work, and expected value.\n\n"
         "Use `list`, `read`, `glob`, and `grep` for small observations. Master has no "
         "direct mutation or shell capability; delegated Harness agents perform domain "
         "work with their filesystem, shell, repository-context, and planning "

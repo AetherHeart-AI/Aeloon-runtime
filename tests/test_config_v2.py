@@ -85,6 +85,7 @@ def test_harness_limits_are_first_class_config(tmp_path: Path) -> None:
                     "harness": {
                         "max_agent_calls": 12,
                         "sub_agent_request_limit": 8,
+                        "max_worker_continuations": 3,
                     }
                 }
             }
@@ -96,6 +97,7 @@ def test_harness_limits_are_first_class_config(tmp_path: Path) -> None:
 
     assert config.agents.harness.max_agent_calls == 12
     assert config.agents.harness.sub_agent_request_limit == 8
+    assert config.agents.harness.max_worker_continuations == 3
 
 
 def test_removed_durable_settings_are_dropped_during_config_load(
@@ -134,10 +136,21 @@ def test_config_set_writes_role_specific_model_and_harness_limits(
 
     main(["config", "set", "--config", str(path), "master-model", "fast-model"])
     main(["config", "set", "--config", str(path), "harness-max-agent-calls", "31"])
+    main(
+        [
+            "config",
+            "set",
+            "--config",
+            str(path),
+            "harness-max-worker-continuations",
+            "4",
+        ]
+    )
 
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["agents"]["routing"]["master"] == "fast-model"
     assert payload["agents"]["harness"]["max_agent_calls"] == 31
+    assert payload["agents"]["harness"]["max_worker_continuations"] == 4
 
 
 def test_load_config_still_rejects_unknown_agent_defaults(tmp_path: Path) -> None:

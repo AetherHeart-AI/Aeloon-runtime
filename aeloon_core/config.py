@@ -128,6 +128,7 @@ class AgentHarnessConfig(BaseModel):
 
     max_agent_calls: int = Field(default=16, ge=1, le=128)
     sub_agent_request_limit: int = Field(default=25, ge=1, le=100)
+    max_worker_continuations: int = Field(default=4, ge=0, le=16)
     workflow_cpu_seconds: float = Field(default=10.0, ge=1.0, le=60.0)
 
 
