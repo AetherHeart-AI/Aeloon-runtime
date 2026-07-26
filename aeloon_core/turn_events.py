@@ -223,6 +223,8 @@ class TurnEventProgress:
         summary: str | None = None,
         usage: dict[str, Any] | None = None,
         objective: str | None = None,
+        template_id: str | None = None,
+        node_id: str | None = None,
     ) -> None:
         """Publish bounded lifecycle data for an ephemeral Harness agent."""
 
@@ -241,6 +243,17 @@ class TurnEventProgress:
         safe_objective = (
             _safe_worker_activity_text(objective, limit=500) if objective else ""
         )
+        if safe_usage:
+            component = (
+                f"template:{template_id}:{node_id}"
+                if template_id and node_id
+                else f"worker:{worker_type_id}"
+            )
+            self._record_usage(
+                safe_usage,
+                node_kind="worker",
+                component=component,
+            )
         await self.emit(
             "chat.worker.lifecycle",
             self._payload(
@@ -255,6 +268,8 @@ class TurnEventProgress:
                 **({"summary": safe_summary} if safe_summary else {}),
                 **({"usage": safe_usage} if safe_usage else {}),
                 **({"objective": safe_objective} if safe_objective else {}),
+                **({"template_id": template_id} if template_id else {}),
+                **({"node_id": node_id} if node_id else {}),
                 ts=_now(),
             ),
         )

@@ -132,12 +132,25 @@ class AgentHarnessConfig(BaseModel):
     workflow_cpu_seconds: float = Field(default=10.0, ge=1.0, le=60.0)
 
 
+class AgentTemplateConfig(BaseModel):
+    """Settings for the fixed Workflow Template fast path."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    max_concurrency: int = Field(default=4, ge=1, le=16)
+    max_nodes: int = Field(default=16, ge=1, le=16)
+    max_upstream_chars: int = Field(default=32_000, ge=1_000, le=128_000)
+    presearch_limit: int = Field(default=3, ge=1, le=10)
+
+
 class AgentsConfig(BaseModel):
     """Agent namespace."""
 
     defaults: AgentDefaultsConfig = Field(default_factory=AgentDefaultsConfig)
     routing: AgentRoutingConfig = Field(default_factory=AgentRoutingConfig)
     harness: AgentHarnessConfig = Field(default_factory=AgentHarnessConfig)
+    templates: AgentTemplateConfig = Field(default_factory=AgentTemplateConfig)
 
 
 class ExecToolConfig(BaseModel):

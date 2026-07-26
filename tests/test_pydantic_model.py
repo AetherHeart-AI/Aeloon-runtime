@@ -11,7 +11,7 @@ from pydantic_ai.providers.anthropic import AnthropicProvider
 from pydantic_ai.providers.openai import OpenAIProvider
 
 from aeloon_core.config import AnthropicProviderConfig, VolcengineProviderConfig
-from aeloon_core.pydantic_model import (
+from aeloon_core.harness.models import (
     build_anthropic_model,
     build_volcengine_model,
     is_prompt_caching_unsupported_error,
@@ -42,7 +42,7 @@ async def test_builds_official_anthropic_model_and_endpoint_cache_mode(
             kwargs.pop("proxy", None)
             super().__init__(*args, **kwargs)
 
-    monkeypatch.setattr("aeloon_core.pydantic_model.httpx.AsyncClient", CapturingClient)
+    monkeypatch.setattr("aeloon_core.harness.models.httpx.AsyncClient", CapturingClient)
     bundle = build_anthropic_model(
         provider=AnthropicProviderConfig(
             api_key="sk-test",
@@ -121,7 +121,7 @@ async def test_builds_volcengine_agent_plan_responses_model(
             kwargs.pop("proxy", None)
             super().__init__(*args, **kwargs)
 
-    monkeypatch.setattr("aeloon_core.pydantic_model.httpx.AsyncClient", CapturingClient)
+    monkeypatch.setattr("aeloon_core.harness.models.httpx.AsyncClient", CapturingClient)
     bundle = build_volcengine_model(
         provider=VolcengineProviderConfig(
             api_key="ark-test-key",

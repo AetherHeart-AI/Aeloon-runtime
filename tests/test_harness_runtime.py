@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import BaseModel
 from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.messages import (
     ModelMessage,
@@ -19,25 +20,47 @@ from pydantic_ai_harness.compaction import SlidingWindow
 from pydantic_ai_harness.dynamic_workflow import DynamicWorkflow
 
 from aeloon_core.config import Config
-from aeloon_core.harness_runtime import (
+from aeloon_core.customization.roles import Role, WorkerRegistry, snapshot_role
+from aeloon_core.harness.agents import (
+    _dynamic_worker_instructions,
     _WorkerSegmentBudget,
     _workflow_name,
     history_capability,
     master_harness_capabilities,
 )
-from aeloon_core.model_router import ModelRouter
-from aeloon_core.pydantic_runtime import (
+from aeloon_core.harness.routing import ModelRouter
+from aeloon_core.harness.runtime import (
     AgentRunSpec,
     CapabilityManifest,
     HarnessAgentRuntime,
 )
 from aeloon_core.tools.registry import ToolRegistry
-from aeloon_core.workers import WorkerRegistry
 
 
 def test_workflow_names_are_valid_python_identifiers() -> None:
     assert _workflow_name("code-reviewer") == "code_reviewer"
     assert _workflow_name("class") == "worker_class"
+
+
+def test_custom_role_output_is_not_forced_into_worker_report() -> None:
+    class CustomOutput(BaseModel):
+        result: str
+
+    class CustomRole(Role):
+        id = "custom"
+        description = "Return a custom result"
+        system_prompt = "Establish the result."
+        output_model = CustomOutput
+        capabilities = ()
+
+    instructions = _dynamic_worker_instructions(
+        snapshot_role(CustomRole, source="test")
+    )
+
+    assert "structured CustomOutput" in instructions
+    assert "Return a WorkerReport" not in instructions
+    assert "through FileSystem and Shell" not in instructions
+    assert "write_plan" not in instructions
 
 
 def test_history_policy_is_owned_by_harness_sliding_window(tmp_path: Path) -> None:

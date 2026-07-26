@@ -7,7 +7,7 @@ from pydantic_ai.messages import ModelResponse, TextPart
 from pydantic_ai.models.function import FunctionModel
 
 from aeloon_core.config import AgentRoutingConfig, AgentsConfig, Config
-from aeloon_core.model_router import FAST_ANTHROPIC_MODEL, ModelRouter
+from aeloon_core.harness.routing import FAST_ANTHROPIC_MODEL, ModelRouter
 
 
 @pytest.mark.asyncio
@@ -125,6 +125,19 @@ def test_injected_model_preserves_the_legacy_all_role_override() -> None:
     assert router.resolve_worker("builder").settings["temperature"] == 0
 
 
+def test_python_role_model_tier_is_used_when_no_route_override() -> None:
+    router = ModelRouter(Config())
+
+    assert (
+        router.resolve_worker("custom", preferred_tier="fast").model_name
+        == FAST_ANTHROPIC_MODEL
+    )
+    assert (
+        router.resolve_worker("explorer", preferred_tier="strong").model_name
+        == Config().agents.defaults.model
+    )
+
+
 @pytest.mark.asyncio
 async def test_router_closes_each_reused_bundle_exactly_once(
     monkeypatch: pytest.MonkeyPatch,
@@ -149,7 +162,7 @@ async def test_router_closes_each_reused_bundle_exactly_once(
         )
 
     monkeypatch.setattr(
-        "aeloon_core.model_router.build_anthropic_model",
+        "aeloon_core.harness.routing.build_anthropic_model",
         build_bundle,
     )
     router = ModelRouter(Config())

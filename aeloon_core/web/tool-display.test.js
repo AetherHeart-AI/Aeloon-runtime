@@ -61,6 +61,20 @@ describe("tool display model", () => {
     expect(display.headline).toBe("执行完成，工具未返回文本结果");
   });
 
+  test("shows fixed workflow template and objective", () => {
+    const display = describeToolBlock({
+      name: "workflow_execute",
+      status: "running",
+      arguments: {
+        template_id: "implement-review",
+        inputs: { objective: "实现模板快速路径" },
+      },
+    });
+
+    expect(display.label).toBe("运行固定工作流");
+    expect(display.headline).toBe("implement-review · 实现模板快速路径");
+  });
+
   test("redacts credentials without hiding harmless token limits", () => {
     const display = describeToolBlock({
       name: "execute",

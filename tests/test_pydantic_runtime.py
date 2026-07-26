@@ -11,8 +11,8 @@ from pydantic_ai.messages import ModelResponse, OutputToolCallEvent, TextPart, T
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.usage import RequestUsage
 
-from aeloon_core.pydantic_model import PromptCacheState
-from aeloon_core.pydantic_runtime import (
+from aeloon_core.harness.models import PromptCacheState
+from aeloon_core.harness.runtime import (
     AgentRunSpec,
     AgentRunStatus,
     PydanticAgentRuntime,

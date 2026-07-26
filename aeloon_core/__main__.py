@@ -48,6 +48,11 @@ CONFIG_SETTERS = {
         "max_worker_continuations",
     ),
     "harness-workflow-cpu-seconds": ("agents", "harness", "workflow_cpu_seconds"),
+    "templates-enabled": ("agents", "templates", "enabled"),
+    "templates-max-concurrency": ("agents", "templates", "max_concurrency"),
+    "templates-max-nodes": ("agents", "templates", "max_nodes"),
+    "templates-max-upstream-chars": ("agents", "templates", "max_upstream_chars"),
+    "templates-presearch-limit": ("agents", "templates", "presearch_limit"),
     "context-compaction-enabled": ("agents", "defaults", "context_compaction", "enabled"),
     "context-compaction-trigger-ratio": (
         "agents",
@@ -444,6 +449,10 @@ def _coerce_config_value(key: str, value: str) -> Any:
         "harness-max-agent-calls",
         "harness-max-worker-continuations",
         "harness-sub-agent-request-limit",
+        "templates-max-concurrency",
+        "templates-max-nodes",
+        "templates-max-upstream-chars",
+        "templates-presearch-limit",
         "runtime-stuck-detection-threshold",
     }:
         return int(value)
@@ -454,6 +463,7 @@ def _coerce_config_value(key: str, value: str) -> Any:
         "runtime-transition-trace-enabled",
         "runtime-stuck-detection-enabled",
         "prompt-caching",
+        "templates-enabled",
     }:
         return _parse_bool(value)
     return value

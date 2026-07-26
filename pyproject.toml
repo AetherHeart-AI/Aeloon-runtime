@@ -16,7 +16,6 @@ dependencies = [
   "pydantic-ai-harness[dynamic-workflow]>=0.9,<0.10",
   # Harness 0.9 still imports MontyRepl, removed in pydantic-monty 0.0.19.
   "pydantic-monty>=0.0.16,<0.0.19",
-  "pyyaml>=6.0",
 ]
 
 [dependency-groups]

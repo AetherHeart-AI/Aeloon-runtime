@@ -11,6 +11,9 @@ const TOOL_LABELS = {
   shell: "执行命令",
   write_file: "写入文件",
   write_plan: "更新计划",
+  workflow_describe: "查看工作流模板",
+  workflow_execute: "运行固定工作流",
+  workflow_search: "搜索工作流模板",
 };
 
 const EMPTY_RESULT_TEXT = new Set(["", "{}", "[]", "null", "none", "undefined"]);
@@ -63,6 +66,15 @@ export function summarizeArguments(name, value = {}) {
     const workflowTask = extractWorkflowTask(String(value.code || ""));
     if (workflowTask) return workflowTask;
     return task ? truncate(task) : "编排并运行临时 Worker";
+  }
+  if (name === "workflow_execute") {
+    const template = firstText(value, ["template_id"]);
+    const inputs = asRecord(value.inputs);
+    const objective = firstText(inputs, ["task", "objective", "prompt"]);
+    return [template, objective ? truncate(objective) : ""].filter(Boolean).join(" · ");
+  }
+  if (name === "workflow_describe") {
+    return firstText(value, ["template_id"]);
   }
   if (task) return truncate(task);
   if (command) return truncate(command.split("\n", 1)[0]);

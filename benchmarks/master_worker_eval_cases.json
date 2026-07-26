@@ -8,16 +8,56 @@
     "output_tokens",
     "revision_count"
   ],
+  "fixed_template_targets": {
+    "minimum_runs_per_case": 5,
+    "end_to_end_duration_p50_improvement": 0.2,
+    "acceptance_pass_rate_improvement": 0.1,
+    "full_baseline_must_not_regress": true
+  },
   "cases": [
     {
       "id": "single_builder_fix",
       "category": "single_node",
       "request": "Fix boolean parsing for `config set`, preserve every other coercion, and add regression tests for true, false, and invalid input.",
       "expected": {
+        "fixed_template_id": "delegate",
         "initial_worker_types": ["builder"],
         "advance_mode": "checkpointed",
         "minimum_frontier_width": 1,
         "requires_completed_evidence_gate": true
+      }
+    },
+    {
+      "id": "parallel_read_only_investigation",
+      "category": "fixed_parallel_investigate",
+      "request": "Independently inspect configuration loading, model routing, and session persistence, then summarize the three reports.",
+      "expected": {
+        "fixed_template_id": "parallel-investigate",
+        "initial_worker_types": ["explorer", "explorer", "explorer"],
+        "minimum_frontier_width": 3,
+        "requires_completed_evidence_gate": true
+      }
+    },
+    {
+      "id": "fixed_implement_review",
+      "category": "fixed_implement_review",
+      "request": "Implement the bounded config change in fixtures/eval/config.md, verify it, and independently review the result.",
+      "expected": {
+        "fixed_template_id": "implement-review",
+        "initial_worker_types": ["builder", "reviewer"],
+        "reviewer_checkpoint_required": true,
+        "requires_completed_evidence_gate": true
+      }
+    },
+    {
+      "id": "fixed_review_revision",
+      "category": "fixed_review_revision",
+      "request": "Implement the cache change in fixtures/eval/cache.md, fix actionable review findings for at most two rounds, and finish with a clean review.",
+      "expected": {
+        "fixed_template_id": "implement-review-revise",
+        "initial_worker_types": ["builder", "reviewer"],
+        "maximum_review_driven_revisions": 2,
+        "requires_finding_evidence_links": true
       }
     },
     {

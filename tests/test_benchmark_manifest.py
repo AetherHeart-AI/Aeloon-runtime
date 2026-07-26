@@ -25,6 +25,13 @@ def test_master_worker_evaluation_manifest_covers_control_plane_risks() -> None:
         "output_tokens",
         "revision_count",
     } <= set(payload["metrics"])
+    targets = payload["fixed_template_targets"]
+    assert targets == {
+        "minimum_runs_per_case": 5,
+        "end_to_end_duration_p50_improvement": 0.2,
+        "acceptance_pass_rate_improvement": 0.1,
+        "full_baseline_must_not_regress": True,
+    }
     cases = payload["cases"]
     assert len({case["id"] for case in cases}) == len(cases)
     assert {
@@ -34,7 +41,21 @@ def test_master_worker_evaluation_manifest_covers_control_plane_risks() -> None:
         "review_revision",
         "budget_partial",
         "request_master",
+        "fixed_parallel_investigate",
+        "fixed_implement_review",
+        "fixed_review_revision",
     } <= {case["category"] for case in cases}
+    fixed = [
+        case
+        for case in cases
+        if case["expected"].get("fixed_template_id") is not None
+    ]
+    assert {
+        "delegate",
+        "parallel-investigate",
+        "implement-review",
+        "implement-review-revise",
+    } <= {case["expected"]["fixed_template_id"] for case in fixed}
 
 
 def test_evaluation_comparator_reports_quality_latency_and_cost_deltas() -> None:

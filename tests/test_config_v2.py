@@ -100,6 +100,34 @@ def test_harness_limits_are_first_class_config(tmp_path: Path) -> None:
     assert config.agents.harness.max_worker_continuations == 3
 
 
+def test_template_fast_path_settings_are_first_class_config(tmp_path: Path) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "agents": {
+                    "templates": {
+                        "enabled": False,
+                        "max_concurrency": 2,
+                        "max_nodes": 8,
+                        "max_upstream_chars": 12_000,
+                        "presearch_limit": 2,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config.agents.templates.enabled is False
+    assert config.agents.templates.max_concurrency == 2
+    assert config.agents.templates.max_nodes == 8
+    assert config.agents.templates.max_upstream_chars == 12_000
+    assert config.agents.templates.presearch_limit == 2
+
+
 def test_removed_durable_settings_are_dropped_during_config_load(
     tmp_path: Path,
 ) -> None:
@@ -136,6 +164,8 @@ def test_config_set_writes_role_specific_model_and_harness_limits(
 
     main(["config", "set", "--config", str(path), "master-model", "fast-model"])
     main(["config", "set", "--config", str(path), "harness-max-agent-calls", "31"])
+    main(["config", "set", "--config", str(path), "templates-max-concurrency", "3"])
+    main(["config", "set", "--config", str(path), "templates-enabled", "false"])
     main(
         [
             "config",
@@ -151,6 +181,8 @@ def test_config_set_writes_role_specific_model_and_harness_limits(
     assert payload["agents"]["routing"]["master"] == "fast-model"
     assert payload["agents"]["harness"]["max_agent_calls"] == 31
     assert payload["agents"]["harness"]["max_worker_continuations"] == 4
+    assert payload["agents"]["templates"]["max_concurrency"] == 3
+    assert payload["agents"]["templates"]["enabled"] is False
 
 
 def test_load_config_still_rejects_unknown_agent_defaults(tmp_path: Path) -> None:

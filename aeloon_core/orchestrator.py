@@ -12,22 +12,25 @@ from pydantic_ai.settings import ModelSettings
 
 from aeloon_core.config import Config
 from aeloon_core.context import SYSTEM_PROMPT
-from aeloon_core.harness_runtime import master_harness_capabilities
-from aeloon_core.master_prompt import MASTER_USER_REQUEST_MARKER, master_system_prompt
-from aeloon_core.model_router import ModelRouter
-from aeloon_core.pydantic_runtime import (
+from aeloon_core.customization.catalog import Catalog
+from aeloon_core.harness import (
     AgentRunSpec,
     AgentRunStatus,
     CapabilityManifest,
     HarnessAgentRuntime,
+    ModelRouter,
+    RoleAgentFactory,
+    WorkflowRunner,
     deserialize_messages,
+    master_harness_capabilities,
     serialize_messages,
+    workflow_tools,
 )
+from aeloon_core.master_prompt import MASTER_USER_REQUEST_MARKER, master_system_prompt
 from aeloon_core.session import SessionStore
 from aeloon_core.tools.filesystem import ReadTool
 from aeloon_core.tools.registry import ToolRegistry
 from aeloon_core.tools.search_grep import GlobTool, GrepTool, ListTool
-from aeloon_core.workers import WorkerRegistry
 
 
 @dataclass
@@ -65,7 +68,8 @@ class AeloonCoreOrchestrator:
         master_binding = self.model_router.resolve_master()
         self.model_settings = dict(master_binding.settings)
         self.agent_runtime = HarnessAgentRuntime()
-        self.worker_types = WorkerRegistry.discover(config.workspace)
+        self.catalog = Catalog.discover(config.workspace)
+        self.worker_types = self.catalog.roles
         self.sessions = SessionStore(data_dir=config.data_dir)
         self.master_observation_tools = self._build_master_observation_tools()
 
@@ -109,11 +113,24 @@ class AeloonCoreOrchestrator:
         )
         history = deserialize_messages(stored_messages)
         worker_types = [snapshot.descriptor() for snapshot in self.worker_types.list()]
+        template_config = self.config.agents.templates
+        workflow_candidates = (
+            list(
+                self.catalog.workflows.search(
+                    prompt,
+                    limit=template_config.presearch_limit,
+                )
+            )
+            if template_config.enabled
+            else []
+        )
         instructions = (
             SYSTEM_PROMPT.strip()
             + f"\n\nWorkspace: {self.config.workspace}\n\n"
             + master_system_prompt(
                 worker_types=worker_types,
+                workflow_candidates=workflow_candidates,
+                workflow_templates_enabled=template_config.enabled,
                 worker_request_limit=self.config.agents.harness.sub_agent_request_limit,
                 max_worker_continuations=(
                     self.config.agents.harness.max_worker_continuations
@@ -125,6 +142,27 @@ class AeloonCoreOrchestrator:
             tool = self.master_observation_tools.get(name)
             assert tool is not None
             tools.register(tool)
+        role_factory = RoleAgentFactory(
+            config=self.config,
+            model_router=self.model_router,
+            roles=self.worker_types,
+            progress=on_progress,
+            session_id=actual_session_id,
+            turn_id=turn_id,
+        )
+        if template_config.enabled:
+            workflow_runner = WorkflowRunner(
+                config=self.config,
+                roles=self.worker_types,
+                role_factory=role_factory,
+            )
+            for tool in workflow_tools(
+                config=self.config,
+                roles=self.worker_types,
+                workflows=self.catalog.workflows,
+                runner=workflow_runner,
+            ):
+                tools.register(tool)
 
         defaults = self.config.agents.defaults
         policy = defaults.runtime
@@ -156,6 +194,7 @@ class AeloonCoreOrchestrator:
                     config=self.config,
                     model_router=self.model_router,
                     worker_types=self.worker_types,
+                    role_factory=role_factory,
                 ),
                 prompt_cache=binding.prompt_cache,
             )

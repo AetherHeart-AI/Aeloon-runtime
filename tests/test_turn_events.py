@@ -103,12 +103,26 @@ async def test_ephemeral_harness_worker_publishes_bounded_result_metadata() -> N
         objective="Review the provider migration",
         summary="Verified the provider migration.",
         usage={"input_tokens": 700, "output_tokens": 300},
+        template_id="implement-review",
+        node_id="review",
     )
 
     payload = events[0][1]
     assert payload["objective"] == "Review the provider migration"
     assert payload["summary"] == "Verified the provider migration."
     assert payload["usage"] == {"input_tokens": 700, "output_tokens": 300}
+    assert payload["template_id"] == "implement-review"
+    assert payload["node_id"] == "review"
+    assert progress.usage == {
+        "input_tokens": 700,
+        "output_tokens": 300,
+        "total_tokens": 1000,
+    }
+    assert progress.usage_by_component["template:implement-review:review"] == {
+        "input_tokens": 700,
+        "output_tokens": 300,
+        "total_tokens": 1000,
+    }
 
 
 def test_web_tool_results_are_bounded_before_they_are_emitted() -> None:
