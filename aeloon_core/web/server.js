@@ -27,6 +27,7 @@ const bridge = Bun.spawn([python, "-m", "aeloon_core.web_bridge"], {
 
 const clients = new Set();
 let bridgeClosed = false;
+let shuttingDown = false;
 
 function broadcast(record) {
   const encoded = typeof record === "string" ? record : JSON.stringify(record);
@@ -55,6 +56,13 @@ async function readBridge() {
       try {
         const record = JSON.parse(line);
         broadcast(record);
+        if (
+          record.type === "response" &&
+          record.command === "shutdown" &&
+          record.ok
+        ) {
+          void shutdown({ requestBridge: false });
+        }
       } catch {
         broadcast({
           type: "server.error",
@@ -64,10 +72,12 @@ async function readBridge() {
     }
   }
   bridgeClosed = true;
-  broadcast({
-    type: "server.error",
-    error: { code: "bridge_closed", message: "Runtime bridge stopped." },
-  });
+  if (!shuttingDown) {
+    broadcast({
+      type: "server.error",
+      error: { code: "bridge_closed", message: "Runtime bridge stopped." },
+    });
+  }
 }
 
 async function readBridgeErrors() {
@@ -84,6 +94,7 @@ const assets = new Map([
   ["/dom.js", ["dom.js", "text/javascript; charset=utf-8"]],
   ["/state.js", ["state.js", "text/javascript; charset=utf-8"]],
   ["/markdown.js", ["markdown.js", "text/javascript; charset=utf-8"]],
+  ["/tool-display.js", ["tool-display.js", "text/javascript; charset=utf-8"]],
   ["/worker-timeline.js", ["worker-timeline.js", "text/javascript; charset=utf-8"]],
   ["/styles.css", ["styles.css", "text/css; charset=utf-8"]],
 ]);
@@ -205,17 +216,22 @@ const browserHost = host === "::1" ? "[::1]" : host;
 const url = `http://${browserHost}:${server.port}/?t=${encodeURIComponent(token)}`;
 console.log(JSON.stringify({ type: "server.ready", url, port: server.port }));
 
-async function shutdown() {
+async function shutdown({ requestBridge = true } = {}) {
+  if (shuttingDown) return;
+  shuttingDown = true;
   broadcast({ type: "server.stopping" });
-  try {
-    bridge.stdin.write(
-      `${JSON.stringify({ type: "shutdown", request_id: `server-${Date.now()}` })}\n`,
-    );
-    bridge.stdin.flush();
-    bridge.stdin.end();
-  } catch {
-    // The bridge may already be gone.
+  if (requestBridge) {
+    try {
+      bridge.stdin.write(
+        `${JSON.stringify({ type: "shutdown", request_id: `server-${Date.now()}` })}\n`,
+      );
+      bridge.stdin.flush();
+      bridge.stdin.end();
+    } catch {
+      // The bridge may already be gone.
+    }
   }
+  await Bun.sleep(0);
   server.stop(true);
   const settled = await Promise.race([
     bridge.exited,
@@ -225,5 +241,5 @@ async function shutdown() {
   process.exit(0);
 }
 
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
+process.on("SIGINT", () => void shutdown());
+process.on("SIGTERM", () => void shutdown());

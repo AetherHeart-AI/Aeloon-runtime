@@ -9,7 +9,13 @@ import {
   tokenTotal,
 } from "./state.js";
 import { COMMANDS, commandSuggestions, parseCommand } from "./commands.js";
-import { renderMarkdown } from "./markdown.js";
+import {
+  captureDisclosureState,
+  reconcileChildren,
+  restoreDisclosureState,
+} from "./dom.js";
+import { appendMarkdown } from "./markdown.js";
+import { describeToolBlock } from "./tool-display.js";
 
 const state = createState();
 const params = new URLSearchParams(location.search);
@@ -43,15 +49,30 @@ let socket;
 let reconnectTimer;
 let requestSequence = 0;
 let renderQueued = false;
+let queuedRenderMask = 0;
 let currentView = "chat";
 let logFilter = "all";
 let commandSelection = 0;
+let renderedHistory = state.history;
+const historyTurnNodes = new Map();
+const logNodes = new WeakMap();
+
+const RENDER_CHROME = 1;
+const RENDER_CHAT = 2;
+const RENDER_AGENTS = 4;
+const RENDER_LOGS = 8;
+const RENDER_ALL = RENDER_CHROME | RENDER_CHAT | RENDER_AGENTS | RENDER_LOGS;
 
 bindInteractions();
 connect();
 requestRender();
 setInterval(() => {
-  if (state.activeTurn || state.liveAgents.size) requestRender();
+  const hasRunningAgent = [...state.liveAgents.values()].some(
+    (agent) => !agent.settled,
+  );
+  if (currentView === "chat" && hasRunningAgent) {
+    renderAgentTimes();
+  }
 }, 1000);
 
 function connect() {
@@ -76,7 +97,7 @@ function connect() {
     }
     if (envelope.type === "response") handleResponse(envelope);
     applyEnvelope(state, envelope);
-    requestRender();
+    requestRender(renderMaskForEnvelope(envelope));
   });
   socket.addEventListener("close", () => {
     state.connection = "disconnected";
@@ -331,23 +352,42 @@ function setView(view) {
   requestRender();
 }
 
-function requestRender() {
+function requestRender(mask = RENDER_ALL) {
+  if (!mask) return;
+  queuedRenderMask |= mask;
   if (renderQueued) return;
   renderQueued = true;
   requestAnimationFrame(() => {
     renderQueued = false;
-    render();
+    const currentMask = queuedRenderMask;
+    queuedRenderMask = 0;
+    render(currentMask);
   });
 }
 
-function render() {
-  renderChrome();
+function render(mask) {
+  if (mask & RENDER_CHROME) renderChrome();
   if (currentView === "chat") {
-    renderChat();
-    renderAgents();
-  } else {
+    if (mask & RENDER_CHAT) renderChat();
+    if (mask & RENDER_AGENTS) renderAgents();
+  } else if (mask & RENDER_LOGS) {
     renderLogs();
   }
+}
+
+function renderMaskForEnvelope(envelope) {
+  if (envelope.type !== "event") return RENDER_ALL;
+  if (envelope.event === "log.entry") return RENDER_LOGS;
+  if (envelope.event === "chat.worker.lifecycle") return RENDER_AGENTS;
+  if (["chat.status", "chat.llm.response"].includes(envelope.event)) return 0;
+  if (
+    ["bridge.prompt.started", "chat.turn.start", "bridge.turn.cancelled"].includes(
+      envelope.event,
+    )
+  ) {
+    return RENDER_CHROME | RENDER_CHAT | RENDER_AGENTS;
+  }
+  return RENDER_CHROME | RENDER_CHAT;
 }
 
 function renderChrome() {
@@ -368,13 +408,40 @@ function renderChrome() {
 }
 
 function renderChat() {
+  const disclosureState = captureDisclosureState(elements.chatScroll);
+  const previousScrollTop = elements.chatScroll.scrollTop;
   const wasNearBottom =
     elements.chatScroll.scrollHeight -
       elements.chatScroll.scrollTop -
       elements.chatScroll.clientHeight <
     120;
-  const turns = state.history.map((turn) => renderTurn(turn, false));
-  if (state.activeTurn) turns.push(renderTurn(state.activeTurn, true));
+  if (renderedHistory !== state.history) {
+    renderedHistory = state.history;
+    historyTurnNodes.clear();
+  }
+  const activeHistoryKeys = new Set();
+  const turns = state.history.map((turn, index) => {
+    const key = historyTurnKey(turn, index);
+    activeHistoryKeys.add(key);
+    let article = historyTurnNodes.get(key);
+    if (!article) {
+      article = renderTurn(turn, false, key);
+      historyTurnNodes.set(key, article);
+    }
+    return article;
+  });
+  for (const key of historyTurnNodes.keys()) {
+    if (!activeHistoryKeys.has(key)) historyTurnNodes.delete(key);
+  }
+  if (state.activeTurn) {
+    turns.push(
+      renderTurn(
+        state.activeTurn,
+        true,
+        `live:${state.activeTurn.turnId || state.activeTurn.requestId || "current"}`,
+      ),
+    );
+  }
   for (const queued of state.queuedPrompts) {
     turns.push(
       node(
@@ -396,11 +463,14 @@ function renderChat() {
       ),
     );
   }
-  elements.chatScroll.replaceChildren(...turns);
-  if (wasNearBottom || state.activeTurn) elements.chatScroll.scrollTop = elements.chatScroll.scrollHeight;
+  reconcileChildren(elements.chatScroll, turns);
+  restoreDisclosureState(elements.chatScroll, disclosureState);
+  elements.chatScroll.scrollTop = wasNearBottom
+    ? elements.chatScroll.scrollHeight
+    : previousScrollTop;
 }
 
-function renderTurn(turn, live) {
+function renderTurn(turn, live, turnKey) {
   const prompt = turn.user_prompt ?? turn.userPrompt ?? "";
   const blocks = Array.isArray(turn.blocks) ? turn.blocks : [];
   const projection = projectTurnBlocks(blocks, turn.final_content || "", live);
@@ -415,6 +485,7 @@ function renderTurn(turn, live) {
   if (prompt) article.append(node("div", "user-message", prompt));
   if (projection.processBlocks.length) {
     const details = node("details", "process");
+    details.dataset.disclosureKey = `${turnKey}:process`;
     if (live) details.open = true;
     details.append(
       node(
@@ -424,13 +495,17 @@ function renderTurn(turn, live) {
       ),
     );
     const body = node("div", "process-body");
-    body.append(...projection.processBlocks.map(renderProcessBlock));
+    body.append(
+      ...projection.processBlocks.map((block, index) =>
+        renderProcessBlock(block, `${turnKey}:block:${block.id || index}`),
+      ),
+    );
     details.append(body);
     article.append(details);
   }
   if (projection.finalText) {
     const answer = node("div", "assistant-answer markdown");
-    answer.innerHTML = renderMarkdown(projection.finalText);
+    appendMarkdown(answer, projection.finalText);
     article.append(answer);
   } else if (live) {
     article.append(node("div", "thinking-line", "Master 正在组织当前 turn…"));
@@ -444,25 +519,49 @@ function renderTurn(turn, live) {
   return article;
 }
 
-function renderProcessBlock(block) {
+function renderProcessBlock(block, disclosureKey) {
   if (block.type === "tool_call") {
-    const details = node("details", `process-entry tool-entry ${block.status || ""}`);
+    const display = describeToolBlock(block);
+    const details = node("details", `process-entry tool-entry ${display.status}`);
+    details.dataset.disclosureKey = disclosureKey;
     details.append(
       node(
         "summary",
-        "",
-        `${block.status === "error" ? "×" : block.status === "done" ? "✓" : "·"} ${
-          block.name || "tool"
-        }${block.duration_ms ? ` · ${formatDuration(block.duration_ms)}` : ""}`,
+        "tool-summary",
+        node("span", `tool-status ${display.status}`, display.icon),
+        node("strong", "tool-name", display.label),
+        node("span", "tool-headline", display.headline),
+        block.duration_ms
+          ? node("span", "tool-duration", formatDuration(block.duration_ms))
+          : null,
       ),
     );
-    const payload = block.result || JSON.stringify(block.arguments || {}, null, 2);
-    if (payload) details.append(node("pre", "", String(payload)));
+    const body = node("div", "tool-entry-body");
+    if (display.argumentsText) {
+      body.append(renderToolDetail("调用参数", display.argumentsText));
+    }
+    if (display.resultText) {
+      body.append(
+        renderToolDetail(display.status === "error" ? "错误详情" : "执行结果", display.resultText),
+      );
+    } else {
+      body.append(node("p", "tool-empty", display.headline));
+    }
+    details.append(body);
     return details;
   }
   const entry = node("div", `process-entry ${block.type || "text"}`);
   entry.textContent = String(block.content || "");
   return entry;
+}
+
+function renderToolDetail(label, content) {
+  return node(
+    "section",
+    "tool-detail",
+    node("div", "tool-detail-label", label),
+    node("pre", "", content),
+  );
 }
 
 function renderAgents() {
@@ -472,17 +571,14 @@ function renderAgents() {
   elements.agentsList.replaceChildren(
     ...agents.map((agent) => {
       const card = node("article", `agent-row ${agent.settled ? "settled" : "active"}`);
+      card.dataset.runId = agent.run_id;
       const heading = node("div", "agent-heading");
       heading.append(
         node("span", `agent-state ${agent.status || "running"}`),
         node("strong", "", agent.worker_type_id || "agent"),
         node("code", "", shortId(agent.run_id)),
       );
-      const elapsed =
-        agent.duration_ms ??
-        agent.elapsed_ms ??
-        (agent.updated_at ? Date.now() - new Date(agent.updated_at).getTime() : 0);
-      heading.append(node("span", "agent-time", formatDuration(elapsed)));
+      heading.append(node("span", "agent-time", formatDuration(agentElapsed(agent))));
       card.append(heading);
       if (agent.objective) card.append(node("p", "agent-objective", agent.objective));
       if (agent.phase && !agent.settled) {
@@ -507,6 +603,22 @@ function renderAgents() {
   );
 }
 
+function renderAgentTimes() {
+  for (const card of elements.agentsList.querySelectorAll("[data-run-id]")) {
+    const agent = state.liveAgents.get(card.dataset.runId);
+    const time = card.querySelector(".agent-time");
+    if (agent && time) time.textContent = formatDuration(agentElapsed(agent));
+  }
+}
+
+function agentElapsed(agent) {
+  return (
+    agent.duration_ms ??
+    agent.elapsed_ms ??
+    (agent.started_at ? Date.now() - new Date(agent.started_at).getTime() : 0)
+  );
+}
+
 function renderLogs() {
   const rank = { TRACE: 0, DEBUG: 1, INFO: 2, SUCCESS: 2, WARNING: 3, ERROR: 4, CRITICAL: 5 };
   const logs = state.logs.filter((entry) => {
@@ -516,10 +628,11 @@ function renderLogs() {
     if (logFilter === "gateway") return String(entry.source || "").includes("gateway");
     return true;
   });
-  elements.logsTable.replaceChildren(
-    ...(logs.length
-      ? [...logs].reverse().map((entry) => {
-          const row = node("details", "log-row");
+  const rows = logs.length
+    ? [...logs].reverse().map((entry) => {
+        let row = logNodes.get(entry);
+        if (!row) {
+          row = node("details", "log-row");
           row.append(
             node(
               "summary",
@@ -531,10 +644,12 @@ function renderLogs() {
             ),
           );
           row.append(node("pre", "", JSON.stringify(entry.detail || {}, null, 2)));
-          return row;
-        })
-      : [node("p", "empty-copy", "当前筛选下没有日志。")]),
-  );
+          logNodes.set(entry, row);
+        }
+        return row;
+      })
+    : [node("p", "empty-copy", "当前筛选下没有日志。")];
+  reconcileChildren(elements.logsTable, rows);
 }
 
 function renderCommandMenu() {
@@ -580,6 +695,14 @@ function node(tag, className = "", ...children) {
 
 function shortId(value) {
   return String(value || "—").slice(0, 8);
+}
+
+function historyTurnKey(turn, index) {
+  return String(
+    turn.turn_id ||
+      turn.request_id ||
+      `${turn.created_at || ""}:${turn.user_prompt || ""}:${index}`,
+  );
 }
 
 function formatClock(value) {

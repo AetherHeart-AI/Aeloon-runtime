@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic_ai.exceptions import ModelHTTPError
-from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
+from pydantic_ai.messages import ModelResponse, OutputToolCallEvent, TextPart, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.usage import RequestUsage
 
@@ -42,6 +43,18 @@ class _RecordingRead(Tool):
     async def execute(self, path: str) -> str:
         self.calls.append(path)
         return f"contents:{path}"
+
+
+@pytest.mark.asyncio
+async def test_output_tool_calls_are_not_projected_as_executing_tools() -> None:
+    runtime = PydanticAgentRuntime()
+
+    async def events():
+        yield OutputToolCallEvent(
+            ToolCallPart("complete_work", {"summary": "done"}, "done-1")
+        )
+
+    await runtime._event_stream_handler(SimpleNamespace(deps=object()), events())
 
 
 def _spec(model: FunctionModel, registry: ToolRegistry, *, request_limit: int = 4) -> AgentRunSpec:

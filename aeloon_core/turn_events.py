@@ -12,6 +12,7 @@ from typing import Any
 from aeloon_core.runtime_events import (
     ToolCallView,
     ToolExecutionRecord,
+    ToolExecutionState,
     tool_result_failed,
 )
 from aeloon_core.transitions import accumulate_usage
@@ -308,8 +309,14 @@ class TurnEventProgress:
         *,
         record_reasoning: bool = True,
     ) -> None:
-        result = str(node.result or "")
-        status = "error" if tool_result_failed(node.result) else "done"
+        raw_result = node.result if node.result is not None else node.error
+        result = "" if raw_result is None else str(raw_result)
+        failed = (
+            node.state == ToolExecutionState.FAILED
+            or node.error is not None
+            or tool_result_failed(result)
+        )
+        status = "error" if failed else "done"
         block = self._find_block(node.call_id)
         if block is None:
             block = {
@@ -341,6 +348,8 @@ class TurnEventProgress:
             )
         bounded_result = _bounded_web_tool_result(block["result"])
         ui_patch = {
+            "name": node.tool_name,
+            "arguments": node.arguments,
             "status": block["status"],
             "result": bounded_result,
             "result_truncated": len(block["result"]) > WEB_TOOL_RESULT_CHARS,
@@ -597,7 +606,6 @@ def _tool_call_detail(tool_call: ToolCallView) -> dict[str, Any]:
         "id": tool_call.id,
         "name": tool_call.name,
         "arguments": tool_call.arguments,
-        "anthropic_tool_use": tool_call.to_anthropic_tool_use(),
     }
 
 
@@ -639,8 +647,8 @@ def _task_node_detail(node: ToolExecutionRecord) -> dict[str, Any]:
         "tool_name": node.tool_name,
         "arguments": node.arguments,
         "mode": node.mode,
-        "deps": sorted(node.deps),
-        "dependents": sorted(node.dependents),
+        "deps": sorted(getattr(node, "deps", ())),
+        "dependents": sorted(getattr(node, "dependents", ())),
         "state": str(node.state),
         "result": _text_summary(node.result),
         "error": node.error,

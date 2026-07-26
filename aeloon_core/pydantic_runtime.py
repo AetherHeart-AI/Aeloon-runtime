@@ -33,7 +33,6 @@ from pydantic_ai.messages import (
     ModelMessagesTypeAdapter,
     ModelRequest,
     ModelResponse,
-    OutputToolCallEvent,
     PartDeltaEvent,
     RetryPromptPart,
     TextPart,
@@ -554,7 +553,7 @@ class HarnessAgentRuntime:
                         delta.content_delta,
                     )
                 continue
-            if isinstance(event, (FunctionToolCallEvent, OutputToolCallEvent)):
+            if isinstance(event, FunctionToolCallEvent):
                 call = _tool_call_view(event.part)
                 ctx.deps.tool_calls[call.id] = call
                 if call.id not in ctx.deps.progress_call_ids:

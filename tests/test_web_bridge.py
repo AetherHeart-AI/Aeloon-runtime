@@ -27,6 +27,8 @@ class _Sessions:
         assert session_id == self.current
         return [
             {
+                "turn_id": "turn-1",
+                "request_id": "request-1",
                 "created_at": "2026-07-25T10:00:00+00:00",
                 "user_prompt": "Inspect the repository",
                 "final_content": "Done",
@@ -69,6 +71,8 @@ async def test_web_bridge_ready_snapshot_contains_conversation_only(tmp_path: Pa
     ready = records[0]
     assert ready["type"] == "ready"
     assert ready["payload"]["session_id"] == "session-1"
+    assert ready["payload"]["history"][0]["turn_id"] == "turn-1"
+    assert ready["payload"]["history"][0]["request_id"] == "request-1"
     assert ready["payload"]["history"][0]["blocks"][0]["content"] == "Done"
     assert "workers" not in ready["payload"]
     assert "flows" not in ready["payload"]

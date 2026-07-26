@@ -45,7 +45,23 @@ export function applyEnvelope(state, envelope) {
     return hydrateSnapshot(state, envelope.payload || {});
   }
   if (envelope.type === "event") {
+    if (
+      envelope.event !== "log.entry" &&
+      !runtimeEventBelongsToSession(state, envelope.payload || {})
+    ) {
+      return state;
+    }
     applyRuntimeEvent(state, envelope.event, envelope.payload || {});
+  } else if (
+    envelope.type === "response" &&
+    envelope.command === "prompt" &&
+    !envelope.ok
+  ) {
+    failPrompt(
+      state,
+      envelope.request_id,
+      envelope.error?.code === "turn_cancelled" ? "cancelled" : "failed",
+    );
   } else if (envelope.type === "server.error") {
     state.connection = "error";
     state.error = envelope.error?.message || "Web server error";
@@ -87,10 +103,21 @@ export function applyRuntimeEvent(state, event, payload) {
     }
     return;
   }
+  if (event === "bridge.turn.cancelled") {
+    failPrompt(state, payload.request_id, "cancelled", payload.ts);
+    return;
+  }
   if (event === "chat.block.add") {
     const turn = ensureActiveTurn(state, payload);
     const block = payload.block || {};
-    if (!turn.blocks.some((item) => item.id === block.id)) {
+    const existing = turn.blocks.find((item) => item.id === block.id);
+    if (existing) {
+      // A result may arrive first after reconnecting or when an earlier add
+      // failed. Fill the placeholder without rolling a settled block back to
+      // the start event's "running" state.
+      const current = { ...existing };
+      Object.assign(existing, block, current);
+    } else {
       turn.blocks.push({ ...block });
     }
     return;
@@ -121,6 +148,7 @@ export function applyRuntimeEvent(state, event, payload) {
       ...payload,
       status,
       settled: SETTLED_AGENT_STATES.has(status),
+      started_at: current.started_at || payload.ts || new Date().toISOString(),
       updated_at: payload.ts || new Date().toISOString(),
     });
     return;
@@ -139,6 +167,46 @@ export function applyRuntimeEvent(state, event, payload) {
     });
     state.activeTurn = null;
   }
+}
+
+export function failPrompt(
+  state,
+  requestId,
+  status = "failed",
+  completedAt = new Date().toISOString(),
+) {
+  state.queuedPrompts = state.queuedPrompts.filter(
+    (item) => item.requestId !== requestId,
+  );
+  const active = state.activeTurn;
+  if (
+    !active ||
+    (active.requestId && requestId && active.requestId !== requestId)
+  ) {
+    return state;
+  }
+  state.activeTurn = null;
+  for (const [runId, agent] of state.liveAgents) {
+    if (agent.settled) continue;
+    const startedAt = new Date(agent.started_at || completedAt).getTime();
+    const finishedAt = new Date(completedAt).getTime();
+    state.liveAgents.set(runId, {
+      ...agent,
+      status,
+      settled: true,
+      duration_ms:
+        Number.isFinite(startedAt) && Number.isFinite(finishedAt)
+          ? Math.max(0, finishedAt - startedAt)
+          : agent.duration_ms,
+      updated_at: completedAt,
+    });
+  }
+  return state;
+}
+
+function runtimeEventBelongsToSession(state, payload) {
+  const eventSessionId = String(payload.session_id || "");
+  return !eventSessionId || !state.sessionId || eventSessionId === state.sessionId;
 }
 
 function ensureActiveTurn(state, payload) {

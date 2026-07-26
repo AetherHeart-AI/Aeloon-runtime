@@ -6,6 +6,11 @@ from typing import Any
 
 import pytest
 
+from aeloon_core.runtime_events import (
+    ToolCallView,
+    ToolExecutionRecord,
+    ToolExecutionState,
+)
 from aeloon_core.turn_events import (
     TurnEventProgress,
     _bounded_web_tool_result,
@@ -112,3 +117,88 @@ def test_web_tool_results_are_bounded_before_they_are_emitted() -> None:
     block = _web_block_view({"type": "tool_call", "result": result})
     assert len(block["result"]) <= 16_000
     assert block["result_truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_tool_start_emits_provider_independent_display_data() -> None:
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    async def emit(name: str, payload: dict[str, Any]) -> None:
+        events.append((name, payload))
+
+    progress = TurnEventProgress(session_id="master", emit=emit)
+    await progress.on_tool_calls(
+        [ToolCallView("call-1", "read", {"path": "README.md"})],
+        record_reasoning=False,
+    )
+
+    payload = next(payload for name, payload in events if name == "chat.block.add")
+    assert payload["block"] == {
+        "id": "call-1",
+        "type": "tool_call",
+        "name": "read",
+        "arguments": {"path": "README.md"},
+        "status": "running",
+        "result": None,
+        "created_at": payload["block"]["created_at"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_tool_result_can_reconstruct_a_missing_start_event() -> None:
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    async def emit(name: str, payload: dict[str, Any]) -> None:
+        events.append((name, payload))
+
+    progress = TurnEventProgress(session_id="master", emit=emit)
+    await progress.on_tool_result(
+        ToolExecutionRecord(
+            index=0,
+            call_id="call-1",
+            tool_name="read",
+            arguments={"path": "README.md"},
+            mode="read_only",
+            state=ToolExecutionState.DONE,
+            result="",
+        ),
+        record_reasoning=False,
+    )
+
+    payload = next(payload for name, payload in events if name == "chat.block.update")
+    assert payload["patch"] == {
+        "name": "read",
+        "arguments": {"path": "README.md"},
+        "status": "done",
+        "result": "",
+        "result_truncated": False,
+        "completed_at": payload["patch"]["completed_at"],
+        "duration_ms": payload["patch"]["duration_ms"],
+    }
+    assert any(name == "log.entry" for name, _payload in events)
+
+
+@pytest.mark.asyncio
+async def test_tool_error_uses_error_text_when_result_is_missing() -> None:
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    async def emit(name: str, payload: dict[str, Any]) -> None:
+        events.append((name, payload))
+
+    progress = TurnEventProgress(session_id="master", emit=emit)
+    await progress.on_tool_result(
+        ToolExecutionRecord(
+            index=0,
+            call_id="call-1",
+            tool_name="read",
+            arguments={"path": "missing.md"},
+            mode="read_only",
+            state=ToolExecutionState.FAILED,
+            error="File not found",
+        ),
+        record_reasoning=False,
+    )
+
+    payload = next(payload for name, payload in events if name == "chat.block.update")
+    assert payload["patch"]["status"] == "error"
+    assert payload["patch"]["result"] == "File not found"

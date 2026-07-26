@@ -243,14 +243,6 @@ summary:focus-visible {
 .turn {
   max-width: 860px;
   margin: 0 auto 42px;
-  animation: turn-enter 180ms ease-out both;
-}
-
-@keyframes turn-enter {
-  from {
-    opacity: 0;
-    transform: translateY(5px);
-  }
 }
 
 .turn-label,
@@ -323,6 +315,75 @@ summary:focus-visible {
   list-style: none;
 }
 
+.tool-summary {
+  display: grid;
+  grid-template-columns: 13px max-content minmax(0, 1fr) max-content;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.tool-status {
+  color: var(--amber);
+  font-weight: 800;
+  text-align: center;
+}
+
+.tool-status.done {
+  color: var(--green);
+}
+
+.tool-status.error {
+  color: var(--red);
+}
+
+.tool-status.cancelled {
+  color: var(--fg-faint);
+}
+
+.tool-name {
+  color: var(--fg);
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.tool-headline {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--fg-dim);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-duration {
+  color: var(--fg-faint);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.tool-entry-body {
+  border-top: 1px solid var(--border);
+}
+
+.tool-detail + .tool-detail {
+  border-top: 1px solid var(--border);
+}
+
+.tool-detail-label {
+  padding: 7px 9px 4px;
+  color: var(--fg-faint);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.tool-empty {
+  margin: 0;
+  padding: 9px;
+  color: var(--fg-faint);
+}
+
 .process-entry.error summary {
   color: var(--red);
 }
@@ -337,6 +398,11 @@ summary:focus-visible {
   color: var(--fg-dim);
   font: 10.5px/1.5 var(--mono);
   white-space: pre-wrap;
+}
+
+.tool-detail pre {
+  border-top: 0;
+  padding-top: 3px;
 }
 
 .assistant-answer {
@@ -587,24 +653,6 @@ summary:focus-visible {
   position: relative;
   padding: 14px 3px 15px;
   border-bottom: 1px solid var(--border);
-  animation: agent-enter 180ms ease-out both;
-}
-
-@keyframes agent-enter {
-  from {
-    opacity: 0;
-    transform: translateX(5px);
-  }
-}
-
-.agent-row.settled {
-  animation: agent-settle 300ms ease-out both;
-}
-
-@keyframes agent-settle {
-  from {
-    background: var(--accent-soft);
-  }
 }
 
 .agent-heading {

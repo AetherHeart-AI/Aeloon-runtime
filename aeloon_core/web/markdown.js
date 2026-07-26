@@ -106,6 +106,11 @@ export function renderMarkdown(source = "") {
   return fragment;
 }
 
+export function appendMarkdown(target, source = "") {
+  target.append(renderMarkdown(source));
+  return target;
+}
+
 function appendInline(parent, text) {
   const pattern = /(`[^`\n]+`|\*\*[^*\n]+\*\*|\[[^\]\n]+\]\([^) \n]+\))/g;
   let cursor = 0;

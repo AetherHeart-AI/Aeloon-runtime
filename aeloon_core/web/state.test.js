@@ -82,6 +82,130 @@ describe("Harness-only Web state", () => {
     expect(state.connection).toBe("connected");
     expect(state.sessionId).toBe("session-1");
   });
+
+  test("cancelled turns clear the active turn and settle running agents", () => {
+    const state = createState();
+    hydrateSnapshot(state, { session_id: "session-1", history: [] });
+    queuePrompt(state, "request-1", "Cancel it");
+    applyRuntimeEvent(state, "bridge.prompt.started", {
+      request_id: "request-1",
+      session_id: "session-1",
+    });
+    applyRuntimeEvent(state, "chat.worker.lifecycle", {
+      session_id: "session-1",
+      run_id: "run-1",
+      status: "running",
+      ts: "2026-07-26T10:00:00.000Z",
+    });
+
+    applyEnvelope(state, {
+      type: "event",
+      event: "bridge.turn.cancelled",
+      payload: {
+        request_id: "request-1",
+        session_id: "session-1",
+        ts: "2026-07-26T10:00:01.500Z",
+      },
+    });
+
+    expect(state.activeTurn).toBeNull();
+    expect(state.liveAgents.get("run-1")).toMatchObject({
+      status: "cancelled",
+      settled: true,
+      duration_ms: 1500,
+    });
+  });
+
+  test("failed prompt responses clear the matching active turn", () => {
+    const state = createState();
+    hydrateSnapshot(state, { session_id: "session-1", history: [] });
+    queuePrompt(state, "request-1", "Fail");
+    applyRuntimeEvent(state, "bridge.prompt.started", {
+      request_id: "request-1",
+      session_id: "session-1",
+    });
+
+    applyEnvelope(state, {
+      type: "response",
+      command: "prompt",
+      request_id: "request-1",
+      ok: false,
+      error: { code: "runtime_error", message: "Failed" },
+    });
+
+    expect(state.activeTurn).toBeNull();
+    expect(state.queuedPrompts).toEqual([]);
+  });
+
+  test("a failed queued prompt does not clear a different active turn", () => {
+    const state = createState();
+    hydrateSnapshot(state, { session_id: "session-1", history: [] });
+    queuePrompt(state, "request-active", "Keep running");
+    applyRuntimeEvent(state, "bridge.prompt.started", {
+      request_id: "request-active",
+      session_id: "session-1",
+    });
+    queuePrompt(state, "request-failed", "Fail separately");
+
+    applyEnvelope(state, {
+      type: "response",
+      command: "prompt",
+      request_id: "request-failed",
+      ok: false,
+      error: { code: "runtime_error", message: "Failed" },
+    });
+
+    expect(state.activeTurn.requestId).toBe("request-active");
+    expect(state.queuedPrompts).toEqual([]);
+  });
+
+  test("ignores runtime events belonging to another session", () => {
+    const state = createState();
+    hydrateSnapshot(state, { session_id: "session-new", history: [] });
+
+    applyEnvelope(state, {
+      type: "event",
+      event: "chat.turn.start",
+      payload: { session_id: "session-old", turn_id: "old-turn" },
+    });
+
+    expect(state.activeTurn).toBeNull();
+    expect(state.sessionId).toBe("session-new");
+  });
+
+  test("merges a late tool start into a result placeholder", () => {
+    const state = createState();
+    applyRuntimeEvent(state, "chat.turn.start", { turn_id: "turn-1" });
+    applyRuntimeEvent(state, "chat.block.update", {
+      turn_id: "turn-1",
+      block_id: "call-1",
+      patch: {
+        name: "read",
+        arguments: { path: "README.md" },
+        status: "done",
+        result: "contents",
+      },
+    });
+    applyRuntimeEvent(state, "chat.block.add", {
+      turn_id: "turn-1",
+      block: {
+        id: "call-1",
+        type: "tool_call",
+        name: "read",
+        arguments: { path: "README.md" },
+        status: "running",
+      },
+    });
+
+    expect(state.activeTurn.blocks).toHaveLength(1);
+    expect(state.activeTurn.blocks[0]).toMatchObject({
+      id: "call-1",
+      name: "read",
+      arguments: { path: "README.md" },
+      status: "done",
+      result: "contents",
+    });
+  });
 });
 
 test("projects the canonical answer separately from process blocks", () => {
