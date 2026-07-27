@@ -164,7 +164,28 @@ def _add_path_args(parser: argparse.ArgumentParser, *, session: bool = False) ->
 
 
 def _add_run_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("prompt", nargs="+", help="Prompt text to send to the agent.")
+    parser.add_argument(
+        "prompt",
+        nargs="*",
+        help="Prompt text to send to the agent (omit with --prompt-file or --stdin).",
+    )
+    parser.add_argument(
+        "--prompt-file",
+        type=Path,
+        default=None,
+        help="Read the prompt from a UTF-8 text file.",
+    )
+    parser.add_argument(
+        "--stdin",
+        action="store_true",
+        help="Read the prompt from standard input.",
+    )
+    parser.add_argument(
+        "--output",
+        choices=("text", "json"),
+        default="text",
+        help="Output format. JSON suppresses streaming progress.",
+    )
     _add_path_args(parser, session=True)
 
 
@@ -252,27 +273,94 @@ class _PlainTextProgressSink:
             self._streaming = False
 
 
+class _SilentProgressSink:
+    """Consume progress events without mixing them into machine-readable stdout."""
+
+    async def emit(self, event: str, payload: dict[str, Any]) -> None:
+        del event, payload
+
+
 async def _run_prompt(args: argparse.Namespace) -> None:
+    prompt = _resolve_run_prompt(args)
     config = _load_with_path_overrides(
         args.config,
         workspace=getattr(args, "workspace", None),
         data_dir=getattr(args, "data_dir", None),
     )
+    if not config.workspace.exists():
+        raise SystemExit(f"Workspace does not exist: {config.workspace}")
+    if not config.workspace.is_dir():
+        raise SystemExit(f"Workspace is not a directory: {config.workspace}")
+
     orchestrator = AeloonCoreOrchestrator(config)
     try:
-        prompt = " ".join(args.prompt)
         session_id = args.session or orchestrator.sessions.new_session()
-        progress = TurnEventProgress(session_id=session_id, emit=_PlainTextProgressSink().emit)
+        output_format = getattr(args, "output", "text")
+        sink = _SilentProgressSink() if output_format == "json" else _PlainTextProgressSink()
+        progress = TurnEventProgress(session_id=session_id, emit=sink.emit)
+        await progress.on_turn_start()
         result = await orchestrator.run_turn(
             prompt,
             session_id=session_id,
             on_progress=progress,
         )
-        print(f"\n[session] {result.session_id}")
-        if result.tools_used:
-            print(f"[tools used] {', '.join(result.tools_used)}")
+        if output_format == "json":
+            _print_json(_turn_result_payload(result, config=config))
+        else:
+            print(f"\n[session] {result.session_id}")
+            if result.tools_used:
+                print(f"[tools used] {', '.join(result.tools_used)}")
     finally:
         await orchestrator.close()
+
+
+def _resolve_run_prompt(args: argparse.Namespace) -> str:
+    positional = " ".join(getattr(args, "prompt", [])).strip()
+    prompt_file = getattr(args, "prompt_file", None)
+    use_stdin = bool(getattr(args, "stdin", False))
+    source_count = int(bool(positional)) + int(prompt_file is not None) + int(use_stdin)
+    if source_count != 1:
+        raise SystemExit(
+            "Provide exactly one prompt source: prompt text, --prompt-file, or --stdin."
+        )
+
+    if prompt_file is not None:
+        path = Path(prompt_file).expanduser().resolve()
+        if not path.is_file():
+            raise SystemExit(f"Prompt file does not exist or is not a file: {path}")
+        try:
+            prompt = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise SystemExit(f"Could not read prompt file {path}: {exc}") from None
+    elif use_stdin:
+        prompt = sys.stdin.read()
+    else:
+        prompt = positional
+
+    if not prompt.strip():
+        raise SystemExit("Prompt must not be empty.")
+    return prompt
+
+
+def _turn_result_payload(result: Any, *, config: Config) -> dict[str, Any]:
+    default_model = config.agents.defaults.model_ref()
+    return {
+        "schema_version": 1,
+        "session_id": result.session_id,
+        "turn_id": result.turn_id,
+        "status": result.status,
+        "final_content": result.final_content,
+        "tools_used": list(result.tools_used),
+        "usage": dict(result.usage),
+        "duration_ms": result.duration_ms,
+        "transitions": list(result.transitions),
+        "workspace": str(config.workspace),
+        "models": {
+            "default": default_model,
+            "master": config.agents.routing.master or default_model,
+            "workers": dict(config.agents.routing.workers),
+        },
+    }
 
 
 async def _run_web(args: argparse.Namespace) -> None:
@@ -494,6 +582,8 @@ def _first_positional(argv: list[str]) -> str | None:
             "--session",
             "--workspace",
             "--data-dir",
+            "--prompt-file",
+            "--output",
             "--gateway-log-level",
             "--port",
         }:

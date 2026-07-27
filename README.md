@@ -42,7 +42,16 @@ Useful variants:
 uv run aeloon-core serve --no-open
 uv run aeloon-core serve --port 0
 uv run aeloon-core run "Inspect the repository and explain its entry points"
+uv run aeloon-core run \
+  --workspace /path/to/repository \
+  --prompt-file /path/to/task.txt \
+  --output json
 ```
+
+`run` accepts exactly one of positional prompt text, `--prompt-file`, or
+`--stdin`. JSON output suppresses progress rendering so automation receives one
+machine-readable result on stdout. See [benchmarks/README.md](benchmarks/README.md)
+for the official RefactorBench runner.
 
 The Web UI has three pieces: the Master conversation, live agents for the current
 turn, and diagnostic logs. Live agent events are display-only and disappear when
