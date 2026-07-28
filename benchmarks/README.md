@@ -1,13 +1,19 @@
 # RefactorBench
 
-This directory contains a lightweight runner for the official
+`run_refactorbench.py` is the single entry point for running Aeloon Core and
+baseline coding harnesses against the official
 [microsoft/RefactorBench](https://github.com/microsoft/RefactorBench). It uses
-the benchmark's published prompt-to-test mappings and AST tests; it does not
-copy those tests into the agent workspace.
+the published prompt-to-test mappings and AST tests; those tests are never
+copied into the agent workspace.
 
-## Run
+## Prerequisites
 
-Clone or download RefactorBench separately, then list the official base cases:
+Clone or download RefactorBench separately. To run baselines, install and
+authenticate the corresponding `pi`, `codex`, and `claude` CLIs first. The
+runner deliberately uses each CLI's existing local model and authentication
+configuration.
+
+List the selected official cases without creating any files:
 
 ```bash
 uv run python benchmarks/run_refactorbench.py \
@@ -15,42 +21,109 @@ uv run python benchmarks/run_refactorbench.py \
   --list
 ```
 
-Run a small smoke sample:
+## Run
+
+With no `--harness`, the runner uses Aeloon Core:
 
 ```bash
 uv run python benchmarks/run_refactorbench.py \
   --refactorbench-root /path/to/RefactorBench \
   --instruction-set base \
-  --limit 3 \
-  --results benchmarks/results/refactorbench-base.jsonl
+  --limit 3
 ```
 
-Filter to one repository or exact case:
+Run every supported harness over the same cases:
 
 ```bash
 uv run python benchmarks/run_refactorbench.py \
   --refactorbench-root /path/to/RefactorBench \
-  --repository fastapi_refactor \
-  --case fastapi_refactor/get-auth-scheme-param \
-  --results benchmarks/results/refactorbench-fastapi.jsonl
+  --harness all \
+  --limit 3
 ```
 
-Use `--resume` to skip cases already recorded in the JSONL ledger. Use
-`--overwrite` only when the existing ledger should be truncated.
+Or select baselines explicitly:
 
-The first case for each of the nine source repositories creates a local git
-snapshot under `.benchmark-workspaces/refactorbench`. Later cases reuse that
-snapshot and reset it to the recorded baseline, avoiding a full repository copy
-per task. Each record contains the agent result, official test verdict, changed
-files, token usage, timings, and a path to the saved patch.
+```bash
+uv run python benchmarks/run_refactorbench.py \
+  --refactorbench-root /path/to/RefactorBench \
+  --harness pi \
+  --harness codex \
+  --harness claude \
+  --output-dir benchmarks/results/my-baseline-run
+```
 
-A case counts as passed only when `aeloon-core run` completes successfully and
-the mapped official AST test exits with code zero. The ledger records the AST
-verdict separately so timeouts/process failures remain diagnosable.
+The adapters intentionally stay thin:
 
-## Isolation
+| Harness | Non-interactive invocation |
+|---|---|
+| `aeloon` | `python -m aeloon_core run --stdin --output json` |
+| `pi` | `pi --print --mode json --no-session` |
+| `codex` | `codex exec --sandbox workspace-write --ephemeral --json -` |
+| `claude` | `claude --print --output-format json --no-session-persistence --dangerously-skip-permissions` |
+
+`--config` applies only to Aeloon Core. The other harnesses use their normal
+local CLI configuration.
+
+Filter to one repository or exact case with repeatable `--repository` and
+`--case` options:
+
+```bash
+uv run python benchmarks/run_refactorbench.py \
+  --refactorbench-root /path/to/RefactorBench \
+  --harness aeloon \
+  --harness codex \
+  --repository fastapi_refactor \
+  --case fastapi_refactor/get-auth-scheme-param
+```
+
+## Result archive
+
+By default, every invocation creates a new timestamped directory under
+`benchmarks/results/refactorbench/`. Use `--output-dir` for a stable location:
+
+```text
+my-baseline-run/
+├── manifest.json
+├── summary.json
+├── aeloon/
+│   ├── results.jsonl
+│   ├── logs/
+│   ├── patches/
+│   └── sessions/
+├── codex/
+│   ├── results.jsonl
+│   ├── logs/
+│   ├── patches/
+│   └── sessions/
+└── ...
+```
+
+The manifest records the selected cases, source revision, CLI paths, and CLI
+versions. Each append-only JSONL record contains the normalized agent result,
+official test verdict, changed files, timing, token usage when exposed by the
+CLI, and relative paths to the full stdout, stderr, and patch artifacts.
+`summary.json` makes pass rates and basic cost/timing comparisons available
+without re-reading every ledger.
+
+Use `--resume` with the same `--output-dir`, harness order, and case selection
+to skip completed harness/case pairs. Use `--overwrite` only to replace managed
+ledgers and artifacts in a compatible archive. The legacy `--results
+path.jsonl` option remains available for single-harness callers, but new
+automation should use `--output-dir`.
+
+## Workspace reuse and isolation
+
+The first case for each source repository creates a local git snapshot under
+`.benchmark-workspaces/refactorbench`. Every harness/case pair resets that
+workspace to the recorded baseline, so all harnesses see identical source while
+avoiding a full copy for every task.
+
+A case passes only when the harness process completes successfully and the
+mapped official AST test exits with code zero. The ledger records process and
+oracle failures separately.
 
 RefactorBench's official Docker setup provides stronger isolation. This runner
-executes the agent and AST test directly on the host to keep feedback fast.
-Use it only with trusted benchmark content and model-generated code in a
-disposable workspace.
+executes agents and AST tests directly on the host to keep comparison runs
+simple and fast. In particular, Claude Code runs with permission prompts
+disabled. Use only trusted benchmark content in the disposable runner-owned
+workspaces.
