@@ -11,6 +11,7 @@ aeloon_core/web/node_modules/
 
 .benchmark-workspaces/
 benchmarks/RefactorBench/
+benchmarks/LiveCodeBench/
 benchmarks/results/
 
 .DS_Store
