@@ -14,7 +14,12 @@ ADAPTER_PATHS = {
 BENCHMARK_NAMES = tuple(ADAPTER_PATHS)
 
 
-def get_adapter(name: str, *, project_root: Path) -> BenchmarkAdapter:
+def get_adapter(
+    name: str,
+    *,
+    project_root: Path,
+    workers: int = 1,
+) -> BenchmarkAdapter:
     try:
         module_name, type_name = ADAPTER_PATHS[name].split(":", maxsplit=1)
     except KeyError:
@@ -24,4 +29,4 @@ def get_adapter(name: str, *, project_root: Path) -> BenchmarkAdapter:
         ) from None
     module = import_module(module_name)
     adapter_type = getattr(module, type_name)
-    return adapter_type(project_root=project_root)
+    return adapter_type(project_root=project_root, workers=workers)

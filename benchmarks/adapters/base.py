@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
@@ -44,9 +45,14 @@ class BenchmarkAdapter(ABC):
         *,
         project_root: Path,
         limit: int | None = None,
+        workers: int = 1,
     ) -> None:
+        if workers <= 0:
+            raise ValueError("workers must be positive")
         self.project_root = project_root.expanduser().resolve()
         self.limit = limit
+        self.workers = workers
+        self._result_lock = threading.Lock()
         workspace_root = self.project_root / ".benchmark-workspaces"
         source_dir = workspace_root / "sources" / self.name
         timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -119,11 +125,12 @@ class BenchmarkAdapter(ABC):
         """Append one durable JSONL record."""
 
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
+        with self._result_lock:
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
 
     def write_json(self, path: Path, payload: dict[str, Any]) -> None:
         """Atomically replace one JSON document."""
@@ -157,6 +164,7 @@ class BenchmarkAdapter(ABC):
             "run_id": self.run.run_id,
             "benchmark": self.name,
             "status": status,
+            "workers": self.workers,
             "source": {
                 "repository": self.repository_url,
                 "checkout": str(self.run.source_dir),

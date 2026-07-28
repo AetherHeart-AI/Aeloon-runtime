@@ -6,14 +6,45 @@ import hashlib
 import json
 import shutil
 import tempfile
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from benchmarks.adapters.base import BenchmarkAdapter, run_checked
 from benchmarks.harness.base import Harness, HarnessRequest, HarnessResult
 from benchmarks.livecodebench import runner as official
 from benchmarks.progress import info
+
+_InputT = TypeVar("_InputT")
+_OutputT = TypeVar("_OutputT")
+
+
+def _parallel_map_ordered(
+    function: Callable[[_InputT], _OutputT],
+    items: list[_InputT],
+    *,
+    max_workers: int,
+    thread_name_prefix: str,
+) -> list[_OutputT]:
+    if max_workers <= 1:
+        return [function(item) for item in items]
+
+    results: dict[int, _OutputT] = {}
+    with ThreadPoolExecutor(
+        max_workers=max_workers,
+        thread_name_prefix=thread_name_prefix,
+    ) as executor:
+        futures = {executor.submit(function, item): index for index, item in enumerate(items)}
+        try:
+            for future in as_completed(futures):
+                results[futures[future]] = future.result()
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            raise
+    return [results[index] for index in range(len(items))]
 
 
 class LiveCodeBenchAdapter(BenchmarkAdapter):
@@ -218,6 +249,7 @@ class LiveCodeBenchAdapter(BenchmarkAdapter):
             "schema_version": 1,
             "benchmark": self.name,
             "run_id": self.run.run_id,
+            "workers": self.workers,
             "release_version": self.release_version,
             "selected_cases": len(cases),
             "archive": str(self.run.output_dir),
@@ -234,9 +266,19 @@ class LiveCodeBenchAdapter(BenchmarkAdapter):
         harness: Harness,
         cases: list[official.LiveCodeBenchCase],
     ) -> dict[str, Any]:
-        baseline_generations: dict[str, tuple[str, HarnessResult]] = {}
-        baseline_prompts: dict[str, str] = {}
-        for index, case in enumerate(cases, start=1):
+        worker_count = min(self.workers, len(cases))
+        if worker_count > 1:
+            info(
+                "[%s/%s] Parallel case execution enabled: workers=%d",
+                self.name,
+                harness.name,
+                worker_count,
+            )
+
+        def generate_baseline(
+            item: tuple[int, official.LiveCodeBenchCase],
+        ) -> tuple[str, str, str, HarnessResult]:
+            index, case = item
             info(
                 "[%s/%s] code-generation %d/%d: %s",
                 self.name,
@@ -246,7 +288,6 @@ class LiveCodeBenchAdapter(BenchmarkAdapter):
                 case.instance_id,
             )
             prompt = official._code_generation_prompt(case)
-            baseline_prompts[case.instance_id] = prompt
             result = self._invoke(
                 harness,
                 case=case,
@@ -254,7 +295,22 @@ class LiveCodeBenchAdapter(BenchmarkAdapter):
                 prompt=prompt,
             )
             code, _error = official._extract_python_code(result.final_content)
-            baseline_generations[case.instance_id] = (code, result)
+            return case.instance_id, prompt, code, result
+
+        indexed_cases = list(enumerate(cases, start=1))
+        generated_baselines = _parallel_map_ordered(
+            generate_baseline,
+            indexed_cases,
+            max_workers=worker_count,
+            thread_name_prefix=f"livecodebench-{harness.name}",
+        )
+        baseline_generations = {
+            instance_id: (code, result)
+            for instance_id, _prompt, code, result in generated_baselines
+        }
+        baseline_prompts = {
+            instance_id: prompt for instance_id, prompt, _code, _result in generated_baselines
+        }
 
         baseline_evaluations = self.evaluate(generations=baseline_generations)
         records: list[dict[str, Any]] = []
@@ -272,12 +328,14 @@ class LiveCodeBenchAdapter(BenchmarkAdapter):
             self._archive_record(record, result)
             records.append(record)
 
-        repair_generations: dict[str, tuple[str, HarnessResult]] = {}
-        repair_prompts: dict[str, str] = {}
         repair_cases = [
             case for case in cases if not baseline_evaluations[case.instance_id]["oracle_passed"]
         ]
-        for index, case in enumerate(repair_cases, start=1):
+
+        def generate_repair(
+            item: tuple[int, official.LiveCodeBenchCase],
+        ) -> tuple[str, str, str, HarnessResult]:
+            index, case = item
             baseline = baseline_evaluations[case.instance_id]
             info(
                 "[%s/%s] self-repair %d/%d: %s",
@@ -293,7 +351,6 @@ class LiveCodeBenchAdapter(BenchmarkAdapter):
                 code=code,
                 metadata=baseline["metadata"],
             )
-            repair_prompts[case.instance_id] = prompt
             result = self._invoke(
                 harness,
                 case=case,
@@ -301,7 +358,22 @@ class LiveCodeBenchAdapter(BenchmarkAdapter):
                 prompt=prompt,
             )
             repaired_code, _error = official._extract_python_code(result.final_content)
-            repair_generations[case.instance_id] = (repaired_code, result)
+            return case.instance_id, prompt, repaired_code, result
+
+        indexed_repairs = list(enumerate(repair_cases, start=1))
+        repair_worker_count = min(self.workers, len(repair_cases))
+        generated_repairs = _parallel_map_ordered(
+            generate_repair,
+            indexed_repairs,
+            max_workers=repair_worker_count,
+            thread_name_prefix=f"livecodebench-repair-{harness.name}",
+        )
+        repair_generations = {
+            instance_id: (code, result) for instance_id, _prompt, code, result in generated_repairs
+        }
+        repair_prompts = {
+            instance_id: prompt for instance_id, prompt, _code, _result in generated_repairs
+        }
 
         repair_evaluations = self.evaluate(generations=repair_generations)
         for case in cases:

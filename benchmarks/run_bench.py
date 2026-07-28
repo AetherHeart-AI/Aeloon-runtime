@@ -15,6 +15,13 @@ from benchmarks.progress import configure_progress, info
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be positive")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=("Prepare and run one official benchmark through one or more coding harnesses.")
@@ -36,6 +43,12 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Official benchmark adapter to prepare and run.",
     )
+    parser.add_argument(
+        "--workers",
+        type=_positive_int,
+        default=1,
+        help="Maximum concurrent benchmark cases (default: 1).",
+    )
     return parser
 
 
@@ -43,12 +56,17 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     harness_names = [name for group in args.harness for name in group]
     started = time.monotonic()
     info(
-        "Selected benchmark=%s harnesses=%s",
+        "Selected benchmark=%s harnesses=%s workers=%d",
         args.benchmark,
         ", ".join(harness_names),
+        args.workers,
     )
     harnesses = get_harnesses(harness_names, project_root=PROJECT_ROOT)
-    adapter = get_adapter(args.benchmark, project_root=PROJECT_ROOT)
+    adapter = get_adapter(
+        args.benchmark,
+        project_root=PROJECT_ROOT,
+        workers=args.workers,
+    )
     info("Preparing benchmark environment...")
     adapter.prepare()
     info(

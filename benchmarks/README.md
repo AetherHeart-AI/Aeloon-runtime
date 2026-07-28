@@ -14,12 +14,20 @@ repeating the option:
 ```bash
 uv run python run_bench.py \
   --harness aeloon pi codex \
+  --workers 4 \
   --benchmark refactorbench
 ```
 
 Supported benchmarks are `refactorbench` and `livecodebench`. Supported
 harnesses are `aeloon`, `pi`, `codex`, and `claude`; `--harness all` selects all
 of them.
+
+`--workers N` enables opt-in case concurrency and defaults to `1`. RefactorBench
+assigns each source repository to one writable lane, so cases that share a
+repository never mutate the same workspace concurrently. LiveCodeBench runs
+independent generation or repair cases concurrently and keeps official
+evaluation batched. Start with `--workers 2` or `--workers 4`; higher values may
+hit model-provider rate limits.
 
 ## Automatic preparation
 

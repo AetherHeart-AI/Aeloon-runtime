@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -59,40 +60,43 @@ class RefactorBenchAdapter(BenchmarkAdapter):
             self.run.workspace_root / "cases" / self.name / source_revision[:12],
             refactorbench_root=self.run.source_dir,
         )
-        harness_summaries: dict[str, dict[str, Any]] = {}
+        records_by_harness: dict[str, list[dict[str, Any]]] = {
+            harness.name: [] for harness in harnesses
+        }
         try:
-            for harness in harnesses:
-                info(
-                    "[%s/%s] Starting %d cases",
-                    self.name,
-                    harness.name,
-                    len(cases),
-                )
-                records = [
-                    self._run_case(
-                        case=case,
+            if self.workers == 1:
+                for harness in harnesses:
+                    records_by_harness[harness.name] = self._run_harness_cases(
                         harness=harness,
+                        cases=cases,
                         cache=cache,
                     )
-                    for case in cases
-                ]
-                harness_summaries[harness.name] = self._summarize(
-                    harness=harness,
-                    records=records,
+            else:
+                records_by_harness = self._run_parallel(
+                    harnesses=harnesses,
+                    cases=cases,
+                    cache=cache,
                 )
-                info("[%s/%s] All cases completed", self.name, harness.name)
         except BaseException:
             manifest["status"] = "interrupted"
             manifest["finished_at"] = datetime.now(UTC).isoformat()
             self.write_json(manifest_path, manifest)
             raise
 
+        harness_summaries = {
+            harness.name: self._summarize(
+                harness=harness,
+                records=records_by_harness[harness.name],
+            )
+            for harness in harnesses
+        }
         passed = sum(item["passed"] for item in harness_summaries.values())
         recorded = sum(item["recorded_cases"] for item in harness_summaries.values())
         summary = {
             "schema_version": 1,
             "benchmark": self.name,
             "run_id": self.run.run_id,
+            "workers": self.workers,
             "selected_cases": len(cases),
             "recorded_cases": recorded,
             "passed": passed,
@@ -105,6 +109,98 @@ class RefactorBenchAdapter(BenchmarkAdapter):
         manifest["finished_at"] = datetime.now(UTC).isoformat()
         self.write_json(manifest_path, manifest)
         return summary
+
+    def _run_harness_cases(
+        self,
+        *,
+        harness: Harness,
+        cases: list[official.RefactorCase],
+        cache: official.WorkspaceCache,
+    ) -> list[dict[str, Any]]:
+        info(
+            "[%s/%s] Starting %d cases",
+            self.name,
+            harness.name,
+            len(cases),
+        )
+        records = [
+            self._run_case(
+                case=case,
+                harness=harness,
+                cache=cache,
+            )
+            for case in cases
+        ]
+        info("[%s/%s] Completed %d cases", self.name, harness.name, len(cases))
+        return records
+
+    def _run_parallel(
+        self,
+        *,
+        harnesses: list[Harness],
+        cases: list[official.RefactorCase],
+        cache: official.WorkspaceCache,
+    ) -> dict[str, list[dict[str, Any]]]:
+        cases_by_repository: dict[str, list[official.RefactorCase]] = {}
+        for case in cases:
+            cases_by_repository.setdefault(case.repository, []).append(case)
+
+        # WorkspaceCache owns one writable checkout per repository. Initialize
+        # them serially, then assign each repository to exactly one worker.
+        for repository_cases in cases_by_repository.values():
+            cache.prepare(repository_cases[0])
+
+        max_workers = min(self.workers, len(cases_by_repository))
+        info(
+            "[%s] Parallel execution enabled: workers=%d repository_lanes=%d",
+            self.name,
+            max_workers,
+            len(cases_by_repository),
+        )
+        records_by_harness = {harness.name: [] for harness in harnesses}
+        with ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="refactorbench",
+        ) as executor:
+            futures = {
+                executor.submit(
+                    self._run_repository_lane,
+                    harnesses=harnesses,
+                    cases=repository_cases,
+                    cache=cache,
+                ): repository
+                for repository, repository_cases in cases_by_repository.items()
+            }
+            try:
+                for future in as_completed(futures):
+                    lane_records = future.result()
+                    for harness_name, records in lane_records.items():
+                        records_by_harness[harness_name].extend(records)
+            except BaseException:
+                for future in futures:
+                    future.cancel()
+                raise
+
+        case_order = {case.instance_id: index for index, case in enumerate(cases)}
+        for records in records_by_harness.values():
+            records.sort(key=lambda record: case_order[str(record["instance_id"])])
+        return records_by_harness
+
+    def _run_repository_lane(
+        self,
+        *,
+        harnesses: list[Harness],
+        cases: list[official.RefactorCase],
+        cache: official.WorkspaceCache,
+    ) -> dict[str, list[dict[str, Any]]]:
+        return {
+            harness.name: self._run_harness_cases(
+                harness=harness,
+                cases=cases,
+                cache=cache,
+            )
+            for harness in harnesses
+        }
 
     def _run_case(
         self,
