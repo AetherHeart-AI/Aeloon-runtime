@@ -1,4 +1,4 @@
-"""Bridge the Aeloon benchmark runner to an official LiveCodeBench checkout.
+"""Bridge benchmark adapters to an official LiveCodeBench checkout.
 
 This module is intentionally executed with the Python environment belonging to
 the LiveCodeBench checkout.  Keeping the adapter in a separate process avoids
@@ -219,3 +219,4 @@ def main(argv: list[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
+

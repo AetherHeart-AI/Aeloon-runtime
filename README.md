@@ -51,8 +51,8 @@ uv run aeloon-core run \
 `run` accepts exactly one of positional prompt text, `--prompt-file`, or
 `--stdin`. JSON output suppresses progress rendering so automation receives one
 machine-readable result on stdout. See [benchmarks/README.md](benchmarks/README.md)
-for the unified Aeloon/Pi/Codex/Claude Code RefactorBench runner and result
-archive format.
+for the unified RefactorBench/LiveCodeBench preparation and runner, including
+Aeloon, Pi, Codex, and Claude Code harness support.
 
 The Web UI has three pieces: the Master conversation, live agents for the current
 turn, and diagnostic logs. Live agent events are display-only and disappear when

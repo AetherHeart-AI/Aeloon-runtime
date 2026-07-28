@@ -1,0 +1,173 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import benchmarks.run_bench as unified
+from benchmarks.adapters.refactorbench import RefactorBenchAdapter
+from benchmarks.harness.base import (
+    HarnessInvocation,
+    HarnessResult,
+    ProcessOutcome,
+)
+from benchmarks.progress import configure_progress, info
+
+
+class FakeHarness:
+    name = "fake"
+    version = "fake@1"
+
+    def run(self, request) -> HarnessResult:
+        (request.workspace / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
+        invocation = HarnessInvocation(
+            command=["fake", "<prompt>"],
+            cwd=request.workspace,
+            prompt_argument=True,
+        )
+        return HarnessResult(
+            harness=self.name,
+            version=self.version,
+            invocation=invocation,
+            process=ProcessOutcome(
+                returncode=0,
+                stdout='{"status":"completed"}',
+                stderr="",
+                duration_ms=1,
+            ),
+            status="completed",
+            final_content="done",
+        )
+
+
+def _make_refactorbench(root: Path) -> None:
+    repository = "demo_refactor"
+    prompt = root / "problems" / "base_problems" / repository / "change-task.txt"
+    test = root / "tests" / repository / "change-test.py"
+    source = root / "repositories" / repository / "module.py"
+    mapping = root / "scripts" / "base_mapping.py"
+    for path in (prompt, test, source, mapping):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    prompt.write_text("Change VALUE from zero to one.\n", encoding="utf-8")
+    source.write_text("VALUE = 0\n", encoding="utf-8")
+    test.write_text(
+        "from pathlib import Path\n"
+        "source = (Path.cwd() / '..' / 'module.py').resolve().read_text()\n"
+        "raise SystemExit(0 if 'VALUE = 1' in source else 1)\n",
+        encoding="utf-8",
+    )
+    mapping.write_text(
+        "file_mapping = {\n"
+        "    '../tests/demo_refactor/change-test.py': "
+        "'../problems/base_problems/demo_refactor/change-task.txt',\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+
+def test_cli_only_exposes_harness_and_benchmark() -> None:
+    parser = unified.build_parser()
+    args = parser.parse_args(
+        [
+            "--harness",
+            "aeloon",
+            "pi",
+            "--benchmark",
+            "refactorbench",
+        ]
+    )
+
+    assert args.harness == [["aeloon", "pi"]]
+    assert args.benchmark == "refactorbench"
+    assert {action.dest for action in parser._actions if action.dest != "help"} == {
+        "harness",
+        "benchmark",
+    }
+
+
+def test_benchmark_python_packages_are_not_gitignored() -> None:
+    root = Path(__file__).resolve().parents[1]
+    ignored_paths = {
+        line.strip().casefold()
+        for line in (root / ".gitignore").read_text(encoding="utf-8").splitlines()
+    }
+
+    assert "benchmarks/refactorbench/" not in ignored_paths
+    assert "benchmarks/livecodebench/" not in ignored_paths
+
+
+def test_progress_is_written_to_stderr_without_polluting_stdout(capsys) -> None:
+    configure_progress()
+
+    info("Preparing %s", "livecodebench")
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "INFO Preparing livecodebench" in captured.err
+
+
+def test_unified_runner_prepares_before_execute(monkeypatch, tmp_path: Path) -> None:
+    events: list[object] = []
+    harnesses = [object(), object()]
+
+    class FakeAdapter:
+        run = SimpleNamespace(
+            source_dir=tmp_path / "source",
+            output_dir=tmp_path / "results",
+        )
+
+        def prepare(self) -> None:
+            events.append("prepare")
+
+        def execute(self, selected) -> dict[str, object]:
+            events.append(("execute", selected))
+            return {"ok": True}
+
+    monkeypatch.setattr(unified, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(
+        unified,
+        "get_harnesses",
+        lambda names, **kwargs: events.append(("harnesses", names)) or harnesses,
+    )
+    monkeypatch.setattr(
+        unified,
+        "get_adapter",
+        lambda name, **kwargs: events.append(("adapter", name)) or FakeAdapter(),
+    )
+    args = unified.build_parser().parse_args(
+        [
+            "--harness",
+            "aeloon",
+            "--harness",
+            "codex",
+            "--benchmark",
+            "livecodebench",
+        ]
+    )
+
+    assert unified.run(args) == {"ok": True}
+    assert events == [
+        ("harnesses", ["aeloon", "codex"]),
+        ("adapter", "livecodebench"),
+        "prepare",
+        ("execute", harnesses),
+    ]
+
+
+def test_refactorbench_adapter_runs_through_shared_harness(tmp_path: Path) -> None:
+    adapter = RefactorBenchAdapter(project_root=tmp_path)
+    _make_refactorbench(adapter.run.source_dir)
+
+    summary = adapter.execute([FakeHarness()])  # type: ignore[list-item]
+
+    assert summary["passed"] == 1
+    assert summary["harnesses"]["fake"]["passed"] == 1
+    records = [
+        json.loads(line)
+        for line in (adapter.run.output_dir / "fake" / "results.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert records[0]["evaluation"]["passed"] is True
+    assert records[0]["agent"]["harness"] == "fake"
+    assert (adapter.run.output_dir / records[0]["patch_path"]).is_file()
