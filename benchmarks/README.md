@@ -29,6 +29,28 @@ independent generation or repair cases concurrently and keeps official
 evaluation batched. Start with `--workers 2` or `--workers 4`; higher values may
 hit model-provider rate limits.
 
+## Resume an interrupted LiveCodeBench run
+
+Pass the original run id to `--resume` and select the same harnesses:
+
+```bash
+uv run python run_bench.py \
+  --harness aeloon pi claude \
+  --workers 8 \
+  --benchmark livecodebench \
+  --resume 20260729T100902Z-d558b57d
+```
+
+LiveCodeBench writes one durable generation checkpoint per scenario and case
+before invoking the official evaluator. Resume reuses those checkpoints plus
+completed `(harness, scenario, case)` records in `results.jsonl`; it only runs
+work that has no durable outcome. Repeating the same resume command is
+idempotent and does not append duplicate result records.
+
+The benchmark, release, source revision, cases, and ordered harness selection
+must match the original manifest. RefactorBench does not currently support the
+unified runner's `--resume` option.
+
 ## Automatic preparation
 
 No separate setup command is required. Before a run, the selected adapter:

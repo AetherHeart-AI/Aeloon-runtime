@@ -49,6 +49,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help="Maximum concurrent benchmark cases (default: 1).",
     )
+    parser.add_argument(
+        "--resume",
+        metavar="RUN_ID",
+        help=(
+            "Resume an existing benchmark run by id. Completed records and "
+            "generation checkpoints are reused."
+        ),
+    )
     return parser
 
 
@@ -66,6 +74,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         args.benchmark,
         project_root=PROJECT_ROOT,
         workers=args.workers,
+        resume_run_id=args.resume,
     )
     info("Preparing benchmark environment...")
     adapter.prepare()

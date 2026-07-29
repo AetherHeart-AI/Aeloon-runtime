@@ -2,23 +2,40 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
+import os
 import shutil
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TypeVar
 
 from benchmarks.adapters.base import BenchmarkAdapter, run_checked
-from benchmarks.harness.base import Harness, HarnessRequest, HarnessResult
+from benchmarks.harness.base import (
+    Harness,
+    HarnessInvocation,
+    HarnessRequest,
+    HarnessResult,
+    ProcessOutcome,
+)
 from benchmarks.livecodebench import runner as official
 from benchmarks.progress import ProgressBar, info
 
 _InputT = TypeVar("_InputT")
 _OutputT = TypeVar("_OutputT")
+
+
+@dataclass(frozen=True)
+class _Generation:
+    prompt: str
+    code: str
+    result: HarnessResult
 
 
 def _parallel_map_ordered(
@@ -50,6 +67,7 @@ def _parallel_map_ordered(
 class LiveCodeBenchAdapter(BenchmarkAdapter):
     name = "livecodebench"
     repository_url = "https://github.com/LiveCodeBench/LiveCodeBench.git"
+    supports_resume = True
     release_version = "v6"
     scenarios = ("code-generation", "self-repair")
 
@@ -207,13 +225,37 @@ class LiveCodeBenchAdapter(BenchmarkAdapter):
                 "oracle_passed": oracle_passed,
                 "metadata": item["metadata"],
             }
-        missing = sorted(set(generations) - evaluations)
+        missing = sorted(set(generations) - evaluations.keys())
         if missing:
             raise RuntimeError(f"LiveCodeBench evaluator omitted cases: {', '.join(missing)}")
         info("[%s] Official evaluation completed", self.name)
         return evaluations
 
     def execute(self, harnesses: list[Harness]) -> dict[str, Any]:
+        with self._run_lock():
+            return self._execute_locked(harnesses)
+
+    @contextmanager
+    def _run_lock(self) -> Iterator[None]:
+        self.run.output_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = self.run.output_dir / ".run.lock"
+        with lock_path.open("a+", encoding="utf-8") as stream:
+            try:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise RuntimeError(
+                    f"Benchmark run is already active: {self.run.run_id}"
+                ) from None
+            stream.seek(0)
+            stream.truncate()
+            stream.write(f"{os.getpid()}\n")
+            stream.flush()
+            try:
+                yield
+            finally:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+    def _execute_locked(self, harnesses: list[Harness]) -> dict[str, Any]:
         info("[%s] Loading official %s cases", self.name, self.release_version)
         cases = self.load_cases()
         if not cases:
@@ -221,13 +263,7 @@ class LiveCodeBenchAdapter(BenchmarkAdapter):
         info("[%s] Loaded %d cases", self.name, len(cases))
 
         manifest_path = self.run.output_dir / "manifest.json"
-        manifest = {
-            **self.manifest(harnesses, status="running"),
-            "created_at": datetime.now(UTC).isoformat(),
-            "release_version": self.release_version,
-            "scenarios": list(self.scenarios),
-            "cases": [case.instance_id for case in cases],
-        }
+        manifest = self._start_manifest(harnesses, cases)
         self.write_json(manifest_path, manifest)
         summaries: dict[str, dict[str, Any]] = {}
         try:
@@ -261,12 +297,106 @@ class LiveCodeBenchAdapter(BenchmarkAdapter):
         self.write_json(manifest_path, manifest)
         return summary
 
+    def _start_manifest(
+        self,
+        harnesses: list[Harness],
+        cases: list[official.LiveCodeBenchCase],
+    ) -> dict[str, Any]:
+        now = datetime.now(UTC).isoformat()
+        if not self.resuming:
+            return {
+                **self.manifest(harnesses, status="running"),
+                "created_at": now,
+                "release_version": self.release_version,
+                "scenarios": list(self.scenarios),
+                "cases": [case.instance_id for case in cases],
+            }
+
+        manifest_path = self.run.output_dir / "manifest.json"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            raise RuntimeError(f"Resume manifest does not exist: {manifest_path}") from None
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Resume manifest is invalid: {manifest_path}: {exc}") from None
+        if not isinstance(manifest, dict):
+            raise RuntimeError(f"Resume manifest is not an object: {manifest_path}")
+
+        expected_harnesses = [harness.name for harness in harnesses]
+        recorded_harnesses = [
+            item.get("id")
+            for item in manifest.get("harnesses", [])
+            if isinstance(item, dict)
+        ]
+        checks = {
+            "benchmark": (manifest.get("benchmark"), self.name),
+            "run_id": (manifest.get("run_id"), self.run.run_id),
+            "release_version": (manifest.get("release_version"), self.release_version),
+            "scenarios": (manifest.get("scenarios"), list(self.scenarios)),
+            "cases": (
+                manifest.get("cases"),
+                [case.instance_id for case in cases],
+            ),
+            "harnesses": (recorded_harnesses, expected_harnesses),
+            "source revision": (
+                manifest.get("source", {}).get("revision")
+                if isinstance(manifest.get("source"), dict)
+                else None,
+                self.source_revision(),
+            ),
+        }
+        mismatches = [
+            label for label, (recorded, expected) in checks.items() if recorded != expected
+        ]
+        if mismatches:
+            raise RuntimeError(
+                "Cannot resume benchmark run because the manifest changed: "
+                + ", ".join(mismatches)
+            )
+
+        previous_finished_at = manifest.pop("finished_at", None)
+        resume_events = manifest.setdefault("resume_events", [])
+        if not isinstance(resume_events, list):
+            raise RuntimeError(f"Resume manifest has invalid resume_events: {manifest_path}")
+        resume_events.append(
+            {
+                "resumed_at": now,
+                "previous_status": manifest.get("status"),
+                "previous_finished_at": previous_finished_at,
+                "workers": self.workers,
+                "harnesses": [
+                    {"id": harness.name, "version": harness.version}
+                    for harness in harnesses
+                ],
+            }
+        )
+        manifest["status"] = "running"
+        return manifest
+
     def _run_harness(
         self,
         harness: Harness,
         cases: list[official.LiveCodeBenchCase],
     ) -> dict[str, Any]:
-        worker_count = min(self.workers, len(cases))
+        records_by_key = self._load_records(harness, cases)
+        baseline_records = {
+            instance_id: record
+            for (scenario, instance_id), record in records_by_key.items()
+            if scenario == "code-generation"
+        }
+        pending_baselines = [
+            case for case in cases if case.instance_id not in baseline_records
+        ]
+        if baseline_records:
+            info(
+                "[%s/%s] Reusing %d code-generation records; pending=%d",
+                self.name,
+                harness.name,
+                len(baseline_records),
+                len(pending_baselines),
+            )
+
+        worker_count = min(self.workers, len(pending_baselines))
         if worker_count > 1:
             info(
                 "[%s/%s] Parallel case execution enabled: workers=%d",
@@ -277,29 +407,51 @@ class LiveCodeBenchAdapter(BenchmarkAdapter):
 
         def generate_baseline(
             item: tuple[int, official.LiveCodeBenchCase],
-        ) -> tuple[str, str, str, HarnessResult]:
+        ) -> tuple[str, _Generation]:
             index, case = item
-            baseline_progress.set_detail(f"running {case.instance_id}")
-            info(
-                "[%s/%s] code-generation %d/%d: %s",
-                self.name,
-                harness.name,
-                index,
-                len(cases),
-                case.instance_id,
-            )
-            prompt = official._code_generation_prompt(case)
-            result = self._invoke(
-                harness,
+            generation = self._load_generation_checkpoint(
+                harness=harness,
                 case=case,
                 scenario="code-generation",
-                prompt=prompt,
             )
-            code, _error = official._extract_python_code(result.final_content)
-            baseline_progress.advance(detail=f"completed {case.instance_id}")
-            return case.instance_id, prompt, code, result
+            if generation is None:
+                baseline_progress.set_detail(f"running {case.instance_id}")
+                info(
+                    "[%s/%s] code-generation %d/%d: %s",
+                    self.name,
+                    harness.name,
+                    index,
+                    len(pending_baselines),
+                    case.instance_id,
+                )
+                prompt = official._code_generation_prompt(case)
+                result = self._invoke(
+                    harness,
+                    case=case,
+                    scenario="code-generation",
+                    prompt=prompt,
+                )
+                code, _error = official._extract_python_code(result.final_content)
+                generation = _Generation(prompt=prompt, code=code, result=result)
+                self._write_generation_checkpoint(
+                    harness=harness,
+                    case=case,
+                    scenario="code-generation",
+                    generation=generation,
+                )
+                detail = f"completed {case.instance_id}"
+            else:
+                info(
+                    "[%s/%s] Reusing code-generation checkpoint: %s",
+                    self.name,
+                    harness.name,
+                    case.instance_id,
+                )
+                detail = f"resumed {case.instance_id}"
+            baseline_progress.advance(detail=detail)
+            return case.instance_id, generation
 
-        indexed_cases = list(enumerate(cases, start=1))
+        indexed_cases = list(enumerate(pending_baselines, start=1))
         with ProgressBar(
             f"{self.name}/{harness.name} code-generation",
             total=len(indexed_cases),
@@ -310,66 +462,113 @@ class LiveCodeBenchAdapter(BenchmarkAdapter):
                 max_workers=worker_count,
                 thread_name_prefix=f"livecodebench-{harness.name}",
             )
-        baseline_generations = {
-            instance_id: (code, result)
-            for instance_id, _prompt, code, result in generated_baselines
+        new_baseline_generations = {
+            instance_id: generation
+            for instance_id, generation in generated_baselines
         }
-        baseline_prompts = {
-            instance_id: prompt for instance_id, prompt, _code, _result in generated_baselines
-        }
-
-        baseline_evaluations = self.evaluate(generations=baseline_generations)
-        records: list[dict[str, Any]] = []
-        for case in cases:
-            code, result = baseline_generations[case.instance_id]
+        baseline_evaluations = (
+            self.evaluate(
+                generations={
+                    instance_id: (generation.code, generation.result)
+                    for instance_id, generation in new_baseline_generations.items()
+                }
+            )
+            if new_baseline_generations
+            else {}
+        )
+        for case in pending_baselines:
+            generation = new_baseline_generations[case.instance_id]
             record = self._record(
                 harness=harness,
                 case=case,
                 scenario="code-generation",
-                prompt=baseline_prompts[case.instance_id],
-                code=code,
-                result=result,
+                prompt=generation.prompt,
+                code=generation.code,
+                result=generation.result,
                 evaluation=baseline_evaluations[case.instance_id],
             )
-            self._archive_record(record, result)
-            records.append(record)
+            self._archive_record(record, generation.result)
+            records_by_key[("code-generation", case.instance_id)] = record
+            baseline_records[case.instance_id] = record
 
-        repair_cases = [
-            case for case in cases if not baseline_evaluations[case.instance_id]["oracle_passed"]
+        repair_records = {
+            instance_id: record
+            for (scenario, instance_id), record in records_by_key.items()
+            if scenario == "self-repair"
+        }
+        self._validate_repair_records(
+            repair_records=repair_records,
+            baseline_records=baseline_records,
+            harness=harness,
+        )
+        pending_repairs = [
+            case
+            for case in cases
+            if case.instance_id not in repair_records
+            and not baseline_records[case.instance_id]["evaluation"]["oracle_passed"]
         ]
+        if repair_records:
+            info(
+                "[%s/%s] Reusing %d self-repair records; pending attempts=%d",
+                self.name,
+                harness.name,
+                len(repair_records),
+                len(pending_repairs),
+            )
 
         def generate_repair(
             item: tuple[int, official.LiveCodeBenchCase],
-        ) -> tuple[str, str, str, HarnessResult]:
+        ) -> tuple[str, _Generation]:
             index, case = item
-            baseline = baseline_evaluations[case.instance_id]
-            repair_progress.set_detail(f"running {case.instance_id}")
-            info(
-                "[%s/%s] self-repair %d/%d: %s",
-                self.name,
-                harness.name,
-                index,
-                len(repair_cases),
-                case.instance_id,
-            )
-            code, _baseline_result = baseline_generations[case.instance_id]
-            prompt = official._self_repair_prompt(
-                case,
-                code=code,
-                metadata=baseline["metadata"],
-            )
-            result = self._invoke(
-                harness,
+            generation = self._load_generation_checkpoint(
+                harness=harness,
                 case=case,
                 scenario="self-repair",
-                prompt=prompt,
             )
-            repaired_code, _error = official._extract_python_code(result.final_content)
-            repair_progress.advance(detail=f"completed {case.instance_id}")
-            return case.instance_id, prompt, repaired_code, result
+            if generation is None:
+                baseline = baseline_records[case.instance_id]
+                repair_progress.set_detail(f"running {case.instance_id}")
+                info(
+                    "[%s/%s] self-repair %d/%d: %s",
+                    self.name,
+                    harness.name,
+                    index,
+                    len(pending_repairs),
+                    case.instance_id,
+                )
+                prompt = official._self_repair_prompt(
+                    case,
+                    code=baseline["generation"]["code"],
+                    metadata=baseline["evaluation"]["metadata"],
+                )
+                result = self._invoke(
+                    harness,
+                    case=case,
+                    scenario="self-repair",
+                    prompt=prompt,
+                )
+                code, _error = official._extract_python_code(result.final_content)
+                generation = _Generation(prompt=prompt, code=code, result=result)
+                self._write_generation_checkpoint(
+                    harness=harness,
+                    case=case,
+                    scenario="self-repair",
+                    generation=generation,
+                )
+                detail = f"completed {case.instance_id}"
+            else:
+                info(
+                    "[%s/%s] Reusing self-repair checkpoint: %s",
+                    self.name,
+                    harness.name,
+                    case.instance_id,
+                )
+                detail = f"resumed {case.instance_id}"
+            repair_progress.advance(detail=detail)
+            return case.instance_id, generation
 
-        indexed_repairs = list(enumerate(repair_cases, start=1))
-        repair_worker_count = min(self.workers, len(repair_cases))
+        indexed_repairs = list(enumerate(pending_repairs, start=1))
+        repair_worker_count = min(self.workers, len(pending_repairs))
         with ProgressBar(
             f"{self.name}/{harness.name} self-repair",
             total=len(indexed_repairs),
@@ -380,25 +579,35 @@ class LiveCodeBenchAdapter(BenchmarkAdapter):
                 max_workers=repair_worker_count,
                 thread_name_prefix=f"livecodebench-repair-{harness.name}",
             )
-        repair_generations = {
-            instance_id: (code, result) for instance_id, _prompt, code, result in generated_repairs
+        new_repair_generations = {
+            instance_id: generation
+            for instance_id, generation in generated_repairs
         }
-        repair_prompts = {
-            instance_id: prompt for instance_id, prompt, _code, _result in generated_repairs
-        }
-
-        repair_evaluations = self.evaluate(generations=repair_generations)
+        repair_evaluations = (
+            self.evaluate(
+                generations={
+                    instance_id: (generation.code, generation.result)
+                    for instance_id, generation in new_repair_generations.items()
+                }
+            )
+            if new_repair_generations
+            else {}
+        )
         for case in cases:
-            baseline_code, baseline_result = baseline_generations[case.instance_id]
-            baseline_evaluation = baseline_evaluations[case.instance_id]
-            attempted = case.instance_id in repair_generations
+            if case.instance_id in repair_records:
+                continue
+            baseline = baseline_records[case.instance_id]
+            attempted = case.instance_id in new_repair_generations
             if attempted:
-                code, result = repair_generations[case.instance_id]
+                generation = new_repair_generations[case.instance_id]
+                code = generation.code
+                result = generation.result
                 evaluation = repair_evaluations[case.instance_id]
-                prompt = repair_prompts[case.instance_id]
+                prompt = generation.prompt
             else:
-                code, result = baseline_code, baseline_result
-                evaluation = baseline_evaluation
+                code = baseline["generation"]["code"]
+                result = self._result_from_record(baseline)
+                evaluation = baseline["evaluation"]
                 prompt = None
             record = self._record(
                 harness=harness,
@@ -409,8 +618,8 @@ class LiveCodeBenchAdapter(BenchmarkAdapter):
                 result=result,
                 evaluation=evaluation,
                 baseline={
-                    "code": baseline_code,
-                    "evaluation": baseline_evaluation,
+                    "code": baseline["generation"]["code"],
+                    "evaluation": baseline["evaluation"],
                 },
                 repair_attempted=attempted,
             )
@@ -422,12 +631,15 @@ class LiveCodeBenchAdapter(BenchmarkAdapter):
                     self.run.output_dir / harness.name / "results.jsonl",
                     record,
                 )
-            records.append(record)
+            records_by_key[("self-repair", case.instance_id)] = record
+            repair_records[case.instance_id] = record
 
         generation_records = [
-            record for record in records if record["scenario"] == "code-generation"
+            records_by_key[("code-generation", case.instance_id)] for case in cases
         ]
-        repair_records = [record for record in records if record["scenario"] == "self-repair"]
+        ordered_repair_records = [
+            records_by_key[("self-repair", case.instance_id)] for case in cases
+        ]
         return {
             "harness": harness.name,
             "version": harness.version,
@@ -436,11 +648,334 @@ class LiveCodeBenchAdapter(BenchmarkAdapter):
                 bool(record["evaluation"]["passed"]) for record in generation_records
             ),
             "self_repair_passed": sum(
-                bool(record["evaluation"]["passed"]) for record in repair_records
+                bool(record["evaluation"]["passed"]) for record in ordered_repair_records
             ),
-            "repaired": sum(bool(record.get("repaired")) for record in repair_records),
+            "repaired": sum(
+                bool(record.get("repaired")) for record in ordered_repair_records
+            ),
             "results": str(self.run.output_dir / harness.name / "results.jsonl"),
         }
+
+    def _validate_repair_records(
+        self,
+        *,
+        repair_records: dict[str, dict[str, Any]],
+        baseline_records: dict[str, dict[str, Any]],
+        harness: Harness,
+    ) -> None:
+        for instance_id, repair in repair_records.items():
+            baseline = baseline_records.get(instance_id)
+            snapshot = repair.get("baseline")
+            if (
+                baseline is None
+                or not isinstance(snapshot, dict)
+                or snapshot.get("code") != baseline["generation"].get("code")
+                or snapshot.get("evaluation") != baseline.get("evaluation")
+            ):
+                raise RuntimeError(
+                    "Cannot resume inconsistent self-repair record: "
+                    f"{harness.name}/{instance_id}"
+                )
+
+    def _load_records(
+        self,
+        harness: Harness,
+        cases: list[official.LiveCodeBenchCase],
+    ) -> dict[tuple[str, str], dict[str, Any]]:
+        selected_ids = {case.instance_id for case in cases}
+        results_path = self.run.output_dir / harness.name / "results.jsonl"
+        records: dict[tuple[str, str], dict[str, Any]] = {}
+        if results_path.is_file():
+            for line_number, line in enumerate(
+                results_path.read_text(encoding="utf-8").splitlines(),
+                start=1,
+            ):
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        f"Invalid benchmark result at {results_path}:{line_number}: {exc}"
+                    ) from None
+                key = self._record_key(
+                    record,
+                    harness=harness,
+                    selected_ids=selected_ids,
+                    source=f"{results_path}:{line_number}",
+                )
+                records[key] = record
+
+        if not self.resuming:
+            return records
+
+        recovery_path = (
+            self.run.output_dir
+            / harness.name
+            / "recovered-code-generation.json"
+        )
+        if not recovery_path.is_file():
+            return records
+        try:
+            recovery = json.loads(recovery_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Invalid recovery artifact at {recovery_path}: {exc}") from None
+        recovered_records = recovery.get("records") if isinstance(recovery, dict) else None
+        if not isinstance(recovered_records, list):
+            raise RuntimeError(f"Recovery artifact contains no records: {recovery_path}")
+
+        imported = 0
+        for index, record in enumerate(recovered_records, start=1):
+            key = self._record_key(
+                record,
+                harness=harness,
+                selected_ids=selected_ids,
+                source=f"{recovery_path}:record {index}",
+            )
+            if key in records:
+                continue
+            self.write_result(results_path, record)
+            records[key] = record
+            imported += 1
+        if imported:
+            info(
+                "[%s/%s] Imported %d recovered records into the resume ledger",
+                self.name,
+                harness.name,
+                imported,
+            )
+        return records
+
+    def _record_key(
+        self,
+        record: Any,
+        *,
+        harness: Harness,
+        selected_ids: set[str],
+        source: str,
+    ) -> tuple[str, str]:
+        if not isinstance(record, dict):
+            raise RuntimeError(f"Benchmark result is not an object: {source}")
+        scenario = record.get("scenario")
+        instance_id = record.get("instance_id")
+        if (
+            record.get("benchmark") != self.name
+            or record.get("release_version") != self.release_version
+            or record.get("harness") != harness.name
+            or scenario not in self.scenarios
+            or not isinstance(instance_id, str)
+            or instance_id not in selected_ids
+            or not isinstance(record.get("generation"), dict)
+            or not isinstance(record.get("evaluation"), dict)
+            or not isinstance(record.get("agent"), dict)
+        ):
+            raise RuntimeError(f"Benchmark result is incompatible with this run: {source}")
+        return scenario, instance_id
+
+    def _checkpoint_path(
+        self,
+        *,
+        harness: Harness,
+        case: official.LiveCodeBenchCase,
+        scenario: str,
+    ) -> Path:
+        return (
+            self.run.output_dir
+            / harness.name
+            / "checkpoints"
+            / scenario
+            / f"{official._safe_id(case.instance_id)}.json"
+        )
+
+    def _write_generation_checkpoint(
+        self,
+        *,
+        harness: Harness,
+        case: official.LiveCodeBenchCase,
+        scenario: str,
+        generation: _Generation,
+    ) -> None:
+        result = generation.result
+        self.write_json(
+            self._checkpoint_path(
+                harness=harness,
+                case=case,
+                scenario=scenario,
+            ),
+            {
+                "schema_version": 1,
+                "benchmark": self.name,
+                "release_version": self.release_version,
+                "harness": harness.name,
+                "scenario": scenario,
+                "instance_id": case.instance_id,
+                "prompt": generation.prompt,
+                "code": generation.code,
+                "result": {
+                    "agent": result.to_record(),
+                    "stdout": result.process.stdout,
+                    "stderr": result.process.stderr,
+                },
+            },
+        )
+
+    def _load_generation_checkpoint(
+        self,
+        *,
+        harness: Harness,
+        case: official.LiveCodeBenchCase,
+        scenario: str,
+    ) -> _Generation | None:
+        checkpoint_path = self._checkpoint_path(
+            harness=harness,
+            case=case,
+            scenario=scenario,
+        )
+        if not checkpoint_path.is_file():
+            return None
+        try:
+            checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"Invalid generation checkpoint at {checkpoint_path}: {exc}"
+            ) from None
+        expected = {
+            "schema_version": 1,
+            "benchmark": self.name,
+            "release_version": self.release_version,
+            "harness": harness.name,
+            "scenario": scenario,
+            "instance_id": case.instance_id,
+        }
+        if not isinstance(checkpoint, dict) or any(
+            checkpoint.get(key) != value for key, value in expected.items()
+        ):
+            raise RuntimeError(
+                f"Generation checkpoint is incompatible with this run: {checkpoint_path}"
+            )
+        prompt = checkpoint.get("prompt")
+        code = checkpoint.get("code")
+        result_payload = checkpoint.get("result")
+        if (
+            not isinstance(prompt, str)
+            or not isinstance(code, str)
+            or not isinstance(result_payload, dict)
+            or not isinstance(result_payload.get("agent"), dict)
+        ):
+            raise RuntimeError(f"Generation checkpoint is invalid: {checkpoint_path}")
+        result = self._result_from_agent(
+            result_payload["agent"],
+            stdout=(
+                result_payload["stdout"]
+                if isinstance(result_payload.get("stdout"), str)
+                else ""
+            ),
+            stderr=(
+                result_payload["stderr"]
+                if isinstance(result_payload.get("stderr"), str)
+                else ""
+            ),
+        )
+        if result.harness != harness.name:
+            raise RuntimeError(
+                f"Generation checkpoint has the wrong harness: {checkpoint_path}"
+            )
+        return _Generation(prompt=prompt, code=code, result=result)
+
+    def _result_from_record(self, record: dict[str, Any]) -> HarnessResult:
+        agent = record.get("agent")
+        if not isinstance(agent, dict):
+            raise RuntimeError(
+                "Cannot resume invalid agent record for "
+                f"{record.get('scenario')}/{record.get('instance_id')}"
+            )
+        return self._result_from_agent(agent)
+
+    def _result_from_agent(
+        self,
+        agent: dict[str, Any],
+        *,
+        stdout: str = "",
+        stderr: str = "",
+    ) -> HarnessResult:
+        command = agent.get("command")
+        if not isinstance(command, list) or not all(
+            isinstance(item, str) for item in command
+        ):
+            command = ["resumed-benchmark-generation"]
+        wall_time_ms = agent.get("wall_time_ms")
+        if (
+            not isinstance(wall_time_ms, int | float)
+            or isinstance(wall_time_ms, bool)
+        ):
+            wall_time_ms = 0
+        returncode = agent.get("returncode")
+        if not isinstance(returncode, int) or isinstance(returncode, bool):
+            returncode = None
+        if not stdout and isinstance(agent.get("stdout"), str):
+            stdout = agent["stdout"]
+        if not stderr and isinstance(agent.get("stderr"), str):
+            stderr = agent["stderr"]
+
+        harness_name = agent.get("harness")
+        status = agent.get("status")
+        if not isinstance(harness_name, str) or not isinstance(status, str):
+            raise RuntimeError("Cannot resume an invalid harness result.")
+        version = agent.get("version")
+        final_content = agent.get("final_content")
+        session_id = agent.get("session_id")
+        turn_id = agent.get("turn_id")
+        payload_error = agent.get("payload_error")
+        duration_ms = agent.get("duration_ms")
+        cost_usd = agent.get("cost_usd")
+        return HarnessResult(
+            harness=harness_name,
+            version=version if isinstance(version, str) else None,
+            invocation=HarnessInvocation(
+                command=command,
+                cwd=self.project_root,
+            ),
+            process=ProcessOutcome(
+                returncode=returncode,
+                stdout=stdout,
+                stderr=stderr,
+                duration_ms=round(wall_time_ms),
+                timed_out=bool(agent.get("timed_out")),
+            ),
+            status=status,
+            final_content=(
+                final_content if isinstance(final_content, str) else None
+            ),
+            session_id=session_id if isinstance(session_id, str) else None,
+            turn_id=turn_id if isinstance(turn_id, str) else None,
+            usage=agent["usage"] if isinstance(agent.get("usage"), dict) else {},
+            models=agent["models"] if isinstance(agent.get("models"), dict) else {},
+            tools_used=(
+                agent["tools_used"]
+                if isinstance(agent.get("tools_used"), list)
+                else []
+            ),
+            transitions=(
+                agent["transitions"]
+                if isinstance(agent.get("transitions"), list)
+                else []
+            ),
+            cost_usd=(
+                cost_usd
+                if isinstance(cost_usd, int | float)
+                and not isinstance(cost_usd, bool)
+                else None
+            ),
+            payload_error=(
+                payload_error if isinstance(payload_error, str) else None
+            ),
+            duration_ms=(
+                duration_ms
+                if isinstance(duration_ms, int | float)
+                and not isinstance(duration_ms, bool)
+                else None
+            ),
+        )
 
     def _invoke(
         self,
