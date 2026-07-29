@@ -1,23 +1,23 @@
 # Aeloon Core
 
-Aeloon Core is a conversation-scoped master/agent runtime built on Pydantic AI
-Harness.
+Aeloon Core is a conversation-scoped agent runtime built on Pydantic AI Harness.
 
-> **Master 负责当前对话；Harness agents 在当前 turn 内完成全部工作。**
+> **Master 是 Ultra Worker；特殊能力以隔离的 ExpertSkill 被调用。**
 
-The runtime has two in-turn execution paths:
+The Master owns the user conversation, final answer, filesystem mutation, shell
+execution, repository context, and planning. It can also call enabled
+`ExpertSkill`s:
 
-- the Master owns the user conversation and final answer;
-- trusted Python `WorkflowTemplate` classes provide a validated fast path for
-  common fixed patterns;
-- Pydantic AI Harness `DynamicWorkflow` remains the fallback for unmatched or
-  genuinely dynamic work;
-- every child agent is isolated and must finish before the current turn returns;
-- child-agent context, checkpoints, leases, and workflow state are not persisted.
+```text
+Master = Ultra Worker
+           + ExpertSkill calls
+           ├── research: plan → 2–4 explorers → primary docs → reduce
+           └── coding:   plan → build → review → one fix → one re-review
+```
 
-There is no durable Flow DAG, WorkerSession store, detached runner, resume protocol,
-or result cache. Harness continues to supply child-agent filesystem access, shell
-execution, repository context, planning, and sliding-window history compaction.
+Expert work is ephemeral. It must finish inside the current turn and has no
+checkpoint, resume, detached runner, background task, or cross-turn state. Core
+does not provide a generic DAG interface.
 
 ## Quick start
 
@@ -25,239 +25,199 @@ execution, repository context, planning, and sliding-window history compaction.
 uv sync
 bun --version  # requires Bun >= 1.3
 
-export ANTHROPIC_BASE_URL="https://api.kimi.com/coding/"
-export ANTHROPIC_API_KEY="你的 API Key"
-export ANTHROPIC_MODEL="k3[1m]"
+export DEEPSEEK_API_KEY="your API key"
+export EXA_API_KEY="your Exa API key"  # only needed by builtin:research
 
 uv run aeloon-core
 ```
 
-The default command starts the local Web UI on `127.0.0.1:7331` and opens it in
-your browser. The bootstrap URL contains a one-time token; after the first load,
-the browser receives a process-local HttpOnly cookie.
-
-Useful variants:
+The default command starts the local Web UI on `127.0.0.1:7331`. Other useful
+forms:
 
 ```bash
 uv run aeloon-core serve --no-open
-uv run aeloon-core serve --port 0
 uv run aeloon-core run "Inspect the repository and explain its entry points"
-uv run aeloon-core run \
-  --workspace /path/to/repository \
-  --prompt-file /path/to/task.txt \
-  --output json
+uv run aeloon-core run --workspace /path/to/repo --prompt-file task.txt --output json
 ```
 
-`run` accepts exactly one of positional prompt text, `--prompt-file`, or
-`--stdin`. JSON output suppresses progress rendering so automation receives one
-machine-readable result on stdout. See [benchmarks/README.md](benchmarks/README.md)
-for the unified RefactorBench/LiveCodeBench preparation and runner, including
-Aeloon, Pi, Codex, and Claude Code harness support.
+## Skills and isolation
 
-The Web UI has three pieces: the Master conversation, live agents for the current
-turn, and diagnostic logs. Live agent events are display-only and disappear when
-the next turn starts. There are no Flow recovery or Worker resume controls.
+A Skill is passive, lazily loaded instructions and resources. An ExpertSkill is
+also a Skill, but adds a registered runner, capability declaration, dependencies,
+and execution policy.
 
-## Execution model
+Discovery is intentionally narrow:
 
-The Master handles small observations with read-only `list`, `read`, `glob`, and
-`grep` tools. Before each Master request, the Host performs a deterministic local
-search over the Workflow Template catalog. A clear match is executed through
-`workflow_execute`, so the Master supplies validated inputs instead of generating
-orchestration code:
+1. package built-ins;
+2. `<workspace>/.aeloon-core/skills`;
+3. roots explicitly listed in config.
 
-```json
-{
-  "template_id": "implement-review",
-  "inputs": {
-    "objective": "Implement the scoped change",
-    "acceptance": "Affected tests pass"
-  },
-  "tuning": {
-    "review_focus": "Correctness and data integrity"
-  }
+Aeloon does not implicitly scan `~/.codex`, `~/.claude`, or `~/.agents`. Canonical
+IDs are `<root-id>:<name>`, so equal names in different roots do not override each
+other.
+
+Master's plain-Skill scope defaults to empty. It sees all enabled ExpertSkill
+descriptors and can use:
+
+- `skill_search`
+- `skill_load`
+- `skill_read`
+- `expert_run`
+
+An expert sees only itself and its declared plain-Skill dependencies. It never
+receives `expert_run`, and expert nesting is rejected by the registry.
+Standard passive metadata such as `license`, `compatibility`, `metadata`, and
+`allowed-tools` is accepted, but it never grants runtime capabilities.
+
+This isolates discovery, prompt context, and Skill tools. It is not an operating
+system confidentiality boundary against a generally authorized shell.
+
+## `SKILL.md`
+
+Plain Skill:
+
+```markdown
+---
+name: project-conventions
+description: Project-specific implementation and verification conventions.
+---
+# Project conventions
+
+Read references/checks.md before changing production code.
+```
+
+ExpertSkill:
+
+```markdown
+---
+name: ppt-builder
+description: Build and verify a presentation.
+kind: expert
+runner: project.ppt
+dependencies:
+  - workspace:slide-style
+capabilities:
+  - filesystem
+  - shell
+  - repo_context
+  - planning
+model_tier: strong
+concurrency_mode: exclusive
+max_calls_per_turn: 2
+---
+# PPT builder
+
+Create the deck, render it, inspect the result, and report artifact paths.
+```
+
+Manifests reference a registered runner ID; they cannot import arbitrary Python.
+Trusted project runner extensions live in `.aeloon-core/catalog.py`:
+
+```python
+from my_project.experts import PptExpertRunner
+
+EXPERT_RUNNERS = {
+    "project.ppt": PptExpertRunner(),
 }
 ```
 
-Built-in templates cover single-role delegation, parallel read-only investigation,
-implementation plus independent review, and a bounded review/fix/re-review loop.
-Run-scoped tuning is validated and never persisted.
+The old `ROLES` and `WORKFLOWS` entries are rejected with a migration error.
+Custom one-agent experts can use `runner: builtin.prompt`. A trusted compiled
+LangGraph can be registered directly or wrapped with `LangGraphExpertRunner`;
+install the optional adapter dependency with:
 
-When no fixed template is compatible, the Master calls Harness `run_workflow` with
-a sandboxed Python program:
-
-```python
-import asyncio
-
-implementation, review = await asyncio.gather(
-    builder(task="Implement the scoped change and verify it"),
-    reviewer(task="Independently inspect the requested behavior and report risks"),
-)
-{"implementation": implementation, "review": review}
+```bash
+uv sync --extra langgraph
 ```
 
-Each named call:
+LangGraph remains an implementation detail of that expert. Core only calls its
+runner and normalizes the final `ExpertResult`.
 
-- starts an isolated Pydantic AI agent;
-- receives the same host-owned dependency context but no Master transcript;
-- can use Harness `FileSystem`, `Shell`, `RepoContext`, and `Planning`;
-- cannot recursively delegate;
-- returns the Role's typed structured output (built-ins use `WorkerReport`);
-- contributes usage to the parent run.
+## Built-in experts
 
-The workflow program may also chain results when the next objective genuinely
-depends on an earlier report. Reports and workspace content remain untrusted task
-data, not higher-priority instructions.
+`builtin:research` runs a bounded research pipeline:
 
-If work needs user input, the Master asks the user directly. Phase 1 does not leave
-a child agent waiting across turns.
+1. a planner emits two to four independent assignments;
+2. explorers fan out with the Harness Exa tools;
+3. a docs stage verifies key claims against official or primary sources;
+4. a reducer produces direct URLs, uncertainty, and unresolved points.
 
-## Python Roles and Workflow Templates
+If Exa is unavailable or `EXA_API_KEY` is missing, the expert returns `blocked`;
+the Master turn does not crash.
 
-Project-facing definitions use the stable bases in
-`aeloon_core.harness.agent` and `aeloon_core.harness.workflow`. Roles configure
-prompts, output types, model tiers, capabilities, and concurrency. The Harness
-still owns agent construction, budgets, lifecycle events, and execution:
+`builtin:coding` runs:
 
-```python
-from aeloon_core.harness.agent import Role
+1. a read-only plan;
+2. a workspace build and verification;
+3. an independent read-only review;
+4. at most one fix and one re-review.
 
-class ProjectReviewer(Role):
-    id = "reviewer"
-    description = "Review project changes"
-    system_prompt = "Return only verified, actionable findings."
-    model_tier = "strong"
-    capabilities = ("filesystem", "shell", "repo_context", "planning")
-    concurrency_mode = "parallel_safe"
-```
-
-`parallel_safe` is a trusted declaration: use it only for read-only work or work
-whose mutations cannot overlap. Use `exclusive` for general workspace mutation.
-
-Workflow Templates compile Pydantic inputs into finite validated plans:
-
-```python
-from pydantic import BaseModel
-from aeloon_core.harness.workflow import WorkflowNode, WorkflowPlan, WorkflowTemplate
-
-class Inputs(BaseModel):
-    task: str
-
-class ProjectWorkflow(WorkflowTemplate):
-    id = "project-review"
-    description = "Run the project review role"
-    tags = ("review",)
-    when_to_use = "Use for project review requests."
-    avoid_when = "Avoid when implementation is also required."
-    input_model = Inputs
-
-    def build(self, inputs, tuning):
-        return WorkflowPlan(nodes=(
-            WorkflowNode(id="review", role_id="reviewer", objective=inputs.task),
-        ))
-```
-
-Projects export trusted definitions from `.aeloon-core/catalog.py`:
-
-```python
-ROLES = (ProjectReviewer,)
-WORKFLOWS = (ProjectWorkflow,)
-```
-
-Definitions are loaded once at process startup; restart after changes. Project IDs
-override built-ins.
-
-## Module boundaries
-
-The Harness is one system organized by cohesive feature packages. Each feature
-keeps its base contracts, presets, and runtime implementation together:
-
-```text
-aeloon_core/
-├── harness/
-│   ├── agent/              # Role base, presets, prompts, and agent factory
-│   ├── model/              # model bindings and routing
-│   ├── provider/           # provider construction and shared transport policy
-│   ├── tool/               # tool base, registry, filesystem, and search tools
-│   ├── workflow/           # template base, presets, runner, and Master tools
-│   ├── execution/          # run engine, events, traces, and stuck detection
-│   └── catalog.py          # built-in and project definition discovery
-├── conversation/           # message serialization and session persistence
-├── web/                    # bridge, event projection, launcher, and UI assets
-├── orchestrator.py         # application composition root
-└── config.py               # configuration schema and persistence
-```
-
-Project definitions subclass only the `agent` and `workflow` base contracts.
-They describe behavior but cannot own budgets, execution, lifecycle, or model
-construction. `orchestrator.py` remains the composition root and imports explicit
-feature APIs instead of relying on a flat compatibility layer.
-
-## Persistence boundary
-
-Only completed Master conversation turns are stored as JSONL under the configured
-`data_dir`. That history lets a user continue the conversation.
-
-Child-agent prompts, messages, plans, and tool state live only in memory for the
-current turn. A process interruption ends them; the next turn starts fresh agents.
-This is deliberate in Phase 1.
-
-## Runtime structure
-
-| Concern | Module |
-|---|---|
-| Master turn and conversation persistence | `aeloon_core.orchestrator`, `aeloon_core.conversation` |
-| Role contracts, presets, prompts, and construction | `aeloon_core.harness.agent` |
-| Workflow contracts, presets, execution, and tools | `aeloon_core.harness.workflow` |
-| Tool contracts and built-in tools | `aeloon_core.harness.tool` |
-| Provider construction and model routing | `aeloon_core.harness.provider`, `aeloon_core.harness.model` |
-| Pydantic AI execution, events, and runtime safeguards | `aeloon_core.harness.execution` |
-| Web transport and live projections | `aeloon_core.web` |
+Remaining findings produce `partial`; there is no unbounded repair loop.
 
 ## Configuration
-
-Configuration is JSON. The relevant agent section is:
 
 ```json
 {
   "agents": {
     "defaults": {
-      "provider": "anthropic",
-      "model": "claude-sonnet-4-6",
+      "provider": "deepseek",
+      "model": "deepseek-v4-flash",
       "max_iterations": 25,
-      "max_output_tokens": 32768,
-      "context_window_tokens": 128000,
-      "context_compaction": {
-        "enabled": true,
-        "trigger_ratio": 0.9,
-        "preserve_recent_tokens": null
-      }
+      "max_output_tokens": 32768
     },
     "routing": {
       "master": null,
-      "workers": {
-        "reviewer": "volcengine/ark-code-latest"
+      "experts": {
+        "builtin:research/reduce": "deepseek/deepseek-v4-pro"
       }
-    },
-    "harness": {
-      "max_agent_calls": 16,
-      "sub_agent_request_limit": 25,
-      "max_worker_continuations": 4,
-      "workflow_cpu_seconds": 10.0
-    },
-    "templates": {
-      "enabled": true,
-      "max_concurrency": 4,
-      "max_nodes": 16,
-      "max_upstream_chars": 32000,
-      "presearch_limit": 3
     }
+  },
+  "skills": {
+    "roots": [
+      {"id": "team", "path": "/opt/team-skills"}
+    ],
+    "master_allowlist": []
+  },
+  "experts": {
+    "enabled": ["builtin:research", "builtin:coding"],
+    "max_calls_per_turn": 8,
+    "max_concurrency": 4,
+    "stage_request_limit": 25,
+    "timeout_seconds": 1800,
+    "max_upstream_chars": 32000,
+    "web_backend": "exa"
   }
 }
 ```
 
-Use `uv run aeloon-core config show`, `config init`, and `config set` to inspect
-or change it.
+An exact `<expert-id>/<stage-id>` route wins over the expert route, then the
+default model is used.
+
+Use `uv run aeloon-core config show`, `config init`, and `config set`. The planned
+command that scans arbitrary installed Skill collections and asks a model to
+generate disabled ExpertSkill drafts is intentionally not part of this MVP.
+
+## Runtime boundaries
+
+```text
+aeloon_core/
+├── harness/
+│   ├── skill/          # manifest parsing, discovery, scopes, lazy tools
+│   ├── expert/         # contracts, registry, runtime, runners, adapters
+│   ├── agent/          # Master prompt
+│   ├── capabilities.py # Ultra and Expert Harness capabilities
+│   ├── execution/      # Pydantic AI run engine and tracing
+│   ├── model/          # Master/expert-stage routing
+│   ├── provider/       # provider construction
+│   └── tool/           # host tool contracts and observation tools
+├── conversation/       # persisted Master turns only
+├── web/                # transport and live lifecycle projection
+├── orchestrator.py     # composition root
+└── config.py
+```
+
+Only completed Master turns are persisted. Expert prompts, reports, stage state,
+and tools live only in memory for the current turn.
 
 ## Development
 

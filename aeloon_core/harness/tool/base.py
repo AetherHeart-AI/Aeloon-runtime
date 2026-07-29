@@ -79,8 +79,10 @@ class WorkspaceTool(Tool):
         *,
         workspace: Path,
         denied_paths: Iterable[Path] = (),
+        confine_to_workspace: bool = False,
     ) -> None:
         self.workspace = Path(workspace).expanduser().resolve(strict=False)
+        self.confine_to_workspace = confine_to_workspace
         self.denied_paths = tuple(
             Path(path).expanduser().resolve(strict=False) for path in denied_paths
         )
@@ -98,6 +100,10 @@ class WorkspaceTool(Tool):
         if not candidate.is_absolute():
             candidate = self.workspace / candidate
         resolved = candidate.resolve(strict=False)
+        if self.confine_to_workspace and not (
+            resolved == self.workspace or resolved.is_relative_to(self.workspace)
+        ):
+            raise PermissionError(f"path escapes the workspace: {path}")
         if self._is_denied(resolved):
             raise PermissionError(f"path is protected from agent tools: {path}")
         return resolved

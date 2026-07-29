@@ -575,7 +575,7 @@ function renderAgents() {
       const heading = node("div", "agent-heading");
       heading.append(
         node("span", `agent-state ${agent.status || "running"}`),
-        node("strong", "", agent.worker_type_id || "agent"),
+        node("strong", "", agent.expert_id || agent.worker_type_id || "agent"),
         node("code", "", shortId(agent.run_id)),
       );
       heading.append(node("span", "agent-time", formatDuration(agentElapsed(agent))));

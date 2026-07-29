@@ -1,4 +1,4 @@
-"""Tests for the Master agent prompt contract."""
+"""Tests for the Ultra Master prompt contract."""
 
 from aeloon_core.harness.agent.prompt import (
     MASTER_SYSTEM_MARKER,
@@ -7,43 +7,38 @@ from aeloon_core.harness.agent.prompt import (
 )
 
 
-def test_prompt_describes_one_ephemeral_harness_path() -> None:
+def test_prompt_describes_ultra_master_and_ephemeral_experts() -> None:
     prompt = master_system_prompt(
-        role_descriptors=[
+        expert_descriptors=[
             {
-                "id": "builder",
-                "description": "Build",
-                "source": "builtin:builder.md",
-                "digest": "a" * 64,
+                "id": "builtin:coding",
+                "kind": "expert",
+                "description": "Build and review",
+                "runner": "builtin.coding",
             }
-        ]
+        ],
+        plain_skill_ids=[],
     )
 
     assert prompt.startswith(MASTER_SYSTEM_MARKER)
-    assert "All child-agent work is ephemeral" in prompt
-    assert "run_workflow" in prompt
-    assert "workflow_execute" in prompt
-    assert "Workflow Template candidates" in prompt
-    assert "asyncio.gather" in prompt
-    assert "plain text" in prompt
-    assert "Each Worker segment has at most 25 model requests" in prompt
-    assert "At most 4 continuations (5 total segments)" in prompt
-    assert "you—not the Worker—must decide" in prompt
-    assert "durable WorkerSessions" in prompt
-    assert "create_flow" not in prompt
-    assert "resume_worker" not in prompt
-    assert "finish_turn" not in prompt
+    assert "full-capability Master" in prompt
+    assert "`expert_run`" in prompt
+    assert "Experts cannot call other experts" in prompt
+    assert "There is no generic DAG" in prompt
+    assert "builtin:coding" in prompt
+    assert "workflow_execute" not in prompt
+    assert "run_workflow" not in prompt
+    assert "resume" in prompt
 
 
-def test_prompt_can_disable_template_tools() -> None:
+def test_prompt_lists_only_allowlisted_plain_skills() -> None:
     prompt = master_system_prompt(
-        role_descriptors=[],
-        workflow_templates_enabled=False,
+        expert_descriptors=[],
+        plain_skill_ids=["workspace:conventions"],
     )
 
-    assert "workflow_execute" not in prompt
-    assert "Workflow Template candidates" not in prompt
-    assert "`run_workflow`." in prompt
+    assert "workspace:conventions" in prompt
+    assert "Plain Skills are visible only when explicitly allowlisted" in prompt
 
 
 def test_user_request_marker_is_stable() -> None:

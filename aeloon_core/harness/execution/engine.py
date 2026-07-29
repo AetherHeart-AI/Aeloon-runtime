@@ -70,7 +70,7 @@ from aeloon_core.harness.provider import (
 )
 from aeloon_core.harness.tool.registry import ToolRegistry
 
-AgentRole = Literal["master", "worker"]
+AgentRole = Literal["master", "expert"]
 OutputValidator = Callable[..., Awaitable[Any] | Any]
 HistoryProcessor = Callable[
     [RunContext["AeloonRunDeps"], list[ModelMessage]],
@@ -666,7 +666,7 @@ def _validate_entire_tool_batch(
             model = tool.args_model if tool is not None else None
         if model is None:
             # Capability-contributed tools (for example Harness
-            # `run_workflow`) are not part of Aeloon's host ToolRegistry.
+            # Harness capability tools are not part of Aeloon's host ToolRegistry.
             # Pydantic AI owns their schema validation and execution.
             continue
         try:

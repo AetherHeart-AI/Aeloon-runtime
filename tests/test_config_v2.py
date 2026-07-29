@@ -42,15 +42,15 @@ def test_load_config_discards_removed_v1_profile_settings(tmp_path: Path) -> Non
 
     cleaned_path = tmp_path / "cleaned.json"
     save_config(config, cleaned_path)
-    cleaned_defaults = json.loads(cleaned_path.read_text(encoding="utf-8"))["agents"][
-        "defaults"
-    ]
+    cleaned_defaults = json.loads(cleaned_path.read_text(encoding="utf-8"))["agents"]["defaults"]
     assert "base_profile_id" not in cleaned_defaults
     assert "profile_id" not in cleaned_defaults
     assert "max_handoffs" not in cleaned_defaults
 
 
-def test_model_routing_config_supports_master_and_worker_overrides(tmp_path: Path) -> None:
+def test_model_routing_config_supports_master_and_expert_stage_overrides(
+    tmp_path: Path,
+) -> None:
     path = tmp_path / "config.json"
     path.write_text(
         json.dumps(
@@ -58,9 +58,9 @@ def test_model_routing_config_supports_master_and_worker_overrides(tmp_path: Pat
                 "agents": {
                     "routing": {
                         "master": "fast-model",
-                        "workers": {
-                            "explorer": "search-model",
-                            "reviewer": "deepseek/deepseek-v4-pro",
+                        "experts": {
+                            "builtin:research": "search-model",
+                            "builtin:coding/review": "deepseek/deepseek-v4-pro",
                         },
                     }
                 }
@@ -72,22 +72,26 @@ def test_model_routing_config_supports_master_and_worker_overrides(tmp_path: Pat
     config = load_config(path)
 
     assert config.agents.routing.master == "fast-model"
-    assert config.agents.routing.workers == {
-        "explorer": "search-model",
-        "reviewer": "deepseek/deepseek-v4-pro",
+    assert config.agents.routing.experts == {
+        "builtin:research": "search-model",
+        "builtin:coding/review": "deepseek/deepseek-v4-pro",
     }
 
 
-def test_harness_limits_are_first_class_config(tmp_path: Path) -> None:
+def test_legacy_worker_routes_migrate_to_builtin_expert_stages(
+    tmp_path: Path,
+) -> None:
     path = tmp_path / "config.json"
     path.write_text(
         json.dumps(
             {
                 "agents": {
-                    "harness": {
-                        "max_agent_calls": 12,
-                        "sub_agent_request_limit": 8,
-                        "max_worker_continuations": 3,
+                    "routing": {
+                        "workers": {
+                            "builder": "build-model",
+                            "reviewer": "review-model",
+                            "unknown-custom-role": "discarded-model",
+                        }
                     }
                 }
             }
@@ -97,24 +101,23 @@ def test_harness_limits_are_first_class_config(tmp_path: Path) -> None:
 
     config = load_config(path)
 
-    assert config.agents.harness.max_agent_calls == 12
-    assert config.agents.harness.sub_agent_request_limit == 8
-    assert config.agents.harness.max_worker_continuations == 3
+    assert config.agents.routing.experts == {
+        "builtin:coding/build": "build-model",
+        "builtin:coding/review": "review-model",
+    }
 
 
-def test_template_fast_path_settings_are_first_class_config(tmp_path: Path) -> None:
+def test_expert_limits_are_first_class_config(tmp_path: Path) -> None:
     path = tmp_path / "config.json"
     path.write_text(
         json.dumps(
             {
-                "agents": {
-                    "templates": {
-                        "enabled": False,
-                        "max_concurrency": 2,
-                        "max_nodes": 8,
-                        "max_upstream_chars": 12_000,
-                        "presearch_limit": 2,
-                    }
+                "experts": {
+                    "enabled": ["builtin:coding"],
+                    "max_calls_per_turn": 12,
+                    "stage_request_limit": 8,
+                    "max_concurrency": 3,
+                    "timeout_seconds": 42,
                 }
             }
         ),
@@ -123,11 +126,35 @@ def test_template_fast_path_settings_are_first_class_config(tmp_path: Path) -> N
 
     config = load_config(path)
 
-    assert config.agents.templates.enabled is False
-    assert config.agents.templates.max_concurrency == 2
-    assert config.agents.templates.max_nodes == 8
-    assert config.agents.templates.max_upstream_chars == 12_000
-    assert config.agents.templates.presearch_limit == 2
+    assert config.experts.enabled == ["builtin:coding"]
+    assert config.experts.max_calls_per_turn == 12
+    assert config.experts.stage_request_limit == 8
+    assert config.experts.max_concurrency == 3
+    assert config.experts.timeout_seconds == 42
+
+
+def test_skill_roots_are_explicit_and_normalized_against_workspace(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "workspace": str(tmp_path / "repo"),
+                "skills": {
+                    "roots": [{"id": "team", "path": "../team-skills"}],
+                    "master_allowlist": ["team:conventions"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config.skills.roots[0].id == "team"
+    assert config.skills.roots[0].path == (tmp_path / "team-skills").resolve()
+    assert config.skills.master_allowlist == ["team:conventions"]
 
 
 def test_removed_durable_settings_are_dropped_during_config_load(
@@ -141,9 +168,12 @@ def test_removed_durable_settings_are_dropped_during_config_load(
                 "agents": {
                     "budgets": {"master": 12, "workers": {"reviewer": 30}},
                     "harness": {
+                        "max_agent_calls": 12,
+                        "sub_agent_request_limit": 7,
                         "dynamic_workflow_enabled": False,
                         "workflow_memory_mb": 512,
                     },
+                    "templates": {"enabled": False},
                 },
             }
         ),
@@ -153,38 +183,40 @@ def test_removed_durable_settings_are_dropped_during_config_load(
     config = load_config(path)
 
     dumped = config.model_dump(mode="json")
-    assert "skills" not in dumped
+    assert dumped["skills"] == {"roots": [], "master_allowlist": []}
     assert "budgets" not in dumped["agents"]
-    assert "dynamic_workflow_enabled" not in dumped["agents"]["harness"]
-    assert "workflow_memory_mb" not in dumped["agents"]["harness"]
+    assert "harness" not in dumped["agents"]
+    assert "templates" not in dumped["agents"]
+    assert dumped["experts"]["max_calls_per_turn"] == 12
+    assert dumped["experts"]["stage_request_limit"] == 7
 
 
-def test_config_set_writes_role_specific_model_and_harness_limits(
+def test_config_set_writes_expert_model_and_runtime_limits(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "config.json"
 
     main(["config", "set", "--config", str(path), "master-model", "fast-model"])
-    main(["config", "set", "--config", str(path), "harness-max-agent-calls", "31"])
-    main(["config", "set", "--config", str(path), "templates-max-concurrency", "3"])
-    main(["config", "set", "--config", str(path), "templates-enabled", "false"])
+    main(["config", "set", "--config", str(path), "experts-max-calls-per-turn", "31"])
+    main(["config", "set", "--config", str(path), "experts-max-concurrency", "3"])
+    main(["config", "set", "--config", str(path), "experts-enabled", "builtin:coding"])
     main(
         [
             "config",
             "set",
             "--config",
             str(path),
-            "harness-max-worker-continuations",
-            "4",
+            "coding-expert-model",
+            "deepseek/deepseek-v4-pro",
         ]
     )
 
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["agents"]["routing"]["master"] == "fast-model"
-    assert payload["agents"]["harness"]["max_agent_calls"] == 31
-    assert payload["agents"]["harness"]["max_worker_continuations"] == 4
-    assert payload["agents"]["templates"]["max_concurrency"] == 3
-    assert payload["agents"]["templates"]["enabled"] is False
+    assert payload["agents"]["routing"]["experts"]["builtin:coding"] == ("deepseek/deepseek-v4-pro")
+    assert payload["experts"]["max_calls_per_turn"] == 31
+    assert payload["experts"]["max_concurrency"] == 3
+    assert payload["experts"]["enabled"] == ["builtin:coding"]
 
 
 def test_load_config_still_rejects_unknown_agent_defaults(tmp_path: Path) -> None:
@@ -223,9 +255,9 @@ def test_removed_per_round_minimal_context_settings_are_not_persisted(
     assert config.agents.defaults.runtime.stuck_detection_threshold == 4
     cleaned_path = tmp_path / "cleaned.json"
     save_config(config, cleaned_path)
-    cleaned_runtime = json.loads(cleaned_path.read_text(encoding="utf-8"))["agents"][
-        "defaults"
-    ]["runtime"]
+    cleaned_runtime = json.loads(cleaned_path.read_text(encoding="utf-8"))["agents"]["defaults"][
+        "runtime"
+    ]
     assert "minimal_context_recent_turns" not in cleaned_runtime
     assert "minimal_context_tool_result_chars" not in cleaned_runtime
     assert "tool_error_guard_threshold" not in cleaned_runtime
@@ -234,9 +266,7 @@ def test_removed_per_round_minimal_context_settings_are_not_persisted(
 
 def test_legacy_compatibility_is_limited_to_persisted_config_loading() -> None:
     with pytest.raises(ValidationError, match="profile_id"):
-        Config.model_validate(
-            {"agents": {"defaults": {"profile_id": "removed-profile"}}}
-        )
+        Config.model_validate({"agents": {"defaults": {"profile_id": "removed-profile"}}})
 
 
 def test_non_object_config_uses_normal_validation_error(tmp_path: Path) -> None:

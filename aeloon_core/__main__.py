@@ -28,30 +28,27 @@ CONFIG_SETTERS = {
     "provider": ("agents", "defaults", "provider"),
     "model": ("agents", "defaults", "model"),
     "master-model": ("agents", "routing", "master"),
-    "builder-model": ("agents", "routing", "workers", "builder"),
-    "explorer-model": ("agents", "routing", "workers", "explorer"),
-    "researcher-model": ("agents", "routing", "workers", "researcher"),
-    "reviewer-model": ("agents", "routing", "workers", "reviewer"),
+    "research-expert-model": (
+        "agents",
+        "routing",
+        "experts",
+        "builtin:research",
+    ),
+    "coding-expert-model": (
+        "agents",
+        "routing",
+        "experts",
+        "builtin:coding",
+    ),
     "reasoning-effort": ("agents", "defaults", "reasoning_effort"),
     "max-output-tokens": ("agents", "defaults", "max_output_tokens"),
     "max-iterations": ("agents", "defaults", "max_iterations"),
-    "harness-max-agent-calls": ("agents", "harness", "max_agent_calls"),
-    "harness-sub-agent-request-limit": (
-        "agents",
-        "harness",
-        "sub_agent_request_limit",
-    ),
-    "harness-max-worker-continuations": (
-        "agents",
-        "harness",
-        "max_worker_continuations",
-    ),
-    "harness-workflow-cpu-seconds": ("agents", "harness", "workflow_cpu_seconds"),
-    "templates-enabled": ("agents", "templates", "enabled"),
-    "templates-max-concurrency": ("agents", "templates", "max_concurrency"),
-    "templates-max-nodes": ("agents", "templates", "max_nodes"),
-    "templates-max-upstream-chars": ("agents", "templates", "max_upstream_chars"),
-    "templates-presearch-limit": ("agents", "templates", "presearch_limit"),
+    "experts-enabled": ("experts", "enabled"),
+    "experts-max-calls-per-turn": ("experts", "max_calls_per_turn"),
+    "experts-max-concurrency": ("experts", "max_concurrency"),
+    "experts-stage-request-limit": ("experts", "stage_request_limit"),
+    "experts-timeout-seconds": ("experts", "timeout_seconds"),
+    "experts-max-upstream-chars": ("experts", "max_upstream_chars"),
     "context-compaction-enabled": ("agents", "defaults", "context_compaction", "enabled"),
     "context-compaction-trigger-ratio": (
         "agents",
@@ -351,7 +348,7 @@ def _turn_result_payload(result: Any, *, config: Config) -> dict[str, Any]:
         "models": {
             "default": default_model,
             "master": config.agents.routing.master or default_model,
-            "workers": dict(config.agents.routing.workers),
+            "experts": dict(config.agents.routing.experts),
         },
     }
 
@@ -519,6 +516,8 @@ def _set_nested_value(data: dict[str, Any], path: tuple[str, ...], value: Any) -
 
 
 def _coerce_config_value(key: str, value: str) -> Any:
+    if key == "experts-enabled":
+        return [item.strip() for item in value.split(",") if item.strip()]
     if key == "context-compaction-preserve-recent-tokens":
         if value.strip().lower() in {"auto", "none", "null"}:
             return None
@@ -526,23 +525,19 @@ def _coerce_config_value(key: str, value: str) -> Any:
     if key in {
         "max-iterations",
         "max-output-tokens",
-        "harness-max-agent-calls",
-        "harness-max-worker-continuations",
-        "harness-sub-agent-request-limit",
-        "templates-max-concurrency",
-        "templates-max-nodes",
-        "templates-max-upstream-chars",
-        "templates-presearch-limit",
+        "experts-max-calls-per-turn",
+        "experts-max-concurrency",
+        "experts-stage-request-limit",
+        "experts-max-upstream-chars",
         "runtime-stuck-detection-threshold",
     }:
         return int(value)
-    if key in {"context-compaction-trigger-ratio", "harness-workflow-cpu-seconds"}:
+    if key in {"context-compaction-trigger-ratio", "experts-timeout-seconds"}:
         return float(value)
     if key in {
         "context-compaction-enabled",
         "runtime-transition-trace-enabled",
         "runtime-stuck-detection-enabled",
-        "templates-enabled",
     }:
         return _parse_bool(value)
     return value

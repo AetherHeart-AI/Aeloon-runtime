@@ -10,9 +10,18 @@ EXPECTED_ROOT_MODULES = {
     "config.py",
     "orchestrator.py",
 }
-EXPECTED_HARNESS_MODULES = {"__init__.py", "catalog.py"}
+EXPECTED_HARNESS_MODULES = {"__init__.py", "capabilities.py"}
 EXPECTED_HARNESS_FEATURES = {
-    "agent": {"__init__.py", "base.py", "factory.py", "presets.py", "prompt.py"},
+    "agent": {"__init__.py", "prompt.py"},
+    "expert": {
+        "__init__.py",
+        "base.py",
+        "langgraph.py",
+        "registry.py",
+        "runtime.py",
+        "stage.py",
+        "tools.py",
+    },
     "execution": {
         "__init__.py",
         "engine.py",
@@ -22,8 +31,8 @@ EXPECTED_HARNESS_FEATURES = {
     },
     "model": {"__init__.py", "router.py"},
     "provider": {"__init__.py", "base.py", "deepseek.py"},
+    "skill": {"__init__.py", "base.py", "registry.py", "tools.py"},
     "tool": {"__init__.py", "base.py", "filesystem.py", "registry.py", "search.py"},
-    "workflow": {"__init__.py", "base.py", "presets.py", "runner.py", "tools.py"},
 }
 EXPECTED_SUPPORT_FEATURES = {
     "conversation": {"__init__.py", "history.py", "session.py"},
@@ -38,19 +47,15 @@ def test_harness_is_grouped_by_feature() -> None:
     assert {
         path.name
         for path in harness_root.iterdir()
-        if path.is_dir() and not path.name.startswith("__")
+        if path.is_dir() and not path.name.startswith("__") and any(path.glob("*.py"))
     } == set(EXPECTED_HARNESS_FEATURES)
     for feature, expected_files in EXPECTED_HARNESS_FEATURES.items():
-        assert {
-            path.name for path in (harness_root / feature).glob("*.py")
-        } == expected_files
+        assert {path.name for path in (harness_root / feature).glob("*.py")} == expected_files
 
 
 def test_support_code_is_grouped_by_feature() -> None:
     for feature, expected_files in EXPECTED_SUPPORT_FEATURES.items():
-        assert {
-            path.name for path in (PACKAGE_ROOT / feature).glob("*.py")
-        } == expected_files
+        assert {path.name for path in (PACKAGE_ROOT / feature).glob("*.py")} == expected_files
 
 
 def test_feature_packages_do_not_import_removed_horizontal_layers() -> None:
@@ -61,6 +66,14 @@ def test_feature_packages_do_not_import_removed_horizontal_layers() -> None:
         for module in imports
         if module.startswith(("aeloon_core.customization", "aeloon_core.tools"))
     }
+    assert not {module for module in imports if module.startswith("aeloon_core.harness.workflow")}
+
+
+def test_removed_role_and_workflow_surfaces_are_absent() -> None:
+    assert not (PACKAGE_ROOT / "harness" / "agent" / "base.py").exists()
+    assert not (PACKAGE_ROOT / "harness" / "agent" / "factory.py").exists()
+    assert not (PACKAGE_ROOT / "harness" / "workflow" / "__init__.py").exists()
+    assert not (PACKAGE_ROOT / "harness" / "catalog.py").exists()
 
 
 def test_package_root_contains_only_entrypoints_and_composition_modules() -> None:

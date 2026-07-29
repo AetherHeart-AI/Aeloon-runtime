@@ -13,7 +13,6 @@ from pydantic_ai.messages import ModelResponse, OutputToolCallEvent, TextPart, T
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.usage import RequestUsage
 
-from aeloon_core.harness.agent import WorkerReport as CompleteWorkArgs
 from aeloon_core.harness.execution import (
     AgentRunSpec,
     AgentRunStatus,
@@ -30,6 +29,14 @@ class _ReadArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     path: str = Field(min_length=1)
+
+
+class CompleteWorkArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    summary: str
+    artifacts: tuple[str, ...] = ()
+    evidence: tuple[dict[str, Any], ...] = ()
 
 
 class _RecordingRead(Tool):
@@ -60,7 +67,7 @@ async def test_output_tool_calls_are_not_projected_as_executing_tools() -> None:
 
 def _spec(model: FunctionModel, registry: ToolRegistry, *, request_limit: int = 4) -> AgentRunSpec:
     return AgentRunSpec(
-        role="worker",
+        role="expert",
         model=model,
         instructions="Complete explicitly.",
         prompt="read and finish",

@@ -125,6 +125,36 @@ async def test_ephemeral_harness_worker_publishes_bounded_result_metadata() -> N
     }
 
 
+@pytest.mark.asyncio
+async def test_expert_stage_keeps_worker_event_compatibility_and_adds_ids() -> None:
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    async def emit(name: str, payload: dict[str, Any]) -> None:
+        events.append((name, payload))
+
+    progress = TurnEventProgress(session_id="master", emit=emit)
+    await progress.on_worker_lifecycle(
+        event="completed",
+        worker_id="stage-run",
+        run_id="stage-run",
+        worker_type_id="builtin:coding",
+        status="completed",
+        usage={"input_tokens": 5, "output_tokens": 2},
+        expert_id="builtin:coding",
+        runner_id="builtin.coding",
+        stage_id="review",
+    )
+
+    name, payload = events[0]
+    assert name == "chat.worker.lifecycle"
+    assert payload["expert_id"] == "builtin:coding"
+    assert payload["runner_id"] == "builtin.coding"
+    assert payload["stage_id"] == "review"
+    assert progress.usage_by_component["expert:builtin:coding:review"][
+        "total_tokens"
+    ] == 7
+
+
 def test_web_tool_results_are_bounded_before_they_are_emitted() -> None:
     result = "x" * 40_000
     assert len(_bounded_web_tool_result(result)) <= 16_000

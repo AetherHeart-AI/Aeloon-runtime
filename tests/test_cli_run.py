@@ -70,7 +70,7 @@ async def test_run_json_emits_one_machine_readable_result(
                 turn_id=on_progress.turn_id,
                 status="completed",
                 final_content="Finished.",
-                tools_used=["workflow_execute"],
+                tools_used=["expert_run"],
                 messages=[],
                 blocks=[],
                 usage={"input_tokens": 12, "output_tokens": 3},
@@ -110,7 +110,7 @@ async def test_run_json_emits_one_machine_readable_result(
         "turn_id": payload["turn_id"],
         "status": "completed",
         "final_content": "Finished.",
-        "tools_used": ["workflow_execute"],
+        "tools_used": ["expert_run"],
         "usage": {"input_tokens": 12, "output_tokens": 3},
         "duration_ms": payload["duration_ms"],
         "transitions": [{"kind": "terminal"}],
@@ -118,7 +118,7 @@ async def test_run_json_emits_one_machine_readable_result(
         "models": {
             "default": "deepseek/deepseek-v4-flash",
             "master": "deepseek/deepseek-v4-flash",
-            "workers": {},
+            "experts": {},
         },
     }
     assert payload["duration_ms"] is not None

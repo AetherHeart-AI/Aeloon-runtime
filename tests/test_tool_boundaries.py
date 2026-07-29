@@ -108,6 +108,26 @@ async def test_read_allows_parent_traversal_outside_workspace(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_read_can_be_confined_for_read_only_expert_stages(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("private\n", encoding="utf-8")
+    tool = ReadTool(
+        workspace=workspace,
+        denied_paths=(tmp_path / "runtime",),
+        confine_to_workspace=True,
+    )
+
+    result = await tool.execute(path="../outside.txt")
+
+    assert "path escapes the workspace" in result
+    assert "private" not in result
+
+
+@pytest.mark.asyncio
 async def test_read_still_blocks_denied_paths(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()

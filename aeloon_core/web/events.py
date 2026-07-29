@@ -225,6 +225,9 @@ class TurnEventProgress:
         objective: str | None = None,
         template_id: str | None = None,
         node_id: str | None = None,
+        expert_id: str | None = None,
+        runner_id: str | None = None,
+        stage_id: str | None = None,
     ) -> None:
         """Publish bounded lifecycle data for an ephemeral Harness agent."""
 
@@ -245,9 +248,13 @@ class TurnEventProgress:
         )
         if safe_usage:
             component = (
-                f"template:{template_id}:{node_id}"
-                if template_id and node_id
-                else f"worker:{worker_type_id}"
+                f"expert:{expert_id}:{stage_id}"
+                if expert_id and stage_id
+                else (
+                    f"template:{template_id}:{node_id}"
+                    if template_id and node_id
+                    else f"worker:{worker_type_id}"
+                )
             )
             self._record_usage(
                 safe_usage,
@@ -270,6 +277,9 @@ class TurnEventProgress:
                 **({"objective": safe_objective} if safe_objective else {}),
                 **({"template_id": template_id} if template_id else {}),
                 **({"node_id": node_id} if node_id else {}),
+                **({"expert_id": expert_id} if expert_id else {}),
+                **({"runner_id": runner_id} if runner_id else {}),
+                **({"stage_id": stage_id} if stage_id else {}),
                 ts=_now(),
             ),
         )

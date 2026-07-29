@@ -7,13 +7,13 @@ const TOOL_LABELS = {
   list_files: "列出目录",
   read: "读取文件",
   read_file: "读取文件",
-  run_workflow: "运行 Worker 工作流",
+  expert_run: "运行 ExpertSkill",
   shell: "执行命令",
+  skill_load: "加载 Skill",
+  skill_read: "读取 Skill 资源",
+  skill_search: "搜索 Skill",
   write_file: "写入文件",
   write_plan: "更新计划",
-  workflow_describe: "查看工作流模板",
-  workflow_execute: "运行固定工作流",
-  workflow_search: "搜索工作流模板",
 };
 
 const EMPTY_RESULT_TEXT = new Set(["", "{}", "[]", "null", "none", "undefined"]);
@@ -62,19 +62,13 @@ export function summarizeArguments(name, value = {}) {
   const task = firstText(value, ["task", "objective", "prompt"]);
   const command = firstText(value, ["command", "cmd"]);
 
-  if (name === "run_workflow") {
-    const workflowTask = extractWorkflowTask(String(value.code || ""));
-    if (workflowTask) return workflowTask;
-    return task ? truncate(task) : "编排并运行临时 Worker";
+  if (name === "expert_run") {
+    const expert = firstText(value, ["expert_id"]);
+    return [expert, task ? truncate(task) : ""].filter(Boolean).join(" · ");
   }
-  if (name === "workflow_execute") {
-    const template = firstText(value, ["template_id"]);
-    const inputs = asRecord(value.inputs);
-    const objective = firstText(inputs, ["task", "objective", "prompt"]);
-    return [template, objective ? truncate(objective) : ""].filter(Boolean).join(" · ");
-  }
-  if (name === "workflow_describe") {
-    return firstText(value, ["template_id"]);
+  if (name === "skill_load" || name === "skill_read") {
+    const skill = firstText(value, ["skill_id"]);
+    return [skill, path ? truncate(path) : ""].filter(Boolean).join(" · ");
   }
   if (task) return truncate(task);
   if (command) return truncate(command.split("\n", 1)[0]);
@@ -98,7 +92,14 @@ export function summarizeResult(result) {
 
   const nestedResult = value.result;
   const candidate =
-    firstText(value, ["error", "message", "summary", "output", "detail"]) ||
+    firstText(value, [
+      "error",
+      "message",
+      "summary",
+      "final_content",
+      "output",
+      "detail",
+    ]) ||
     (nestedResult && typeof nestedResult === "object"
       ? firstText(nestedResult, ["error", "message", "summary", "output", "detail"])
       : "");
@@ -130,14 +131,6 @@ function normalizeResult(value) {
     return null;
   }
   return { parsed, text };
-}
-
-function extractWorkflowTask(code) {
-  const match = code.match(
-    /\b([A-Za-z_]\w*)\s*\(\s*task\s*=\s*(["'])([\s\S]*?)\2\s*\)/,
-  );
-  if (!match) return "";
-  return `${humanizeName(match[1])} · ${truncate(match[3])}`;
 }
 
 function normalizeStatus(status) {
@@ -189,7 +182,6 @@ function isScalar(value) {
 
 function humanizeName(value) {
   return String(value || "tool")
-    .replace(/^worker_/, "")
     .replace(/[_-]+/g, " ")
     .replace(/\b\w/g, (letter) => letter.toUpperCase());
 }

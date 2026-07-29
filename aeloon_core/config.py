@@ -5,12 +5,16 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
 ProviderName = Literal["deepseek"]
 KNOWN_PROVIDERS: frozenset[str] = frozenset({"deepseek"})
+SkillRootId = Annotated[
+    str,
+    StringConstraints(pattern=r"^[a-z][a-z0-9_-]{0,63}$"),
+]
 
 _REMOVED_V1_AGENT_DEFAULTS = frozenset(
     {"base_profile_id", "profile_id", "max_handoffs"}
@@ -72,7 +76,7 @@ class AgentDefaultsConfig(BaseModel):
 
 
 class AgentRoutingConfig(BaseModel):
-    """Optional provider/model overrides for Master and Worker roles.
+    """Optional provider/model overrides for Master and Expert stages.
 
     Values may be bare model names (inherit `agents.defaults.provider`) or
     explicit `provider/model` refs. The model router falls back to the config
@@ -82,7 +86,7 @@ class AgentRoutingConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     master: str | None = Field(default=None, min_length=1)
-    workers: dict[str, str] = Field(default_factory=dict)
+    experts: dict[str, str] = Field(default_factory=dict)
 
     @field_validator("master")
     @classmethod
@@ -94,49 +98,85 @@ class AgentRoutingConfig(BaseModel):
             raise ValueError("master model route requires a nonempty model ref")
         return normalized
 
-    @field_validator("workers")
+    @field_validator("experts")
     @classmethod
-    def _worker_routes_are_nonempty(cls, value: dict[str, str]) -> dict[str, str]:
+    def _expert_routes_are_nonempty(cls, value: dict[str, str]) -> dict[str, str]:
         normalized: dict[str, str] = {}
-        for worker_type_id, model_name in value.items():
-            worker_id = worker_type_id.strip()
+        for route_key, model_name in value.items():
+            expert_route = route_key.strip()
             model = model_name.strip()
-            if not worker_id or not model:
-                raise ValueError("worker model routes require nonempty ids and model names")
-            normalized[worker_id] = model
+            if not expert_route or not model:
+                raise ValueError("expert model routes require nonempty ids and model names")
+            normalized[expert_route] = model
         return normalized
 
 
-class AgentHarnessConfig(BaseModel):
-    """Settings for the in-turn Pydantic AI Harness workflow."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    max_agent_calls: int = Field(default=16, ge=1, le=128)
-    sub_agent_request_limit: int = Field(default=25, ge=1, le=100)
-    max_worker_continuations: int = Field(default=4, ge=0, le=16)
-    workflow_cpu_seconds: float = Field(default=10.0, ge=1.0, le=60.0)
-
-
-class AgentTemplateConfig(BaseModel):
-    """Settings for the fixed Workflow Template fast path."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    enabled: bool = True
-    max_concurrency: int = Field(default=4, ge=1, le=16)
-    max_nodes: int = Field(default=16, ge=1, le=16)
-    max_upstream_chars: int = Field(default=32_000, ge=1_000, le=128_000)
-    presearch_limit: int = Field(default=3, ge=1, le=10)
-
-
 class AgentsConfig(BaseModel):
-    """Agent namespace."""
+    """Model defaults and routing for the Master and Expert stages."""
 
     defaults: AgentDefaultsConfig = Field(default_factory=AgentDefaultsConfig)
     routing: AgentRoutingConfig = Field(default_factory=AgentRoutingConfig)
-    harness: AgentHarnessConfig = Field(default_factory=AgentHarnessConfig)
-    templates: AgentTemplateConfig = Field(default_factory=AgentTemplateConfig)
+
+
+class SkillRootConfig(BaseModel):
+    """One explicitly trusted source of discoverable Skill manifests."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: SkillRootId
+    path: Path
+
+
+class SkillsConfig(BaseModel):
+    """Skill discovery roots and the plain-Skill scope granted to Master."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    roots: list[SkillRootConfig] = Field(default_factory=list)
+    master_allowlist: list[str] = Field(default_factory=list)
+
+    @field_validator("roots")
+    @classmethod
+    def _root_ids_are_unique(
+        cls,
+        roots: list[SkillRootConfig],
+    ) -> list[SkillRootConfig]:
+        ids = [root.id for root in roots]
+        if len(ids) != len(set(ids)):
+            raise ValueError("skill root ids must be unique")
+        if "builtin" in ids or "workspace" in ids:
+            raise ValueError("'builtin' and 'workspace' are reserved skill root ids")
+        return roots
+
+    @field_validator("master_allowlist")
+    @classmethod
+    def _master_skill_ids_are_nonempty(cls, value: list[str]) -> list[str]:
+        normalized = [item.strip() for item in value]
+        if any(not item for item in normalized):
+            raise ValueError("master skill allowlist entries must be nonempty")
+        return list(dict.fromkeys(normalized))
+
+
+class ExpertsConfig(BaseModel):
+    """Turn-scoped ExpertSkill execution policy."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: list[str] = Field(default_factory=lambda: ["builtin:research", "builtin:coding"])
+    max_calls_per_turn: int = Field(default=8, ge=1, le=128)
+    max_concurrency: int = Field(default=4, ge=1, le=32)
+    stage_request_limit: int = Field(default=25, ge=1, le=100)
+    timeout_seconds: float = Field(default=1800.0, ge=1.0, le=7200.0)
+    max_upstream_chars: int = Field(default=32_000, ge=1_000, le=256_000)
+    web_backend: Literal["exa"] = "exa"
+
+    @field_validator("enabled")
+    @classmethod
+    def _enabled_expert_ids_are_nonempty(cls, value: list[str]) -> list[str]:
+        normalized = [item.strip() for item in value]
+        if any(not item for item in normalized):
+            raise ValueError("enabled expert ids must be nonempty")
+        return list(dict.fromkeys(normalized))
 
 
 class ExecToolConfig(BaseModel):
@@ -156,6 +196,8 @@ class Config(BaseModel):
 
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
+    skills: SkillsConfig = Field(default_factory=SkillsConfig)
+    experts: ExpertsConfig = Field(default_factory=ExpertsConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     workspace: Path = Field(default_factory=Path.cwd)
     data_dir: Path = Field(default_factory=lambda: Path("~/.aeloon-core").expanduser())
@@ -163,10 +205,24 @@ class Config(BaseModel):
     def normalized(self) -> Config:
         """Return a copy with filesystem paths expanded and resolved."""
 
+        workspace = self.workspace.expanduser().resolve(strict=False)
+        roots = [
+            root.model_copy(
+                update={
+                    "path": (
+                        root.path.expanduser()
+                        if root.path.expanduser().is_absolute()
+                        else workspace / root.path.expanduser()
+                    ).resolve(strict=False)
+                }
+            )
+            for root in self.skills.roots
+        ]
         return self.model_copy(
             update={
-                "workspace": self.workspace.expanduser().resolve(strict=False),
+                "workspace": workspace,
                 "data_dir": self.data_dir.expanduser().resolve(strict=False),
+                "skills": self.skills.model_copy(update={"roots": roots}),
             }
         )
 
@@ -337,19 +393,44 @@ def _drop_removed_v1_settings(data: Any) -> None:
 
 
 def _drop_removed_orchestration_settings(data: Any) -> None:
-    """Discard configuration for the removed durable child-agent control plane."""
+    """Migrate safe orchestration fields and discard removed DAG settings."""
 
     if not isinstance(data, dict):
         return
-    data.pop("skills", None)
+    skills = data.get("skills")
+    if isinstance(skills, dict):
+        skills.pop("enabled", None)
     agents = data.get("agents")
     if not isinstance(agents, dict):
         return
     agents.pop("budgets", None)
-    harness = agents.get("harness")
+    harness = agents.pop("harness", None)
     if isinstance(harness, dict):
-        harness.pop("dynamic_workflow_enabled", None)
-        harness.pop("workflow_memory_mb", None)
+        experts = data.setdefault("experts", {})
+        if isinstance(experts, dict):
+            if "sub_agent_request_limit" in harness:
+                experts.setdefault(
+                    "stage_request_limit",
+                    harness["sub_agent_request_limit"],
+                )
+            if "max_agent_calls" in harness:
+                experts.setdefault("max_calls_per_turn", harness["max_agent_calls"])
+    agents.pop("templates", None)
+    routing = agents.get("routing")
+    if isinstance(routing, dict):
+        workers = routing.pop("workers", None)
+        if isinstance(workers, dict) and "experts" not in routing:
+            legacy_routes = {
+                "builder": "builtin:coding/build",
+                "reviewer": "builtin:coding/review",
+                "explorer": "builtin:research",
+                "researcher": "builtin:research/docs",
+            }
+            routing["experts"] = {
+                legacy_routes[worker_id]: model
+                for worker_id, model in workers.items()
+                if worker_id in legacy_routes
+            }
 
 
 def _migrate_active_provider(data: Any) -> None:

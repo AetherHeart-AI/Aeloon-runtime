@@ -13,23 +13,19 @@ from aeloon_core.harness.model import ModelRouter
 
 
 @pytest.mark.asyncio
-async def test_deepseek_routes_all_roles_to_default_model() -> None:
+async def test_deepseek_routes_master_and_expert_stages_to_default_model() -> None:
     config = Config()
     router = ModelRouter(config)
 
     master = router.resolve_master()
-    explorer = router.resolve_worker("explorer")
-    researcher = router.resolve_worker("researcher")
-    builder = router.resolve_worker("builder")
-    reviewer = router.resolve_worker("reviewer")
-    custom = router.resolve_worker("custom")
+    research = router.resolve_expert("builtin:research", stage_id="reduce")
+    coding = router.resolve_expert("builtin:coding", stage_id="build")
+    custom = router.resolve_expert("workspace:custom")
 
     assert master.model_name == config.agents.defaults.model
     assert master.provider == "deepseek"
-    assert explorer.model is master.model
-    assert researcher.model is master.model
-    assert builder.model is master.model
-    assert reviewer.model is master.model
+    assert research.model is master.model
+    assert coding.model is master.model
     assert custom.model is master.model
     await router.close()
 
@@ -40,15 +36,18 @@ async def test_explicit_routes_override_provider_defaults() -> None:
         agents=AgentsConfig(
             routing=AgentRoutingConfig(
                 master="master-model",
-                workers={"explorer": "search-model", "builder": "build-model"},
+                experts={
+                    "builtin:research": "search-model",
+                    "builtin:coding/build": "build-model",
+                },
             )
         )
     )
     router = ModelRouter(config)
 
     assert router.resolve_master().model_name == "master-model"
-    assert router.resolve_worker("explorer").model_name == "search-model"
-    assert router.resolve_worker("builder").model_name == "build-model"
+    assert router.resolve_expert("builtin:research", stage_id="docs").model_name == ("search-model")
+    assert router.resolve_expert("builtin:coding", stage_id="build").model_name == ("build-model")
     await router.close()
 
 
@@ -58,14 +57,14 @@ async def test_routing_profile_can_override_provider_and_model() -> None:
         agents=AgentsConfig(
             routing=AgentRoutingConfig(
                 master="deepseek/deepseek-v4-flash",
-                workers={"builder": "deepseek/deepseek-v4-pro"},
+                experts={"builtin:coding": "deepseek/deepseek-v4-pro"},
             )
         )
     )
     router = ModelRouter(config)
 
     master = router.resolve_master()
-    builder = router.resolve_worker("builder")
+    builder = router.resolve_expert("builtin:coding", stage_id="review")
     assert master.provider == "deepseek"
     assert master.model_name == "deepseek-v4-flash"
     assert master.route == "override"
@@ -74,30 +73,27 @@ async def test_routing_profile_can_override_provider_and_model() -> None:
     await router.close()
 
 
-def test_injected_model_preserves_the_legacy_all_role_override() -> None:
-    model = FunctionModel(
-        lambda _messages, _info: ModelResponse(parts=[TextPart("done")])
-    )
+def test_injected_model_applies_to_master_and_all_expert_stages() -> None:
+    model = FunctionModel(lambda _messages, _info: ModelResponse(parts=[TextPart("done")]))
     router = ModelRouter(Config(), injected_model=model, injected_settings={"temperature": 0})
 
     assert router.resolve_master().model is model
-    assert router.resolve_worker("explorer").model is model
-    assert router.resolve_worker("reviewer").route == "injected"
-    assert router.resolve_worker("builder").settings["temperature"] == 0
+    assert router.resolve_expert("builtin:research").model is model
+    assert router.resolve_expert("builtin:coding", stage_id="review").route == "injected"
+    assert router.resolve_expert("workspace:custom").settings["temperature"] == 0
 
 
-def test_python_role_model_tier_is_used_when_no_route_override() -> None:
+def test_expert_model_tier_uses_default_when_no_route_override() -> None:
     config = Config()
     router = ModelRouter(config)
 
-    assert (
-        router.resolve_worker("custom", preferred_tier="fast").model_name
-        == config.agents.defaults.model
-    )
-    assert (
-        router.resolve_worker("explorer", preferred_tier="strong").model_name
-        == config.agents.defaults.model
-    )
+    fast = router.resolve_expert("workspace:custom", preferred_tier="fast")
+    strong = router.resolve_expert("builtin:research", preferred_tier="strong")
+
+    assert fast.model_name == config.agents.defaults.model
+    assert fast.route == "fast"
+    assert strong.model_name == config.agents.defaults.model
+    assert strong.route == "strong"
 
 
 @pytest.mark.asyncio
@@ -130,11 +126,9 @@ async def test_router_closes_each_reused_bundle_exactly_once(
     router = ModelRouter(Config())
 
     router.resolve_master()
-    router.resolve_worker("explorer")
-    router.resolve_worker("builder")
-    router.resolve_worker("reviewer")
+    router.resolve_expert("builtin:research", stage_id="plan")
+    router.resolve_expert("builtin:coding", stage_id="build")
+    router.resolve_expert("builtin:coding", stage_id="review")
     await router.close()
 
-    assert sorted(closed) == sorted(
-        [Config().agents.defaults.model]
-    )
+    assert sorted(closed) == sorted([Config().agents.defaults.model])

@@ -1,4 +1,4 @@
-"""Process-scoped model routing for Master and Worker responsibilities."""
+"""Process-scoped model routing for Master and Expert stages."""
 
 from __future__ import annotations
 
@@ -76,16 +76,20 @@ class ModelRouter:
     def resolve_master(self) -> ModelBinding:
         return self._resolve_role(
             override=self.config.agents.routing.master,
-            prefer_fast=True,
+            prefer_fast=False,
         )
 
-    def resolve_worker(
+    def resolve_expert(
         self,
-        worker_type_id: str,
+        expert_id: str,
         *,
+        stage_id: str | None = None,
         preferred_tier: Literal["fast", "strong"] | None = None,
     ) -> ModelBinding:
-        override = self.config.agents.routing.workers.get(worker_type_id)
+        routes = self.config.agents.routing.experts
+        override = (
+            routes.get(f"{expert_id}/{stage_id}") if stage_id is not None else None
+        ) or routes.get(expert_id)
         return self._resolve_role(
             override=override,
             prefer_fast=(
@@ -98,13 +102,14 @@ class ModelRouter:
     def resolved_model_name(
         self,
         *,
-        role: Literal["master", "worker"],
-        worker_type_id: str | None = None,
+        role: Literal["master", "expert"],
+        expert_id: str | None = None,
+        stage_id: str | None = None,
     ) -> str:
         binding = (
             self.resolve_master()
             if role == "master"
-            else self.resolve_worker(worker_type_id or "")
+            else self.resolve_expert(expert_id or "", stage_id=stage_id)
         )
         return binding.model_name
 
@@ -148,7 +153,7 @@ class ModelRouter:
         return self._resolve(
             provider=defaults.provider,
             model_name=defaults.model,
-            route="strong",
+            route="fast" if prefer_fast else "strong",
         )
 
     def _resolve(

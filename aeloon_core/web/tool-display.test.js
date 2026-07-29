@@ -30,21 +30,22 @@ describe("tool display model", () => {
     expect(display.argumentsText).not.toBe("");
   });
 
-  test("summarizes structured worker reports instead of showing raw JSON", () => {
+  test("summarizes structured expert reports instead of showing raw JSON", () => {
     const display = describeToolBlock({
-      name: "run_workflow",
+      name: "expert_run",
       status: "done",
       arguments: {
-        code: 'result = builder(task="修复工具调用显示")',
+        expert_id: "builtin:coding",
+        task: "修复工具调用显示",
       },
       result: JSON.stringify({
         status: "completed",
-        summary: "工具调用显示已修复并通过测试",
+        final_content: "工具调用显示已修复并通过测试",
         artifacts: [],
       }),
     });
 
-    expect(display.argumentSummary).toBe("Builder · 修复工具调用显示");
+    expect(display.argumentSummary).toBe("builtin:coding · 修复工具调用显示");
     expect(display.resultSummary).toBe("completed · 工具调用显示已修复并通过测试");
     expect(display.resultText).toContain('"artifacts"');
   });
@@ -61,18 +62,20 @@ describe("tool display model", () => {
     expect(display.headline).toBe("执行完成，工具未返回文本结果");
   });
 
-  test("shows fixed workflow template and objective", () => {
+  test("shows scoped skill id and resource", () => {
     const display = describeToolBlock({
-      name: "workflow_execute",
+      name: "skill_read",
       status: "running",
       arguments: {
-        template_id: "implement-review",
-        inputs: { objective: "实现模板快速路径" },
+        skill_id: "workspace:ppt-style",
+        path: "references/layout.md",
       },
     });
 
-    expect(display.label).toBe("运行固定工作流");
-    expect(display.headline).toBe("implement-review · 实现模板快速路径");
+    expect(display.label).toBe("读取 Skill 资源");
+    expect(display.headline).toBe(
+      "workspace:ppt-style · references/layout.md",
+    );
   });
 
   test("redacts credentials without hiding harmless token limits", () => {

@@ -1,4 +1,4 @@
-"""Conversation-scoped Master orchestration powered by Pydantic AI Harness."""
+"""Conversation-scoped Ultra Master with isolated ExpertSkills."""
 
 from __future__ import annotations
 
@@ -12,33 +12,32 @@ from pydantic_ai.settings import ModelSettings
 
 from aeloon_core.config import Config
 from aeloon_core.conversation import SessionStore
-from aeloon_core.harness.agent import (
-    RoleAgentFactory,
-    master_harness_capabilities,
-)
 from aeloon_core.harness.agent.prompt import (
     MASTER_USER_REQUEST_MARKER,
     SYSTEM_PROMPT,
     master_system_prompt,
 )
-from aeloon_core.harness.catalog import Catalog
+from aeloon_core.harness.capabilities import (
+    WebCapabilityFactory,
+    master_capabilities,
+)
 from aeloon_core.harness.execution import (
     AgentRunSpec,
     AgentRunStatus,
     CapabilityManifest,
     HarnessAgentRuntime,
+    accumulate_usage,
     deserialize_messages,
     serialize_messages,
 )
-from aeloon_core.harness.model import ModelRouter
-from aeloon_core.harness.tool import (
-    GlobTool,
-    GrepTool,
-    ListTool,
-    ReadTool,
-    ToolRegistry,
+from aeloon_core.harness.expert import (
+    ExpertRunnerRegistry,
+    ExpertRuntime,
+    expert_run_tool,
 )
-from aeloon_core.harness.workflow import WorkflowRunner, workflow_tools
+from aeloon_core.harness.model import ModelRouter
+from aeloon_core.harness.skill import SkillRegistry, skill_tools
+from aeloon_core.harness.tool import ToolRegistry
 
 
 @dataclass
@@ -58,7 +57,7 @@ class TurnResult:
 
 
 class AeloonCoreOrchestrator:
-    """Own the Master conversation and its in-turn Harness child agents."""
+    """Own the Master conversation and all current-turn ExpertSkill work."""
 
     def __init__(
         self,
@@ -66,6 +65,7 @@ class AeloonCoreOrchestrator:
         *,
         model: Model | None = None,
         model_settings: ModelSettings | None = None,
+        web_capability_factory: WebCapabilityFactory | None = None,
     ) -> None:
         self.config = config
         self.model_router = ModelRouter(
@@ -76,10 +76,14 @@ class AeloonCoreOrchestrator:
         master_binding = self.model_router.resolve_master()
         self.model_settings = dict(master_binding.settings)
         self.agent_runtime = HarnessAgentRuntime()
-        self.catalog = Catalog.discover(config.workspace)
-        self.roles = self.catalog.roles
+        self.skills = SkillRegistry.discover(config)
+        self.runners = ExpertRunnerRegistry.discover(config.workspace)
+        for expert in self.skills.enabled_experts(config.experts.enabled):
+            self.runners.require(expert.runner)
+        self.experts = self.skills.enabled_experts(config.experts.enabled)
+        self.master_skill_scope = self.skills.master_scope(config)
         self.sessions = SessionStore(data_dir=config.data_dir)
-        self.master_observation_tools = self._build_master_observation_tools()
+        self.web_capability_factory = web_capability_factory
 
     @property
     def model(self) -> Model:
@@ -91,18 +95,6 @@ class AeloonCoreOrchestrator:
     def model(self, value: Model) -> None:
         self.model_router.set_injected_model(value, settings=self.model_settings)
 
-    def _build_master_observation_tools(self) -> ToolRegistry:
-        registry = ToolRegistry()
-        protected = (self.config.data_dir,)
-        for tool in (
-            ListTool(workspace=self.config.workspace, denied_paths=protected),
-            ReadTool(workspace=self.config.workspace, denied_paths=protected),
-            GlobTool(workspace=self.config.workspace, denied_paths=protected),
-            GrepTool(workspace=self.config.workspace, denied_paths=protected),
-        ):
-            registry.register(tool)
-        return registry
-
     async def run_turn(
         self,
         prompt: str,
@@ -110,7 +102,7 @@ class AeloonCoreOrchestrator:
         session_id: str | None = None,
         on_progress: Any | None = None,
     ) -> TurnResult:
-        """Run one user request and finish every child agent before returning."""
+        """Run one Master request and finish every ExpertSkill before returning."""
 
         actual_session_id = session_id or self.sessions.new_session()
         self.sessions.session_path(actual_session_id)
@@ -120,57 +112,34 @@ class AeloonCoreOrchestrator:
             actual_session_id,
         )
         history = deserialize_messages(stored_messages)
-        role_descriptors = [snapshot.descriptor() for snapshot in self.roles.list()]
-        template_config = self.config.agents.templates
-        workflow_candidates = (
-            list(
-                self.catalog.workflows.search(
-                    prompt,
-                    limit=template_config.presearch_limit,
-                )
-            )
-            if template_config.enabled
-            else []
+        expert_runtime = ExpertRuntime(
+            config=self.config,
+            skills=self.skills,
+            runners=self.runners,
+            model_router=self.model_router,
+            agent_runtime=self.agent_runtime,
+            progress=on_progress,
+            session_id=actual_session_id,
+            turn_id=turn_id,
+            web_capability_factory=self.web_capability_factory,
         )
         instructions = (
             SYSTEM_PROMPT.strip()
             + f"\n\nWorkspace: {self.config.workspace}\n\n"
             + master_system_prompt(
-                role_descriptors=role_descriptors,
-                workflow_candidates=workflow_candidates,
-                workflow_templates_enabled=template_config.enabled,
-                worker_request_limit=self.config.agents.harness.sub_agent_request_limit,
-                max_worker_continuations=(
-                    self.config.agents.harness.max_worker_continuations
+                expert_descriptors=list(expert_runtime.descriptors()),
+                plain_skill_ids=sorted(
+                    self.master_skill_scope.skill_ids - {expert.id for expert in self.experts}
                 ),
             )
         )
         tools = ToolRegistry()
-        for name in ("list", "read", "glob", "grep"):
-            tool = self.master_observation_tools.get(name)
-            assert tool is not None
+        for tool in skill_tools(
+            registry=self.skills,
+            scope=self.master_skill_scope,
+        ):
             tools.register(tool)
-        role_factory = RoleAgentFactory(
-            config=self.config,
-            model_router=self.model_router,
-            roles=self.roles,
-            progress=on_progress,
-            session_id=actual_session_id,
-            turn_id=turn_id,
-        )
-        if template_config.enabled:
-            workflow_runner = WorkflowRunner(
-                config=self.config,
-                roles=self.roles,
-                role_factory=role_factory,
-            )
-            for tool in workflow_tools(
-                config=self.config,
-                roles=self.roles,
-                workflows=self.catalog.workflows,
-                runner=workflow_runner,
-            ):
-                tools.register(tool)
+        tools.register(expert_run_tool(expert_runtime))
 
         defaults = self.config.agents.defaults
         policy = defaults.runtime
@@ -198,12 +167,7 @@ class AeloonCoreOrchestrator:
                 session_id=actual_session_id,
                 turn_id=turn_id,
                 progress=on_progress,
-                capabilities=master_harness_capabilities(
-                    config=self.config,
-                    model_router=self.model_router,
-                    roles=self.roles,
-                    role_factory=role_factory,
-                ),
+                capabilities=master_capabilities(self.config),
                 prompt_cache=binding.prompt_cache,
             )
         )
@@ -215,6 +179,8 @@ class AeloonCoreOrchestrator:
                 + (outcome.failure or outcome.status.value)
             )
 
+        usage = dict(outcome.usage)
+        accumulate_usage(usage, expert_runtime.usage)
         messages = serialize_messages(outcome.messages)
         blocks = list(getattr(on_progress, "blocks", []) or [])
         result = TurnResult(
@@ -223,7 +189,7 @@ class AeloonCoreOrchestrator:
             tools_used=list(outcome.tools_used),
             messages=messages,
             blocks=blocks,
-            usage=outcome.usage,
+            usage=usage,
             duration_ms=getattr(on_progress, "duration_ms", None),
             transitions=[record.to_dict() for record in outcome.transitions],
             status=outcome.status.value,
