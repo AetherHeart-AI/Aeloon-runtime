@@ -37,7 +37,13 @@ def test_history_policy_is_owned_by_harness_sliding_window(tmp_path: Path) -> No
 def test_master_is_an_ultra_worker_with_direct_workspace_capabilities(
     tmp_path: Path,
 ) -> None:
-    capabilities = master_capabilities(Config(workspace=tmp_path).normalized())
+    capabilities = master_capabilities(
+        Config(
+            mode="normal",
+            workspace=tmp_path,
+            tools={"master_capabilities": []},
+        ).normalized()
+    )
 
     assert any(isinstance(item, FileSystem) for item in capabilities)
     assert any(isinstance(item, Shell) for item in capabilities)
@@ -51,3 +57,18 @@ def test_master_capabilities_do_not_include_dynamic_workflow(tmp_path: Path) -> 
 
     assert "DynamicWorkflow" not in names
     assert "SubAgents" not in names
+
+
+def test_expert_mode_restricts_master_host_capabilities(tmp_path: Path) -> None:
+    capabilities = master_capabilities(
+        Config(
+            mode="expert",
+            workspace=tmp_path,
+            tools={"master_capabilities": ["repo_context", "planning"]},
+        ).normalized()
+    )
+
+    assert not any(isinstance(item, FileSystem) for item in capabilities)
+    assert not any(isinstance(item, Shell) for item in capabilities)
+    assert any(isinstance(item, RepoContext) for item in capabilities)
+    assert any(isinstance(item, Planning) for item in capabilities)

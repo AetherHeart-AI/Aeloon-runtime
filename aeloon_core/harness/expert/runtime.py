@@ -19,6 +19,7 @@ from aeloon_core.harness.expert.base import (
 )
 from aeloon_core.harness.expert.registry import ExpertRunnerRegistry
 from aeloon_core.harness.expert.stage import HarnessExpertStageExecutor
+from aeloon_core.harness.mcp import McpRegistry
 from aeloon_core.harness.model import ModelRouter
 from aeloon_core.harness.skill import ExpertSkillSnapshot, SkillRegistry
 
@@ -37,6 +38,7 @@ class ExpertRuntime:
         progress: Any | None = None,
         session_id: str | None = None,
         turn_id: str | None = None,
+        mcp: McpRegistry | None = None,
         web_capability_factory: WebCapabilityFactory | None = None,
     ) -> None:
         self.config = config
@@ -47,10 +49,13 @@ class ExpertRuntime:
         self.progress = progress
         self.session_id = session_id
         self.turn_id = turn_id
+        self.mcp = mcp or McpRegistry()
         self.web_capability_factory = web_capability_factory
         self._enabled = {
             expert.id: expert for expert in skills.enabled_experts(config.experts.enabled)
         }
+        for expert in self._enabled.values():
+            self.mcp.expert_toolsets(expert)
         self._calls = 0
         self._calls_by_expert: Counter[str] = Counter()
         self._semaphore = asyncio.Semaphore(config.experts.max_concurrency)
@@ -78,6 +83,7 @@ class ExpertRuntime:
             progress=self.progress,
             session_id=self.session_id,
             turn_id=self.turn_id,
+            mcp=self.mcp,
             web_capability_factory=self.web_capability_factory,
         )
         context = ExpertRunContext(

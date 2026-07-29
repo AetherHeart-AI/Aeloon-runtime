@@ -21,6 +21,7 @@ from aeloon_core.harness.execution import (
     HarnessAgentRuntime,
 )
 from aeloon_core.harness.expert.base import StageOutcome
+from aeloon_core.harness.mcp import McpRegistry
 from aeloon_core.harness.model import ModelRouter
 from aeloon_core.harness.skill import (
     ExpertSkillSnapshot,
@@ -47,6 +48,7 @@ class HarnessExpertStageExecutor:
         progress: Any | None,
         session_id: str | None,
         turn_id: str | None,
+        mcp: McpRegistry | None = None,
         web_capability_factory: WebCapabilityFactory | None = None,
     ) -> None:
         self.config = config
@@ -59,6 +61,7 @@ class HarnessExpertStageExecutor:
         self.progress = progress
         self.session_id = session_id
         self.turn_id = turn_id
+        self.mcp = mcp or McpRegistry()
         self.web_capability_factory = web_capability_factory
 
     async def run(
@@ -161,6 +164,7 @@ class HarnessExpertStageExecutor:
                         names=capabilities,
                         web_capability_factory=self.web_capability_factory,
                     ),
+                    toolsets=self.mcp.expert_toolsets(self.expert),
                     prompt_cache=binding.prompt_cache,
                 )
             )

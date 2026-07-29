@@ -30,6 +30,7 @@ EXPECTED_HARNESS_FEATURES = {
         "transitions.py",
     },
     "model": {"__init__.py", "router.py"},
+    "mcp": {"__init__.py", "registry.py"},
     "provider": {"__init__.py", "base.py", "deepseek.py"},
     "skill": {"__init__.py", "base.py", "registry.py", "tools.py"},
     "tool": {"__init__.py", "base.py", "filesystem.py", "registry.py", "search.py"},

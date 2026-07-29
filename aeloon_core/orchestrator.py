@@ -21,6 +21,7 @@ from aeloon_core.harness.agent.prompt import (
 from aeloon_core.harness.capabilities import (
     WebCapabilityFactory,
     master_capabilities,
+    master_capability_names,
 )
 from aeloon_core.harness.execution import (
     AgentRunSpec,
@@ -36,6 +37,7 @@ from aeloon_core.harness.expert import (
     ExpertRuntime,
     expert_run_tool,
 )
+from aeloon_core.harness.mcp import McpRegistry
 from aeloon_core.harness.model import ModelRouter
 from aeloon_core.harness.skill import SkillRegistry, skill_tools
 from aeloon_core.harness.tool import ToolRegistry
@@ -66,6 +68,7 @@ class AeloonCoreOrchestrator:
         *,
         model: Model | None = None,
         model_settings: ModelSettings | None = None,
+        mcp: McpRegistry | None = None,
         web_capability_factory: WebCapabilityFactory | None = None,
     ) -> None:
         self.config = config
@@ -83,6 +86,13 @@ class AeloonCoreOrchestrator:
             self.runners.require(expert.runner)
         self.experts = self.skills.enabled_experts(config.experts.enabled)
         self.master_skill_scope = self.skills.master_scope(config)
+        self.mcp = mcp or McpRegistry.discover(config)
+        self.master_mcp_toolsets = self.mcp.master_toolsets(config)
+        self.master_mcp_ids = (
+            self.mcp.ids()
+            if config.mode == "normal"
+            else tuple(config.mcp.master_allowlist)
+        )
         self.sessions = SessionStore(data_dir=config.data_dir)
         self.web_capability_factory = web_capability_factory
 
@@ -122,6 +132,7 @@ class AeloonCoreOrchestrator:
             progress=on_progress,
             session_id=actual_session_id,
             turn_id=turn_id,
+            mcp=self.mcp,
             web_capability_factory=self.web_capability_factory,
         )
         instructions = (
@@ -132,6 +143,9 @@ class AeloonCoreOrchestrator:
                 plain_skill_ids=sorted(
                     self.master_skill_scope.skill_ids - {expert.id for expert in self.experts}
                 ),
+                mode=self.config.mode,
+                mcp_server_ids=list(self.master_mcp_ids),
+                capability_names=list(master_capability_names(self.config)),
             )
         )
         tools = ToolRegistry()
@@ -170,6 +184,7 @@ class AeloonCoreOrchestrator:
                 turn_id=turn_id,
                 progress=on_progress,
                 capabilities=master_capabilities(self.config),
+                toolsets=self.master_mcp_toolsets,
                 prompt_cache=binding.prompt_cache,
             )
         )

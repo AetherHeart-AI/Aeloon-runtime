@@ -42,6 +42,7 @@ class CapabilityUnavailable(RuntimeError):
 
 
 WebCapabilityFactory = Callable[[], Any]
+MASTER_CAPABILITY_NAMES = ("filesystem", "shell", "repo_context", "planning")
 
 
 def history_capability(config: Config) -> SlidingWindow[Any] | None:
@@ -110,12 +111,20 @@ def harness_capabilities(
 
 
 def master_capabilities(config: Config) -> list[Any]:
-    """Give Master the full Ultra Worker workspace surface."""
+    """Build the mode-specific Master capability surface."""
 
     return harness_capabilities(
         config=config,
-        names=("filesystem", "shell", "repo_context", "planning"),
+        names=master_capability_names(config),
     )
+
+
+def master_capability_names(config: Config) -> tuple[str, ...]:
+    """Expose the full normal surface or the configured expert-mode subset."""
+
+    if config.mode == "normal":
+        return MASTER_CAPABILITY_NAMES
+    return tuple(config.tools.master_capabilities)
 
 
 def _default_exa_capability() -> Any:
@@ -136,8 +145,10 @@ __all__ = [
     "CapabilityUnavailable",
     "DENIED_ENV_PATTERNS",
     "HARNESS_PROTECTED_PATTERNS",
+    "MASTER_CAPABILITY_NAMES",
     "WebCapabilityFactory",
     "harness_capabilities",
     "history_capability",
     "master_capabilities",
+    "master_capability_names",
 ]

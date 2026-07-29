@@ -104,16 +104,24 @@ class SkillRegistry:
         return tuple(experts)
 
     def master_scope(self, config: Config) -> SkillScope:
-        """Expose configured plain Skills and enabled ExpertSkill descriptors to Master."""
+        """Resolve the mode-specific Skill scope granted to Master."""
 
-        plain_ids: list[str] = []
-        for skill_id in config.skills.master_allowlist:
-            snapshot = self.require(skill_id)
-            if isinstance(snapshot, ExpertSkillSnapshot):
-                raise SkillDefinitionError(
-                    f"master_allowlist is for plain Skills; {skill_id!r} is an ExpertSkill"
-                )
-            plain_ids.append(skill_id)
+        if config.mode == "normal":
+            plain_ids = [
+                snapshot.id
+                for snapshot in self.list()
+                if not isinstance(snapshot, ExpertSkillSnapshot)
+            ]
+        else:
+            plain_ids = []
+            for skill_id in config.skills.master_allowlist:
+                snapshot = self.require(skill_id)
+                if isinstance(snapshot, ExpertSkillSnapshot):
+                    raise SkillDefinitionError(
+                        f"master_allowlist is for plain Skills; "
+                        f"{skill_id!r} is an ExpertSkill"
+                    )
+                plain_ids.append(skill_id)
         enabled = [expert.id for expert in self.enabled_experts(config.experts.enabled)]
         return SkillScope(owner="master", skill_ids=frozenset([*plain_ids, *enabled]))
 

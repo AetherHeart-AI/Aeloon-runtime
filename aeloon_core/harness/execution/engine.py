@@ -46,7 +46,7 @@ from pydantic_ai.messages import (
 from pydantic_ai.models import Model, ModelRequestContext
 from pydantic_ai.run import AgentRunResult
 from pydantic_ai.settings import ModelSettings
-from pydantic_ai.toolsets import FunctionToolset
+from pydantic_ai.toolsets import AbstractToolset, FunctionToolset
 from pydantic_ai.usage import RunUsage, UsageLimits
 
 from aeloon_core.conversation.history import (
@@ -185,6 +185,7 @@ class AgentRunSpec:
     prompt_cache: PromptCacheState | None = None
     on_transition: Callable[[TransitionRecord], Any] | None = None
     capabilities: Sequence[Any] = ()
+    toolsets: Sequence[AbstractToolset[Any]] = ()
 
 
 @dataclass(slots=True)
@@ -295,7 +296,10 @@ class HarnessAgentRuntime:
             output_type=spec.output_type,
             instructions=spec.instructions,
             deps_type=AeloonRunDeps,
-            toolsets=[AeloonToolset(spec.tools, max_retries=max_retries)],
+            toolsets=[
+                AeloonToolset(spec.tools, max_retries=max_retries),
+                *spec.toolsets,
+            ],
             retries=max_retries,
             end_strategy="early",
             capabilities=capabilities,

@@ -23,6 +23,7 @@ WEB_ONLY_OPTIONS = {
     "--gateway-log-level",
 }
 CONFIG_SETTERS = {
+    "mode": ("mode",),
     "workspace": ("workspace",),
     "data-dir": ("data_dir",),
     "provider": ("agents", "defaults", "provider"),
@@ -49,6 +50,9 @@ CONFIG_SETTERS = {
     "experts-stage-request-limit": ("experts", "stage_request_limit"),
     "experts-timeout-seconds": ("experts", "timeout_seconds"),
     "experts-max-upstream-chars": ("experts", "max_upstream_chars"),
+    "mcp-config-path": ("mcp", "config_path"),
+    "mcp-master-allowlist": ("mcp", "master_allowlist"),
+    "tools-master-capabilities": ("tools", "master_capabilities"),
     "context-compaction-enabled": ("agents", "defaults", "context_compaction", "enabled"),
     "context-compaction-trigger-ratio": (
         "agents",
@@ -208,6 +212,12 @@ def _add_web_args(parser: argparse.ArgumentParser) -> None:
 
 def _add_config_write_args(parser: argparse.ArgumentParser) -> None:
     _add_path_args(parser)
+    parser.add_argument(
+        "--mode",
+        choices=("normal", "expert"),
+        default=None,
+        help="Capability policy mode (default: normal).",
+    )
     parser.add_argument(
         "--provider",
         choices=("deepseek",),
@@ -432,6 +442,8 @@ def _load_with_path_overrides(
 def _config_with_write_args(config: Config, args: argparse.Namespace) -> Config:
     # Map each --init flag to the same nested config path the `set` command uses.
     data = config.model_dump(mode="json")
+    if args.mode is not None:
+        _set_nested_value(data, CONFIG_SETTERS["mode"], args.mode)
     if args.provider is not None:
         _set_nested_value(data, CONFIG_SETTERS["provider"], args.provider)
     write_arg_keys = {
@@ -522,7 +534,11 @@ def _set_nested_value(data: dict[str, Any], path: tuple[str, ...], value: Any) -
 
 
 def _coerce_config_value(key: str, value: str) -> Any:
-    if key == "experts-enabled":
+    if key in {
+        "experts-enabled",
+        "mcp-master-allowlist",
+        "tools-master-capabilities",
+    }:
         return [item.strip() for item in value.split(",") if item.strip()]
     if key == "max-iterations" and value.strip().lower() in {
         "none",

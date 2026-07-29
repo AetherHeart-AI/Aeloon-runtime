@@ -11,6 +11,8 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_vali
 
 ProviderName = Literal["deepseek"]
 KNOWN_PROVIDERS: frozenset[str] = frozenset({"deepseek"})
+RuntimeMode = Literal["normal", "expert"]
+MasterCapabilityName = Literal["filesystem", "shell", "repo_context", "planning"]
 SkillRootId = Annotated[
     str,
     StringConstraints(pattern=r"^[a-z][a-z0-9_-]{0,63}$"),
@@ -180,6 +182,23 @@ class ExpertsConfig(BaseModel):
         return list(dict.fromkeys(normalized))
 
 
+class McpConfig(BaseModel):
+    """Configured MCP servers and the expert-mode scope granted to Master."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    config_path: Path | None = None
+    master_allowlist: list[str] = Field(default_factory=list)
+
+    @field_validator("master_allowlist")
+    @classmethod
+    def _master_mcp_ids_are_nonempty(cls, value: list[str]) -> list[str]:
+        normalized = [item.strip() for item in value]
+        if any(not item for item in normalized):
+            raise ValueError("master MCP allowlist entries must be nonempty")
+        return list(dict.fromkeys(normalized))
+
+
 class ExecToolConfig(BaseModel):
     """Shell execution settings."""
 
@@ -187,18 +206,36 @@ class ExecToolConfig(BaseModel):
 
 
 class ToolsConfig(BaseModel):
-    """Tool namespace."""
+    """Tool namespace and expert-mode Master capability policy."""
 
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
+    master_capabilities: list[MasterCapabilityName] = Field(
+        default_factory=lambda: [
+            "filesystem",
+            "shell",
+            "repo_context",
+            "planning",
+        ]
+    )
+
+    @field_validator("master_capabilities")
+    @classmethod
+    def _master_capabilities_are_unique(
+        cls,
+        value: list[MasterCapabilityName],
+    ) -> list[MasterCapabilityName]:
+        return list(dict.fromkeys(value))
 
 
 class Config(BaseModel):
     """Top-level runtime config."""
 
+    mode: RuntimeMode = "normal"
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
     skills: SkillsConfig = Field(default_factory=SkillsConfig)
     experts: ExpertsConfig = Field(default_factory=ExpertsConfig)
+    mcp: McpConfig = Field(default_factory=McpConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     workspace: Path = Field(default_factory=Path.cwd)
     data_dir: Path = Field(default_factory=lambda: Path("~/.aeloon-core").expanduser())
@@ -219,11 +256,20 @@ class Config(BaseModel):
             )
             for root in self.skills.roots
         ]
+        mcp_config_path = self.mcp.config_path
+        if mcp_config_path is not None:
+            expanded = mcp_config_path.expanduser()
+            mcp_config_path = (
+                expanded if expanded.is_absolute() else workspace / expanded
+            ).resolve(strict=False)
         return self.model_copy(
             update={
                 "workspace": workspace,
                 "data_dir": self.data_dir.expanduser().resolve(strict=False),
                 "skills": self.skills.model_copy(update={"roots": roots}),
+                "mcp": self.mcp.model_copy(
+                    update={"config_path": mcp_config_path}
+                ),
             }
         )
 

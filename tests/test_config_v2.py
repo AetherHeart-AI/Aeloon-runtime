@@ -29,6 +29,37 @@ def test_master_request_limit_is_unbounded_by_default() -> None:
     ).agents.defaults.max_iterations == 25
 
 
+def test_runtime_modes_have_explicit_normal_and_expert_policies(
+    tmp_path: Path,
+) -> None:
+    assert Config().mode == "normal"
+
+    config = Config(
+        mode="expert",
+        workspace=tmp_path,
+        mcp={
+            "config_path": ".aeloon-core/mcp.json",
+            "master_allowlist": ["github"],
+        },
+        tools={"master_capabilities": ["filesystem", "planning"]},
+    ).normalized()
+
+    assert config.mode == "expert"
+    assert config.mcp.config_path == (
+        tmp_path / ".aeloon-core" / "mcp.json"
+    ).resolve()
+    assert config.mcp.master_allowlist == ["github"]
+    assert config.tools.master_capabilities == ["filesystem", "planning"]
+
+
+def test_config_set_supports_runtime_mode(tmp_path: Path) -> None:
+    path = tmp_path / "config.json"
+
+    main(["config", "set", "--config", str(path), "mode", "expert"])
+
+    assert json.loads(path.read_text(encoding="utf-8"))["mode"] == "expert"
+
+
 def test_config_set_supports_unlimited_master_and_independent_retries(
     tmp_path: Path,
 ) -> None:

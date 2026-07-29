@@ -1,8 +1,14 @@
 # Aeloon Core
 
 Aeloon Core is a conversation-scoped agent runtime built on Pydantic AI Harness.
+It has two explicit capability-policy modes:
 
-> **Master 是 Ultra Worker；特殊能力以隔离的 ExpertSkill 被调用。**
+- `normal`: Master can use every discovered plain Skill, every configured MCP
+  server, and the full workspace capability surface;
+- `expert`: Master and predefined ExpertSkills receive explicit Skill, MCP, and
+  host-capability scopes.
+
+> **Normal 放开 Master；Expert 模式收紧 Master 与 ExpertSkill 的能力边界。**
 
 The Master owns the user conversation, final answer, filesystem mutation, shell
 execution, repository context, and planning. It can also call enabled
@@ -40,7 +46,7 @@ uv run aeloon-core run "Inspect the repository and explain its entry points"
 uv run aeloon-core run --workspace /path/to/repo --prompt-file task.txt --output json
 ```
 
-## Skills and isolation
+## Modes, Skills, and isolation
 
 A Skill is passive, lazily loaded instructions and resources. An ExpertSkill is
 also a Skill, but adds a registered runner, capability declaration, dependencies,
@@ -56,16 +62,25 @@ Aeloon does not implicitly scan `~/.codex`, `~/.claude`, or `~/.agents`. Canonic
 IDs are `<root-id>:<name>`, so equal names in different roots do not override each
 other.
 
-Master's plain-Skill scope defaults to empty. It sees all enabled ExpertSkill
-descriptors and can use:
+`normal` is the default. Master sees all plain Skills found in the discovery
+roots, all MCP servers in the explicit MCP config, and all standard workspace
+capabilities. In `expert` mode, Master sees only:
+
+- plain Skills in `skills.master_allowlist`;
+- MCP servers in `mcp.master_allowlist`;
+- host capability groups in `tools.master_capabilities`;
+- ExpertSkills in `experts.enabled`.
+
+In both modes Master can use:
 
 - `skill_search`
 - `skill_load`
 - `skill_read`
 - `expert_run`
 
-An expert sees only itself and its declared plain-Skill dependencies. It never
-receives `expert_run`, and expert nesting is rejected by the registry.
+An expert sees only itself, its declared plain-Skill dependencies, declared MCP
+servers, and declared host capabilities. It never receives `expert_run`, and
+expert nesting is rejected by the registry.
 Standard passive metadata such as `license`, `compatibility`, `metadata`, and
 `allowed-tools` is accepted, but it never grants runtime capabilities.
 
@@ -101,6 +116,8 @@ capabilities:
   - shell
   - repo_context
   - planning
+mcp-servers:
+  - github
 model_tier: strong
 concurrency_mode: exclusive
 max_calls_per_turn: 2
@@ -133,6 +150,27 @@ uv sync --extra langgraph
 LangGraph remains an implementation detail of that expert. Core only calls its
 runner and normalizes the final `ExpertResult`.
 
+## MCP
+
+MCP servers use the standard `mcpServers` JSON shape:
+
+```json
+{
+  "mcpServers": {
+    "github": {"url": "http://127.0.0.1:8000/mcp"},
+    "local": {
+      "command": "python",
+      "args": ["server.py"]
+    }
+  }
+}
+```
+
+Set `mcp.config_path` to this file. Normal mode exposes every server and every
+tool returned by those servers to Master. Expert mode applies the configured
+server scopes. MCP and Skill discovery never generates ExpertSkills; executable
+experts must already have a manifest and registered runner.
+
 ## Built-in experts
 
 `builtin:research` runs a bounded research pipeline:
@@ -158,6 +196,7 @@ Remaining findings produce `partial`; there is no unbounded repair loop.
 
 ```json
 {
+  "mode": "expert",
   "agents": {
     "defaults": {
       "provider": "deepseek",
@@ -180,6 +219,18 @@ Remaining findings produce `partial`; there is no unbounded repair loop.
       {"id": "team", "path": "/opt/team-skills"}
     ],
     "master_allowlist": []
+  },
+  "mcp": {
+    "config_path": ".aeloon-core/mcp.json",
+    "master_allowlist": ["github"]
+  },
+  "tools": {
+    "master_capabilities": [
+      "filesystem",
+      "shell",
+      "repo_context",
+      "planning"
+    ]
   },
   "experts": {
     "enabled": ["builtin:research", "builtin:coding"],
@@ -212,6 +263,11 @@ Use `uv run aeloon-core config show`, `config init`, and `config set`. The plann
 command that scans arbitrary installed Skill collections and asks a model to
 generate disabled ExpertSkill drafts is intentionally not part of this MVP.
 
+```bash
+uv run aeloon-core config set mode normal
+uv run aeloon-core config set mode expert
+```
+
 ## Runtime boundaries
 
 ```text
@@ -223,6 +279,7 @@ aeloon_core/
 │   ├── capabilities.py # Ultra and Expert Harness capabilities
 │   ├── execution/      # Pydantic AI run engine and tracing
 │   ├── model/          # Master/expert-stage routing
+│   ├── mcp/            # configured MCP loading and per-agent scopes
 │   ├── provider/       # provider construction
 │   └── tool/           # host tool contracts and observation tools
 ├── conversation/       # persisted Master turns only

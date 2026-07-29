@@ -29,6 +29,7 @@ def _skill(
     kind: str = "skill",
     runner: str | None = None,
     dependencies: tuple[str, ...] = (),
+    mcp_servers: tuple[str, ...] = (),
 ) -> Path:
     path = root / directory
     path.mkdir(parents=True, exist_ok=True)
@@ -42,6 +43,8 @@ def _skill(
         metadata.append(f"runner: {runner}")
     if dependencies:
         metadata.extend(["dependencies:", *[f"  - {item}" for item in dependencies]])
+    if mcp_servers:
+        metadata.extend(["mcp-servers:", *[f"  - {item}" for item in mcp_servers]])
     metadata.extend(["---", f"# {name}", "", f"Instructions for {name}."])
     (path / "SKILL.md").write_text("\n".join(metadata), encoding="utf-8")
     return path
@@ -93,6 +96,7 @@ def test_expert_scope_contains_only_itself_and_plain_dependencies(
         kind="expert",
         runner="builtin.prompt",
         dependencies=("rules",),
+        mcp_servers=("github",),
     )
     config = Config(
         workspace=tmp_path / "workspace",
@@ -102,6 +106,7 @@ def test_expert_scope_contains_only_itself_and_plain_dependencies(
     expert = registry.require("workspace:custom")
 
     assert isinstance(expert, ExpertSkillSnapshot)
+    assert expert.mcp_servers == ("github",)
     scope = registry.expert_scope(expert)
     assert scope.skill_ids == frozenset({"workspace:custom", "workspace:rules"})
     assert (
@@ -142,6 +147,7 @@ def test_expert_nesting_is_rejected_at_discovery(tmp_path: Path) -> None:
 
 def test_master_plain_skill_allowlist_rejects_expert_ids(tmp_path: Path) -> None:
     config = Config(
+        mode="expert",
         workspace=tmp_path,
         skills={"master_allowlist": ["builtin:coding"]},
     ).normalized()
@@ -149,6 +155,38 @@ def test_master_plain_skill_allowlist_rejects_expert_ids(tmp_path: Path) -> None
 
     with pytest.raises(SkillDefinitionError, match="plain Skills"):
         registry.master_scope(config)
+
+
+def test_normal_mode_exposes_every_discovered_plain_skill_to_master(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / ".aeloon-core" / "skills"
+    _skill(root, "one", name="one")
+    _skill(root, "two", name="two")
+    config = Config(workspace=tmp_path).normalized()
+    registry = SkillRegistry.discover(config)
+
+    assert {"workspace:one", "workspace:two"} <= registry.master_scope(
+        config
+    ).skill_ids
+
+
+def test_expert_mode_exposes_only_allowlisted_plain_skills_to_master(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / ".aeloon-core" / "skills"
+    _skill(root, "one", name="one")
+    _skill(root, "two", name="two")
+    config = Config(
+        mode="expert",
+        workspace=tmp_path,
+        skills={"master_allowlist": ["workspace:one"]},
+    ).normalized()
+    registry = SkillRegistry.discover(config)
+
+    scope = registry.master_scope(config).skill_ids
+    assert "workspace:one" in scope
+    assert "workspace:two" not in scope
 
 
 def test_missing_explicit_root_fails_fast(tmp_path: Path) -> None:

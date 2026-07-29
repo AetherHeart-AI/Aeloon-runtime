@@ -15,8 +15,10 @@ from pydantic_ai.messages import (
     ToolReturnPart,
 )
 from pydantic_ai.models.function import FunctionModel
+from pydantic_ai.toolsets import FunctionToolset
 
 from aeloon_core.config import Config
+from aeloon_core.harness.mcp import McpRegistry
 from aeloon_core.orchestrator import AeloonCoreOrchestrator
 
 
@@ -152,6 +154,31 @@ async def test_master_exposes_ultra_skill_and_expert_tools(tmp_path: Path) -> No
         "expert_run",
     } <= set(exposed)
     assert not {"workflow_execute", "run_workflow", "spawn_worker"} & set(exposed)
+    await app.close()
+
+
+@pytest.mark.asyncio
+async def test_normal_master_exposes_tools_from_every_configured_mcp_server(
+    tmp_path: Path,
+) -> None:
+    exposed: list[str] = []
+
+    async def lookup(query: str) -> str:
+        return query
+
+    async def respond(_messages: list[ModelMessage], info: Any) -> ModelResponse:
+        exposed.extend(tool.name for tool in info.model_request_parameters.function_tools)
+        return ModelResponse(parts=[TextPart("done")])
+
+    docs = FunctionToolset([lookup], id="docs").prefixed("docs")
+    app = AeloonCoreOrchestrator(
+        _config(tmp_path, mode="normal"),
+        model=FunctionModel(respond),
+        mcp=McpRegistry({"docs": docs}),
+    )
+    await app.run_turn("inspect")
+
+    assert "docs_lookup" in exposed
     await app.close()
 
 

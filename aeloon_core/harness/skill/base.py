@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 SKILL_NAME_PATTERN = r"^[a-z][a-z0-9_-]{0,63}$"
 SKILL_ID_PATTERN = r"^[a-z][a-z0-9_-]{0,63}:[a-z][a-z0-9_-]{0,63}$"
 RUNNER_ID_PATTERN = r"^[a-z][a-z0-9_.-]{0,127}$"
+MCP_SERVER_NAME_PATTERN = r"^[a-z][a-z0-9_-]{0,63}$"
 MAX_SKILL_INSTRUCTION_CHARS = 128_000
 ALLOWED_EXPERT_CAPABILITIES = frozenset(
     {
@@ -53,6 +54,11 @@ class SkillManifest(BaseModel):
     runner: str | None = Field(default=None, pattern=RUNNER_ID_PATTERN)
     dependencies: tuple[str, ...] = Field(default=(), max_length=64)
     capabilities: tuple[str, ...] = Field(default=(), max_length=16)
+    mcp_servers: tuple[str, ...] = Field(
+        default=(),
+        alias="mcp-servers",
+        max_length=64,
+    )
     model_tier: Literal["fast", "strong"] = "strong"
     concurrency_mode: Literal["parallel_safe", "exclusive"] = "exclusive"
     max_calls_per_turn: int = Field(default=1, ge=1, le=32)
@@ -93,6 +99,7 @@ class ExpertSkill(Skill):
     runner: str
     dependencies: tuple[str, ...] = ()
     capabilities: tuple[str, ...] = ()
+    mcp_servers: tuple[str, ...] = ()
     model_tier: Literal["fast", "strong"] = "strong"
     concurrency_mode: Literal["parallel_safe", "exclusive"] = "exclusive"
     max_calls_per_turn: int = 1
@@ -103,6 +110,7 @@ class ExpertSkill(Skill):
             {
                 "runner": self.runner,
                 "capabilities": list(self.capabilities),
+                "mcp_servers": list(self.mcp_servers),
                 "model_tier": self.model_tier,
                 "concurrency_mode": self.concurrency_mode,
                 "max_calls_per_turn": self.max_calls_per_turn,
@@ -178,6 +186,7 @@ def parse_skill_manifest(
             "runner",
             "dependencies",
             "capabilities",
+            "mcp_servers",
             "model_tier",
             "concurrency_mode",
             "max_calls_per_turn",
@@ -195,6 +204,18 @@ def parse_skill_manifest(
         raise SkillDefinitionError(f"ExpertSkill {skill_id!r} has duplicate dependencies")
     if len(set(manifest.capabilities)) != len(manifest.capabilities):
         raise SkillDefinitionError(f"ExpertSkill {skill_id!r} has duplicate capabilities")
+    if len(set(manifest.mcp_servers)) != len(manifest.mcp_servers):
+        raise SkillDefinitionError(f"ExpertSkill {skill_id!r} has duplicate MCP servers")
+    invalid_mcp_servers = sorted(
+        server
+        for server in manifest.mcp_servers
+        if re.fullmatch(MCP_SERVER_NAME_PATTERN, server) is None
+    )
+    if invalid_mcp_servers:
+        raise SkillDefinitionError(
+            f"ExpertSkill {skill_id!r} has invalid MCP servers: "
+            + ", ".join(invalid_mcp_servers)
+        )
     unknown = sorted(set(manifest.capabilities) - ALLOWED_EXPERT_CAPABILITIES)
     if unknown:
         raise SkillDefinitionError(
@@ -206,6 +227,7 @@ def parse_skill_manifest(
         runner=manifest.runner,
         dependencies=manifest.dependencies,
         capabilities=manifest.capabilities,
+        mcp_servers=manifest.mcp_servers,
         model_tier=manifest.model_tier,
         concurrency_mode=manifest.concurrency_mode,
         max_calls_per_turn=manifest.max_calls_per_turn,
@@ -245,6 +267,7 @@ __all__ = [
     "ExpertSkill",
     "ExpertSkillSnapshot",
     "MAX_SKILL_INSTRUCTION_CHARS",
+    "MCP_SERVER_NAME_PATTERN",
     "RUNNER_ID_PATTERN",
     "SkillDefinitionError",
     "Skill",
