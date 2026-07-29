@@ -41,11 +41,10 @@ uv run python run_bench.py \
   --resume 20260729T100902Z-d558b57d
 ```
 
-LiveCodeBench writes one durable generation checkpoint per scenario and case
-before invoking the official evaluator. Resume reuses those checkpoints plus
-completed `(harness, scenario, case)` records in `results.jsonl`; it only runs
-work that has no durable outcome. Repeating the same resume command is
-idempotent and does not append duplicate result records.
+LiveCodeBench resume reuses completed `(harness, scenario, case)` records in
+`results.jsonl`. A generation interrupted before official evaluation has no
+durable result and runs again. Repeating the same resume command is idempotent
+and does not append duplicate result records.
 
 The benchmark, release, source revision, cases, and ordered harness selection
 must match the original manifest. RefactorBench does not currently support the

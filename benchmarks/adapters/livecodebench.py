@@ -409,46 +409,25 @@ class LiveCodeBenchAdapter(BenchmarkAdapter):
             item: tuple[int, official.LiveCodeBenchCase],
         ) -> tuple[str, _Generation]:
             index, case = item
-            generation = self._load_generation_checkpoint(
-                harness=harness,
+            baseline_progress.set_detail(f"running {case.instance_id}")
+            info(
+                "[%s/%s] code-generation %d/%d: %s",
+                self.name,
+                harness.name,
+                index,
+                len(pending_baselines),
+                case.instance_id,
+            )
+            prompt = official._code_generation_prompt(case)
+            result = self._invoke(
+                harness,
                 case=case,
                 scenario="code-generation",
+                prompt=prompt,
             )
-            if generation is None:
-                baseline_progress.set_detail(f"running {case.instance_id}")
-                info(
-                    "[%s/%s] code-generation %d/%d: %s",
-                    self.name,
-                    harness.name,
-                    index,
-                    len(pending_baselines),
-                    case.instance_id,
-                )
-                prompt = official._code_generation_prompt(case)
-                result = self._invoke(
-                    harness,
-                    case=case,
-                    scenario="code-generation",
-                    prompt=prompt,
-                )
-                code, _error = official._extract_python_code(result.final_content)
-                generation = _Generation(prompt=prompt, code=code, result=result)
-                self._write_generation_checkpoint(
-                    harness=harness,
-                    case=case,
-                    scenario="code-generation",
-                    generation=generation,
-                )
-                detail = f"completed {case.instance_id}"
-            else:
-                info(
-                    "[%s/%s] Reusing code-generation checkpoint: %s",
-                    self.name,
-                    harness.name,
-                    case.instance_id,
-                )
-                detail = f"resumed {case.instance_id}"
-            baseline_progress.advance(detail=detail)
+            code, _error = official._extract_python_code(result.final_content)
+            generation = _Generation(prompt=prompt, code=code, result=result)
+            baseline_progress.advance(detail=f"completed {case.instance_id}")
             return case.instance_id, generation
 
         indexed_cases = list(enumerate(pending_baselines, start=1))
@@ -520,51 +499,30 @@ class LiveCodeBenchAdapter(BenchmarkAdapter):
             item: tuple[int, official.LiveCodeBenchCase],
         ) -> tuple[str, _Generation]:
             index, case = item
-            generation = self._load_generation_checkpoint(
-                harness=harness,
+            baseline = baseline_records[case.instance_id]
+            repair_progress.set_detail(f"running {case.instance_id}")
+            info(
+                "[%s/%s] self-repair %d/%d: %s",
+                self.name,
+                harness.name,
+                index,
+                len(pending_repairs),
+                case.instance_id,
+            )
+            prompt = official._self_repair_prompt(
+                case,
+                code=baseline["generation"]["code"],
+                metadata=baseline["evaluation"]["metadata"],
+            )
+            result = self._invoke(
+                harness,
                 case=case,
                 scenario="self-repair",
+                prompt=prompt,
             )
-            if generation is None:
-                baseline = baseline_records[case.instance_id]
-                repair_progress.set_detail(f"running {case.instance_id}")
-                info(
-                    "[%s/%s] self-repair %d/%d: %s",
-                    self.name,
-                    harness.name,
-                    index,
-                    len(pending_repairs),
-                    case.instance_id,
-                )
-                prompt = official._self_repair_prompt(
-                    case,
-                    code=baseline["generation"]["code"],
-                    metadata=baseline["evaluation"]["metadata"],
-                )
-                result = self._invoke(
-                    harness,
-                    case=case,
-                    scenario="self-repair",
-                    prompt=prompt,
-                )
-                code, _error = official._extract_python_code(result.final_content)
-                generation = _Generation(prompt=prompt, code=code, result=result)
-                self._write_generation_checkpoint(
-                    harness=harness,
-                    case=case,
-                    scenario="self-repair",
-                    generation=generation,
-                )
-                detail = f"completed {case.instance_id}"
-            else:
-                info(
-                    "[%s/%s] Reusing self-repair checkpoint: %s",
-                    self.name,
-                    harness.name,
-                    case.instance_id,
-                )
-                detail = f"resumed {case.instance_id}"
-            repair_progress.advance(detail=detail)
+            code, _error = official._extract_python_code(result.final_content)
+            generation = _Generation(prompt=prompt, code=code, result=result)
+            repair_progress.advance(detail=f"completed {case.instance_id}")
             return case.instance_id, generation
 
         indexed_repairs = list(enumerate(pending_repairs, start=1))
@@ -771,116 +729,6 @@ class LiveCodeBenchAdapter(BenchmarkAdapter):
         ):
             raise RuntimeError(f"Benchmark result is incompatible with this run: {source}")
         return scenario, instance_id
-
-    def _checkpoint_path(
-        self,
-        *,
-        harness: Harness,
-        case: official.LiveCodeBenchCase,
-        scenario: str,
-    ) -> Path:
-        return (
-            self.run.output_dir
-            / harness.name
-            / "checkpoints"
-            / scenario
-            / f"{official._safe_id(case.instance_id)}.json"
-        )
-
-    def _write_generation_checkpoint(
-        self,
-        *,
-        harness: Harness,
-        case: official.LiveCodeBenchCase,
-        scenario: str,
-        generation: _Generation,
-    ) -> None:
-        result = generation.result
-        self.write_json(
-            self._checkpoint_path(
-                harness=harness,
-                case=case,
-                scenario=scenario,
-            ),
-            {
-                "schema_version": 1,
-                "benchmark": self.name,
-                "release_version": self.release_version,
-                "harness": harness.name,
-                "scenario": scenario,
-                "instance_id": case.instance_id,
-                "prompt": generation.prompt,
-                "code": generation.code,
-                "result": {
-                    "agent": result.to_record(),
-                    "stdout": result.process.stdout,
-                    "stderr": result.process.stderr,
-                },
-            },
-        )
-
-    def _load_generation_checkpoint(
-        self,
-        *,
-        harness: Harness,
-        case: official.LiveCodeBenchCase,
-        scenario: str,
-    ) -> _Generation | None:
-        checkpoint_path = self._checkpoint_path(
-            harness=harness,
-            case=case,
-            scenario=scenario,
-        )
-        if not checkpoint_path.is_file():
-            return None
-        try:
-            checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                f"Invalid generation checkpoint at {checkpoint_path}: {exc}"
-            ) from None
-        expected = {
-            "schema_version": 1,
-            "benchmark": self.name,
-            "release_version": self.release_version,
-            "harness": harness.name,
-            "scenario": scenario,
-            "instance_id": case.instance_id,
-        }
-        if not isinstance(checkpoint, dict) or any(
-            checkpoint.get(key) != value for key, value in expected.items()
-        ):
-            raise RuntimeError(
-                f"Generation checkpoint is incompatible with this run: {checkpoint_path}"
-            )
-        prompt = checkpoint.get("prompt")
-        code = checkpoint.get("code")
-        result_payload = checkpoint.get("result")
-        if (
-            not isinstance(prompt, str)
-            or not isinstance(code, str)
-            or not isinstance(result_payload, dict)
-            or not isinstance(result_payload.get("agent"), dict)
-        ):
-            raise RuntimeError(f"Generation checkpoint is invalid: {checkpoint_path}")
-        result = self._result_from_agent(
-            result_payload["agent"],
-            stdout=(
-                result_payload["stdout"]
-                if isinstance(result_payload.get("stdout"), str)
-                else ""
-            ),
-            stderr=(
-                result_payload["stderr"]
-                if isinstance(result_payload.get("stderr"), str)
-                else ""
-            ),
-        )
-        if result.harness != harness.name:
-            raise RuntimeError(
-                f"Generation checkpoint has the wrong harness: {checkpoint_path}"
-            )
-        return _Generation(prompt=prompt, code=code, result=result)
 
     def _result_from_record(self, record: dict[str, Any]) -> HarnessResult:
         agent = record.get("agent")

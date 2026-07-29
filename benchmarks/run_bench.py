@@ -53,8 +53,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--resume",
         metavar="RUN_ID",
         help=(
-            "Resume an existing benchmark run by id. Completed records and "
-            "generation checkpoints are reused."
+            "Resume an existing benchmark run by id. Completed result records "
+            "are reused."
         ),
     )
     return parser

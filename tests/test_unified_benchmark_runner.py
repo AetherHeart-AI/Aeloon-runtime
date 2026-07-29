@@ -14,10 +14,13 @@ from benchmarks import progress as benchmark_progress
 from benchmarks.adapters.livecodebench import LiveCodeBenchAdapter
 from benchmarks.adapters.refactorbench import RefactorBenchAdapter
 from benchmarks.harness.base import (
+    Harness,
     HarnessInvocation,
+    HarnessRequest,
     HarnessResult,
     ProcessOutcome,
 )
+from benchmarks.harness.pi import PiHarness
 from benchmarks.livecodebench.runner import LiveCodeBenchCase
 from benchmarks.progress import ProgressBar, configure_progress, info
 
@@ -126,6 +129,67 @@ def test_cli_exposes_harness_benchmark_workers_and_resume() -> None:
     )
 
     assert resumed.resume == "20260729T100902Z-d558b57d"
+
+
+def test_pi_uses_text_mode_without_json_event_history(tmp_path: Path) -> None:
+    harness = object.__new__(PiHarness)
+    harness.executable = "/fake/pi"
+    request = HarnessRequest(
+        prompt="solve it",
+        workspace=tmp_path,
+        session_dir=tmp_path / "sessions",
+        project_root=tmp_path,
+    )
+
+    invocation = harness.build_invocation(request)
+    result = harness.interpret(
+        ProcessOutcome(
+            returncode=0,
+            stdout="```python\nprint(1)\n```\n",
+            stderr="",
+            duration_ms=1,
+        )
+    )
+
+    assert invocation.command[:4] == ["/fake/pi", "--print", "--mode", "text"]
+    assert result["status"] == "completed"
+    assert result["final_content"] == "```python\nprint(1)\n```"
+
+
+def test_harness_run_bounds_raw_process_output(tmp_path: Path, monkeypatch) -> None:
+    class CompactingHarness(Harness):
+        name = "compacting"
+
+        def resolve_executable(self) -> str:
+            return "/fake/compacting"
+
+        def build_invocation(self, request: HarnessRequest) -> HarnessInvocation:
+            return HarnessInvocation(command=[self.executable], cwd=request.workspace)
+
+        def interpret(self, outcome: ProcessOutcome) -> dict[str, object]:
+            return {"status": "completed", "final_content": "done"}
+
+    harness = object.__new__(CompactingHarness)
+    harness.executable = "/fake/compacting"
+    harness.version = "fake@1"
+    raw_output = "x" * 100_000
+    monkeypatch.setattr(
+        "benchmarks.harness.base.run_process",
+        lambda *args, **kwargs: ProcessOutcome(0, raw_output, "", 1),
+    )
+
+    result = harness.run(
+        HarnessRequest(
+            prompt="solve it",
+            workspace=tmp_path,
+            session_dir=tmp_path / "sessions",
+            project_root=tmp_path,
+        )
+    )
+
+    assert result.final_content == "done"
+    assert len(result.process.stdout) < 21_000
+    assert result.process.stdout.endswith("x" * 20_000)
 
 
 def test_benchmark_python_packages_are_not_gitignored() -> None:
@@ -404,7 +468,7 @@ def test_livecodebench_evaluate_accepts_complete_official_results(
     }
 
 
-def test_livecodebench_reuses_generation_checkpoints_after_evaluator_failure(
+def test_livecodebench_reruns_uncommitted_generations_after_evaluator_failure(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -443,7 +507,7 @@ def test_livecodebench_reuses_generation_checkpoints_after_evaluator_failure(
         adapter._run_harness(first_harness, cases)  # type: ignore[arg-type]
 
     assert first_harness.calls == 2
-    assert len(list(adapter.run.output_dir.glob("fake/checkpoints/code-generation/*.json"))) == 2
+    assert not (adapter.run.output_dir / "fake" / "checkpoints").exists()
 
     second_harness = CountingHarness()
 
@@ -460,7 +524,7 @@ def test_livecodebench_reuses_generation_checkpoints_after_evaluator_failure(
     monkeypatch.setattr(adapter, "evaluate", pass_evaluation)
     summary = adapter._run_harness(second_harness, cases)  # type: ignore[arg-type]
 
-    assert second_harness.calls == 0
+    assert second_harness.calls == 2
     assert summary["code_generation_passed"] == 2
     assert summary["self_repair_passed"] == 2
     results_path = adapter.run.output_dir / "fake" / "results.jsonl"
@@ -473,7 +537,7 @@ def test_livecodebench_reuses_generation_checkpoints_after_evaluator_failure(
     )
     adapter._run_harness(second_harness, cases)  # type: ignore[arg-type]
 
-    assert second_harness.calls == 0
+    assert second_harness.calls == 2
     assert len(results_path.read_text(encoding="utf-8").splitlines()) == 4
 
 

@@ -140,11 +140,18 @@ class Harness(ABC):
             input_text=invocation.input_text,
         )
         fields = self.interpret(outcome)
+        captured_outcome = ProcessOutcome(
+            returncode=outcome.returncode,
+            stdout=bounded(outcome.stdout),
+            stderr=bounded(outcome.stderr),
+            duration_ms=outcome.duration_ms,
+            timed_out=outcome.timed_out,
+        )
         return HarnessResult(
             harness=self.name,
             version=self.version,
             invocation=invocation,
-            process=outcome,
+            process=captured_outcome,
             status=str(fields.pop("status")),
             final_content=fields.pop("final_content", None),
             **fields,
