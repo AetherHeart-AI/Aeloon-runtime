@@ -19,16 +19,9 @@ from aeloon_core.config import (
 from aeloon_core.harness.provider import (
     PromptCacheState,
     PydanticModelBundle,
-    build_anthropic_model,
-    build_volcengine_model,
+    build_deepseek_model,
 )
 
-FAST_ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
-_OFFICIAL_ANTHROPIC_URLS = {
-    "https://api.anthropic.com",
-    "https://api.anthropic.com/v1",
-}
-_FAST_WORKER_TYPES = frozenset({"explorer", "researcher"})
 RouteKind = Literal["fast", "strong", "override", "fallback", "injected"]
 
 
@@ -98,7 +91,7 @@ class ModelRouter:
             prefer_fast=(
                 preferred_tier == "fast"
                 if preferred_tier is not None
-                else worker_type_id in _FAST_WORKER_TYPES
+                else False
             ),
         )
 
@@ -152,12 +145,6 @@ class ModelRouter:
                 route="fallback",
             )
 
-        if prefer_fast and self._uses_official_anthropic():
-            return self._resolve(
-                provider="anthropic",
-                model_name=FAST_ANTHROPIC_MODEL,
-                route="fast",
-            )
         return self._resolve(
             provider=defaults.provider,
             model_name=defaults.model,
@@ -186,22 +173,13 @@ class ModelRouter:
         bundle = self._bundles.get(key)
         if bundle is None:
             defaults = self.config.agents.defaults
-            if provider == "volcengine":
-                bundle = build_volcengine_model(
-                    provider=self.config.providers.volcengine,
-                    model_name=model_name,
-                    temperature=defaults.temperature,
-                    reasoning_effort=defaults.reasoning_effort,
-                    timeout=defaults.chat_timeout,
-                )
-            else:
-                bundle = build_anthropic_model(
-                    provider=self.config.providers.anthropic,
-                    model_name=model_name,
-                    temperature=defaults.temperature,
-                    reasoning_effort=defaults.reasoning_effort,
-                    timeout=defaults.chat_timeout,
-                )
+            bundle = build_deepseek_model(
+                provider=self.config.providers.deepseek,
+                model_name=model_name,
+                temperature=defaults.temperature,
+                reasoning_effort=defaults.reasoning_effort,
+                timeout=defaults.chat_timeout,
+            )
             self._bundles[key] = bundle
         return ModelBinding(
             provider=provider,
@@ -218,29 +196,10 @@ class ModelRouter:
             return False
         if not model_name.strip():
             return False
-        # The built-in Anthropic fast model only works on the official endpoint.
-        if (
-            model_name == FAST_ANTHROPIC_MODEL
-            and provider == "anthropic"
-            and not self._uses_official_anthropic_endpoint()
-        ):
-            return False
         return True
-
-    def _uses_official_anthropic(self) -> bool:
-        return (
-            self.config.agents.defaults.provider == "anthropic"
-            and self._uses_official_anthropic_endpoint()
-        )
-
-    def _uses_official_anthropic_endpoint(self) -> bool:
-        return self.config.providers.anthropic.base_url.rstrip("/") in {
-            url.rstrip("/") for url in _OFFICIAL_ANTHROPIC_URLS
-        }
 
 
 __all__ = [
-    "FAST_ANTHROPIC_MODEL",
     "ModelBinding",
     "ModelRouter",
 ]

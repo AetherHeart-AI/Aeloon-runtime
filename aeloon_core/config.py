@@ -9,29 +9,18 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-ProviderName = Literal["anthropic", "volcengine"]
-KNOWN_PROVIDERS: frozenset[str] = frozenset({"anthropic", "volcengine"})
+ProviderName = Literal["deepseek"]
+KNOWN_PROVIDERS: frozenset[str] = frozenset({"deepseek"})
 
 _REMOVED_V1_AGENT_DEFAULTS = frozenset(
     {"base_profile_id", "profile_id", "max_handoffs"}
 )
 
 
-class AnthropicProviderConfig(BaseModel):
-    """Anthropic Messages API provider settings."""
+class DeepSeekProviderConfig(BaseModel):
+    """Credentials and transport settings for Pydantic AI's DeepSeek provider."""
 
     api_key: str = "no-key"
-    base_url: str = "https://api.anthropic.com"
-    extra_headers: dict[str, str] = Field(default_factory=dict)
-    proxy: str | None = None
-    prompt_caching: bool = True
-
-
-class VolcengineProviderConfig(BaseModel):
-    """Volcano Engine Ark Agent Plan settings for the OpenAI Responses API."""
-
-    api_key: str = "no-key"
-    base_url: str = "https://ark.cn-beijing.volces.com/api/plan/v3"
     extra_headers: dict[str, str] = Field(default_factory=dict)
     proxy: str | None = None
 
@@ -39,8 +28,7 @@ class VolcengineProviderConfig(BaseModel):
 class ProvidersConfig(BaseModel):
     """Provider credential namespace (no global active switch)."""
 
-    anthropic: AnthropicProviderConfig = Field(default_factory=AnthropicProviderConfig)
-    volcengine: VolcengineProviderConfig = Field(default_factory=VolcengineProviderConfig)
+    deepseek: DeepSeekProviderConfig = Field(default_factory=DeepSeekProviderConfig)
 
 
 class ContextCompactionConfig(BaseModel):
@@ -64,14 +52,12 @@ class AgentDefaultsConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    provider: ProviderName = "anthropic"
-    model: str = "claude-sonnet-4-6"
+    provider: ProviderName = "deepseek"
+    model: str = "deepseek-v4-flash"
     temperature: float = 0.7
     reasoning_effort: str | None = None
     chat_timeout: int = 3600
     context_window_tokens: int = 128_000
-    # Per-request completion ceiling. Anthropic-compatible SDKs default to 4096
-    # when unset, which thinking models routinely exhaust before tool output.
     max_output_tokens: int = Field(default=32_768, ge=256)
     max_iterations: int = 25
     context_compaction: ContextCompactionConfig = Field(
@@ -213,7 +199,7 @@ def parse_model_ref(
 
     text = value.strip()
     if not text:
-        raise ValueError("model ref must be nonempty")
+        raise ValueError("model ref should be nonempty")
     provider_candidate, separator, remainder = text.partition("/")
     if separator and provider_candidate in KNOWN_PROVIDERS:
         model = remainder.strip()
@@ -246,7 +232,6 @@ def load_config(path: Path | str | None = None) -> Config:
         _drop_removed_v1_settings(data)
         _drop_removed_orchestration_settings(data)
         _migrate_agent_runtime_settings(data)
-        _migrate_provider_settings(data)
         _migrate_active_provider(data)
 
     config = Config.model_validate(data)
@@ -258,39 +243,21 @@ def load_config(path: Path | str | None = None) -> Config:
     )
     if default_provider not in KNOWN_PROVIDERS:
         raise ValueError(
-            "AELOON_CORE_PROVIDER must be 'anthropic' or 'volcengine', "
+            "AELOON_CORE_PROVIDER must be 'deepseek', "
             f"got {default_provider!r}"
         )
     updates.setdefault("agents", {}).setdefault("defaults", {})[
         "provider"
     ] = default_provider
 
-    # Credential env vars apply to their own provider independently of the default.
-    if api_key := os.environ.get("ARK_API_KEY"):
-        updates.setdefault("providers", {}).setdefault("volcengine", {})[
+    if api_key := os.environ.get("DEEPSEEK_API_KEY"):
+        updates.setdefault("providers", {}).setdefault("deepseek", {})[
             "api_key"
         ] = api_key
-    if base_url := os.environ.get("ARK_BASE_URL"):
-        updates.setdefault("providers", {}).setdefault("volcengine", {})[
-            "base_url"
-        ] = base_url
-    if api_key := os.environ.get("ANTHROPIC_API_KEY"):
-        updates.setdefault("providers", {}).setdefault("anthropic", {})[
-            "api_key"
-        ] = api_key
-    if base_url := os.environ.get("ANTHROPIC_BASE_URL"):
-        updates.setdefault("providers", {}).setdefault("anthropic", {})[
-            "base_url"
-        ] = base_url
 
-    if default_provider == "volcengine":
-        if model := os.environ.get("ARK_MODEL"):
-            updates.setdefault("agents", {}).setdefault("defaults", {})["model"] = model
-    else:
-        if model := os.environ.get("ANTHROPIC_MODEL"):
-            updates.setdefault("agents", {}).setdefault("defaults", {})[
-                "model"
-            ] = model
+    if model := os.environ.get("DEEPSEEK_MODEL"):
+        updates.setdefault("agents", {}).setdefault("defaults", {})["model"] = model
+
     max_context_tokens = os.environ.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS")
     auto_compact_window = os.environ.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
     parsed_max_context = (
@@ -383,23 +350,6 @@ def _drop_removed_orchestration_settings(data: Any) -> None:
     if isinstance(harness, dict):
         harness.pop("dynamic_workflow_enabled", None)
         harness.pop("workflow_memory_mb", None)
-
-
-def _migrate_provider_settings(data: Any) -> None:
-    """Upgrade the former custom provider config into Anthropic naming."""
-
-    if not isinstance(data, dict):
-        return
-    providers = data.get("providers")
-    if not isinstance(providers, dict):
-        return
-    legacy = providers.pop("custom", None)
-    if not isinstance(legacy, dict) or "anthropic" in providers:
-        return
-    migrated = dict(legacy)
-    if "api_base" in migrated and "base_url" not in migrated:
-        migrated["base_url"] = migrated.pop("api_base")
-    providers["anthropic"] = migrated
 
 
 def _migrate_active_provider(data: Any) -> None:

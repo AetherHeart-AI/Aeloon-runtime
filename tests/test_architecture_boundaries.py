@@ -21,7 +21,7 @@ EXPECTED_HARNESS_FEATURES = {
         "transitions.py",
     },
     "model": {"__init__.py", "router.py"},
-    "provider": {"__init__.py", "anthropic.py", "base.py", "volcengine.py"},
+    "provider": {"__init__.py", "base.py", "deepseek.py"},
     "tool": {"__init__.py", "base.py", "filesystem.py", "registry.py", "search.py"},
     "workflow": {"__init__.py", "base.py", "presets.py", "runner.py", "tools.py"},
 }

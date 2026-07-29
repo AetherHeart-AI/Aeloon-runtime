@@ -116,8 +116,8 @@ async def test_run_json_emits_one_machine_readable_result(
         "transitions": [{"kind": "terminal"}],
         "workspace": str(tmp_path),
         "models": {
-            "default": "anthropic/claude-sonnet-4-6",
-            "master": "anthropic/claude-sonnet-4-6",
+            "default": "deepseek/deepseek-v4-flash",
+            "master": "deepseek/deepseek-v4-flash",
             "workers": {},
         },
     }

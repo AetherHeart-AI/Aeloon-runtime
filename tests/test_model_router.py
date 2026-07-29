@@ -1,3 +1,5 @@
+"""Tests for process-scoped model routing."""
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -7,11 +9,11 @@ from pydantic_ai.messages import ModelResponse, TextPart
 from pydantic_ai.models.function import FunctionModel
 
 from aeloon_core.config import AgentRoutingConfig, AgentsConfig, Config
-from aeloon_core.harness.model import FAST_ANTHROPIC_MODEL, ModelRouter
+from aeloon_core.harness.model import ModelRouter
 
 
 @pytest.mark.asyncio
-async def test_official_anthropic_routes_coordination_and_read_only_workers_fast() -> None:
+async def test_deepseek_routes_all_roles_to_default_model() -> None:
     config = Config()
     router = ModelRouter(config)
 
@@ -22,39 +24,13 @@ async def test_official_anthropic_routes_coordination_and_read_only_workers_fast
     reviewer = router.resolve_worker("reviewer")
     custom = router.resolve_worker("custom")
 
-    assert master.model_name == FAST_ANTHROPIC_MODEL
-    assert master.provider == "anthropic"
+    assert master.model_name == config.agents.defaults.model
+    assert master.provider == "deepseek"
     assert explorer.model is master.model
     assert researcher.model is master.model
-    assert builder.model_name == config.agents.defaults.model
-    assert builder.provider == config.agents.defaults.provider
-    assert reviewer.model is builder.model
-    assert custom.model is builder.model
-    await router.close()
-
-
-@pytest.mark.asyncio
-async def test_nonofficial_gateway_falls_back_to_default_model() -> None:
-    config = Config()
-    config.providers.anthropic.base_url = "https://api.kimi.com/coding/"
-    router = ModelRouter(config)
-
-    assert router.resolve_master().model_name == config.agents.defaults.model
-    assert router.resolve_worker("explorer").model_name == config.agents.defaults.model
-    await router.close()
-
-
-@pytest.mark.asyncio
-async def test_volcengine_falls_back_to_the_configured_default_model() -> None:
-    config = Config()
-    config.agents.defaults.provider = "volcengine"
-    config.agents.defaults.model = "ark-code-latest"
-    router = ModelRouter(config)
-
-    assert router.resolve_master().model_name == "ark-code-latest"
-    assert router.resolve_master().provider == "volcengine"
-    assert router.resolve_worker("researcher").model_name == "ark-code-latest"
-    assert router.resolve_worker("reviewer").model_name == "ark-code-latest"
+    assert builder.model is master.model
+    assert reviewer.model is master.model
+    assert custom.model is master.model
     await router.close()
 
 
@@ -81,8 +57,8 @@ async def test_routing_profile_can_override_provider_and_model() -> None:
     config = Config(
         agents=AgentsConfig(
             routing=AgentRoutingConfig(
-                master="volcengine/ark-code-latest",
-                workers={"builder": "anthropic/claude-sonnet-4-6"},
+                master="deepseek/deepseek-v4-flash",
+                workers={"builder": "deepseek/deepseek-v4-pro"},
             )
         )
     )
@@ -90,26 +66,11 @@ async def test_routing_profile_can_override_provider_and_model() -> None:
 
     master = router.resolve_master()
     builder = router.resolve_worker("builder")
-    assert master.provider == "volcengine"
-    assert master.model_name == "ark-code-latest"
+    assert master.provider == "deepseek"
+    assert master.model_name == "deepseek-v4-flash"
     assert master.route == "override"
-    assert builder.provider == "anthropic"
-    assert builder.model_name == "claude-sonnet-4-6"
-    await router.close()
-
-
-@pytest.mark.asyncio
-async def test_unusable_routing_override_falls_back_to_config_default() -> None:
-    config = Config()
-    config.providers.anthropic.base_url = "https://api.deepseek.com/anthropic"
-    config.agents.defaults.model = "deepseek-v4-pro"
-    config.agents.routing.master = f"anthropic/{FAST_ANTHROPIC_MODEL}"
-    router = ModelRouter(config)
-
-    master = router.resolve_master()
-    assert master.route == "fallback"
-    assert master.provider == "anthropic"
-    assert master.model_name == "deepseek-v4-pro"
+    assert builder.provider == "deepseek"
+    assert builder.model_name == "deepseek-v4-pro"
     await router.close()
 
 
@@ -126,15 +87,16 @@ def test_injected_model_preserves_the_legacy_all_role_override() -> None:
 
 
 def test_python_role_model_tier_is_used_when_no_route_override() -> None:
-    router = ModelRouter(Config())
+    config = Config()
+    router = ModelRouter(config)
 
     assert (
         router.resolve_worker("custom", preferred_tier="fast").model_name
-        == FAST_ANTHROPIC_MODEL
+        == config.agents.defaults.model
     )
     assert (
         router.resolve_worker("explorer", preferred_tier="strong").model_name
-        == Config().agents.defaults.model
+        == config.agents.defaults.model
     )
 
 
@@ -162,7 +124,7 @@ async def test_router_closes_each_reused_bundle_exactly_once(
         )
 
     monkeypatch.setattr(
-        "aeloon_core.harness.model.router.build_anthropic_model",
+        "aeloon_core.harness.model.router.build_deepseek_model",
         build_bundle,
     )
     router = ModelRouter(Config())
@@ -174,5 +136,5 @@ async def test_router_closes_each_reused_bundle_exactly_once(
     await router.close()
 
     assert sorted(closed) == sorted(
-        [FAST_ANTHROPIC_MODEL, Config().agents.defaults.model]
+        [Config().agents.defaults.model]
     )

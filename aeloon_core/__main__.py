@@ -26,7 +26,6 @@ CONFIG_SETTERS = {
     "workspace": ("workspace",),
     "data-dir": ("data_dir",),
     "provider": ("agents", "defaults", "provider"),
-    "prompt-caching": ("providers", "anthropic", "prompt_caching"),
     "model": ("agents", "defaults", "model"),
     "master-model": ("agents", "routing", "master"),
     "builder-model": ("agents", "routing", "workers", "builder"),
@@ -87,7 +86,6 @@ CONFIG_SETTERS = {
 }
 DYNAMIC_PROVIDER_SETTERS = {
     "api-key": "api_key",
-    "base-url": "base_url",
 }
 CONFIG_KEYS = {*CONFIG_SETTERS, *DYNAMIC_PROVIDER_SETTERS}
 SECRET_KEYS = {"api_key"}
@@ -209,24 +207,19 @@ def _add_config_write_args(parser: argparse.ArgumentParser) -> None:
     _add_path_args(parser)
     parser.add_argument(
         "--provider",
-        choices=("anthropic", "volcengine"),
+        choices=("deepseek",),
         default=None,
-        help="Model provider.",
+        help="Pydantic AI model provider (default: deepseek).",
     )
     parser.add_argument(
         "--api-key",
         default=None,
-        help="API key for the default provider (agents.defaults.provider).",
-    )
-    parser.add_argument(
-        "--base-url",
-        default=None,
-        help="API base URL for the default provider (agents.defaults.provider).",
+        help="DeepSeek API key.",
     )
     parser.add_argument(
         "--model",
         default=None,
-        help="Default model (bare name or provider/model).",
+        help="Default model name.",
     )
 
 
@@ -442,7 +435,6 @@ def _config_with_write_args(config: Config, args: argparse.Namespace) -> Config:
         "workspace": "workspace",
         "data_dir": "data-dir",
         "api_key": "api-key",
-        "base_url": "base-url",
         "model": "model",
     }
     for attr, key in write_arg_keys.items():
@@ -471,8 +463,8 @@ def _default_provider_from_data(data: dict[str, Any]) -> str:
     agents = data.get("agents")
     defaults = agents.get("defaults") if isinstance(agents, dict) else None
     provider = defaults.get("provider") if isinstance(defaults, dict) else None
-    if provider not in {"anthropic", "volcengine"}:
-        raise SystemExit(f"Unknown default provider: {provider!r}")
+    if provider not in {"deepseek"}:
+        return "deepseek"
     return provider
 
 
@@ -482,7 +474,7 @@ def _normalize_default_model_value(data: dict[str, Any], value: Any) -> Any:
     if not isinstance(value, str) or "/" not in value:
         return value
     provider_candidate, _, model = value.partition("/")
-    if provider_candidate not in {"anthropic", "volcengine"} or not model.strip():
+    if provider_candidate not in {"deepseek"} or not model.strip():
         return value
     _set_nested_value(data, CONFIG_SETTERS["provider"], provider_candidate)
     return model.strip()
@@ -550,7 +542,6 @@ def _coerce_config_value(key: str, value: str) -> Any:
         "context-compaction-enabled",
         "runtime-transition-trace-enabled",
         "runtime-stuck-detection-enabled",
-        "prompt-caching",
         "templates-enabled",
     }:
         return _parse_bool(value)

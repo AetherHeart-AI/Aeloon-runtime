@@ -1,3 +1,5 @@
+"""Tests for runtime config loading, migration, and persistence."""
+
 from __future__ import annotations
 
 import json
@@ -32,7 +34,7 @@ def test_load_config_discards_removed_v1_profile_settings(tmp_path: Path) -> Non
     config = load_config(path)
 
     assert config.agents.defaults.model == "test-model"
-    assert config.agents.defaults.provider == "anthropic"
+    assert config.agents.defaults.provider == "deepseek"
     dumped_defaults = config.model_dump(mode="json")["agents"]["defaults"]
     assert "base_profile_id" not in dumped_defaults
     assert "profile_id" not in dumped_defaults
@@ -58,7 +60,7 @@ def test_model_routing_config_supports_master_and_worker_overrides(tmp_path: Pat
                         "master": "fast-model",
                         "workers": {
                             "explorer": "search-model",
-                            "reviewer": "volcengine/strong-model",
+                            "reviewer": "deepseek/deepseek-v4-pro",
                         },
                     }
                 }
@@ -72,7 +74,7 @@ def test_model_routing_config_supports_master_and_worker_overrides(tmp_path: Pat
     assert config.agents.routing.master == "fast-model"
     assert config.agents.routing.workers == {
         "explorer": "search-model",
-        "reviewer": "volcengine/strong-model",
+        "reviewer": "deepseek/deepseek-v4-pro",
     }
 
 
@@ -245,25 +247,20 @@ def test_non_object_config_uses_normal_validation_error(tmp_path: Path) -> None:
         load_config(path)
 
 
-def test_volcengine_environment_selects_default_provider(
+def test_deepseek_environment_selects_default_provider(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("AELOON_CORE_PROVIDER", "volcengine")
-    monkeypatch.setenv("ARK_API_KEY", "ark-test-key")
-    monkeypatch.setenv("ARK_MODEL", "ark-code-latest")
+    monkeypatch.setenv("AELOON_CORE_PROVIDER", "deepseek")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test-key")
+    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
 
     config = load_config(tmp_path / "missing.json")
 
-    assert "active" not in config.model_dump(mode="json")["providers"]
-    assert config.agents.defaults.provider == "volcengine"
-    assert config.providers.volcengine.api_key == "ark-test-key"
-    assert (
-        config.providers.volcengine.base_url
-        == "https://ark.cn-beijing.volces.com/api/plan/v3"
-    )
-    assert config.agents.defaults.model == "ark-code-latest"
-    assert config.agents.defaults.model_ref() == "volcengine/ark-code-latest"
+    assert config.agents.defaults.provider == "deepseek"
+    assert config.providers.deepseek.api_key == "deepseek-test-key"
+    assert config.agents.defaults.model == "deepseek-v4-pro"
+    assert config.agents.defaults.model_ref() == "deepseek/deepseek-v4-pro"
 
 
 def test_legacy_providers_active_migrates_to_defaults_provider(tmp_path: Path) -> None:
@@ -271,8 +268,8 @@ def test_legacy_providers_active_migrates_to_defaults_provider(tmp_path: Path) -
     path.write_text(
         json.dumps(
             {
-                "providers": {"active": "volcengine"},
-                "agents": {"defaults": {"model": "ark-code-latest"}},
+                "providers": {"active": "deepseek"},
+                "agents": {"defaults": {"model": "deepseek-v4-flash"}},
             }
         ),
         encoding="utf-8",
@@ -280,31 +277,31 @@ def test_legacy_providers_active_migrates_to_defaults_provider(tmp_path: Path) -
 
     config = load_config(path)
 
-    assert config.agents.defaults.provider == "volcengine"
-    assert config.agents.defaults.model == "ark-code-latest"
+    assert config.agents.defaults.provider == "deepseek"
+    assert config.agents.defaults.model == "deepseek-v4-flash"
     cleaned_path = tmp_path / "cleaned.json"
     save_config(config, cleaned_path)
     cleaned = json.loads(cleaned_path.read_text(encoding="utf-8"))
     assert "active" not in cleaned["providers"]
-    assert cleaned["agents"]["defaults"]["provider"] == "volcengine"
+    assert cleaned["agents"]["defaults"]["provider"] == "deepseek"
 
 
 def test_parse_model_ref_supports_bare_and_provider_prefixed_forms() -> None:
-    assert parse_model_ref("deepseek-v4-pro", default_provider="anthropic") == (
-        "anthropic",
-        "deepseek-v4-pro",
+    assert parse_model_ref("deepseek-v4-flash", default_provider="deepseek") == (
+        "deepseek",
+        "deepseek-v4-flash",
     )
     assert parse_model_ref(
-        "volcengine/ark-code-latest",
-        default_provider="anthropic",
-    ) == ("volcengine", "ark-code-latest")
+        "deepseek/deepseek-v4-pro",
+        default_provider="deepseek",
+    ) == ("deepseek", "deepseek-v4-pro")
     assert parse_model_ref(
         "org/custom-model",
-        default_provider="anthropic",
-    ) == ("anthropic", "org/custom-model")
+        default_provider="deepseek",
+    ) == ("deepseek", "org/custom-model")
 
 
-def test_config_init_routes_credentials_to_selected_provider(
+def test_config_init_routes_credentials_to_deepseek_provider(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -318,20 +315,20 @@ def test_config_init_routes_credentials_to_selected_provider(
             "--config",
             str(path),
             "--provider",
-            "volcengine",
+            "deepseek",
             "--api-key",
-            "ark-config-key",
+            "deepseek-config-key",
             "--model",
-            "ark-code-latest",
+            "deepseek-v4-flash",
         ]
     )
 
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert "active" not in payload["providers"]
-    assert payload["agents"]["defaults"]["provider"] == "volcengine"
-    assert payload["providers"]["volcengine"]["api_key"] == "ark-config-key"
-    assert payload["providers"]["anthropic"]["api_key"] == "no-key"
-    assert payload["agents"]["defaults"]["model"] == "ark-code-latest"
+    assert payload["agents"]["defaults"]["provider"] == "deepseek"
+    assert payload["providers"]["deepseek"]["api_key"] == "deepseek-config-key"
+    assert "base_url" not in payload["providers"]["deepseek"]
+    assert payload["agents"]["defaults"]["model"] == "deepseek-v4-flash"
 
 
 def test_config_set_model_accepts_provider_model_ref(tmp_path: Path) -> None:
@@ -343,9 +340,9 @@ def test_config_set_model_accepts_provider_model_ref(tmp_path: Path) -> None:
             "--config",
             str(path),
             "--provider",
-            "anthropic",
+            "deepseek",
             "--model",
-            "claude-sonnet-4-6",
+            "deepseek-v4-flash",
         ]
     )
     main(
@@ -355,10 +352,10 @@ def test_config_set_model_accepts_provider_model_ref(tmp_path: Path) -> None:
             "--config",
             str(path),
             "model",
-            "volcengine/ark-code-latest",
+            "deepseek/deepseek-v4-pro",
         ]
     )
 
     payload = json.loads(path.read_text(encoding="utf-8"))
-    assert payload["agents"]["defaults"]["provider"] == "volcengine"
-    assert payload["agents"]["defaults"]["model"] == "ark-code-latest"
+    assert payload["agents"]["defaults"]["provider"] == "deepseek"
+    assert payload["agents"]["defaults"]["model"] == "deepseek-v4-pro"
