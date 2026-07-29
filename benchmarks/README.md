@@ -41,8 +41,11 @@ No separate setup command is required. Before a run, the selected adapter:
    `benchmarks/results/<benchmark>/<run-id>/`.
 
 Preparation, dataset loading, harness execution, evaluation, and result paths
-are reported as `INFO` progress on stderr. The final machine-readable summary
-remains the only content written to stdout.
+are reported on stderr. Case execution includes a progress bar with completed
+and total counts, percentage, elapsed time, ETA, and the current case. The bar
+updates in place in an interactive terminal and falls back to one line per
+completed case when stderr is redirected (for example, in CI). The final
+machine-readable summary remains the only content written to stdout.
 
 LiveCodeBench uses a dedicated environment under
 `.benchmark-workspaces/environments/livecodebench`. The adapter installs only

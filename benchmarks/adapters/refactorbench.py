@@ -9,7 +9,7 @@ from typing import Any
 
 from benchmarks.adapters.base import BenchmarkAdapter
 from benchmarks.harness.base import Harness, HarnessRequest
-from benchmarks.progress import info
+from benchmarks.progress import ProgressBar, info
 from benchmarks.refactorbench import runner as official
 
 
@@ -64,19 +64,25 @@ class RefactorBenchAdapter(BenchmarkAdapter):
             harness.name: [] for harness in harnesses
         }
         try:
-            if self.workers == 1:
-                for harness in harnesses:
-                    records_by_harness[harness.name] = self._run_harness_cases(
-                        harness=harness,
+            with ProgressBar(
+                self.name,
+                total=len(cases) * len(harnesses),
+            ) as progress:
+                if self.workers == 1:
+                    for harness in harnesses:
+                        records_by_harness[harness.name] = self._run_harness_cases(
+                            harness=harness,
+                            cases=cases,
+                            cache=cache,
+                            progress=progress,
+                        )
+                else:
+                    records_by_harness = self._run_parallel(
+                        harnesses=harnesses,
                         cases=cases,
                         cache=cache,
+                        progress=progress,
                     )
-            else:
-                records_by_harness = self._run_parallel(
-                    harnesses=harnesses,
-                    cases=cases,
-                    cache=cache,
-                )
         except BaseException:
             manifest["status"] = "interrupted"
             manifest["finished_at"] = datetime.now(UTC).isoformat()
@@ -116,6 +122,7 @@ class RefactorBenchAdapter(BenchmarkAdapter):
         harness: Harness,
         cases: list[official.RefactorCase],
         cache: official.WorkspaceCache,
+        progress: ProgressBar,
     ) -> list[dict[str, Any]]:
         info(
             "[%s/%s] Starting %d cases",
@@ -128,6 +135,7 @@ class RefactorBenchAdapter(BenchmarkAdapter):
                 case=case,
                 harness=harness,
                 cache=cache,
+                progress=progress,
             )
             for case in cases
         ]
@@ -140,6 +148,7 @@ class RefactorBenchAdapter(BenchmarkAdapter):
         harnesses: list[Harness],
         cases: list[official.RefactorCase],
         cache: official.WorkspaceCache,
+        progress: ProgressBar,
     ) -> dict[str, list[dict[str, Any]]]:
         cases_by_repository: dict[str, list[official.RefactorCase]] = {}
         for case in cases:
@@ -168,6 +177,7 @@ class RefactorBenchAdapter(BenchmarkAdapter):
                     harnesses=harnesses,
                     cases=repository_cases,
                     cache=cache,
+                    progress=progress,
                 ): repository
                 for repository, repository_cases in cases_by_repository.items()
             }
@@ -192,12 +202,14 @@ class RefactorBenchAdapter(BenchmarkAdapter):
         harnesses: list[Harness],
         cases: list[official.RefactorCase],
         cache: official.WorkspaceCache,
+        progress: ProgressBar,
     ) -> dict[str, list[dict[str, Any]]]:
         return {
             harness.name: self._run_harness_cases(
                 harness=harness,
                 cases=cases,
                 cache=cache,
+                progress=progress,
             )
             for harness in harnesses
         }
@@ -208,7 +220,9 @@ class RefactorBenchAdapter(BenchmarkAdapter):
         case: official.RefactorCase,
         harness: Harness,
         cache: official.WorkspaceCache,
+        progress: ProgressBar,
     ) -> dict[str, Any]:
+        progress.set_detail(f"{harness.name} running {case.instance_id}")
         info("[%s/%s] Running case %s", self.name, harness.name, case.instance_id)
         workspace, baseline = cache.prepare(case)
         prompt = case.prompt_path.read_text(encoding="utf-8")
@@ -278,6 +292,7 @@ class RefactorBenchAdapter(BenchmarkAdapter):
             case.instance_id,
             verdict,
         )
+        progress.advance(detail=f"{harness.name} {case.instance_id} {verdict}")
         return record
 
     def _summarize(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import threading
 import time
@@ -7,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import benchmarks.run_bench as unified
+from benchmarks import progress as benchmark_progress
 from benchmarks.adapters.livecodebench import LiveCodeBenchAdapter
 from benchmarks.adapters.refactorbench import RefactorBenchAdapter
 from benchmarks.harness.base import (
@@ -15,7 +17,7 @@ from benchmarks.harness.base import (
     ProcessOutcome,
 )
 from benchmarks.livecodebench.runner import LiveCodeBenchCase
-from benchmarks.progress import configure_progress, info
+from benchmarks.progress import ProgressBar, configure_progress, info
 
 
 class FakeHarness:
@@ -128,6 +130,48 @@ def test_progress_is_written_to_stderr_without_polluting_stdout(capsys) -> None:
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "INFO Preparing livecodebench" in captured.err
+
+
+def test_progress_bar_renders_and_coexists_with_logs(monkeypatch) -> None:
+    class TerminalStream(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    stream = TerminalStream()
+    monkeypatch.setattr(benchmark_progress.sys, "stderr", stream)
+    configure_progress()
+
+    with ProgressBar("refactorbench", total=2) as progress:
+        progress.set_detail("running case-1")
+        progress.advance(detail="case-1 PASS")
+        info("Evaluator finished")
+        progress.advance(detail="case-2 PASS")
+
+    rendered = stream.getvalue()
+    assert "refactorbench" in rendered
+    assert "2/2" in rendered
+    assert "100%" in rendered
+    assert "case-2 PASS" in rendered
+    assert "INFO Evaluator finished" in rendered
+
+
+def test_progress_bar_uses_line_snapshots_when_stderr_is_redirected(
+    monkeypatch,
+) -> None:
+    stream = io.StringIO()
+    monkeypatch.setattr(benchmark_progress.sys, "stderr", stream)
+
+    with ProgressBar("livecodebench", total=2) as progress:
+        progress.advance(detail="case-1")
+        progress.advance(detail="case-2")
+
+    rendered = stream.getvalue()
+    assert "\r" not in rendered
+    assert [line.split()[2] for line in rendered.splitlines()] == [
+        "0/2",
+        "1/2",
+        "2/2",
+    ]
 
 
 def test_unified_runner_prepares_before_execute(monkeypatch, tmp_path: Path) -> None:

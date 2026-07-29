@@ -15,7 +15,7 @@ from typing import Any, TypeVar
 from benchmarks.adapters.base import BenchmarkAdapter, run_checked
 from benchmarks.harness.base import Harness, HarnessRequest, HarnessResult
 from benchmarks.livecodebench import runner as official
-from benchmarks.progress import info
+from benchmarks.progress import ProgressBar, info
 
 _InputT = TypeVar("_InputT")
 _OutputT = TypeVar("_OutputT")
@@ -279,6 +279,7 @@ class LiveCodeBenchAdapter(BenchmarkAdapter):
             item: tuple[int, official.LiveCodeBenchCase],
         ) -> tuple[str, str, str, HarnessResult]:
             index, case = item
+            baseline_progress.set_detail(f"running {case.instance_id}")
             info(
                 "[%s/%s] code-generation %d/%d: %s",
                 self.name,
@@ -295,15 +296,20 @@ class LiveCodeBenchAdapter(BenchmarkAdapter):
                 prompt=prompt,
             )
             code, _error = official._extract_python_code(result.final_content)
+            baseline_progress.advance(detail=f"completed {case.instance_id}")
             return case.instance_id, prompt, code, result
 
         indexed_cases = list(enumerate(cases, start=1))
-        generated_baselines = _parallel_map_ordered(
-            generate_baseline,
-            indexed_cases,
-            max_workers=worker_count,
-            thread_name_prefix=f"livecodebench-{harness.name}",
-        )
+        with ProgressBar(
+            f"{self.name}/{harness.name} code-generation",
+            total=len(indexed_cases),
+        ) as baseline_progress:
+            generated_baselines = _parallel_map_ordered(
+                generate_baseline,
+                indexed_cases,
+                max_workers=worker_count,
+                thread_name_prefix=f"livecodebench-{harness.name}",
+            )
         baseline_generations = {
             instance_id: (code, result)
             for instance_id, _prompt, code, result in generated_baselines
@@ -337,6 +343,7 @@ class LiveCodeBenchAdapter(BenchmarkAdapter):
         ) -> tuple[str, str, str, HarnessResult]:
             index, case = item
             baseline = baseline_evaluations[case.instance_id]
+            repair_progress.set_detail(f"running {case.instance_id}")
             info(
                 "[%s/%s] self-repair %d/%d: %s",
                 self.name,
@@ -358,16 +365,21 @@ class LiveCodeBenchAdapter(BenchmarkAdapter):
                 prompt=prompt,
             )
             repaired_code, _error = official._extract_python_code(result.final_content)
+            repair_progress.advance(detail=f"completed {case.instance_id}")
             return case.instance_id, prompt, repaired_code, result
 
         indexed_repairs = list(enumerate(repair_cases, start=1))
         repair_worker_count = min(self.workers, len(repair_cases))
-        generated_repairs = _parallel_map_ordered(
-            generate_repair,
-            indexed_repairs,
-            max_workers=repair_worker_count,
-            thread_name_prefix=f"livecodebench-repair-{harness.name}",
-        )
+        with ProgressBar(
+            f"{self.name}/{harness.name} self-repair",
+            total=len(indexed_repairs),
+        ) as repair_progress:
+            generated_repairs = _parallel_map_ordered(
+                generate_repair,
+                indexed_repairs,
+                max_workers=repair_worker_count,
+                thread_name_prefix=f"livecodebench-repair-{harness.name}",
+            )
         repair_generations = {
             instance_id: (code, result) for instance_id, _prompt, code, result in generated_repairs
         }
