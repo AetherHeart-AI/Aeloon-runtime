@@ -159,6 +159,7 @@ export function applyRuntimeEvent(state, event, payload) {
       turn_id: payload.turn_id || turn.turnId,
       request_id: turn.requestId,
       created_at: payload.ts || new Date().toISOString(),
+      status: payload.status || "completed",
       user_prompt: turn.userPrompt,
       final_content: payload.final || "",
       blocks: Array.isArray(payload.blocks) ? payload.blocks : turn.blocks,

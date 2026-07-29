@@ -80,6 +80,12 @@ CONFIG_SETTERS = {
         "runtime",
         "stuck_detection_threshold",
     ),
+    "runtime-max-retries": (
+        "agents",
+        "defaults",
+        "runtime",
+        "max_retries",
+    ),
 }
 DYNAMIC_PROVIDER_SETTERS = {
     "api-key": "api_key",
@@ -518,6 +524,12 @@ def _set_nested_value(data: dict[str, Any], path: tuple[str, ...], value: Any) -
 def _coerce_config_value(key: str, value: str) -> Any:
     if key == "experts-enabled":
         return [item.strip() for item in value.split(",") if item.strip()]
+    if key == "max-iterations" and value.strip().lower() in {
+        "none",
+        "null",
+        "unlimited",
+    }:
+        return None
     if key == "context-compaction-preserve-recent-tokens":
         if value.strip().lower() in {"auto", "none", "null"}:
             return None
@@ -530,6 +542,7 @@ def _coerce_config_value(key: str, value: str) -> Any:
         "experts-stage-request-limit",
         "experts-max-upstream-chars",
         "runtime-stuck-detection-threshold",
+        "runtime-max-retries",
     }:
         return int(value)
     if key in {"context-compaction-trigger-ratio", "experts-timeout-seconds"}:

@@ -404,7 +404,7 @@ class TurnEventProgress:
         )
 
     async def on_final(self, content: str, **kwargs: Any) -> None:
-        del kwargs
+        status = str(kwargs.get("status") or "completed")
         if self._reasoning_block_id:
             reasoning_block = self._find_block(self._reasoning_block_id)
             if reasoning_block is not None:
@@ -480,6 +480,7 @@ class TurnEventProgress:
         self.duration_ms = duration_ms
         payload = self._payload(
             final=content,
+            status=status,
             blocks=[_web_block_view(block) for block in self.blocks],
             duration_ms=duration_ms,
             ts=completed_at,
@@ -492,6 +493,7 @@ class TurnEventProgress:
             detail=self._payload(
                 event="chat.turn.end",
                 final=_text_summary(content),
+                status=status,
                 blocks=[_block_log_detail(item) for item in self.blocks],
                 duration_ms=duration_ms,
                 ts=completed_at,

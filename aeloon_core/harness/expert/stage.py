@@ -142,6 +142,7 @@ class HarnessExpertStageExecutor:
                         snapshot_digest=self.expert.digest,
                     ),
                     request_limit=self.config.experts.stage_request_limit,
+                    max_retries=self.config.agents.defaults.runtime.max_retries,
                     max_output_tokens=self.config.agents.defaults.max_output_tokens,
                     transition_trace_enabled=(
                         self.config.agents.defaults.runtime.transition_trace_enabled

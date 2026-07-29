@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
@@ -160,6 +161,7 @@ class AeloonCoreOrchestrator:
                     namespace="master",
                 ),
                 request_limit=defaults.max_iterations,
+                max_retries=policy.max_retries,
                 max_output_tokens=defaults.max_output_tokens,
                 transition_trace_enabled=policy.transition_trace_enabled,
                 stuck_detection_enabled=policy.stuck_detection_enabled,
@@ -171,9 +173,23 @@ class AeloonCoreOrchestrator:
                 prompt_cache=binding.prompt_cache,
             )
         )
-        if outcome.status is not AgentRunStatus.COMPLETED or not isinstance(
-            outcome.output, str
+        messages = serialize_messages(outcome.messages)
+        if outcome.status is AgentRunStatus.COMPLETED and isinstance(
+            outcome.output,
+            str,
         ):
+            final_content = outcome.output
+            turn_status = outcome.status.value
+        elif outcome.status is AgentRunStatus.LIMIT_EXCEEDED:
+            final_content = _limit_partial_content(outcome.failure)
+            turn_status = "partial"
+            await _emit_final(
+                on_progress,
+                final_content,
+                messages=messages,
+                status=turn_status,
+            )
+        else:
             raise RuntimeError(
                 "Master did not produce a final response: "
                 + (outcome.failure or outcome.status.value)
@@ -181,18 +197,17 @@ class AeloonCoreOrchestrator:
 
         usage = dict(outcome.usage)
         accumulate_usage(usage, expert_runtime.usage)
-        messages = serialize_messages(outcome.messages)
         blocks = list(getattr(on_progress, "blocks", []) or [])
         result = TurnResult(
             session_id=actual_session_id,
-            final_content=outcome.output,
+            final_content=final_content,
             tools_used=list(outcome.tools_used),
             messages=messages,
             blocks=blocks,
             usage=usage,
             duration_ms=getattr(on_progress, "duration_ms", None),
             transitions=[record.to_dict() for record in outcome.transitions],
-            status=outcome.status.value,
+            status=turn_status,
             turn_id=turn_id,
         )
         await asyncio.to_thread(
@@ -206,6 +221,7 @@ class AeloonCoreOrchestrator:
             usage=result.usage,
             duration_ms=result.duration_ms,
             turn_id=turn_id,
+            status=turn_status,
         )
         return result
 
@@ -213,6 +229,31 @@ class AeloonCoreOrchestrator:
         """Close the model clients owned by this orchestrator."""
 
         await self.model_router.close()
+
+
+def _limit_partial_content(failure: str | None) -> str:
+    detail = (failure or "execution usage limit reached").strip()
+    return (
+        "The configured execution limit was reached before the Master could produce "
+        "its normal final response. Completed tool effects and partial session history "
+        "were preserved. Continue this session to review or finish any unresolved work."
+        f"\n\nLimit detail: {detail}"
+    )
+
+
+async def _emit_final(
+    progress: Any | None,
+    content: str,
+    *,
+    messages: list[dict[str, Any]],
+    status: str,
+) -> None:
+    hook = getattr(progress, "on_final", None)
+    if hook is None:
+        return
+    value = hook(content, messages=messages, status=status)
+    if inspect.isawaitable(value):
+        await value
 
 
 __all__ = ["AeloonCoreOrchestrator", "TurnResult"]

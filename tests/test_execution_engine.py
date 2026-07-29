@@ -65,7 +65,12 @@ async def test_output_tool_calls_are_not_projected_as_executing_tools() -> None:
     await runtime._event_stream_handler(SimpleNamespace(deps=object()), events())
 
 
-def _spec(model: FunctionModel, registry: ToolRegistry, *, request_limit: int = 4) -> AgentRunSpec:
+def _spec(
+    model: FunctionModel,
+    registry: ToolRegistry,
+    *,
+    request_limit: int | None = 4,
+) -> AgentRunSpec:
     return AgentRunSpec(
         role="expert",
         model=model,
@@ -202,9 +207,92 @@ async def test_request_limit_returns_exact_partial_history() -> None:
 
     assert outcome.status is AgentRunStatus.LIMIT_EXCEEDED
     assert outcome.failure is not None
-    assert read.calls == ["call-0"]
+    assert read.calls == []
     assert outcome.messages
     assert deserialize_messages(serialize_messages(outcome.messages)) == outcome.messages
+
+
+@pytest.mark.asyncio
+async def test_bounded_run_reserves_final_request_for_structured_output() -> None:
+    read = _RecordingRead()
+    registry = ToolRegistry()
+    registry.register(read)
+    exposed_tools: list[list[str]] = []
+    instructions: list[str] = []
+
+    def script(_messages: list[Any], info: AgentInfo) -> ModelResponse:
+        exposed_tools.append(
+            [tool.name for tool in info.model_request_parameters.function_tools]
+        )
+        instructions.append(str(info.instructions))
+        if not read.calls:
+            return ModelResponse(
+                parts=[ToolCallPart("read", {"path": "README.md"}, "read-1")]
+            )
+        return ModelResponse(
+            parts=[ToolCallPart("complete_work", {"summary": "checkpoint"}, "done")]
+        )
+
+    outcome = await HarnessAgentRuntime().run(
+        _spec(FunctionModel(script), registry, request_limit=2)
+    )
+
+    assert outcome.status is AgentRunStatus.COMPLETED
+    assert outcome.output.summary == "checkpoint"
+    assert read.calls == ["README.md"]
+    assert exposed_tools == [["read"], []]
+    assert "HOST BUDGET NOTICE" in instructions[-1]
+    assert outcome.usage["requests"] == 2
+
+
+@pytest.mark.asyncio
+async def test_unlimited_run_is_not_capped_by_pydantic_default() -> None:
+    read = _RecordingRead()
+    registry = ToolRegistry()
+    registry.register(read)
+
+    def script(_messages: list[Any], _info: AgentInfo) -> ModelResponse:
+        if len(read.calls) < 55:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "read",
+                        {"path": f"call-{len(read.calls)}"},
+                        f"read-{len(read.calls)}",
+                    )
+                ]
+            )
+        return ModelResponse(
+            parts=[ToolCallPart("complete_work", {"summary": "done"}, "done")]
+        )
+
+    outcome = await HarnessAgentRuntime().run(
+        _spec(FunctionModel(script), registry, request_limit=None)
+    )
+
+    assert outcome.status is AgentRunStatus.COMPLETED
+    assert outcome.output.summary == "done"
+    assert len(read.calls) == 55
+    assert outcome.usage["requests"] == 56
+
+
+@pytest.mark.asyncio
+async def test_retry_budget_is_independent_from_request_limit() -> None:
+    registry = ToolRegistry()
+    registry.register(_RecordingRead())
+    attempts = 0
+
+    def script(_messages: list[Any], _info: AgentInfo) -> ModelResponse:
+        nonlocal attempts
+        attempts += 1
+        return ModelResponse(parts=[ToolCallPart("read", {}, "invalid")])
+
+    spec = _spec(FunctionModel(script), registry, request_limit=10)
+    spec.max_retries = 0
+    outcome = await HarnessAgentRuntime().run(spec)
+
+    assert outcome.status is AgentRunStatus.FAILED
+    assert attempts == 1
 
 
 @pytest.mark.asyncio

@@ -88,6 +88,7 @@ class SessionStore:
         usage: dict[str, Any] | None = None,
         duration_ms: int | None = None,
         turn_id: str,
+        status: str = "completed",
     ) -> bool:
         """Append one Master turn once, repairing a crash-truncated JSONL tail."""
 
@@ -100,6 +101,7 @@ class SessionStore:
             "message_format": MESSAGE_FORMAT,
             "session_id": session_id,
             "turn_id": turn_id,
+            "status": status,
             "user_prompt": user_prompt,
             "final_content": final_content,
             "tools_used": tools_used,
@@ -117,6 +119,8 @@ class SessionStore:
             matching = [record for record in records if record.get("turn_id") == turn_id]
             if matching:
                 persisted = matching[-1]
+                if persisted.get("status") is None:
+                    persisted = {**persisted, "status": "completed"}
                 fields = tuple(expected)
                 if any(persisted.get(field) != expected[field] for field in fields):
                     raise ValueError("persisted Master turn differs from the current result")

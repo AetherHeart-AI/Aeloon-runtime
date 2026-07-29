@@ -29,6 +29,7 @@ from pydantic_ai.exceptions import (
 from pydantic_ai.messages import (
     FunctionToolCallEvent,
     FunctionToolResultEvent,
+    InstructionPart,
     ModelMessage,
     ModelMessagesTypeAdapter,
     ModelRequest,
@@ -168,7 +169,8 @@ class AgentRunSpec:
     terminal_models: dict[str, type[BaseModel]]
     capability_manifest: CapabilityManifest | None = None
     model_settings: ModelSettings | None = None
-    request_limit: int = 25
+    request_limit: int | None = None
+    max_retries: int = 3
     max_tool_calls: int | None = None
     max_tokens: int | None = None
     max_output_tokens: int | None = None
@@ -250,7 +252,12 @@ class HarnessAgentRuntime:
     """Compose Pydantic AI with Harness capabilities and Aeloon policy hooks."""
 
     async def run(self, spec: AgentRunSpec) -> AgentRunOutcome:
-        request_limit = max(1, int(spec.request_limit))
+        request_limit = (
+            None
+            if spec.request_limit is None
+            else max(1, int(spec.request_limit))
+        )
+        max_retries = max(0, int(spec.max_retries))
         manifest = spec.capability_manifest or CapabilityManifest.from_registry(
             spec.tools,
             namespace=spec.role,
@@ -275,14 +282,21 @@ class HarnessAgentRuntime:
         capabilities: list[Any] = [hooks, *spec.capabilities]
         if spec.history_processor is not None:
             capabilities.append(ProcessHistory(spec.history_processor))
+        if request_limit is not None:
+            capabilities.append(
+                self._final_request_guard(
+                    spec,
+                    request_limit=request_limit,
+                )
+            )
 
         agent = Agent[AeloonRunDeps, Any](
             spec.model,
             output_type=spec.output_type,
             instructions=spec.instructions,
             deps_type=AeloonRunDeps,
-            toolsets=[AeloonToolset(spec.tools, max_retries=request_limit)],
-            retries=request_limit,
+            toolsets=[AeloonToolset(spec.tools, max_retries=max_retries)],
+            retries=max_retries,
             end_strategy="early",
             capabilities=capabilities,
         )
@@ -350,6 +364,7 @@ class HarnessAgentRuntime:
                 "on_final",
                 _output_text(output),
                 messages=serialize_messages(messages),
+                status=status.value,
             )
             await self._record_transition(
                 deps,
@@ -368,6 +383,65 @@ class HarnessAgentRuntime:
             transitions=list(deps.transitions),
             failure=failure,
         )
+
+    def _final_request_guard(
+        self,
+        spec: AgentRunSpec,
+        *,
+        request_limit: int,
+    ) -> Hooks:
+        """Reserve a configured run's last request for a graceful checkpoint."""
+
+        hooks = Hooks[AeloonRunDeps](id=f"aeloon-final-request-{spec.role}")
+
+        @hooks.on.prepare_tools
+        async def prepare_tools(
+            ctx: RunContext[AeloonRunDeps],
+            tool_defs: list[Any],
+        ) -> list[Any]:
+            if _is_final_model_request(ctx, request_limit):
+                return []
+            return tool_defs
+
+        @hooks.on.before_model_request
+        async def before_model_request(
+            ctx: RunContext[AeloonRunDeps],
+            request_context: ModelRequestContext,
+        ) -> ModelRequestContext:
+            if not _is_final_model_request(ctx, request_limit):
+                return request_context
+            if spec.role == "master":
+                output_guidance = (
+                    "Immediately return the best available final response in plain text. "
+                    "Do not request more work or call a tool. State what was completed, "
+                    "what was verified, and any unresolved work honestly."
+                )
+            else:
+                output_guidance = (
+                    "Immediately return the configured structured output. Do not request "
+                    "more work or call an ordinary tool. Represent only established "
+                    "results and report incomplete or blocked work honestly when the "
+                    "output schema supports it."
+                )
+            final_instruction = InstructionPart(
+                (
+                    "HOST BUDGET NOTICE: This is the final model request in the "
+                    f"configured {request_limit}-request run. Ordinary tools are now "
+                    f"disabled. {output_guidance}"
+                ),
+                dynamic=True,
+            )
+            parameters = request_context.model_request_parameters
+            request_context.model_request_parameters = replace(
+                parameters,
+                instruction_parts=[
+                    *(parameters.instruction_parts or []),
+                    final_instruction,
+                ],
+            )
+            return request_context
+
+        return hooks
 
     def _hooks(self, spec: AgentRunSpec, deps: AeloonRunDeps) -> Hooks:
         hooks = Hooks[AeloonRunDeps]()
@@ -631,6 +705,13 @@ def output_tools(*specs: tuple[type[BaseModel], str, str]) -> list[ToolOutput[An
         ToolOutput(model, name=name, description=description, sequential=True)
         for model, name, description in specs
     ]
+
+
+def _is_final_model_request(
+    ctx: RunContext[AeloonRunDeps],
+    request_limit: int,
+) -> bool:
+    return ctx.usage.requests == max(0, request_limit - 1)
 
 
 def _validate_capability_manifest(

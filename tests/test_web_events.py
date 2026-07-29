@@ -38,7 +38,23 @@ async def test_final_content_gets_a_distinct_canonical_text_block() -> None:
     assert [block["role"] for block in text_blocks] == ["narration", "final"]
     turn_end = next(payload for name, payload in events if name == "chat.turn.end")
     assert turn_end["final"] == "The problem is fixed and verified."
+    assert turn_end["status"] == "completed"
     assert turn_end["blocks"][-1]["content"] == "The problem is fixed and verified."
+
+
+@pytest.mark.asyncio
+async def test_partial_final_status_is_projected_to_turn_end() -> None:
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    async def emit(name: str, payload: dict[str, Any]) -> None:
+        events.append((name, payload))
+
+    progress = TurnEventProgress(session_id="master", emit=emit)
+    await progress.on_turn_start()
+    await progress.on_final("Partial progress was preserved.", status="partial")
+
+    turn_end = next(payload for name, payload in events if name == "chat.turn.end")
+    assert turn_end["status"] == "partial"
 
 
 @pytest.mark.asyncio

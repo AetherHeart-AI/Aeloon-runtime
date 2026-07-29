@@ -49,6 +49,7 @@ class AgentRuntimePolicy(BaseModel):
     transition_trace_enabled: bool = True
     stuck_detection_enabled: bool = True
     stuck_detection_threshold: int = Field(default=4, ge=3, le=20)
+    max_retries: int = Field(default=3, ge=0, le=20)
 
 
 class AgentDefaultsConfig(BaseModel):
@@ -63,7 +64,7 @@ class AgentDefaultsConfig(BaseModel):
     chat_timeout: int = 3600
     context_window_tokens: int = 128_000
     max_output_tokens: int = Field(default=32_768, ge=256)
-    max_iterations: int = 25
+    max_iterations: int | None = Field(default=None, ge=1)
     context_compaction: ContextCompactionConfig = Field(
         default_factory=ContextCompactionConfig
     )

@@ -641,6 +641,7 @@ def _history_turn_view(record: Any) -> dict[str, Any]:
     raw = _mapping(record)
     return {
         "turn_id": raw.get("turn_id"),
+        "status": raw.get("status") or "completed",
         "request_id": raw.get("request_id"),
         "created_at": raw.get("created_at"),
         "user_prompt": raw.get("user_prompt"),

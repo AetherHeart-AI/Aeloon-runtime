@@ -19,6 +19,32 @@ def _write_config(path: Path, defaults: dict[str, object]) -> None:
     )
 
 
+def test_master_request_limit_is_unbounded_by_default() -> None:
+    defaults = Config().agents.defaults
+
+    assert defaults.max_iterations is None
+    assert defaults.runtime.max_retries == 3
+    assert Config.model_validate(
+        {"agents": {"defaults": {"max_iterations": 25}}}
+    ).agents.defaults.max_iterations == 25
+
+
+def test_config_set_supports_unlimited_master_and_independent_retries(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.json"
+
+    main(["config", "set", "--config", str(path), "max-iterations", "40"])
+    main(["config", "set", "--config", str(path), "runtime-max-retries", "2"])
+    configured = json.loads(path.read_text(encoding="utf-8"))
+    assert configured["agents"]["defaults"]["max_iterations"] == 40
+    assert configured["agents"]["defaults"]["runtime"]["max_retries"] == 2
+
+    main(["config", "set", "--config", str(path), "max-iterations", "unlimited"])
+    unlimited = json.loads(path.read_text(encoding="utf-8"))
+    assert unlimited["agents"]["defaults"]["max_iterations"] is None
+
+
 def test_load_config_discards_removed_v1_profile_settings(tmp_path: Path) -> None:
     path = tmp_path / "config.json"
     _write_config(

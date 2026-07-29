@@ -64,12 +64,14 @@ describe("Harness-only Web state", () => {
     });
     applyRuntimeEvent(state, "chat.turn.end", {
       turn_id: "turn-1",
+      status: "partial",
       final: "Complete",
       blocks: [{ id: "answer", type: "text", role: "final", content: "Complete" }],
     });
 
     expect(state.activeTurn).toBeNull();
     expect(state.history.at(-1).final_content).toBe("Complete");
+    expect(state.history.at(-1).status).toBe("partial");
     expect(state.liveAgents.get("run-1").settled).toBe(true);
   });
 

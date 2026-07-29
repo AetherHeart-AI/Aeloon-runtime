@@ -68,6 +68,63 @@ async def test_plain_text_turn_is_persisted_as_master_history(tmp_path: Path) ->
         "second request",
     ]
     assert [turn["final_content"] for turn in history] == ["answer-1", "answer-2"]
+    assert [turn["status"] for turn in history] == ["completed", "completed"]
+    await app.close()
+
+
+@pytest.mark.asyncio
+async def test_master_limit_returns_and_persists_partial_turn(
+    tmp_path: Path,
+) -> None:
+    requests = 0
+
+    def respond(_messages: list[ModelMessage], info: Any) -> ModelResponse:
+        nonlocal requests
+        requests += 1
+        assert [tool.name for tool in info.model_request_parameters.function_tools] == []
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    "read_file",
+                    {"path": "README.md"},
+                    "tool-after-limit",
+                )
+            ]
+        )
+
+    config = _config(
+        tmp_path,
+        agents={
+            "defaults": {
+                "max_iterations": 1,
+                "context_compaction": {"enabled": False},
+            }
+        },
+    )
+    app = AeloonCoreOrchestrator(config, model=FunctionModel(respond))
+
+    result = await app.run_turn("inspect")
+
+    assert requests == 1
+    assert result.status == "partial"
+    assert "partial session history were preserved" in result.final_content
+    assert result.messages
+    persisted = app.sessions.history(result.session_id)
+    assert persisted[-1]["status"] == "partial"
+    assert persisted[-1]["final_content"] == result.final_content
+    assert persisted[-1]["messages"] == result.messages
+
+    app.model = FunctionModel(
+        lambda _messages, _info: ModelResponse(parts=[TextPart("resumed")])
+    )
+    resumed = await app.run_turn("continue", session_id=result.session_id)
+
+    assert resumed.status == "completed"
+    assert resumed.final_content == "resumed"
+    assert [turn["status"] for turn in app.sessions.history(result.session_id)] == [
+        "partial",
+        "completed",
+    ]
     await app.close()
 
 

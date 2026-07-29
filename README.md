@@ -162,8 +162,11 @@ Remaining findings produce `partial`; there is no unbounded repair loop.
     "defaults": {
       "provider": "deepseek",
       "model": "deepseek-v4-flash",
-      "max_iterations": 25,
-      "max_output_tokens": 32768
+      "max_iterations": null,
+      "max_output_tokens": 32768,
+      "runtime": {
+        "max_retries": 3
+      }
     },
     "routing": {
       "master": null,
@@ -188,6 +191,18 @@ Remaining findings produce `partial`; there is no unbounded repair loop.
     "web_backend": "exa"
   }
 }
+```
+
+Master follows Pi's natural tool loop by default: it continues until it returns
+plain text, is cancelled, or another runtime guard stops it. Set
+`agents.defaults.max_iterations` to an integer for an optional hard model-request
+limit. A bounded run reserves its final request for a tool-free progress
+checkpoint instead of failing immediately after the last tool call. Expert
+stages remain bounded by `experts.stage_request_limit`.
+
+```bash
+uv run aeloon-core config set max-iterations unlimited
+uv run aeloon-core config set max-iterations 100
 ```
 
 An exact `<expert-id>/<stage-id>` route wins over the expert route, then the
