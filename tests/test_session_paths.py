@@ -5,12 +5,12 @@ from pathlib import Path
 
 import pytest
 
-from aeloon_core.session import SessionStore
+from aeloon_core.conversation import SessionStore
 from tests.message_helpers import checkpoint as message_checkpoint
 
 
 def _store(tmp_path: Path) -> SessionStore:
-    return SessionStore(data_dir=tmp_path / "data", workspace=tmp_path)
+    return SessionStore(data_dir=tmp_path / "data")
 
 
 def _turn_record(
@@ -52,38 +52,23 @@ def test_unsafe_session_ids_use_distinct_contained_paths(tmp_path: Path) -> None
     traversal = "../../outside"
 
     assert store.session_path(unsafe) != store.session_path(formerly_colliding)
-    assert store.trace_path(unsafe) != store.trace_path(formerly_colliding)
     assert store.session_path(traversal).parent == store.sessions_dir
-    assert store.trace_path(traversal).parent == store.traces_dir
     assert "/" not in store.session_path(unsafe).name
 
     assert _append_once(store, unsafe, "same-turn") is True
     assert _append_once(store, formerly_colliding, "same-turn") is True
-    store.append_transition(
-        session_id=unsafe,
-        turn_id="same-turn",
-        transition={"state": "unsafe"},
-    )
-    store.append_transition(
-        session_id=formerly_colliding,
-        turn_id="same-turn",
-        transition={"state": "safe"},
-    )
 
     assert [record["session_id"] for record in store.history(unsafe)] == [unsafe]
+    assert store.history(unsafe)[0]["status"] == "completed"
     assert [record["session_id"] for record in store.history(formerly_colliding)] == [
         formerly_colliding
     ]
-    assert "message for team/a" in str(store.load_messages(unsafe))
-    assert store.transition_history(unsafe)[0]["state"] == "unsafe"
-    assert store.transition_history(formerly_colliding)[0]["state"] == "safe"
 
 
 def test_existing_safe_names_stay_stable_and_empty_has_own_namespace(tmp_path: Path) -> None:
     store = _store(tmp_path)
 
     assert store.session_path("master-1_a").name == "master-1_a.jsonl"
-    assert store.trace_path("master-1_a").name == "master-1_a.jsonl"
     assert store.session_path("") != store.session_path("default")
     assert store.session_path("").name.startswith("~")
 
@@ -99,13 +84,48 @@ def test_case_variants_are_isolated_on_case_insensitive_filesystems(tmp_path: Pa
     store = _store(tmp_path)
 
     assert store.session_path("TeamA") != store.session_path("teama")
-    assert store.trace_path("TeamA") != store.trace_path("teama")
 
     assert _append_once(store, "TeamA", "upper-turn") is True
     assert _append_once(store, "teama", "lower-turn") is True
 
     assert [record["turn_id"] for record in store.history("TeamA")] == ["upper-turn"]
     assert [record["turn_id"] for record in store.history("teama")] == ["lower-turn"]
+
+
+def test_completed_idempotency_accepts_records_written_before_status_field(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    session_id = "legacy-status"
+    turn_id = "same-turn"
+    checkpoint = message_checkpoint("message for legacy-status")
+    messages = checkpoint["messages"]
+    record = {
+        **checkpoint,
+        "type": "turn",
+        "session_id": session_id,
+        "turn_id": turn_id,
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "user_prompt": f"prompt for {session_id}",
+        "final_content": f"answer for {session_id}",
+        "tools_used": [],
+        "blocks": [],
+        "usage": {},
+        "duration_ms": None,
+    }
+    store.session_path(session_id).write_text(
+        json.dumps(record) + "\n",
+        encoding="utf-8",
+    )
+
+    assert store.append_turn_once(
+        session_id=session_id,
+        user_prompt=f"prompt for {session_id}",
+        final_content=f"answer for {session_id}",
+        tools_used=[],
+        messages=messages,
+        turn_id=turn_id,
+    ) is False
 
 
 def test_legacy_colliding_file_is_filtered_and_migrated_by_record_owner(

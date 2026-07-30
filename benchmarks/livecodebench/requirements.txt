@@ -1,0 +1,5 @@
+datasets>=3.2,<4
+numpy>=1.26
+pandas>=2
+pebble>=5.1
+tqdm>=4.66

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from aeloon_core.stuck_detection import detect_repeated_tool_exchanges
+from aeloon_core.harness.execution.stuck import detect_repeated_tool_exchanges
 
 _TOOL_MODES = {"read": "read_only", "write": "mutating"}
 

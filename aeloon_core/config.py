@@ -5,33 +5,28 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
-ProviderName = Literal["anthropic", "volcengine"]
-KNOWN_PROVIDERS: frozenset[str] = frozenset({"anthropic", "volcengine"})
+ProviderName = Literal["deepseek"]
+KNOWN_PROVIDERS: frozenset[str] = frozenset({"deepseek"})
+RuntimeMode = Literal["normal", "expert"]
+MasterCapabilityName = Literal["filesystem", "shell", "repo_context", "planning"]
+SkillRootId = Annotated[
+    str,
+    StringConstraints(pattern=r"^[a-z][a-z0-9_-]{0,63}$"),
+]
 
 _REMOVED_V1_AGENT_DEFAULTS = frozenset(
     {"base_profile_id", "profile_id", "max_handoffs"}
 )
 
 
-class AnthropicProviderConfig(BaseModel):
-    """Anthropic Messages API provider settings."""
+class DeepSeekProviderConfig(BaseModel):
+    """Credentials and transport settings for Pydantic AI's DeepSeek provider."""
 
     api_key: str = "no-key"
-    base_url: str = "https://api.anthropic.com"
-    extra_headers: dict[str, str] = Field(default_factory=dict)
-    proxy: str | None = None
-    prompt_caching: bool = True
-
-
-class VolcengineProviderConfig(BaseModel):
-    """Volcano Engine Ark Agent Plan settings for the OpenAI Responses API."""
-
-    api_key: str = "no-key"
-    base_url: str = "https://ark.cn-beijing.volces.com/api/plan/v3"
     extra_headers: dict[str, str] = Field(default_factory=dict)
     proxy: str | None = None
 
@@ -39,18 +34,15 @@ class VolcengineProviderConfig(BaseModel):
 class ProvidersConfig(BaseModel):
     """Provider credential namespace (no global active switch)."""
 
-    anthropic: AnthropicProviderConfig = Field(default_factory=AnthropicProviderConfig)
-    volcengine: VolcengineProviderConfig = Field(default_factory=VolcengineProviderConfig)
+    deepseek: DeepSeekProviderConfig = Field(default_factory=DeepSeekProviderConfig)
 
 
 class ContextCompactionConfig(BaseModel):
-    """Automatic model-context compaction settings."""
+    """Harness sliding-window settings."""
 
     enabled: bool = True
     trigger_ratio: float = Field(default=0.9, ge=0.1, le=1.0)
-    preserve_recent_turns: int = Field(default=2, ge=1)
     preserve_recent_tokens: int | None = Field(default=None, ge=1)
-    summary_max_tokens: int = Field(default=4096, ge=256)
 
 
 class AgentRuntimePolicy(BaseModel):
@@ -59,6 +51,7 @@ class AgentRuntimePolicy(BaseModel):
     transition_trace_enabled: bool = True
     stuck_detection_enabled: bool = True
     stuck_detection_threshold: int = Field(default=4, ge=3, le=20)
+    max_retries: int = Field(default=3, ge=0, le=20)
 
 
 class AgentDefaultsConfig(BaseModel):
@@ -66,16 +59,14 @@ class AgentDefaultsConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    provider: ProviderName = "anthropic"
-    model: str = "claude-sonnet-4-6"
+    provider: ProviderName = "deepseek"
+    model: str = "deepseek-v4-flash"
     temperature: float = 0.7
     reasoning_effort: str | None = None
     chat_timeout: int = 3600
     context_window_tokens: int = 128_000
-    # Per-request completion ceiling. Anthropic-compatible SDKs default to 4096
-    # when unset, which thinking models routinely exhaust before tool output.
     max_output_tokens: int = Field(default=32_768, ge=256)
-    max_iterations: int = 25
+    max_iterations: int | None = Field(default=None, ge=1)
     context_compaction: ContextCompactionConfig = Field(
         default_factory=ContextCompactionConfig
     )
@@ -88,7 +79,7 @@ class AgentDefaultsConfig(BaseModel):
 
 
 class AgentRoutingConfig(BaseModel):
-    """Optional provider/model overrides for Master and Worker roles.
+    """Optional provider/model overrides for Master and Expert stages.
 
     Values may be bare model names (inherit `agents.defaults.provider`) or
     explicit `provider/model` refs. The model router falls back to the config
@@ -98,7 +89,7 @@ class AgentRoutingConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     master: str | None = Field(default=None, min_length=1)
-    workers: dict[str, str] = Field(default_factory=dict)
+    experts: dict[str, str] = Field(default_factory=dict)
 
     @field_validator("master")
     @classmethod
@@ -110,47 +101,102 @@ class AgentRoutingConfig(BaseModel):
             raise ValueError("master model route requires a nonempty model ref")
         return normalized
 
-    @field_validator("workers")
+    @field_validator("experts")
     @classmethod
-    def _worker_routes_are_nonempty(cls, value: dict[str, str]) -> dict[str, str]:
+    def _expert_routes_are_nonempty(cls, value: dict[str, str]) -> dict[str, str]:
         normalized: dict[str, str] = {}
-        for worker_type_id, model_name in value.items():
-            worker_id = worker_type_id.strip()
+        for route_key, model_name in value.items():
+            expert_route = route_key.strip()
             model = model_name.strip()
-            if not worker_id or not model:
-                raise ValueError("worker model routes require nonempty ids and model names")
-            normalized[worker_id] = model
-        return normalized
-
-
-class AgentBudgetConfig(BaseModel):
-    """Optional request-budget overrides by orchestration responsibility."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    master: int | None = Field(default=None, ge=1)
-    workers: dict[str, int] = Field(default_factory=dict)
-
-    @field_validator("workers")
-    @classmethod
-    def _worker_budgets_are_positive(cls, value: dict[str, int]) -> dict[str, int]:
-        normalized: dict[str, int] = {}
-        for worker_type_id, max_iterations in value.items():
-            worker_id = worker_type_id.strip()
-            if not worker_id:
-                raise ValueError("worker budget overrides require nonempty ids")
-            if max_iterations < 1:
-                raise ValueError("worker budget overrides must be positive")
-            normalized[worker_id] = max_iterations
+            if not expert_route or not model:
+                raise ValueError("expert model routes require nonempty ids and model names")
+            normalized[expert_route] = model
         return normalized
 
 
 class AgentsConfig(BaseModel):
-    """Agent namespace."""
+    """Model defaults and routing for the Master and Expert stages."""
 
     defaults: AgentDefaultsConfig = Field(default_factory=AgentDefaultsConfig)
     routing: AgentRoutingConfig = Field(default_factory=AgentRoutingConfig)
-    budgets: AgentBudgetConfig = Field(default_factory=AgentBudgetConfig)
+
+
+class SkillRootConfig(BaseModel):
+    """One explicitly trusted source of discoverable Skill manifests."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: SkillRootId
+    path: Path
+
+
+class SkillsConfig(BaseModel):
+    """Skill discovery roots and the plain-Skill scope granted to Master."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    roots: list[SkillRootConfig] = Field(default_factory=list)
+    master_allowlist: list[str] = Field(default_factory=list)
+
+    @field_validator("roots")
+    @classmethod
+    def _root_ids_are_unique(
+        cls,
+        roots: list[SkillRootConfig],
+    ) -> list[SkillRootConfig]:
+        ids = [root.id for root in roots]
+        if len(ids) != len(set(ids)):
+            raise ValueError("skill root ids must be unique")
+        if "builtin" in ids or "workspace" in ids:
+            raise ValueError("'builtin' and 'workspace' are reserved skill root ids")
+        return roots
+
+    @field_validator("master_allowlist")
+    @classmethod
+    def _master_skill_ids_are_nonempty(cls, value: list[str]) -> list[str]:
+        normalized = [item.strip() for item in value]
+        if any(not item for item in normalized):
+            raise ValueError("master skill allowlist entries must be nonempty")
+        return list(dict.fromkeys(normalized))
+
+
+class ExpertsConfig(BaseModel):
+    """Turn-scoped ExpertSkill execution policy."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: list[str] = Field(default_factory=lambda: ["builtin:research", "builtin:coding"])
+    max_calls_per_turn: int = Field(default=8, ge=1, le=128)
+    max_concurrency: int = Field(default=4, ge=1, le=32)
+    stage_request_limit: int = Field(default=25, ge=1, le=100)
+    timeout_seconds: float = Field(default=1800.0, ge=1.0, le=7200.0)
+    max_upstream_chars: int = Field(default=32_000, ge=1_000, le=256_000)
+    web_backend: Literal["exa"] = "exa"
+
+    @field_validator("enabled")
+    @classmethod
+    def _enabled_expert_ids_are_nonempty(cls, value: list[str]) -> list[str]:
+        normalized = [item.strip() for item in value]
+        if any(not item for item in normalized):
+            raise ValueError("enabled expert ids must be nonempty")
+        return list(dict.fromkeys(normalized))
+
+
+class McpConfig(BaseModel):
+    """Configured MCP servers and the expert-mode scope granted to Master."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    config_path: Path | None = None
+    master_allowlist: list[str] = Field(default_factory=list)
+
+    @field_validator("master_allowlist")
+    @classmethod
+    def _master_mcp_ids_are_nonempty(cls, value: list[str]) -> list[str]:
+        normalized = [item.strip() for item in value]
+        if any(not item for item in normalized):
+            raise ValueError("master MCP allowlist entries must be nonempty")
+        return list(dict.fromkeys(normalized))
 
 
 class ExecToolConfig(BaseModel):
@@ -159,48 +205,71 @@ class ExecToolConfig(BaseModel):
     timeout: int = 60
 
 
-class WebToolConfig(BaseModel):
-    """Web fetch and web search settings."""
-
-    fetch_timeout: int = 20
-    search_api_url: str | None = None
-    search_api_key: str | None = None
-    max_results: int = 5
-
-
 class ToolsConfig(BaseModel):
-    """Tool namespace."""
+    """Tool namespace and expert-mode Master capability policy."""
 
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
-    web: WebToolConfig = Field(default_factory=WebToolConfig)
+    master_capabilities: list[MasterCapabilityName] = Field(
+        default_factory=lambda: [
+            "filesystem",
+            "shell",
+            "repo_context",
+            "planning",
+        ]
+    )
 
-
-class SkillsConfig(BaseModel):
-    """Skill discovery settings."""
-
-    enabled: bool = True
-    external: bool = True
-    claude_code: bool = True
-    paths: list[str] = Field(default_factory=list)
+    @field_validator("master_capabilities")
+    @classmethod
+    def _master_capabilities_are_unique(
+        cls,
+        value: list[MasterCapabilityName],
+    ) -> list[MasterCapabilityName]:
+        return list(dict.fromkeys(value))
 
 
 class Config(BaseModel):
     """Top-level runtime config."""
 
+    mode: RuntimeMode = "normal"
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
-    tools: ToolsConfig = Field(default_factory=ToolsConfig)
     skills: SkillsConfig = Field(default_factory=SkillsConfig)
+    experts: ExpertsConfig = Field(default_factory=ExpertsConfig)
+    mcp: McpConfig = Field(default_factory=McpConfig)
+    tools: ToolsConfig = Field(default_factory=ToolsConfig)
     workspace: Path = Field(default_factory=Path.cwd)
     data_dir: Path = Field(default_factory=lambda: Path("~/.aeloon-core").expanduser())
 
     def normalized(self) -> Config:
         """Return a copy with filesystem paths expanded and resolved."""
 
+        workspace = self.workspace.expanduser().resolve(strict=False)
+        roots = [
+            root.model_copy(
+                update={
+                    "path": (
+                        root.path.expanduser()
+                        if root.path.expanduser().is_absolute()
+                        else workspace / root.path.expanduser()
+                    ).resolve(strict=False)
+                }
+            )
+            for root in self.skills.roots
+        ]
+        mcp_config_path = self.mcp.config_path
+        if mcp_config_path is not None:
+            expanded = mcp_config_path.expanduser()
+            mcp_config_path = (
+                expanded if expanded.is_absolute() else workspace / expanded
+            ).resolve(strict=False)
         return self.model_copy(
             update={
-                "workspace": self.workspace.expanduser().resolve(strict=False),
+                "workspace": workspace,
                 "data_dir": self.data_dir.expanduser().resolve(strict=False),
+                "skills": self.skills.model_copy(update={"roots": roots}),
+                "mcp": self.mcp.model_copy(
+                    update={"config_path": mcp_config_path}
+                ),
             }
         )
 
@@ -233,7 +302,7 @@ def parse_model_ref(
 
     text = value.strip()
     if not text:
-        raise ValueError("model ref must be nonempty")
+        raise ValueError("model ref should be nonempty")
     provider_candidate, separator, remainder = text.partition("/")
     if separator and provider_candidate in KNOWN_PROVIDERS:
         model = remainder.strip()
@@ -264,8 +333,8 @@ def load_config(path: Path | str | None = None) -> Config:
     if config_path.exists():
         data = json.loads(config_path.read_text(encoding="utf-8"))
         _drop_removed_v1_settings(data)
+        _drop_removed_orchestration_settings(data)
         _migrate_agent_runtime_settings(data)
-        _migrate_provider_settings(data)
         _migrate_active_provider(data)
 
     config = Config.model_validate(data)
@@ -277,39 +346,21 @@ def load_config(path: Path | str | None = None) -> Config:
     )
     if default_provider not in KNOWN_PROVIDERS:
         raise ValueError(
-            "AELOON_CORE_PROVIDER must be 'anthropic' or 'volcengine', "
+            "AELOON_CORE_PROVIDER must be 'deepseek', "
             f"got {default_provider!r}"
         )
     updates.setdefault("agents", {}).setdefault("defaults", {})[
         "provider"
     ] = default_provider
 
-    # Credential env vars apply to their own provider independently of the default.
-    if api_key := os.environ.get("ARK_API_KEY"):
-        updates.setdefault("providers", {}).setdefault("volcengine", {})[
+    if api_key := os.environ.get("DEEPSEEK_API_KEY"):
+        updates.setdefault("providers", {}).setdefault("deepseek", {})[
             "api_key"
         ] = api_key
-    if base_url := os.environ.get("ARK_BASE_URL"):
-        updates.setdefault("providers", {}).setdefault("volcengine", {})[
-            "base_url"
-        ] = base_url
-    if api_key := os.environ.get("ANTHROPIC_API_KEY"):
-        updates.setdefault("providers", {}).setdefault("anthropic", {})[
-            "api_key"
-        ] = api_key
-    if base_url := os.environ.get("ANTHROPIC_BASE_URL"):
-        updates.setdefault("providers", {}).setdefault("anthropic", {})[
-            "base_url"
-        ] = base_url
 
-    if default_provider == "volcengine":
-        if model := os.environ.get("ARK_MODEL"):
-            updates.setdefault("agents", {}).setdefault("defaults", {})["model"] = model
-    else:
-        if model := os.environ.get("ANTHROPIC_MODEL"):
-            updates.setdefault("agents", {}).setdefault("defaults", {})[
-                "model"
-            ] = model
+    if model := os.environ.get("DEEPSEEK_MODEL"):
+        updates.setdefault("agents", {}).setdefault("defaults", {})["model"] = model
+
     max_context_tokens = os.environ.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS")
     auto_compact_window = os.environ.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
     parsed_max_context = (
@@ -344,15 +395,6 @@ def load_config(path: Path | str | None = None) -> Config:
         updates["workspace"] = workspace
     if data_dir := os.environ.get("AELOON_CORE_DATA_DIR"):
         updates["data_dir"] = data_dir
-    if skills_enabled := os.environ.get("AELOON_CORE_SKILLS_ENABLED"):
-        updates.setdefault("skills", {})["enabled"] = _parse_bool(skills_enabled)
-    if disable_external := os.environ.get("AELOON_CORE_DISABLE_EXTERNAL_SKILLS"):
-        updates.setdefault("skills", {})["external"] = not _parse_bool(disable_external)
-    if disable_claude := os.environ.get("AELOON_CORE_DISABLE_CLAUDE_CODE_SKILLS"):
-        updates.setdefault("skills", {})["claude_code"] = not _parse_bool(disable_claude)
-    if skill_paths := os.environ.get("AELOON_CORE_SKILL_PATHS"):
-        updates.setdefault("skills", {})["paths"] = _split_env_list(skill_paths)
-
     if updates:
         merged = config.model_dump(mode="json")
         _deep_update(merged, updates)
@@ -372,19 +414,6 @@ def save_config(config: Config, path: Path | str | None = None) -> Path:
         encoding="utf-8",
     )
     return config_path
-
-
-def _parse_bool(value: str) -> bool:
-    normalized = value.strip().lower()
-    if normalized in {"1", "true", "yes", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "off"}:
-        return False
-    raise ValueError(f"invalid boolean value: {value!r}")
-
-
-def _split_env_list(value: str) -> list[str]:
-    return [item.strip() for item in value.split(os.pathsep) if item.strip()]
 
 
 def _parse_positive_int(value: str, *, name: str) -> int:
@@ -410,21 +439,45 @@ def _drop_removed_v1_settings(data: Any) -> None:
         defaults.pop(key, None)
 
 
-def _migrate_provider_settings(data: Any) -> None:
-    """Upgrade the former custom provider config into Anthropic naming."""
+def _drop_removed_orchestration_settings(data: Any) -> None:
+    """Migrate safe orchestration fields and discard removed DAG settings."""
 
     if not isinstance(data, dict):
         return
-    providers = data.get("providers")
-    if not isinstance(providers, dict):
+    skills = data.get("skills")
+    if isinstance(skills, dict):
+        skills.pop("enabled", None)
+    agents = data.get("agents")
+    if not isinstance(agents, dict):
         return
-    legacy = providers.pop("custom", None)
-    if not isinstance(legacy, dict) or "anthropic" in providers:
-        return
-    migrated = dict(legacy)
-    if "api_base" in migrated and "base_url" not in migrated:
-        migrated["base_url"] = migrated.pop("api_base")
-    providers["anthropic"] = migrated
+    agents.pop("budgets", None)
+    harness = agents.pop("harness", None)
+    if isinstance(harness, dict):
+        experts = data.setdefault("experts", {})
+        if isinstance(experts, dict):
+            if "sub_agent_request_limit" in harness:
+                experts.setdefault(
+                    "stage_request_limit",
+                    harness["sub_agent_request_limit"],
+                )
+            if "max_agent_calls" in harness:
+                experts.setdefault("max_calls_per_turn", harness["max_agent_calls"])
+    agents.pop("templates", None)
+    routing = agents.get("routing")
+    if isinstance(routing, dict):
+        workers = routing.pop("workers", None)
+        if isinstance(workers, dict) and "experts" not in routing:
+            legacy_routes = {
+                "builder": "builtin:coding/build",
+                "reviewer": "builtin:coding/review",
+                "explorer": "builtin:research",
+                "researcher": "builtin:research/docs",
+            }
+            routing["experts"] = {
+                legacy_routes[worker_id]: model
+                for worker_id, model in workers.items()
+                if worker_id in legacy_routes
+            }
 
 
 def _migrate_active_provider(data: Any) -> None:

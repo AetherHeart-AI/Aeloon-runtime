@@ -1,3 +1,5 @@
+"""Tests for runtime config loading, migration, and persistence."""
+
 from __future__ import annotations
 
 import json
@@ -17,6 +19,63 @@ def _write_config(path: Path, defaults: dict[str, object]) -> None:
     )
 
 
+def test_master_request_limit_is_unbounded_by_default() -> None:
+    defaults = Config().agents.defaults
+
+    assert defaults.max_iterations is None
+    assert defaults.runtime.max_retries == 3
+    assert Config.model_validate(
+        {"agents": {"defaults": {"max_iterations": 25}}}
+    ).agents.defaults.max_iterations == 25
+
+
+def test_runtime_modes_have_explicit_normal_and_expert_policies(
+    tmp_path: Path,
+) -> None:
+    assert Config().mode == "normal"
+
+    config = Config(
+        mode="expert",
+        workspace=tmp_path,
+        mcp={
+            "config_path": ".aeloon-core/mcp.json",
+            "master_allowlist": ["github"],
+        },
+        tools={"master_capabilities": ["filesystem", "planning"]},
+    ).normalized()
+
+    assert config.mode == "expert"
+    assert config.mcp.config_path == (
+        tmp_path / ".aeloon-core" / "mcp.json"
+    ).resolve()
+    assert config.mcp.master_allowlist == ["github"]
+    assert config.tools.master_capabilities == ["filesystem", "planning"]
+
+
+def test_config_set_supports_runtime_mode(tmp_path: Path) -> None:
+    path = tmp_path / "config.json"
+
+    main(["config", "set", "--config", str(path), "mode", "expert"])
+
+    assert json.loads(path.read_text(encoding="utf-8"))["mode"] == "expert"
+
+
+def test_config_set_supports_unlimited_master_and_independent_retries(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.json"
+
+    main(["config", "set", "--config", str(path), "max-iterations", "40"])
+    main(["config", "set", "--config", str(path), "runtime-max-retries", "2"])
+    configured = json.loads(path.read_text(encoding="utf-8"))
+    assert configured["agents"]["defaults"]["max_iterations"] == 40
+    assert configured["agents"]["defaults"]["runtime"]["max_retries"] == 2
+
+    main(["config", "set", "--config", str(path), "max-iterations", "unlimited"])
+    unlimited = json.loads(path.read_text(encoding="utf-8"))
+    assert unlimited["agents"]["defaults"]["max_iterations"] is None
+
+
 def test_load_config_discards_removed_v1_profile_settings(tmp_path: Path) -> None:
     path = tmp_path / "config.json"
     _write_config(
@@ -32,7 +91,7 @@ def test_load_config_discards_removed_v1_profile_settings(tmp_path: Path) -> Non
     config = load_config(path)
 
     assert config.agents.defaults.model == "test-model"
-    assert config.agents.defaults.provider == "anthropic"
+    assert config.agents.defaults.provider == "deepseek"
     dumped_defaults = config.model_dump(mode="json")["agents"]["defaults"]
     assert "base_profile_id" not in dumped_defaults
     assert "profile_id" not in dumped_defaults
@@ -40,15 +99,15 @@ def test_load_config_discards_removed_v1_profile_settings(tmp_path: Path) -> Non
 
     cleaned_path = tmp_path / "cleaned.json"
     save_config(config, cleaned_path)
-    cleaned_defaults = json.loads(cleaned_path.read_text(encoding="utf-8"))["agents"][
-        "defaults"
-    ]
+    cleaned_defaults = json.loads(cleaned_path.read_text(encoding="utf-8"))["agents"]["defaults"]
     assert "base_profile_id" not in cleaned_defaults
     assert "profile_id" not in cleaned_defaults
     assert "max_handoffs" not in cleaned_defaults
 
 
-def test_model_routing_config_supports_master_and_worker_overrides(tmp_path: Path) -> None:
+def test_model_routing_config_supports_master_and_expert_stage_overrides(
+    tmp_path: Path,
+) -> None:
     path = tmp_path / "config.json"
     path.write_text(
         json.dumps(
@@ -56,9 +115,9 @@ def test_model_routing_config_supports_master_and_worker_overrides(tmp_path: Pat
                 "agents": {
                     "routing": {
                         "master": "fast-model",
-                        "workers": {
-                            "explorer": "search-model",
-                            "reviewer": "volcengine/strong-model",
+                        "experts": {
+                            "builtin:research": "search-model",
+                            "builtin:coding/review": "deepseek/deepseek-v4-pro",
                         },
                     }
                 }
@@ -70,21 +129,26 @@ def test_model_routing_config_supports_master_and_worker_overrides(tmp_path: Pat
     config = load_config(path)
 
     assert config.agents.routing.master == "fast-model"
-    assert config.agents.routing.workers == {
-        "explorer": "search-model",
-        "reviewer": "volcengine/strong-model",
+    assert config.agents.routing.experts == {
+        "builtin:research": "search-model",
+        "builtin:coding/review": "deepseek/deepseek-v4-pro",
     }
 
 
-def test_request_budgets_support_master_and_worker_overrides(tmp_path: Path) -> None:
+def test_legacy_worker_routes_migrate_to_builtin_expert_stages(
+    tmp_path: Path,
+) -> None:
     path = tmp_path / "config.json"
     path.write_text(
         json.dumps(
             {
                 "agents": {
-                    "budgets": {
-                        "master": 12,
-                        "workers": {"explorer": 8, "reviewer": 30},
+                    "routing": {
+                        "workers": {
+                            "builder": "build-model",
+                            "reviewer": "review-model",
+                            "unknown-custom-role": "discarded-model",
+                        }
                     }
                 }
             }
@@ -94,21 +158,122 @@ def test_request_budgets_support_master_and_worker_overrides(tmp_path: Path) -> 
 
     config = load_config(path)
 
-    assert config.agents.budgets.master == 12
-    assert config.agents.budgets.workers == {"explorer": 8, "reviewer": 30}
+    assert config.agents.routing.experts == {
+        "builtin:coding/build": "build-model",
+        "builtin:coding/review": "review-model",
+    }
 
 
-def test_config_set_writes_role_specific_model_and_budget_routes(
+def test_expert_limits_are_first_class_config(tmp_path: Path) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "experts": {
+                    "enabled": ["builtin:coding"],
+                    "max_calls_per_turn": 12,
+                    "stage_request_limit": 8,
+                    "max_concurrency": 3,
+                    "timeout_seconds": 42,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config.experts.enabled == ["builtin:coding"]
+    assert config.experts.max_calls_per_turn == 12
+    assert config.experts.stage_request_limit == 8
+    assert config.experts.max_concurrency == 3
+    assert config.experts.timeout_seconds == 42
+
+
+def test_skill_roots_are_explicit_and_normalized_against_workspace(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "workspace": str(tmp_path / "repo"),
+                "skills": {
+                    "roots": [{"id": "team", "path": "../team-skills"}],
+                    "master_allowlist": ["team:conventions"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config.skills.roots[0].id == "team"
+    assert config.skills.roots[0].path == (tmp_path / "team-skills").resolve()
+    assert config.skills.master_allowlist == ["team:conventions"]
+
+
+def test_removed_durable_settings_are_dropped_during_config_load(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "skills": {"enabled": True},
+                "agents": {
+                    "budgets": {"master": 12, "workers": {"reviewer": 30}},
+                    "harness": {
+                        "max_agent_calls": 12,
+                        "sub_agent_request_limit": 7,
+                        "dynamic_workflow_enabled": False,
+                        "workflow_memory_mb": 512,
+                    },
+                    "templates": {"enabled": False},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    dumped = config.model_dump(mode="json")
+    assert dumped["skills"] == {"roots": [], "master_allowlist": []}
+    assert "budgets" not in dumped["agents"]
+    assert "harness" not in dumped["agents"]
+    assert "templates" not in dumped["agents"]
+    assert dumped["experts"]["max_calls_per_turn"] == 12
+    assert dumped["experts"]["stage_request_limit"] == 7
+
+
+def test_config_set_writes_expert_model_and_runtime_limits(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "config.json"
 
     main(["config", "set", "--config", str(path), "master-model", "fast-model"])
-    main(["config", "set", "--config", str(path), "reviewer-max-iterations", "31"])
+    main(["config", "set", "--config", str(path), "experts-max-calls-per-turn", "31"])
+    main(["config", "set", "--config", str(path), "experts-max-concurrency", "3"])
+    main(["config", "set", "--config", str(path), "experts-enabled", "builtin:coding"])
+    main(
+        [
+            "config",
+            "set",
+            "--config",
+            str(path),
+            "coding-expert-model",
+            "deepseek/deepseek-v4-pro",
+        ]
+    )
 
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["agents"]["routing"]["master"] == "fast-model"
-    assert payload["agents"]["budgets"]["workers"]["reviewer"] == 31
+    assert payload["agents"]["routing"]["experts"]["builtin:coding"] == ("deepseek/deepseek-v4-pro")
+    assert payload["experts"]["max_calls_per_turn"] == 31
+    assert payload["experts"]["max_concurrency"] == 3
+    assert payload["experts"]["enabled"] == ["builtin:coding"]
 
 
 def test_load_config_still_rejects_unknown_agent_defaults(tmp_path: Path) -> None:
@@ -147,9 +312,9 @@ def test_removed_per_round_minimal_context_settings_are_not_persisted(
     assert config.agents.defaults.runtime.stuck_detection_threshold == 4
     cleaned_path = tmp_path / "cleaned.json"
     save_config(config, cleaned_path)
-    cleaned_runtime = json.loads(cleaned_path.read_text(encoding="utf-8"))["agents"][
-        "defaults"
-    ]["runtime"]
+    cleaned_runtime = json.loads(cleaned_path.read_text(encoding="utf-8"))["agents"]["defaults"][
+        "runtime"
+    ]
     assert "minimal_context_recent_turns" not in cleaned_runtime
     assert "minimal_context_tool_result_chars" not in cleaned_runtime
     assert "tool_error_guard_threshold" not in cleaned_runtime
@@ -158,9 +323,7 @@ def test_removed_per_round_minimal_context_settings_are_not_persisted(
 
 def test_legacy_compatibility_is_limited_to_persisted_config_loading() -> None:
     with pytest.raises(ValidationError, match="profile_id"):
-        Config.model_validate(
-            {"agents": {"defaults": {"profile_id": "removed-profile"}}}
-        )
+        Config.model_validate({"agents": {"defaults": {"profile_id": "removed-profile"}}})
 
 
 def test_non_object_config_uses_normal_validation_error(tmp_path: Path) -> None:
@@ -171,25 +334,20 @@ def test_non_object_config_uses_normal_validation_error(tmp_path: Path) -> None:
         load_config(path)
 
 
-def test_volcengine_environment_selects_default_provider(
+def test_deepseek_environment_selects_default_provider(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("AELOON_CORE_PROVIDER", "volcengine")
-    monkeypatch.setenv("ARK_API_KEY", "ark-test-key")
-    monkeypatch.setenv("ARK_MODEL", "ark-code-latest")
+    monkeypatch.setenv("AELOON_CORE_PROVIDER", "deepseek")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test-key")
+    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
 
     config = load_config(tmp_path / "missing.json")
 
-    assert "active" not in config.model_dump(mode="json")["providers"]
-    assert config.agents.defaults.provider == "volcengine"
-    assert config.providers.volcengine.api_key == "ark-test-key"
-    assert (
-        config.providers.volcengine.base_url
-        == "https://ark.cn-beijing.volces.com/api/plan/v3"
-    )
-    assert config.agents.defaults.model == "ark-code-latest"
-    assert config.agents.defaults.model_ref() == "volcengine/ark-code-latest"
+    assert config.agents.defaults.provider == "deepseek"
+    assert config.providers.deepseek.api_key == "deepseek-test-key"
+    assert config.agents.defaults.model == "deepseek-v4-pro"
+    assert config.agents.defaults.model_ref() == "deepseek/deepseek-v4-pro"
 
 
 def test_legacy_providers_active_migrates_to_defaults_provider(tmp_path: Path) -> None:
@@ -197,8 +355,8 @@ def test_legacy_providers_active_migrates_to_defaults_provider(tmp_path: Path) -
     path.write_text(
         json.dumps(
             {
-                "providers": {"active": "volcengine"},
-                "agents": {"defaults": {"model": "ark-code-latest"}},
+                "providers": {"active": "deepseek"},
+                "agents": {"defaults": {"model": "deepseek-v4-flash"}},
             }
         ),
         encoding="utf-8",
@@ -206,31 +364,31 @@ def test_legacy_providers_active_migrates_to_defaults_provider(tmp_path: Path) -
 
     config = load_config(path)
 
-    assert config.agents.defaults.provider == "volcengine"
-    assert config.agents.defaults.model == "ark-code-latest"
+    assert config.agents.defaults.provider == "deepseek"
+    assert config.agents.defaults.model == "deepseek-v4-flash"
     cleaned_path = tmp_path / "cleaned.json"
     save_config(config, cleaned_path)
     cleaned = json.loads(cleaned_path.read_text(encoding="utf-8"))
     assert "active" not in cleaned["providers"]
-    assert cleaned["agents"]["defaults"]["provider"] == "volcengine"
+    assert cleaned["agents"]["defaults"]["provider"] == "deepseek"
 
 
 def test_parse_model_ref_supports_bare_and_provider_prefixed_forms() -> None:
-    assert parse_model_ref("deepseek-v4-pro", default_provider="anthropic") == (
-        "anthropic",
-        "deepseek-v4-pro",
+    assert parse_model_ref("deepseek-v4-flash", default_provider="deepseek") == (
+        "deepseek",
+        "deepseek-v4-flash",
     )
     assert parse_model_ref(
-        "volcengine/ark-code-latest",
-        default_provider="anthropic",
-    ) == ("volcengine", "ark-code-latest")
+        "deepseek/deepseek-v4-pro",
+        default_provider="deepseek",
+    ) == ("deepseek", "deepseek-v4-pro")
     assert parse_model_ref(
         "org/custom-model",
-        default_provider="anthropic",
-    ) == ("anthropic", "org/custom-model")
+        default_provider="deepseek",
+    ) == ("deepseek", "org/custom-model")
 
 
-def test_config_init_routes_credentials_to_selected_provider(
+def test_config_init_routes_credentials_to_deepseek_provider(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -244,20 +402,20 @@ def test_config_init_routes_credentials_to_selected_provider(
             "--config",
             str(path),
             "--provider",
-            "volcengine",
+            "deepseek",
             "--api-key",
-            "ark-config-key",
+            "deepseek-config-key",
             "--model",
-            "ark-code-latest",
+            "deepseek-v4-flash",
         ]
     )
 
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert "active" not in payload["providers"]
-    assert payload["agents"]["defaults"]["provider"] == "volcengine"
-    assert payload["providers"]["volcengine"]["api_key"] == "ark-config-key"
-    assert payload["providers"]["anthropic"]["api_key"] == "no-key"
-    assert payload["agents"]["defaults"]["model"] == "ark-code-latest"
+    assert payload["agents"]["defaults"]["provider"] == "deepseek"
+    assert payload["providers"]["deepseek"]["api_key"] == "deepseek-config-key"
+    assert "base_url" not in payload["providers"]["deepseek"]
+    assert payload["agents"]["defaults"]["model"] == "deepseek-v4-flash"
 
 
 def test_config_set_model_accepts_provider_model_ref(tmp_path: Path) -> None:
@@ -269,9 +427,9 @@ def test_config_set_model_accepts_provider_model_ref(tmp_path: Path) -> None:
             "--config",
             str(path),
             "--provider",
-            "anthropic",
+            "deepseek",
             "--model",
-            "claude-sonnet-4-6",
+            "deepseek-v4-flash",
         ]
     )
     main(
@@ -281,10 +439,10 @@ def test_config_set_model_accepts_provider_model_ref(tmp_path: Path) -> None:
             "--config",
             str(path),
             "model",
-            "volcengine/ark-code-latest",
+            "deepseek/deepseek-v4-pro",
         ]
     )
 
     payload = json.loads(path.read_text(encoding="utf-8"))
-    assert payload["agents"]["defaults"]["provider"] == "volcengine"
-    assert payload["agents"]["defaults"]["model"] == "ark-code-latest"
+    assert payload["agents"]["defaults"]["provider"] == "deepseek"
+    assert payload["agents"]["defaults"]["model"] == "deepseek-v4-pro"

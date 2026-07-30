@@ -6,8 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from aeloon_core.tools.filesystem import ReadTool, WriteTool
-from aeloon_core.tools.search_grep import GlobTool, GrepTool
+from aeloon_core.harness.tool import GlobTool, GrepTool, ReadTool
 
 
 @pytest.mark.asyncio
@@ -54,7 +53,7 @@ async def test_python_grep_fallback_follows_symlinks_outside_workspace(
     outside.write_text("outside-secret-value", encoding="utf-8")
     (workspace / "outside-link.txt").symlink_to(outside)
     (workspace / "inside.txt").write_text("inside-public-value", encoding="utf-8")
-    monkeypatch.setattr("aeloon_core.tools.search_grep.shutil.which", lambda _: None)
+    monkeypatch.setattr("aeloon_core.harness.tool.search.shutil.which", lambda _: None)
     tool = GrepTool(workspace=workspace, denied_paths=(tmp_path / "runtime",))
 
     secret = await tool.execute("outside-secret-value", path=".")
@@ -109,16 +108,23 @@ async def test_read_allows_parent_traversal_outside_workspace(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
-async def test_write_allows_absolute_path_outside_workspace(tmp_path: Path) -> None:
+async def test_read_can_be_confined_for_read_only_expert_stages(
+    tmp_path: Path,
+) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    outside = tmp_path / "created-outside.txt"
-    tool = WriteTool(workspace=workspace, denied_paths=(tmp_path / "runtime",))
+    outside = tmp_path / "outside.txt"
+    outside.write_text("private\n", encoding="utf-8")
+    tool = ReadTool(
+        workspace=workspace,
+        denied_paths=(tmp_path / "runtime",),
+        confine_to_workspace=True,
+    )
 
-    result = await tool.execute(path=str(outside), content="written outside\n")
+    result = await tool.execute(path="../outside.txt")
 
-    assert result.startswith("Successfully wrote")
-    assert outside.read_text(encoding="utf-8") == "written outside\n"
+    assert "path escapes the workspace" in result
+    assert "private" not in result
 
 
 @pytest.mark.asyncio
