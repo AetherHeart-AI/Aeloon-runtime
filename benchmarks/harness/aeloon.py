@@ -46,6 +46,8 @@ class AeloonHarness(Harness):
             "--stdin",
             "--output",
             "json",
+            "--model",
+            self.model,
         ]
         if request.config_path is not None:
             command.extend(["--config", str(request.config_path.expanduser().resolve())])

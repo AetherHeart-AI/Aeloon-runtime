@@ -32,6 +32,8 @@ class PiHarness(Harness):
                 "text",
                 "--no-session",
                 "--approve",
+                "--model",
+                self.model,
                 request.prompt,
             ],
             cwd=request.workspace,

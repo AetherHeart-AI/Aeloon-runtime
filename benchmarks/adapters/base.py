@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import shutil
 import subprocess
 import threading
@@ -40,7 +39,6 @@ class BenchmarkAdapter(ABC):
 
     name: str
     repository_url: str
-    supports_resume = False
 
     def __init__(
         self,
@@ -48,29 +46,18 @@ class BenchmarkAdapter(ABC):
         project_root: Path,
         limit: int | None = None,
         workers: int = 1,
-        resume_run_id: str | None = None,
     ) -> None:
         if workers <= 0:
             raise ValueError("workers must be positive")
-        if resume_run_id is not None and not self.supports_resume:
-            raise RuntimeError(f"Benchmark {self.name!r} does not support --resume.")
         self.project_root = project_root.expanduser().resolve()
         self.limit = limit
         self.workers = workers
-        self.resuming = resume_run_id is not None
         self._result_lock = threading.Lock()
         workspace_root = self.project_root / ".benchmark-workspaces"
         source_dir = workspace_root / "sources" / self.name
-        if resume_run_id is None:
-            timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-            run_id = f"{timestamp}-{uuid.uuid4().hex[:8]}"
-        else:
-            if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", resume_run_id) is None:
-                raise RuntimeError(f"Invalid benchmark run id: {resume_run_id!r}")
-            run_id = resume_run_id
+        timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        run_id = f"{timestamp}-{uuid.uuid4().hex[:8]}"
         output_dir = self.project_root / "benchmarks" / "results" / self.name / run_id
-        if self.resuming and not output_dir.is_dir():
-            raise RuntimeError(f"Benchmark run does not exist: {output_dir}")
         self.run = BenchmarkRun(
             run_id=run_id,
             output_dir=output_dir,
@@ -185,7 +172,12 @@ class BenchmarkAdapter(ABC):
                 "revision": self.source_revision(),
             },
             "harnesses": [
-                {"id": harness.name, "version": harness.version} for harness in harnesses
+                {
+                    "id": harness.name,
+                    "version": harness.version,
+                    "model": harness.model,
+                }
+                for harness in harnesses
             ],
         }
 

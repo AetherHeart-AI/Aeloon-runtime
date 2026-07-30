@@ -191,6 +191,11 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
         default="text",
         help="Output format. JSON suppresses streaming progress.",
     )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="Override the model for this run.",
+    )
     _add_path_args(parser, session=True)
 
 
@@ -292,6 +297,7 @@ async def _run_prompt(args: argparse.Namespace) -> None:
         args.config,
         workspace=getattr(args, "workspace", None),
         data_dir=getattr(args, "data_dir", None),
+        model=getattr(args, "model", None),
     )
     if not config.workspace.exists():
         raise SystemExit(f"Workspace does not exist: {config.workspace}")
@@ -429,8 +435,19 @@ def _load_with_path_overrides(
     *,
     workspace: Path | None,
     data_dir: Path | None,
+    model: str | None = None,
 ) -> Config:
     config = load_config(config_path)
+    if model is not None:
+        model = model.strip()
+        if not model:
+            raise SystemExit("Model name must not be empty.")
+        data = config.model_dump(mode="json")
+        normalized_model = _normalize_default_model_value(data, model)
+        _set_nested_value(data, CONFIG_SETTERS["model"], normalized_model)
+        _set_nested_value(data, CONFIG_SETTERS["master-model"], None)
+        _set_nested_value(data, ("agents", "routing", "experts"), {})
+        config = Config.model_validate(data)
     updates: dict[str, Any] = {
         "workspace": workspace if workspace is not None else Path.cwd(),
     }
@@ -599,6 +616,7 @@ def _first_positional(argv: list[str]) -> str | None:
             "--data-dir",
             "--prompt-file",
             "--output",
+            "--model",
             "--gateway-log-level",
             "--port",
         }:

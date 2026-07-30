@@ -34,6 +34,8 @@ class CodexHarness(Harness):
                 "workspace-write",
                 "--ephemeral",
                 "--json",
+                "--model",
+                self.model,
                 "-",
             ],
             cwd=request.workspace,

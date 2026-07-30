@@ -103,8 +103,11 @@ class Harness(ABC):
 
     name: str
 
-    def __init__(self, *, project_root: Path) -> None:
+    def __init__(self, *, project_root: Path, model: str) -> None:
         self.project_root = project_root.expanduser().resolve()
+        self.model = model.strip()
+        if not self.model:
+            raise ValueError("model name must not be empty")
         self.executable = self.resolve_executable()
         self.version = self.resolve_version()
 

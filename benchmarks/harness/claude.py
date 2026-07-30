@@ -34,6 +34,8 @@ class ClaudeHarness(Harness):
                 "json",
                 "--no-session-persistence",
                 "--dangerously-skip-permissions",
+                "--model",
+                self.model,
                 request.prompt,
             ],
             cwd=request.workspace,

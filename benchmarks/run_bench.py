@@ -13,12 +13,20 @@ from benchmarks.harness import HARNESS_NAMES, get_harnesses
 from benchmarks.progress import configure_progress, info
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_MODEL = "deepseek-v4-flash"
 
 
 def _positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError("value must be positive")
+    return parsed
+
+
+def _model_name(value: str) -> str:
+    parsed = value.strip()
+    if not parsed:
+        raise argparse.ArgumentTypeError("model name must not be empty")
     return parsed
 
 
@@ -44,18 +52,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Official benchmark adapter to prepare and run.",
     )
     parser.add_argument(
+        "--model",
+        type=_model_name,
+        default=DEFAULT_MODEL,
+        help=f"Model name passed to every selected harness (default: {DEFAULT_MODEL}).",
+    )
+    parser.add_argument(
         "--workers",
         type=_positive_int,
         default=1,
         help="Maximum concurrent benchmark cases (default: 1).",
     )
     parser.add_argument(
-        "--resume",
-        metavar="RUN_ID",
-        help=(
-            "Resume an existing benchmark run by id. Completed result records "
-            "are reused."
-        ),
+        "--limit",
+        type=_positive_int,
+        default=None,
+        help="Run only the first N deterministically selected cases.",
     )
     return parser
 
@@ -64,17 +76,23 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     harness_names = [name for group in args.harness for name in group]
     started = time.monotonic()
     info(
-        "Selected benchmark=%s harnesses=%s workers=%d",
+        "Selected benchmark=%s harnesses=%s model=%s workers=%d limit=%s",
         args.benchmark,
         ", ".join(harness_names),
+        args.model,
         args.workers,
+        args.limit if args.limit is not None else "all",
     )
-    harnesses = get_harnesses(harness_names, project_root=PROJECT_ROOT)
+    harnesses = get_harnesses(
+        harness_names,
+        project_root=PROJECT_ROOT,
+        model=args.model,
+    )
     adapter = get_adapter(
         args.benchmark,
         project_root=PROJECT_ROOT,
+        limit=args.limit,
         workers=args.workers,
-        resume_run_id=args.resume,
     )
     info("Preparing benchmark environment...")
     adapter.prepare()

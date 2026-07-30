@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from aeloon_core.__main__ import (
+    _load_with_path_overrides,
     _resolve_run_prompt,
     _run_prompt,
     build_parser,
@@ -18,9 +19,7 @@ def test_run_prompt_file_is_an_exclusive_prompt_source(tmp_path: Path) -> None:
     prompt_path = tmp_path / "task.txt"
     prompt_path.write_text("Refactor the parser.\n", encoding="utf-8")
 
-    args = build_parser().parse_args(
-        ["run", "--prompt-file", str(prompt_path), "--output", "json"]
-    )
+    args = build_parser().parse_args(["run", "--prompt-file", str(prompt_path), "--output", "json"])
 
     assert _resolve_run_prompt(args) == "Refactor the parser.\n"
     assert args.output == "json"
@@ -37,6 +36,37 @@ def test_run_reads_prompt_from_stdin(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("sys.stdin", io.StringIO("Inspect this workspace."))
 
     assert _resolve_run_prompt(args) == "Inspect this workspace."
+
+
+def test_run_model_overrides_config_for_one_invocation(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "agents": {
+                    "defaults": {"model": "deepseek-v4-flash"},
+                    "routing": {
+                        "master": "deepseek-v4-pro",
+                        "experts": {"builtin:coding": "deepseek-v4-pro"},
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = build_parser().parse_args(["run", "Inspect", "--model", "deepseek/deepseek-v4-pro"])
+
+    config = _load_with_path_overrides(
+        config_path,
+        workspace=tmp_path,
+        data_dir=None,
+        model=args.model,
+    )
+
+    assert config.agents.defaults.provider == "deepseek"
+    assert config.agents.defaults.model == "deepseek-v4-pro"
+    assert config.agents.routing.master is None
+    assert config.agents.routing.experts == {}
 
 
 async def test_run_json_emits_one_machine_readable_result(
@@ -127,9 +157,7 @@ async def test_run_json_emits_one_machine_readable_result(
 async def test_run_rejects_missing_workspace_before_model_start(
     tmp_path: Path,
 ) -> None:
-    args = build_parser().parse_args(
-        ["run", "Inspect", "--workspace", str(tmp_path / "missing")]
-    )
+    args = build_parser().parse_args(["run", "Inspect", "--workspace", str(tmp_path / "missing")])
 
     with pytest.raises(SystemExit, match="Workspace does not exist"):
         await _run_prompt(args)

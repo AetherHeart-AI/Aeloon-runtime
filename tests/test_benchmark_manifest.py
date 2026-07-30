@@ -9,7 +9,7 @@ from benchmarks.harness.registry import HARNESS_TYPES
 
 
 def test_benchmark_and_harness_registries_expose_supported_integrations() -> None:
-    assert set(ADAPTER_PATHS) == {"refactorbench", "livecodebench"}
+    assert set(ADAPTER_PATHS) == {"refactorbench", "livecodebench", "repoqa"}
     assert set(HARNESS_TYPES) == {"aeloon", "pi", "codex", "claude"}
     assert all(
         isinstance(get_adapter(name, project_root=Path.cwd()), BenchmarkAdapter)
@@ -22,8 +22,16 @@ def test_benchmark_manifest_records_source_and_harness_versions(
 ) -> None:
     adapter = get_adapter("refactorbench", project_root=tmp_path)
     harnesses = [
-        SimpleNamespace(name="aeloon", version="aeloon-core@abc"),
-        SimpleNamespace(name="codex", version="codex-cli 1"),
+        SimpleNamespace(
+            name="aeloon",
+            version="aeloon-core@abc",
+            model="deepseek-v4-flash",
+        ),
+        SimpleNamespace(
+            name="codex",
+            version="codex-cli 1",
+            model="deepseek-v4-flash",
+        ),
     ]
 
     manifest = adapter.manifest(harnesses, status="running")
@@ -37,6 +45,14 @@ def test_benchmark_manifest_records_source_and_harness_versions(
         "revision": None,
     }
     assert manifest["harnesses"] == [
-        {"id": "aeloon", "version": "aeloon-core@abc"},
-        {"id": "codex", "version": "codex-cli 1"},
+        {
+            "id": "aeloon",
+            "version": "aeloon-core@abc",
+            "model": "deepseek-v4-flash",
+        },
+        {
+            "id": "codex",
+            "version": "codex-cli 1",
+            "model": "deepseek-v4-flash",
+        },
     ]

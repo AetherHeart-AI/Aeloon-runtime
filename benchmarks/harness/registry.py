@@ -20,21 +20,26 @@ HARNESS_TYPES: dict[str, type[Harness]] = {
 HARNESS_NAMES = tuple(HARNESS_TYPES)
 
 
-def get_harness(name: str, *, project_root: Path) -> Harness:
+def get_harness(name: str, *, project_root: Path, model: str) -> Harness:
     try:
         harness_type = HARNESS_TYPES[name]
     except KeyError:
         available = ", ".join(HARNESS_NAMES)
         raise RuntimeError(f"Unknown harness {name!r}; available harnesses: {available}") from None
-    return harness_type(project_root=project_root)
+    return harness_type(project_root=project_root, model=model)
 
 
-def get_harnesses(names: list[str], *, project_root: Path) -> list[Harness]:
+def get_harnesses(
+    names: list[str],
+    *,
+    project_root: Path,
+    model: str,
+) -> list[Harness]:
     selected = list(HARNESS_NAMES) if "all" in names else list(dict.fromkeys(names))
     harnesses: list[Harness] = []
     for name in selected:
         info("Checking harness %s...", name)
-        harness = get_harness(name, project_root=project_root)
+        harness = get_harness(name, project_root=project_root, model=model)
         info("Harness %s ready; version=%s", name, harness.version or "unknown")
         harnesses.append(harness)
     return harnesses

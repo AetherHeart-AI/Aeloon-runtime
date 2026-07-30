@@ -5,6 +5,7 @@ The benchmark runner has one public command:
 ```bash
 uv run python run_bench.py \
   --harness aeloon \
+  --model deepseek-v4-flash \
   --benchmark refactorbench
 ```
 
@@ -18,37 +19,37 @@ uv run python run_bench.py \
   --benchmark refactorbench
 ```
 
-Supported benchmarks are `refactorbench` and `livecodebench`. Supported
-harnesses are `aeloon`, `pi`, `codex`, and `claude`; `--harness all` selects all
-of them.
+Supported benchmarks are `refactorbench`, `livecodebench`, and `repoqa`.
+Supported harnesses are `aeloon`, `pi`, `codex`, and `claude`; `--harness all`
+selects all of them.
+
+`--model MODEL` passes the same explicit model selection to every harness and
+defaults to `deepseek-v4-flash`. This keeps comparisons on the same model
+instead of inheriting each CLI's configured default.
 
 `--workers N` enables opt-in case concurrency and defaults to `1`. RefactorBench
 assigns each source repository to one writable lane, so cases that share a
 repository never mutate the same workspace concurrently. LiveCodeBench runs
 independent generation or repair cases concurrently and keeps official
-evaluation batched. Start with `--workers 2` or `--workers 4`; higher values may
-hit model-provider rate limits.
+evaluation batched. RepoQA assigns each repository to one lane and reuses
+separately reset workspaces for each harness. Start with `--workers 2` or
+`--workers 4`; higher values may hit model-provider rate limits.
 
-## Resume an interrupted LiveCodeBench run
-
-Pass the original run id to `--resume` and select the same harnesses:
+Use `--limit N` for a deterministic smoke run. RepoQA interleaves languages and
+repositories before applying the limit, so a small run does not collapse to a
+single language:
 
 ```bash
 uv run python run_bench.py \
-  --harness aeloon pi claude \
-  --workers 8 \
-  --benchmark livecodebench \
-  --resume 20260729T100902Z-d558b57d
+  --harness aeloon \
+  --workers 4 \
+  --limit 60 \
+  --benchmark repoqa
 ```
 
-LiveCodeBench resume reuses completed `(harness, scenario, case)` records in
-`results.jsonl`. A generation interrupted before official evaluation has no
-durable result and runs again. Repeating the same resume command is idempotent
-and does not append duplicate result records.
-
-The benchmark, release, source revision, cases, and ordered harness selection
-must match the original manifest. RefactorBench does not currently support the
-unified runner's `--resume` option.
+Each invocation creates a new run. If it is interrupted, rerun the command to
+start from the beginning; the unified runner does not keep generation
+checkpoints or support `--resume`.
 
 ## Automatic preparation
 
@@ -73,6 +74,24 @@ LiveCodeBench uses a dedicated environment under
 the public dataset and evaluation dependencies; model inference is supplied by
 the selected harness, so LiveCodeBench's GPU inference stack is unnecessary.
 
+RepoQA uses the pinned official `2024-06-23` dataset. Preparation downloads and
+verifies the compressed release once; task execution and grading are then
+local. This integration is an agentized Search Needle Function task: the prompt
+contains only the repository, language, and natural-language function
+description. The harness must search the materialized repository and finish
+with:
+
+```text
+REPOQA_RESULT: {"path":"relative/path.ext","symbol":"function_name"}
+```
+
+The grader uses exact path-and-symbol matching. Repository changes are recorded
+as collateral damage and make the task fail. Unlike upstream RepoQA's
+long-context generation setup, this integration does not install model
+backends, tokenizers, Tree-sitter, or BLEU dependencies. The benchmark itself
+does not require network access after preparation; network policy for a remote
+model or harness remains the responsibility of that harness.
+
 The `pi`, `codex`, and `claude` commands must already be installed and
 authenticated. Aeloon uses the current project environment and configuration.
 
@@ -83,7 +102,8 @@ benchmarks/
 ├── adapters/
 │   ├── base.py
 │   ├── refactorbench.py
-│   └── livecodebench.py
+│   ├── livecodebench.py
+│   └── repoqa.py
 ├── harness/
 │   ├── base.py
 │   ├── aeloon.py
@@ -92,6 +112,7 @@ benchmarks/
 │   └── claude.py
 ├── refactorbench/
 ├── livecodebench/
+├── repoqa/
 └── run_bench.py
 run_bench.py
 ```
