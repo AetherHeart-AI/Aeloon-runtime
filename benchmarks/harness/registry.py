@@ -8,6 +8,8 @@ from benchmarks.harness.aeloon import AeloonHarness
 from benchmarks.harness.base import Harness
 from benchmarks.harness.claude import ClaudeHarness
 from benchmarks.harness.codex import CodexHarness
+from benchmarks.harness.hermes import HermesHarness
+from benchmarks.harness.openclaw import OpenClawHarness
 from benchmarks.harness.pi import PiHarness
 from benchmarks.progress import info
 
@@ -16,6 +18,8 @@ HARNESS_TYPES: dict[str, type[Harness]] = {
     "pi": PiHarness,
     "codex": CodexHarness,
     "claude": ClaudeHarness,
+    "openclaw": OpenClawHarness,
+    "hermes": HermesHarness,
 }
 HARNESS_NAMES = tuple(HARNESS_TYPES)
 

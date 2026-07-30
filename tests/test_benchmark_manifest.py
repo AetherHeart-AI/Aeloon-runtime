@@ -10,7 +10,14 @@ from benchmarks.harness.registry import HARNESS_TYPES
 
 def test_benchmark_and_harness_registries_expose_supported_integrations() -> None:
     assert set(ADAPTER_PATHS) == {"refactorbench", "livecodebench", "repoqa"}
-    assert set(HARNESS_TYPES) == {"aeloon", "pi", "codex", "claude"}
+    assert set(HARNESS_TYPES) == {
+        "aeloon",
+        "pi",
+        "codex",
+        "claude",
+        "openclaw",
+        "hermes",
+    }
     assert all(
         isinstance(get_adapter(name, project_root=Path.cwd()), BenchmarkAdapter)
         for name in ADAPTER_PATHS

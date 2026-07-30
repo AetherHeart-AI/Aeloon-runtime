@@ -20,8 +20,8 @@ uv run python run_bench.py \
 ```
 
 Supported benchmarks are `refactorbench`, `livecodebench`, and `repoqa`.
-Supported harnesses are `aeloon`, `pi`, `codex`, and `claude`; `--harness all`
-selects all of them.
+Supported harnesses are `aeloon`, `pi`, `codex`, `claude`, `openclaw`, and
+`hermes`; `--harness all` selects all of them.
 
 `--model MODEL` passes the same explicit model selection to every harness and
 defaults to `deepseek-v4-flash`. This keeps comparisons on the same model
@@ -92,8 +92,9 @@ backends, tokenizers, Tree-sitter, or BLEU dependencies. The benchmark itself
 does not require network access after preparation; network policy for a remote
 model or harness remains the responsibility of that harness.
 
-The `pi`, `codex`, and `claude` commands must already be installed and
-authenticated. Aeloon uses the current project environment and configuration.
+The `pi`, `codex`, `claude`, `openclaw`, and `hermes` commands must already be
+installed and authenticated. Aeloon uses the current project environment and
+configuration.
 
 ## Architecture
 
@@ -109,7 +110,9 @@ benchmarks/
 │   ├── aeloon.py
 │   ├── pi.py
 │   ├── codex.py
-│   └── claude.py
+│   ├── claude.py
+│   ├── openclaw.py
+│   └── hermes.py
 ├── refactorbench/
 ├── livecodebench/
 ├── repoqa/

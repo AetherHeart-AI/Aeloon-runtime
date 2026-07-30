@@ -13,6 +13,7 @@ import benchmarks.run_bench as unified
 from benchmarks import progress as benchmark_progress
 from benchmarks.adapters.livecodebench import LiveCodeBenchAdapter
 from benchmarks.adapters.refactorbench import RefactorBenchAdapter
+from benchmarks.harness import HARNESS_NAMES
 from benchmarks.harness.aeloon import AeloonHarness
 from benchmarks.harness.base import (
     Harness,
@@ -23,6 +24,8 @@ from benchmarks.harness.base import (
 )
 from benchmarks.harness.claude import ClaudeHarness
 from benchmarks.harness.codex import CodexHarness
+from benchmarks.harness.hermes import HermesHarness
+from benchmarks.harness.openclaw import OpenClawHarness
 from benchmarks.harness.pi import PiHarness
 from benchmarks.livecodebench.runner import LiveCodeBenchCase
 from benchmarks.progress import ProgressBar, configure_progress, info
@@ -142,6 +145,8 @@ def test_cli_exposes_harness_benchmark_model_workers_and_limit() -> None:
         (PiHarness, "/fake/pi"),
         (CodexHarness, "/fake/codex"),
         (ClaudeHarness, "/fake/claude"),
+        (OpenClawHarness, "/fake/openclaw"),
+        (HermesHarness, "/fake/hermes"),
     ],
 )
 def test_harness_invocations_forward_selected_model(
@@ -163,6 +168,129 @@ def test_harness_invocations_forward_selected_model(
 
     model_option = command.index("--model")
     assert command[model_option + 1] == "deepseek-v4-pro"
+
+
+def test_harness_registry_includes_openclaw_and_hermes() -> None:
+    assert HARNESS_NAMES == (
+        "aeloon",
+        "pi",
+        "codex",
+        "claude",
+        "openclaw",
+        "hermes",
+    )
+
+
+def test_openclaw_uses_headless_json_exec_and_normalizes_result(tmp_path: Path) -> None:
+    harness = object.__new__(OpenClawHarness)
+    harness.executable = "/fake/openclaw"
+    harness.model = "openai/gpt-5.6-sol"
+    request = HarnessRequest(
+        prompt="solve it",
+        workspace=tmp_path,
+        session_dir=tmp_path / "sessions",
+        project_root=tmp_path,
+    )
+
+    invocation = harness.build_invocation(request)
+    result = harness.interpret(
+        ProcessOutcome(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "ok": True,
+                    "status": "ok",
+                    "final": "done",
+                    "usage": {"input": 120, "output": 8, "total": 128},
+                    "costUsd": 0.0021,
+                    "toolSummary": {"calls": 2, "tools": ["read", "write"]},
+                    "model": "gpt-5.6-sol",
+                    "provider": "openai",
+                    "sessionId": "session-1",
+                }
+            ),
+            stderr="",
+            duration_ms=1,
+        )
+    )
+
+    assert invocation.command[:3] == ["/fake/openclaw", "agent", "exec"]
+    assert invocation.input_text == "solve it"
+    assert invocation.prompt_argument is False
+    assert invocation.command[invocation.command.index("--message-file") + 1] == "-"
+    assert invocation.command[invocation.command.index("--cwd") + 1] == str(tmp_path)
+    assert "--json" in invocation.command
+    assert result == {
+        "status": "completed",
+        "session_id": "session-1",
+        "duration_ms": None,
+        "final_content": "done",
+        "tools_used": ["read", "write"],
+        "usage": {"input": 120, "output": 8, "total": 128},
+        "models": {"model": "gpt-5.6-sol", "provider": "openai"},
+        "cost_usd": 0.0021,
+        "payload_error": None,
+    }
+
+
+def test_openclaw_reports_structured_agent_errors(tmp_path: Path) -> None:
+    harness = object.__new__(OpenClawHarness)
+
+    result = harness.interpret(
+        ProcessOutcome(
+            returncode=1,
+            stdout=json.dumps(
+                {
+                    "ok": False,
+                    "status": "error",
+                    "final": None,
+                    "error": {"kind": "model_error", "message": "provider failed"},
+                }
+            ),
+            stderr="",
+            duration_ms=1,
+        )
+    )
+
+    assert result["status"] == "agent_error"
+    assert result["payload_error"] == "model_error: provider failed"
+
+
+def test_hermes_uses_scripted_oneshot_mode(tmp_path: Path) -> None:
+    harness = object.__new__(HermesHarness)
+    harness.executable = "/fake/hermes"
+    harness.model = "deepseek/deepseek-v4"
+    request = HarnessRequest(
+        prompt="solve it",
+        workspace=tmp_path,
+        session_dir=tmp_path / "sessions",
+        project_root=tmp_path,
+    )
+
+    invocation = harness.build_invocation(request)
+    result = harness.interpret(
+        ProcessOutcome(
+            returncode=0,
+            stdout="done\n",
+            stderr="",
+            duration_ms=1,
+        )
+    )
+
+    assert invocation.command == [
+        "/fake/hermes",
+        "--yolo",
+        "--model",
+        "deepseek/deepseek-v4",
+        "-z",
+        "solve it",
+    ]
+    assert invocation.prompt_argument is True
+    assert result == {
+        "status": "completed",
+        "final_content": "done",
+        "payload_error": None,
+    }
 
 
 def test_pi_uses_text_mode_without_json_event_history(tmp_path: Path) -> None:
