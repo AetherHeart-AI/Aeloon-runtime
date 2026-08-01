@@ -1,4 +1,6 @@
 const TOOL_LABELS = {
+  bash: "执行命令",
+  edit: "编辑文件",
   edit_file: "编辑文件",
   execute: "执行命令",
   glob: "查找文件",
@@ -12,6 +14,8 @@ const TOOL_LABELS = {
   skill_load: "加载 Skill",
   skill_read: "读取 Skill 资源",
   skill_search: "搜索 Skill",
+  update_plan: "更新计划",
+  write: "写入文件",
   write_file: "写入文件",
   write_plan: "更新计划",
 };

@@ -4,16 +4,19 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic_ai_harness import FileSystem, Shell
-from pydantic_ai_harness.compaction import SlidingWindow
-from pydantic_ai_harness.context import RepoContext
-from pydantic_ai_harness.planning import Planning
-
 from aeloon_core.config import Config
-from aeloon_core.harness.capabilities import history_capability, master_capabilities
+from aeloon_core.harness.capabilities import (
+    FileSystem,
+    Planning,
+    RepoContext,
+    Shell,
+    SlidingWindow,
+    history_capability,
+    master_capabilities,
+)
 
 
-def test_history_policy_is_owned_by_harness_sliding_window(tmp_path: Path) -> None:
+def test_history_policy_is_owned_by_pi_sliding_window(tmp_path: Path) -> None:
     config = Config(
         workspace=tmp_path,
         agents={

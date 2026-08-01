@@ -5,9 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
-from pydantic_ai.models.function import FunctionModel
-from pydantic_ai.models.test import TestModel
 
 from aeloon_core.config import Config
 from aeloon_core.harness.execution import HarnessAgentRuntime
@@ -19,7 +16,16 @@ from aeloon_core.harness.expert import (
     LangGraphExpertRunner,
 )
 from aeloon_core.harness.model import ModelRouter
+from aeloon_core.harness.provider import ScriptedPiModel
 from aeloon_core.harness.skill import SkillRegistry
+
+
+def _response(*parts: dict[str, object]) -> dict[str, object]:
+    return {"content": list(parts)}
+
+
+def _call(name: str, arguments: dict[str, object], call_id: str) -> dict[str, object]:
+    return {"type": "toolCall", "name": name, "arguments": arguments, "id": call_id}
 
 
 class FakeRunner:
@@ -66,7 +72,10 @@ async def test_runtime_enforces_per_expert_budget_and_accumulates_usage(
         config=config,
         skills=skills,
         runners=ExpertRunnerRegistry({"project.custom": FakeRunner()}),
-        model_router=ModelRouter(config, injected_model=TestModel()),
+        model_router=ModelRouter(
+            config,
+            injected_model=ScriptedPiModel(({"text": "unused"},)),
+        ),
         agent_runtime=HarnessAgentRuntime(),
     )
 
@@ -82,15 +91,17 @@ async def test_runtime_enforces_per_expert_budget_and_accumulates_usage(
 async def test_default_research_backend_returns_blocked_without_exa_key(
     tmp_path: Path,
 ) -> None:
-    async def respond(
-        _messages: list[ModelMessage],
-        info,
-    ) -> ModelResponse:
-        output_tool = info.model_request_parameters.output_tools[0].name
-        return ModelResponse(
-            parts=[
-                ToolCallPart(
-                    output_tool,
+    config = Config(
+        workspace=tmp_path,
+        agents={"defaults": {"context_compaction": {"enabled": False}}},
+        experts={"enabled": ["builtin:research"]},
+    ).normalized()
+    skills = SkillRegistry.discover(config)
+    model = ScriptedPiModel(
+        (
+            _response(
+                _call(
+                    "final_result",
                     {
                         "objective": "answer",
                         "assignments": [
@@ -101,16 +112,9 @@ async def test_default_research_backend_returns_blocked_without_exa_key(
                     },
                     "research-plan",
                 )
-            ]
+            ),
         )
-
-    config = Config(
-        workspace=tmp_path,
-        agents={"defaults": {"context_compaction": {"enabled": False}}},
-        experts={"enabled": ["builtin:research"]},
-    ).normalized()
-    skills = SkillRegistry.discover(config)
-    model = FunctionModel(respond)
+    )
     runtime = ExpertRuntime(
         config=config,
         skills=skills,

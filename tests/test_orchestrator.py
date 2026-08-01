@@ -6,20 +6,30 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from pydantic_ai.messages import (
-    ModelMessage,
-    ModelRequest,
-    ModelResponse,
-    TextPart,
-    ToolCallPart,
-    ToolReturnPart,
-)
-from pydantic_ai.models.function import FunctionModel
-from pydantic_ai.toolsets import FunctionToolset
+from pydantic import BaseModel, ConfigDict
 
 from aeloon_core.config import Config
+from aeloon_core.harness.expert import ExpertResult, ExpertRunnerRegistry
 from aeloon_core.harness.mcp import McpRegistry
+from aeloon_core.harness.provider import ScriptedPiModel
+from aeloon_core.harness.tool import FunctionTool
 from aeloon_core.orchestrator import AeloonCoreOrchestrator
+
+
+def _response(*parts: dict[str, Any]) -> dict[str, Any]:
+    return {"content": list(parts)}
+
+
+def _call(name: str, arguments: dict[str, Any], call_id: str) -> dict[str, Any]:
+    return {"type": "toolCall", "name": name, "arguments": arguments, "id": call_id}
+
+
+def _text(value: str) -> dict[str, Any]:
+    return {"type": "text", "text": value}
+
+
+def _model(*responses: dict[str, Any]) -> ScriptedPiModel:
+    return ScriptedPiModel(tuple(responses))
 
 
 def _config(tmp_path: Path, **overrides: Any) -> Config:
@@ -35,10 +45,7 @@ def _config(tmp_path: Path, **overrides: Any) -> Config:
 def test_orchestrator_uses_skills_and_has_no_role_or_workflow_catalog(
     tmp_path: Path,
 ) -> None:
-    def respond(_messages: list[ModelMessage], _info: Any) -> ModelResponse:
-        return ModelResponse(parts=[TextPart("done")])
-
-    app = AeloonCoreOrchestrator(_config(tmp_path), model=FunctionModel(respond))
+    app = AeloonCoreOrchestrator(_config(tmp_path), model=_model(_response(_text("done"))))
 
     assert [expert.id for expert in app.experts] == [
         "builtin:research",
@@ -51,19 +58,19 @@ def test_orchestrator_uses_skills_and_has_no_role_or_workflow_catalog(
 
 @pytest.mark.asyncio
 async def test_plain_text_turn_is_persisted_as_master_history(tmp_path: Path) -> None:
-    requests: list[list[ModelMessage]] = []
-
-    async def respond(messages: list[ModelMessage], _info: Any) -> ModelResponse:
-        requests.append(messages)
-        return ModelResponse(parts=[TextPart(f"answer-{len(requests)}")])
-
-    app = AeloonCoreOrchestrator(_config(tmp_path), model=FunctionModel(respond))
+    app = AeloonCoreOrchestrator(
+        _config(tmp_path),
+        model=_model(_response(_text("answer-1"))),
+    )
     first = await app.run_turn("first request")
+    app.model = _model(_response(_text("answer-2")))
     second = await app.run_turn("second request", session_id=first.session_id)
 
     assert first.final_content == "answer-1"
     assert second.final_content == "answer-2"
-    assert len(requests[1]) > len(requests[0])
+    first_request = next(item for item in first.transitions if item["node"] == "model_request")
+    second_request = next(item for item in second.transitions if item["node"] == "model_request")
+    assert second_request["before_digest"] != first_request["before_digest"]
     history = app.sessions.history(first.session_id)
     assert [turn["user_prompt"] for turn in history] == [
         "first request",
@@ -78,22 +85,6 @@ async def test_plain_text_turn_is_persisted_as_master_history(tmp_path: Path) ->
 async def test_master_limit_returns_and_persists_partial_turn(
     tmp_path: Path,
 ) -> None:
-    requests = 0
-
-    def respond(_messages: list[ModelMessage], info: Any) -> ModelResponse:
-        nonlocal requests
-        requests += 1
-        assert [tool.name for tool in info.model_request_parameters.function_tools] == []
-        return ModelResponse(
-            parts=[
-                ToolCallPart(
-                    "read_file",
-                    {"path": "README.md"},
-                    "tool-after-limit",
-                )
-            ]
-        )
-
     config = _config(
         tmp_path,
         agents={
@@ -103,11 +94,20 @@ async def test_master_limit_returns_and_persists_partial_turn(
             }
         },
     )
-    app = AeloonCoreOrchestrator(config, model=FunctionModel(respond))
+    app = AeloonCoreOrchestrator(
+        config,
+        model=_model(
+            _response(
+                _call("read_file", {"path": "README.md"}, "tool-after-limit")
+            )
+        ),
+    )
 
     result = await app.run_turn("inspect")
 
-    assert requests == 1
+    requests = [item for item in result.transitions if item["node"] == "model_request"]
+    assert len(requests) == 1
+    assert requests[0]["decision"]["tool_names"] == []
     assert result.status == "partial"
     assert "partial session history were preserved" in result.final_content
     assert result.messages
@@ -116,9 +116,7 @@ async def test_master_limit_returns_and_persists_partial_turn(
     assert persisted[-1]["final_content"] == result.final_content
     assert persisted[-1]["messages"] == result.messages
 
-    app.model = FunctionModel(
-        lambda _messages, _info: ModelResponse(parts=[TextPart("resumed")])
-    )
+    app.model = _model(_response(_text("resumed")))
     resumed = await app.run_turn("continue", session_id=result.session_id)
 
     assert resumed.status == "completed"
@@ -132,28 +130,36 @@ async def test_master_limit_returns_and_persists_partial_turn(
 
 @pytest.mark.asyncio
 async def test_master_exposes_ultra_skill_and_expert_tools(tmp_path: Path) -> None:
-    exposed: list[str] = []
-
-    async def respond(_messages: list[ModelMessage], info: Any) -> ModelResponse:
-        exposed.extend(tool.name for tool in info.model_request_parameters.function_tools)
-        return ModelResponse(parts=[TextPart("done")])
-
-    app = AeloonCoreOrchestrator(_config(tmp_path), model=FunctionModel(respond))
+    app = AeloonCoreOrchestrator(
+        _config(tmp_path),
+        model=_model(_response(_text("done"))),
+    )
     result = await app.run_turn("inspect")
+    request = next(item for item in result.transitions if item["node"] == "model_request")
+    exposed = set(request["decision"]["tool_names"])
 
     assert result.final_content == "done"
     assert {
         "read_file",
         "write_file",
+        "edit_file",
         "run_command",
+        "start_command",
+        "check_command",
+        "stop_command",
         "inventory_agent_context",
+        "list_directory",
+        "find_files",
+        "search_files",
+        "create_directory",
+        "file_info",
         "write_plan",
         "skill_search",
         "skill_load",
         "skill_read",
         "expert_run",
-    } <= set(exposed)
-    assert not {"workflow_execute", "run_workflow", "spawn_worker"} & set(exposed)
+    } <= exposed
+    assert not {"workflow_execute", "run_workflow", "spawn_worker"} & exposed
     await app.close()
 
 
@@ -161,24 +167,29 @@ async def test_master_exposes_ultra_skill_and_expert_tools(tmp_path: Path) -> No
 async def test_normal_master_exposes_tools_from_every_configured_mcp_server(
     tmp_path: Path,
 ) -> None:
-    exposed: list[str] = []
+    class LookupArgs(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        query: str
 
     async def lookup(query: str) -> str:
         return query
 
-    async def respond(_messages: list[ModelMessage], info: Any) -> ModelResponse:
-        exposed.extend(tool.name for tool in info.model_request_parameters.function_tools)
-        return ModelResponse(parts=[TextPart("done")])
-
-    docs = FunctionToolset([lookup], id="docs").prefixed("docs")
+    docs = FunctionTool(
+        name="docs_lookup",
+        description="Look up documentation.",
+        args_model=LookupArgs,
+        handler=lookup,
+        concurrency_mode="read_only",
+    )
     app = AeloonCoreOrchestrator(
         _config(tmp_path, mode="normal"),
-        model=FunctionModel(respond),
+        model=_model(_response(_text("done"))),
         mcp=McpRegistry({"docs": docs}),
     )
-    await app.run_turn("inspect")
+    result = await app.run_turn("inspect")
+    request = next(item for item in result.transitions if item["node"] == "model_request")
 
-    assert "docs_lookup" in exposed
+    assert "docs_lookup" in request["decision"]["tool_names"]
     await app.close()
 
 
@@ -186,16 +197,23 @@ async def test_normal_master_exposes_tools_from_every_configured_mcp_server(
 async def test_enabled_experts_are_injected_without_internal_dependencies(
     tmp_path: Path,
 ) -> None:
-    instructions: list[str] = []
-
-    async def respond(_messages: list[ModelMessage], info: Any) -> ModelResponse:
-        instructions.append(str(info.instructions))
-        return ModelResponse(parts=[TextPart("done")])
-
-    app = AeloonCoreOrchestrator(_config(tmp_path), model=FunctionModel(respond))
+    app = AeloonCoreOrchestrator(
+        _config(tmp_path),
+        model=_model(_response(_text("done"))),
+    )
     await app.run_turn("delegate if useful")
 
-    prompt = "\n".join(instructions)
+    from aeloon_core.harness.agent.prompt import master_system_prompt
+
+    prompt = master_system_prompt(
+        expert_descriptors=[expert.descriptor() for expert in app.experts],
+        plain_skill_ids=sorted(
+            app.master_skill_scope.skill_ids - {expert.id for expert in app.experts}
+        ),
+        mode=app.config.mode,
+        mcp_server_ids=list(app.master_mcp_ids),
+        capability_names=["filesystem", "shell", "repo_context", "planning"],
+    )
     assert "full-capability Master" in prompt
     assert '"id": "builtin:coding"' in prompt
     assert '"id": "builtin:research"' in prompt
@@ -227,45 +245,14 @@ Return the assigned outcome as a structured report.
         encoding="utf-8",
     )
 
-    async def respond(messages: list[ModelMessage], info: Any) -> ModelResponse:
-        function_tools = [tool.name for tool in info.model_request_parameters.function_tools]
-        output_tools = [tool.name for tool in info.model_request_parameters.output_tools]
-        if "expert_run" in function_tools:
-            already_called = any(
-                isinstance(message, ModelRequest)
-                and any(
-                    isinstance(part, ToolReturnPart) and part.tool_name == "expert_run"
-                    for part in message.parts
-                )
-                for message in messages
+    class FakePromptRunner:
+        async def run(self, request, context) -> ExpertResult:
+            del request, context
+            return ExpertResult(
+                status="completed",
+                final_content="verified result",
+                usage={"requests": 1},
             )
-            if already_called:
-                return ModelResponse(parts=[TextPart("expert complete")])
-            return ModelResponse(
-                parts=[
-                    ToolCallPart(
-                        "expert_run",
-                        {"expert_id": "workspace:echo", "task": "Return verified result"},
-                        "expert-call",
-                    )
-                ]
-            )
-        return ModelResponse(
-            parts=[
-                ToolCallPart(
-                    output_tools[0],
-                    {
-                        "status": "completed",
-                        "final_content": "verified result",
-                        "artifacts": [],
-                        "evidence": [],
-                        "findings": [],
-                        "unresolved": [],
-                    },
-                    "expert-output",
-                )
-            ]
-        )
 
     config = _config(
         tmp_path,
@@ -274,7 +261,20 @@ Return the assigned outcome as a structured report.
             "max_calls_per_turn": 2,
         },
     )
-    app = AeloonCoreOrchestrator(config, model=FunctionModel(respond))
+    app = AeloonCoreOrchestrator(
+        config,
+        model=_model(
+            _response(
+                _call(
+                    "expert_run",
+                    {"expert_id": "workspace:echo", "task": "Return verified result"},
+                    "expert-call",
+                )
+            ),
+            _response(_text("expert complete")),
+        ),
+    )
+    app.runners = ExpertRunnerRegistry({"builtin.prompt": FakePromptRunner()})
     result = await app.run_turn("Use the echo expert")
 
     assert result.final_content == "expert complete"

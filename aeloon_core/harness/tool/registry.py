@@ -36,6 +36,23 @@ class ToolRegistry:
 
         return self._tools.get(name)
 
+    def values(self) -> tuple[Tool, ...]:
+        """Return registered tools in stable advertisement order."""
+
+        return tuple(self._tools.values())
+
+    def copy(self) -> ToolRegistry:
+        """Copy definitions while preserving this registry's execution callbacks."""
+
+        duplicate = ToolRegistry(
+            execution_guard=self._execution_guard,
+            execution_started=self._execution_started,
+            execution_finished=self._execution_finished,
+        )
+        for tool in self._tools.values():
+            duplicate.register(tool)
+        return duplicate
+
     def get_definitions(self) -> list[dict[str, Any]]:
         """Get all tool definitions in Anthropic format."""
 

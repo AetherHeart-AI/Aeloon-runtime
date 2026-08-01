@@ -128,6 +128,72 @@ def test_completed_idempotency_accepts_records_written_before_status_field(
     ) is False
 
 
+def test_pydantic_ai_v2_history_is_migrated_without_rewriting_source(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    session_id = "previous-kernel"
+    record = {
+        "type": "turn",
+        "schema_version": 2,
+        "message_format": "pydantic-ai-v1",
+        "session_id": session_id,
+        "turn_id": "old-turn",
+        "messages": [
+            {
+                "kind": "request",
+                "parts": [
+                    {
+                        "part_kind": "user-prompt",
+                        "content": "inspect",
+                        "timestamp": "2026-01-01T00:00:00Z",
+                    }
+                ],
+            },
+            {
+                "kind": "response",
+                "model_name": "deepseek-v4-flash",
+                "parts": [
+                    {
+                        "part_kind": "tool-call",
+                        "tool_name": "read_file",
+                        "tool_call_id": "call-1",
+                        "args": {"path": "README.md"},
+                    }
+                ],
+                "usage": {"input_tokens": 4, "output_tokens": 2},
+            },
+            {
+                "kind": "request",
+                "parts": [
+                    {
+                        "part_kind": "tool-return",
+                        "tool_name": "read_file",
+                        "tool_call_id": "call-1",
+                        "content": "contents",
+                        "outcome": "success",
+                    }
+                ],
+            },
+        ],
+    }
+    path = store.session_path(session_id)
+    path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    migrated = store.load_messages(session_id)
+
+    assert [message["role"] for message in migrated] == [
+        "user",
+        "assistant",
+        "toolResult",
+    ]
+    assert migrated[1]["content"][0]["name"] == "read_file"
+    assert migrated[2]["toolCallId"] == "call-1"
+    assert json.loads(path.read_text(encoding="utf-8"))["message_format"] == (
+        "pydantic-ai-v1"
+    )
+
+
 def test_legacy_colliding_file_is_filtered_and_migrated_by_record_owner(
     tmp_path: Path,
 ) -> None:

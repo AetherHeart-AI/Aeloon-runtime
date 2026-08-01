@@ -1,6 +1,7 @@
 # Aeloon Core
 
-Aeloon Core is a conversation-scoped agent runtime built on Pydantic AI Harness.
+Aeloon Core is a conversation-scoped Python agent runtime whose provider layer
+uses `pi-ai` and whose tool loop uses `pi-agent-core` (Pi Core).
 It has two explicit capability-policy modes:
 
 - `normal`: Master can use every discovered plain Skill, every configured MCP
@@ -30,6 +31,7 @@ does not provide a generic DAG interface.
 ```bash
 uv sync
 bun --version  # requires Bun >= 1.3
+bun install --cwd aeloon_core/pi_runtime --frozen-lockfile
 
 export DEEPSEEK_API_KEY="your API key"
 export EXA_API_KEY="your Exa API key"  # only needed by builtin:research
@@ -176,7 +178,7 @@ experts must already have a manifest and registered runner.
 `builtin:research` runs a bounded research pipeline:
 
 1. a planner emits two to four independent assignments;
-2. explorers fan out with the Harness Exa tools;
+2. explorers fan out with Aeloon's scoped Exa tool;
 3. a docs stage verifies key claims against official or primary sources;
 4. a reducer produces direct URLs, uncertainty, and unresolved points.
 
@@ -276,11 +278,11 @@ aeloon_core/
 │   ├── skill/          # manifest parsing, discovery, scopes, lazy tools
 │   ├── expert/         # contracts, registry, runtime, runners, adapters
 │   ├── agent/          # Master prompt
-│   ├── capabilities.py # Ultra and Expert Harness capabilities
-│   ├── execution/      # Pydantic AI run engine and tracing
+│   ├── capabilities.py # Ultra and Expert capability policy
+│   ├── execution/      # Python ↔ Pi Core bridge, run policy, and tracing
 │   ├── model/          # Master/expert-stage routing
 │   ├── mcp/            # configured MCP loading and per-agent scopes
-│   ├── provider/       # provider construction
+│   ├── provider/       # pi-ai provider/model construction
 │   └── tool/           # host tool contracts and observation tools
 ├── conversation/       # persisted Master turns only
 ├── web/                # transport and live lifecycle projection
@@ -296,6 +298,7 @@ and tools live only in memory for the current turn.
 ```bash
 uv run pytest -q
 uv run ruff check .
+(cd aeloon_core/pi_runtime && bun install --frozen-lockfile)
 (cd aeloon_core/web && bun test)
 uv build
 git diff --check

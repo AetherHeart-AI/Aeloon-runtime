@@ -8,9 +8,6 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from pydantic_ai.models import Model
-from pydantic_ai.settings import ModelSettings
-
 from aeloon_core.config import Config
 from aeloon_core.conversation import SessionStore
 from aeloon_core.harness.agent.prompt import (
@@ -26,7 +23,6 @@ from aeloon_core.harness.capabilities import (
 from aeloon_core.harness.execution import (
     AgentRunSpec,
     AgentRunStatus,
-    CapabilityManifest,
     HarnessAgentRuntime,
     accumulate_usage,
     deserialize_messages,
@@ -39,6 +35,7 @@ from aeloon_core.harness.expert import (
 )
 from aeloon_core.harness.mcp import McpRegistry
 from aeloon_core.harness.model import ModelRouter
+from aeloon_core.harness.provider import PiModelLike, PiModelSettings
 from aeloon_core.harness.skill import SkillRegistry, skill_tools
 from aeloon_core.harness.tool import ToolRegistry
 
@@ -66,8 +63,8 @@ class AeloonCoreOrchestrator:
         self,
         config: Config,
         *,
-        model: Model | None = None,
-        model_settings: ModelSettings | None = None,
+        model: PiModelLike | None = None,
+        model_settings: PiModelSettings | None = None,
         mcp: McpRegistry | None = None,
         web_capability_factory: WebCapabilityFactory | None = None,
     ) -> None:
@@ -97,13 +94,13 @@ class AeloonCoreOrchestrator:
         self.web_capability_factory = web_capability_factory
 
     @property
-    def model(self) -> Model:
+    def model(self) -> PiModelLike:
         """Return the currently resolved Master model."""
 
         return self.model_router.resolve_master().model
 
     @model.setter
-    def model(self, value: Model) -> None:
+    def model(self, value: PiModelLike) -> None:
         self.model_router.set_injected_model(value, settings=self.model_settings)
 
     async def run_turn(
@@ -119,7 +116,7 @@ class AeloonCoreOrchestrator:
         self.sessions.session_path(actual_session_id)
         turn_id = str(getattr(on_progress, "turn_id", "") or uuid.uuid4().hex[:12])
         stored_messages = await asyncio.to_thread(
-            self.sessions.load_pydantic_messages,
+            self.sessions.load_messages,
             actual_session_id,
         )
         history = deserialize_messages(stored_messages)
@@ -170,10 +167,6 @@ class AeloonCoreOrchestrator:
                 tools=tools,
                 output_type=str,
                 terminal_models={},
-                capability_manifest=CapabilityManifest.from_registry(
-                    tools,
-                    namespace="master",
-                ),
                 request_limit=defaults.max_iterations,
                 max_retries=policy.max_retries,
                 max_output_tokens=defaults.max_output_tokens,
@@ -185,7 +178,6 @@ class AeloonCoreOrchestrator:
                 progress=on_progress,
                 capabilities=master_capabilities(self.config),
                 toolsets=self.master_mcp_toolsets,
-                prompt_cache=binding.prompt_cache,
             )
         )
         messages = serialize_messages(outcome.messages)

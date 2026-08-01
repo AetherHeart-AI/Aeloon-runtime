@@ -248,6 +248,40 @@ def test_removed_durable_settings_are_dropped_during_config_load(
     assert dumped["experts"]["stage_request_limit"] == 7
 
 
+def test_split_manifest_settings_migrate_to_the_unified_skill_config(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "workspace": str(tmp_path / "repo"),
+                "skills": {
+                    "roots": [{"id": "plain", "path": "../plain-skills"}],
+                    "master_allowlist": ["plain:style"],
+                    "master_preload": ["plain:style", "plain:workflow"],
+                },
+                "experts": {
+                    "roots": [{"id": "team", "path": "../team-experts"}],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert [root.id for root in config.skills.roots] == ["plain", "team"]
+    assert [root.path for root in config.skills.roots] == [
+        (tmp_path / "plain-skills").resolve(),
+        (tmp_path / "team-experts").resolve(),
+    ]
+    assert config.skills.master_allowlist == ["plain:style", "plain:workflow"]
+    dumped = config.model_dump(mode="json")
+    assert "master_preload" not in dumped["skills"]
+    assert "roots" not in dumped["experts"]
+
+
 def test_config_set_writes_expert_model_and_runtime_limits(
     tmp_path: Path,
 ) -> None:

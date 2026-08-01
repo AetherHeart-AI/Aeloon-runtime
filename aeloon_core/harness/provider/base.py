@@ -1,48 +1,79 @@
-"""Provider-neutral model bundles, transports, and prompt-cache helpers."""
+"""Provider-neutral Pi model bundles and request settings."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Protocol, runtime_checkable
 
-import httpx
-from pydantic_ai.models import Model
-from pydantic_ai.providers import Provider
-from pydantic_ai.settings import ModelSettings
+PiModelSettings = dict[str, Any]
+
+
+@runtime_checkable
+class PiModelLike(Protocol):
+    """Small Python-side model contract consumed by the Pi runtime bridge."""
+
+    provider: str
+    model_id: str
+
+    def to_runtime(self) -> dict[str, Any]:
+        """Return the JSON payload used to resolve a pi-ai model."""
+
+
+@dataclass(frozen=True, slots=True)
+class PiModel:
+    """A provider/model selection resolved by pi-ai in the Bun process."""
+
+    provider: str
+    model_id: str
+    api_key: str = field(repr=False)
+    proxy: str | None = None
+
+    @property
+    def model_name(self) -> str:
+        """Compatibility spelling used by existing routing and display code."""
+
+        return self.model_id
+
+    def to_runtime(self) -> dict[str, Any]:
+        return {
+            "kind": "pi-ai",
+            "provider": self.provider,
+            "model_id": self.model_id,
+            "api_key": self.api_key,
+            "proxy": self.proxy,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ScriptedPiModel:
+    """Deterministic pi-core test model backed by serialized responses."""
+
+    responses: tuple[dict[str, Any], ...]
+    provider: str = "aeloon-test"
+    model_id: str = "scripted"
+
+    @property
+    def model_name(self) -> str:
+        return self.model_id
+
+    def to_runtime(self) -> dict[str, Any]:
+        return {
+            "kind": "scripted",
+            "provider": self.provider,
+            "model_id": self.model_id,
+            "responses": list(self.responses),
+        }
 
 
 @dataclass(slots=True)
-class PromptCacheState:
-    """Process-local prompt-cache capability state for one endpoint."""
+class PiModelBundle:
+    """A pi-ai model reference and settings owned by Aeloon."""
 
-    disabled: bool = False
-
-
-@dataclass(slots=True)
-class PydanticModelBundle:
-    """A model, provider, settings, and transport owned by Aeloon."""
-
-    model: Model
-    provider: Provider[Any]
-    settings: ModelSettings
-    http_client: httpx.AsyncClient
-    prompt_cache: PromptCacheState | None = None
+    model: PiModel
+    settings: PiModelSettings
 
     async def close(self) -> None:
-        await self.http_client.aclose()
-
-
-def _http_client(
-    *,
-    proxy: str | None,
-    timeout: int,
-    extra_headers: dict[str, str],
-) -> httpx.AsyncClient:
-    return httpx.AsyncClient(
-        proxy=proxy,
-        timeout=httpx.Timeout(timeout),
-        headers=extra_headers or None,
-    )
+        """Pi transports are process-local and close with each bridge run."""
 
 
 def _base_settings(
@@ -51,74 +82,22 @@ def _base_settings(
     reasoning_effort: str | None,
     timeout: int,
     extra_headers: dict[str, str],
-) -> ModelSettings:
-    settings: ModelSettings = {
+) -> PiModelSettings:
+    settings: PiModelSettings = {
         "temperature": temperature,
-        "timeout": timeout,
+        "timeout_ms": int(timeout * 1_000),
     }
     if reasoning_effort:
-        settings["thinking"] = reasoning_effort  # type: ignore[typeddict-item]
+        settings["reasoning"] = reasoning_effort
     if extra_headers:
-        settings["extra_headers"] = dict(extra_headers)
+        settings["headers"] = dict(extra_headers)
     return settings
 
 
-def without_prompt_caching(settings: dict[str, Any] | None) -> dict[str, Any]:
-    """Return model settings with every Anthropic prompt-cache switch removed."""
-
-    return {
-        key: value
-        for key, value in (settings or {}).items()
-        if key
-        not in {
-            "anthropic_cache",
-            "anthropic_cache_messages",
-            "anthropic_cache_instructions",
-            "anthropic_cache_tool_definitions",
-        }
-    }
-
-
-def prompt_caching_enabled(settings: dict[str, Any] | None) -> bool:
-    return any(
-        bool((settings or {}).get(key))
-        for key in (
-            "anthropic_cache",
-            "anthropic_cache_messages",
-            "anthropic_cache_instructions",
-            "anthropic_cache_tool_definitions",
-        )
-    )
-
-
-def is_prompt_caching_unsupported_error(exc: Exception) -> bool:
-    """Recognize explicit cache-field compatibility failures."""
-
-    body = getattr(exc, "body", None)
-    text = f"{exc} {body}".lower()
-    field_markers = ("cache_control", "cache control", "prompt cache", "prompt caching")
-    rejection_markers = (
-        "does not support",
-        "extra_forbidden",
-        "extra fields not permitted",
-        "invalid field",
-        "not allowed",
-        "not supported",
-        "unexpected argument",
-        "unknown field",
-        "unknown parameter",
-        "unrecognized",
-        "unsupported",
-    )
-    return any(marker in text for marker in field_markers) and any(
-        marker in text for marker in rejection_markers
-    )
-
-
 __all__ = [
-    "PromptCacheState",
-    "PydanticModelBundle",
-    "is_prompt_caching_unsupported_error",
-    "prompt_caching_enabled",
-    "without_prompt_caching",
+    "PiModel",
+    "PiModelBundle",
+    "PiModelLike",
+    "PiModelSettings",
+    "ScriptedPiModel",
 ]

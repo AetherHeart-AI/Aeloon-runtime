@@ -24,7 +24,7 @@ _REMOVED_V1_AGENT_DEFAULTS = frozenset(
 
 
 class DeepSeekProviderConfig(BaseModel):
-    """Credentials and transport settings for Pydantic AI's DeepSeek provider."""
+    """Credentials and transport settings for pi-ai's DeepSeek provider."""
 
     api_key: str = "no-key"
     extra_headers: dict[str, str] = Field(default_factory=dict)
@@ -46,7 +46,7 @@ class ContextCompactionConfig(BaseModel):
 
 
 class AgentRuntimePolicy(BaseModel):
-    """Host policy layered around the PydanticAI execution loop."""
+    """Host policy layered around the pi-core execution loop."""
 
     transition_trace_enabled: bool = True
     stuck_detection_enabled: bool = True
@@ -447,6 +447,28 @@ def _drop_removed_orchestration_settings(data: Any) -> None:
     skills = data.get("skills")
     if isinstance(skills, dict):
         skills.pop("enabled", None)
+        master_preload = skills.pop("master_preload", None)
+        master_allowlist = skills.setdefault("master_allowlist", [])
+        if isinstance(master_preload, list) and isinstance(master_allowlist, list):
+            master_allowlist.extend(
+                skill_id
+                for skill_id in master_preload
+                if skill_id not in master_allowlist
+            )
+
+    experts = data.get("experts")
+    if isinstance(experts, dict):
+        expert_roots = experts.pop("roots", None)
+        if isinstance(expert_roots, list):
+            if not isinstance(skills, dict):
+                skills = data.setdefault("skills", {})
+            if isinstance(skills, dict):
+                skill_roots = skills.setdefault("roots", [])
+                if isinstance(skill_roots, list):
+                    for root in expert_roots:
+                        if root not in skill_roots:
+                            skill_roots.append(root)
+
     agents = data.get("agents")
     if not isinstance(agents, dict):
         return

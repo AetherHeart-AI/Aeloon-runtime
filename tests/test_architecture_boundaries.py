@@ -24,6 +24,7 @@ EXPECTED_HARNESS_FEATURES = {
     },
     "execution": {
         "__init__.py",
+        "bridge.py",
         "engine.py",
         "events.py",
         "stuck.py",

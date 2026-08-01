@@ -14,10 +14,13 @@ from pathlib import Path
 from typing import Any
 
 from aeloon_core.conversation.history import (
+    LEGACY_PYDANTIC_AI_MESSAGE_FORMAT,
+    LEGACY_PYDANTIC_AI_SCHEMA_VERSION,
     MESSAGE_FORMAT,
     MESSAGE_SCHEMA_VERSION,
     LegacySessionError,
     deserialize_messages,
+    migrate_pydantic_messages,
 )
 
 _ENCODED_SESSION_PREFIX = "~"
@@ -56,24 +59,28 @@ class SessionStore:
 
         return self._canonical_path(self.sessions_dir, session_id)
 
-    def load_pydantic_messages(self, session_id: str) -> list[dict[str, Any]]:
-        """Load executable v2 history, rejecting but never altering legacy data."""
+    def load_messages(self, session_id: str) -> list[dict[str, Any]]:
+        """Load Pi history, translating the immediately previous wire format."""
 
         records = self._read_records(session_id)
         if not records:
             return []
         record = records[-1]
+        schema_version = record.get("schema_version")
+        message_format = record.get("message_format")
+        messages = record.get("messages")
         if (
-            record.get("schema_version") != MESSAGE_SCHEMA_VERSION
-            or record.get("message_format") != MESSAGE_FORMAT
+            schema_version == LEGACY_PYDANTIC_AI_SCHEMA_VERSION
+            and message_format == LEGACY_PYDANTIC_AI_MESSAGE_FORMAT
         ):
+            return migrate_pydantic_messages(messages)
+        if schema_version != MESSAGE_SCHEMA_VERSION or message_format != MESSAGE_FORMAT:
             raise LegacySessionError(
                 f"Session {session_id!r} uses the legacy message format; "
                 "create a new session to continue. Existing data was not modified."
             )
-        messages = record.get("messages")
         if not isinstance(messages, list):
-            raise ValueError("PydanticAI session record has no message array")
+            raise ValueError("Pi session record has no message array")
         return messages
 
     def append_turn_once(

@@ -3,21 +3,26 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
-from pydantic_ai.toolsets import FunctionToolset
 
 from aeloon_core.config import Config
 from aeloon_core.harness.mcp import McpConfigError, McpRegistry
 from aeloon_core.harness.skill import ExpertSkillSnapshot, SkillRegistry
 
 
+@dataclass(frozen=True)
+class _FakeToolset:
+    id: str
+
+
 def _registry() -> McpRegistry:
     return McpRegistry(
         {
-            "docs": FunctionToolset(id="docs"),
-            "github": FunctionToolset(id="github"),
+            "docs": _FakeToolset(id="docs"),
+            "github": _FakeToolset(id="github"),
         }
     )
 

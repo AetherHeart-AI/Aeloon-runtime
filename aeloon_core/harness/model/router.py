@@ -6,9 +6,6 @@ import asyncio
 from dataclasses import dataclass
 from typing import Literal
 
-from pydantic_ai.models import Model
-from pydantic_ai.settings import ModelSettings
-
 from aeloon_core.config import (
     KNOWN_PROVIDERS,
     Config,
@@ -17,8 +14,9 @@ from aeloon_core.config import (
     parse_model_ref,
 )
 from aeloon_core.harness.provider import (
-    PromptCacheState,
-    PydanticModelBundle,
+    PiModelBundle,
+    PiModelLike,
+    PiModelSettings,
     build_deepseek_model,
 )
 
@@ -32,10 +30,9 @@ class ModelBinding:
     provider: ProviderName | Literal["injected"]
     model_name: str
     route: RouteKind
-    model: Model
-    settings: ModelSettings
-    prompt_cache: PromptCacheState | None
-    bundle: PydanticModelBundle | None = None
+    model: PiModelLike
+    settings: PiModelSettings
+    bundle: PiModelBundle | None = None
 
     @property
     def model_ref(self) -> str:
@@ -53,19 +50,19 @@ class ModelRouter:
         self,
         config: Config,
         *,
-        injected_model: Model | None = None,
-        injected_settings: ModelSettings | None = None,
+        injected_model: PiModelLike | None = None,
+        injected_settings: PiModelSettings | None = None,
     ) -> None:
         self.config = config
-        self._bundles: dict[tuple[str, str], PydanticModelBundle] = {}
+        self._bundles: dict[tuple[str, str], PiModelBundle] = {}
         self._injected_model = injected_model
         self._injected_settings = dict(injected_settings or {})
 
     def set_injected_model(
         self,
-        model: Model,
+        model: PiModelLike,
         *,
-        settings: ModelSettings | None = None,
+        settings: PiModelSettings | None = None,
     ) -> None:
         """Override every route, preserving the legacy embedding/test surface."""
 
@@ -172,7 +169,6 @@ class ModelRouter:
                 route="injected",
                 model=self._injected_model,
                 settings=dict(self._injected_settings),
-                prompt_cache=None,
             )
         key = (provider, model_name)
         bundle = self._bundles.get(key)
@@ -192,7 +188,6 @@ class ModelRouter:
             route=route,
             model=bundle.model,
             settings=dict(bundle.settings),
-            prompt_cache=bundle.prompt_cache,
             bundle=bundle,
         )
 

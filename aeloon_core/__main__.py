@@ -227,7 +227,7 @@ def _add_config_write_args(parser: argparse.ArgumentParser) -> None:
         "--provider",
         choices=("deepseek",),
         default=None,
-        help="Pydantic AI model provider (default: deepseek).",
+        help="pi-ai model provider (default: deepseek).",
     )
     parser.add_argument(
         "--api-key",

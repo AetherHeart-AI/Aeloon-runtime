@@ -5,11 +5,10 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-from pydantic_ai.messages import ModelResponse, TextPart
-from pydantic_ai.models.function import FunctionModel
 
 from aeloon_core.config import AgentRoutingConfig, AgentsConfig, Config
 from aeloon_core.harness.model import ModelRouter
+from aeloon_core.harness.provider import ScriptedPiModel
 
 
 @pytest.mark.asyncio
@@ -74,7 +73,7 @@ async def test_routing_profile_can_override_provider_and_model() -> None:
 
 
 def test_injected_model_applies_to_master_and_all_expert_stages() -> None:
-    model = FunctionModel(lambda _messages, _info: ModelResponse(parts=[TextPart("done")]))
+    model = ScriptedPiModel(({"text": "done"},))
     router = ModelRouter(Config(), injected_model=model, injected_settings={"temperature": 0})
 
     assert router.resolve_master().model is model
@@ -104,9 +103,9 @@ async def test_router_closes_each_reused_bundle_exactly_once(
 
     def build_bundle(**kwargs):
         model_name = kwargs["model_name"]
-        model = FunctionModel(
-            lambda _messages, _info: ModelResponse(parts=[TextPart("done")]),
-            model_name=model_name,
+        model = ScriptedPiModel(
+            ({"text": "done"},),
+            model_id=model_name,
         )
 
         async def close() -> None:
@@ -115,7 +114,6 @@ async def test_router_closes_each_reused_bundle_exactly_once(
         return SimpleNamespace(
             model=model,
             settings={},
-            prompt_cache=None,
             close=close,
         )
 

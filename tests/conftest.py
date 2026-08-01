@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-import pydantic_ai.models
+from pathlib import Path
+
 import pytest
 
 # Keep file-based config tests deterministic regardless of the host shell.
@@ -22,17 +23,13 @@ _CONFIG_ENV_OVERRIDES = (
     "EXA_API_KEY",
 )
 
-
 @pytest.fixture(autouse=True)
-def forbid_real_model_requests(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Every model-driving test must use TestModel or FunctionModel explicitly."""
-
-    monkeypatch.setattr(pydantic_ai.models, "ALLOW_MODEL_REQUESTS", False)
-
-
-@pytest.fixture(autouse=True)
-def clear_config_environment_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+def clear_config_environment_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     """Isolate load_config() from developer shell credentials and model defaults."""
 
     for name in _CONFIG_ENV_OVERRIDES:
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("AELOON_CORE_CONFIG", str(tmp_path / "isolated-config.json"))

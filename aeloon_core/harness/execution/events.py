@@ -17,7 +17,7 @@ class ToolCallView:
 
 
 class ToolExecutionState(StrEnum):
-    """Lifecycle state for one PydanticAI-managed tool execution."""
+    """Lifecycle state for one pi-core-managed tool execution."""
 
     PENDING = "pending"
     RUNNING = "running"

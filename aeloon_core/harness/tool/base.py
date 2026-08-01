@@ -28,7 +28,7 @@ class Tool(ABC):
         """Execute the tool with validated parameters."""
 
     def to_schema(self) -> dict[str, Any]:
-        """Convert the tool to Anthropic's client-tool schema."""
+        """Convert the tool to the JSON schema consumed by the Pi bridge."""
 
         return {
             "name": self.name,

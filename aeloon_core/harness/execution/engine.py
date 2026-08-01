@@ -1,60 +1,28 @@
-"""One PydanticAI execution engine shared by Master and Worker actors."""
+"""One pi-core execution engine shared by Master and Expert actors."""
 
 from __future__ import annotations
 
 import hashlib
 import inspect
 import json
-from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import asdict, dataclass, field, replace
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
+from pathlib import Path
 from typing import Any, Literal
 
+from jsonschema import Draft202012Validator
 from loguru import logger
 from pydantic import BaseModel, ValidationError
-from pydantic_ai import (
-    Agent,
-    ModelRetry,
-    RunContext,
-    Tool,
-    ToolOutput,
-    capture_run_messages,
-)
-from pydantic_ai.capabilities import Hooks, ProcessHistory
-from pydantic_ai.exceptions import (
-    ModelHTTPError,
-    UnexpectedModelBehavior,
-    UsageLimitExceeded,
-)
-from pydantic_ai.messages import (
-    FunctionToolCallEvent,
-    FunctionToolResultEvent,
-    InstructionPart,
-    ModelMessage,
-    ModelMessagesTypeAdapter,
-    ModelRequest,
-    ModelResponse,
-    PartDeltaEvent,
-    RetryPromptPart,
-    TextPart,
-    TextPartDelta,
-    ThinkingPart,
-    ThinkingPartDelta,
-    ToolCallPart,
-    ToolReturnPart,
-)
-from pydantic_ai.models import Model, ModelRequestContext
-from pydantic_ai.run import AgentRunResult
-from pydantic_ai.settings import ModelSettings
-from pydantic_ai.toolsets import AbstractToolset, FunctionToolset
-from pydantic_ai.usage import RunUsage, UsageLimits
 
 from aeloon_core.conversation.history import (
     MESSAGE_FORMAT,
     MESSAGE_SCHEMA_VERSION,
+    PiMessage,
     deserialize_messages,
     serialize_messages,
 )
+from aeloon_core.harness.execution.bridge import PiRuntimeBridge
 from aeloon_core.harness.execution.events import (
     ModelResponseView,
     ToolCallView,
@@ -63,20 +31,12 @@ from aeloon_core.harness.execution.events import (
 )
 from aeloon_core.harness.execution.stuck import detect_repeated_tool_exchanges
 from aeloon_core.harness.execution.transitions import NodeKind, TransitionRecord
-from aeloon_core.harness.provider import (
-    PromptCacheState,
-    is_prompt_caching_unsupported_error,
-    prompt_caching_enabled,
-    without_prompt_caching,
-)
+from aeloon_core.harness.mcp.registry import connect_mcp_toolsets
+from aeloon_core.harness.provider import PiModelLike, PiModelSettings
 from aeloon_core.harness.tool.registry import ToolRegistry
 
 AgentRole = Literal["master", "expert"]
 OutputValidator = Callable[..., Awaitable[Any] | Any]
-HistoryProcessor = Callable[
-    [RunContext["AeloonRunDeps"], list[ModelMessage]],
-    Awaitable[list[ModelMessage]] | list[ModelMessage],
-]
 
 
 class AgentRunStatus(StrEnum):
@@ -86,8 +46,24 @@ class AgentRunStatus(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class TerminalOutput:
+    """One model-visible terminal tool backed by a Pydantic result model."""
+
+    model: type[BaseModel]
+    name: str
+    description: str
+
+    def definition(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "input_schema": _strip_titles(self.model.model_json_schema()),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class CapabilityManifest:
-    """Immutable host-owned capability boundary for one model run."""
+    """Immutable host-owned capability boundary for one Pi run."""
 
     namespace: str
     tool_names: tuple[str, ...]
@@ -102,11 +78,13 @@ class CapabilityManifest:
         namespace: str,
         terminal_names: Sequence[str] = (),
         snapshot_digest: str | None = None,
+        additional_tool_names: Sequence[str] = (),
     ) -> CapabilityManifest:
         return cls(
             namespace=namespace,
-            tool_names=tuple(
-                str(definition["name"]) for definition in registry.get_definitions()
+            tool_names=(
+                *(str(definition["name"]) for definition in registry.get_definitions()),
+                *additional_tool_names,
             ),
             terminal_names=tuple(terminal_names),
             snapshot_digest=snapshot_digest,
@@ -115,7 +93,7 @@ class CapabilityManifest:
 
 @dataclass(slots=True)
 class AeloonRunDeps:
-    """Host-owned policy and observability state available to one Agent run."""
+    """Host-owned policy and observability state for one pi-core loop."""
 
     role: AgentRole
     tools: ToolRegistry
@@ -125,25 +103,29 @@ class AeloonRunDeps:
     session_id: str | None = None
     turn_id: str | None = None
     max_tokens: int | None = None
+    max_tool_calls: int | None = None
+    max_retries: int = 3
     stuck_detection_enabled: bool = True
     stuck_detection_threshold: int = 4
-    prompt_cache: PromptCacheState | None = None
     tools_used: list[str] = field(default_factory=list)
     tool_observations: list[ToolObservation] = field(default_factory=list)
     transitions: list[TransitionRecord] = field(default_factory=list)
     tool_calls: dict[str, ToolCallView] = field(default_factory=dict)
-    progress_call_ids: set[str] = field(default_factory=set)
-    progress_result_ids: set[str] = field(default_factory=set)
     transition_sequence: int = 0
     transition_digest: str = ""
+    tool_call_count: int = 0
+    validation_failures: int = 0
 
     @property
     def tool_modes(self) -> dict[str, str]:
-        return {
+        modes = {
             definition["name"]: self.tools.get(str(definition["name"])).concurrency_mode
             for definition in self.tools.get_definitions()
             if self.tools.get(str(definition["name"])) is not None
         }
+        for name in self.capability_manifest.tool_names:
+            modes.setdefault(name, "exclusive")
+        return modes
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,19 +138,27 @@ class ToolObservation:
 
 
 @dataclass(slots=True)
+class PiRunContext:
+    """Minimal context supplied to compatibility output validators."""
+
+    deps: AeloonRunDeps
+    messages: list[PiMessage]
+
+
+@dataclass(slots=True)
 class AgentRunSpec:
-    """Everything that varies between one Master or Worker invocation."""
+    """Everything that varies between one Master or Expert invocation."""
 
     role: AgentRole
-    model: Model
+    model: PiModelLike
     instructions: str
     prompt: str
-    history: list[ModelMessage]
+    history: list[PiMessage]
     tools: ToolRegistry
     output_type: Any
     terminal_models: dict[str, type[BaseModel]]
     capability_manifest: CapabilityManifest | None = None
-    model_settings: ModelSettings | None = None
+    model_settings: PiModelSettings | None = None
     request_limit: int | None = None
     max_retries: int = 3
     max_tool_calls: int | None = None
@@ -178,191 +168,203 @@ class AgentRunSpec:
     session_id: str | None = None
     turn_id: str | None = None
     output_validator: OutputValidator | None = None
-    history_processor: HistoryProcessor | None = None
+    on_transition: Callable[[TransitionRecord], Any] | None = None
     transition_trace_enabled: bool = True
     stuck_detection_enabled: bool = True
     stuck_detection_threshold: int = 4
-    prompt_cache: PromptCacheState | None = None
-    on_transition: Callable[[TransitionRecord], Any] | None = None
     capabilities: Sequence[Any] = ()
-    toolsets: Sequence[AbstractToolset[Any]] = ()
+    toolsets: Sequence[Any] = ()
 
 
 @dataclass(slots=True)
 class AgentRunOutcome:
     status: AgentRunStatus
     output: Any | None
-    messages: list[ModelMessage]
+    messages: list[PiMessage]
     usage: dict[str, int]
     tools_used: list[str]
     transitions: list[TransitionRecord]
     failure: str | None = None
 
 
-class AeloonToolset(FunctionToolset[AeloonRunDeps]):
-    """Expose exactly one host-resolved ToolRegistry to PydanticAI."""
+class PiAgentRuntime:
+    """Drive pi-agent-core while keeping tools and policy in Python."""
 
-    def __init__(self, registry: ToolRegistry, *, max_retries: int) -> None:
-        super().__init__(max_retries=max_retries, id="aeloon-tools")
-        self.registry = registry
-        for definition in registry.get_definitions():
-            name = str(definition["name"])
-            host_tool = registry.get(name)
-            assert host_tool is not None
-            self.add_tool(
-                Tool.from_schema(
-                    self._call_host_tool(name),
-                    name=name,
-                    description=str(definition.get("description") or ""),
-                    json_schema=dict(definition["input_schema"]),
-                    takes_ctx=True,
-                    sequential=host_tool.concurrency_mode != "read_only",
-                    args_validator=self._validate_host_tool(name),
-                )
-            )
-
-    def _call_host_tool(self, name: str) -> Callable[..., Awaitable[str]]:
-        async def call(ctx: RunContext[AeloonRunDeps], **kwargs: Any) -> str:
-            result = await self.registry.execute(name, kwargs)
-            ctx.deps.tools_used.append(name)
-            ctx.deps.tool_observations.append(
-                ToolObservation(
-                    name=name,
-                    arguments=dict(kwargs),
-                    result=result,
-                )
-            )
-            return result
-
-        return call
-
-    def _validate_host_tool(self, name: str) -> Callable[..., None]:
-        def validate(_ctx: RunContext[AeloonRunDeps], **kwargs: Any) -> None:
-            tool = self.registry.get(name)
-            if tool is None:
-                raise ModelRetry(f"Tool {name!r} is no longer available in this namespace.")
-            try:
-                tool.args_model.model_validate(kwargs)
-            except ValidationError as exc:
-                raise ModelRetry(_validation_retry(name, exc)) from exc
-
-        return validate
-
-
-class HarnessAgentRuntime:
-    """Compose Pydantic AI with Harness capabilities and Aeloon policy hooks."""
+    def __init__(self, *, bridge: PiRuntimeBridge | None = None) -> None:
+        self.bridge = bridge or PiRuntimeBridge()
 
     async def run(self, spec: AgentRunSpec) -> AgentRunOutcome:
-        request_limit = (
-            None
-            if spec.request_limit is None
-            else max(1, int(spec.request_limit))
-        )
+        if spec.toolsets:
+            async with connect_mcp_toolsets(tuple(spec.toolsets)) as mcp_tools:
+                tools = spec.tools.copy()
+                for tool in mcp_tools:
+                    tools.register(tool)
+                return await self.run(
+                    replace(
+                        spec,
+                        tools=tools,
+                        toolsets=(),
+                        capability_manifest=None,
+                    )
+                )
+        request_limit = None if spec.request_limit is None else max(1, int(spec.request_limit))
         max_retries = max(0, int(spec.max_retries))
+        terminals = _terminal_outputs(spec)
+        terminal_models = {terminal.name: terminal.model for terminal in terminals}
+        registry = spec.tools.copy()
+        runtime_capabilities: list[dict[str, Any]] = []
+        builtin_names: list[str] = []
+        workspace = Path.cwd()
+        for capability in spec.capabilities:
+            for tool in getattr(capability, "host_tools", lambda: ())():
+                registry.register(tool)
+            runtime = getattr(capability, "runtime_config", lambda: None)()
+            if runtime is None:
+                continue
+            runtime_capabilities.append(runtime)
+            if runtime.get("kind") == "filesystem":
+                workspace = Path(runtime["cwd"])
+                names = runtime.get("tool_names") or {}
+                builtin_names.extend(
+                    (
+                        str(names.get("read") or "read"),
+                        str(names.get("write") or "write"),
+                        str(names.get("edit") or "edit"),
+                    )
+                )
+            elif runtime.get("kind") == "shell":
+                workspace = Path(runtime["cwd"])
+                builtin_names.append(str(runtime.get("tool_name") or "bash"))
+
         manifest = spec.capability_manifest or CapabilityManifest.from_registry(
-            spec.tools,
+            registry,
             namespace=spec.role,
-            terminal_names=spec.terminal_models,
+            terminal_names=terminal_models,
+            additional_tool_names=builtin_names,
         )
-        _validate_capability_manifest(spec, manifest)
+        _validate_capability_manifest(registry, terminal_models, builtin_names, manifest)
         deps = AeloonRunDeps(
             role=spec.role,
-            tools=spec.tools,
-            terminal_models=dict(spec.terminal_models),
+            tools=registry,
+            terminal_models=terminal_models,
             capability_manifest=manifest,
             progress=spec.progress,
             session_id=spec.session_id,
             turn_id=spec.turn_id,
             max_tokens=spec.max_tokens,
+            max_tool_calls=spec.max_tool_calls,
+            max_retries=max_retries,
             stuck_detection_enabled=spec.stuck_detection_enabled,
             stuck_detection_threshold=spec.stuck_detection_threshold,
-            prompt_cache=spec.prompt_cache,
             transition_digest=_messages_digest(spec.history),
         )
-        hooks = self._hooks(spec, deps)
-        capabilities: list[Any] = [hooks, *spec.capabilities]
-        if spec.history_processor is not None:
-            capabilities.append(ProcessHistory(spec.history_processor))
-        if request_limit is not None:
-            capabilities.append(
-                self._final_request_guard(
-                    spec,
-                    request_limit=request_limit,
-                )
-            )
-
-        agent = Agent[AeloonRunDeps, Any](
-            spec.model,
-            output_type=spec.output_type,
-            instructions=spec.instructions,
-            deps_type=AeloonRunDeps,
-            toolsets=[
-                AeloonToolset(spec.tools, max_retries=max_retries),
-                *spec.toolsets,
-            ],
-            retries=max_retries,
-            end_strategy="early",
-            capabilities=capabilities,
+        tool_schemas: dict[str, dict[str, Any]] = {
+            str(definition["name"]): dict(definition["input_schema"])
+            for definition in registry.get_definitions()
+        }
+        terminal_definitions = [terminal.definition() for terminal in terminals]
+        tool_schemas.update(
+            {str(definition["name"]): dict(definition["input_schema"])
+             for definition in terminal_definitions}
         )
-        if spec.output_validator is not None:
-            validator = spec.output_validator
 
-            @agent.output_validator
-            async def validate_output(
-                _ctx: RunContext[AeloonRunDeps], output: Any
-            ) -> Any:
-                validated = _invoke_output_validator(validator, _ctx, output)
-                if inspect.isawaitable(validated):
-                    return await validated
-                return validated
+        async def on_rpc(message: dict[str, Any]) -> dict[str, Any]:
+            method = message.get("method")
+            payload = message.get("payload")
+            if not isinstance(payload, dict):
+                raise ValueError("Pi RPC payload must be an object")
+            if method == "tool_call":
+                name = str(payload.get("name") or "")
+                arguments = payload.get("arguments")
+                if not isinstance(arguments, dict):
+                    arguments = {}
+                result = await registry.execute(name, arguments)
+                deps.tool_observations.append(ToolObservation(name, dict(arguments), result))
+                return {
+                    "result": result,
+                    "is_error": result.lstrip().lower().startswith("error"),
+                }
+            if method == "preflight":
+                return _preflight(deps, payload, tool_schemas)
+            raise ValueError(f"unknown Pi RPC method: {method!r}")
 
-        usage = RunUsage()
-        captured: list[ModelMessage]
-        result: AgentRunResult[Any] | None = None
-        status = AgentRunStatus.COMPLETED
-        failure: str | None = None
-        with capture_run_messages() as captured:
-            try:
-                model_settings = dict(spec.model_settings or {})
-                if spec.max_output_tokens is not None:
-                    configured = model_settings.get("max_tokens")
-                    model_settings["max_tokens"] = (
-                        min(int(configured), spec.max_output_tokens)
-                        if configured is not None
-                        else spec.max_output_tokens
+        async def on_event(message: dict[str, Any]) -> None:
+            await self._on_event(deps, spec, message)
+
+        instructions = spec.instructions
+        if terminals:
+            names = ", ".join(terminal.name for terminal in terminals)
+            instructions += (
+                "\n\nSTRUCTURED COMPLETION: Plain text cannot complete this run. "
+                f"Finish by calling exactly one terminal tool: {names}."
+            )
+        payload = {
+            "model": spec.model.to_runtime(),
+            "settings": dict(spec.model_settings or {}),
+            "instructions": instructions,
+            "prompt": spec.prompt,
+            "history": serialize_messages(spec.history),
+            "tools": [
+                {
+                    **definition,
+                    "mode": registry.get(str(definition["name"])).concurrency_mode,
+                }
+                for definition in registry.get_definitions()
+            ],
+            "terminals": terminal_definitions,
+            "capabilities": runtime_capabilities,
+            "workspace": str(workspace),
+            "request_limit": request_limit,
+            "max_retries": max_retries,
+            "max_tool_calls": spec.max_tool_calls,
+            "max_tokens": spec.max_tokens,
+            "max_output_tokens": spec.max_output_tokens,
+            "session_id": spec.session_id,
+            "turn_id": spec.turn_id,
+        }
+        try:
+            raw = await self.bridge.run(payload, on_rpc=on_rpc, on_event=on_event)
+        finally:
+            for capability in spec.capabilities:
+                close = getattr(capability, "close", None)
+                if close is None:
+                    continue
+                try:
+                    closed = close()
+                    if inspect.isawaitable(closed):
+                        await closed
+                except Exception as exc:
+                    logger.warning(
+                        "Ignoring capability cleanup failure for {}: {}",
+                        type(capability).__name__,
+                        exc,
                     )
-                event_stream_handler = self._event_stream_handler
-                if (
-                    hasattr(spec.model, "stream_function")
-                    and spec.model.stream_function is None
-                ):
-                    event_stream_handler = None
-
-                result = await agent.run(
-                    spec.prompt,
-                    message_history=spec.history,
-                    deps=deps,
-                    model_settings=model_settings,
-                    usage_limits=UsageLimits(
-                        request_limit=request_limit,
-                        tool_calls_limit=spec.max_tool_calls,
-                        total_tokens_limit=spec.max_tokens,
-                    ),
-                    usage=usage,
-                    event_stream_handler=event_stream_handler,
-                )
-            except UsageLimitExceeded as exc:
-                status = AgentRunStatus.LIMIT_EXCEEDED
-                failure = str(exc)
-            except UnexpectedModelBehavior as exc:
+        status = AgentRunStatus(str(raw.get("status") or AgentRunStatus.FAILED))
+        messages = deserialize_messages(raw.get("messages") or spec.history)
+        output = raw.get("output")
+        output_name = raw.get("output_name")
+        if status is AgentRunStatus.COMPLETED and terminals:
+            model = terminal_models.get(str(output_name))
+            if model is None:
                 status = AgentRunStatus.FAILED
-                failure = str(exc)
-
-        messages = list(result.all_messages() if result is not None else captured)
-        if not messages:
-            messages = list(spec.history)
-        output = result.output if result is not None else None
-        if result is not None:
+                output = None
+                raw["failure"] = "Pi runtime completed without a known terminal output"
+            else:
+                try:
+                    output = model.model_validate(output)
+                except ValidationError as exc:
+                    status = AgentRunStatus.FAILED
+                    output = None
+                    raw["failure"] = f"invalid terminal output: {exc}"
+        if status is AgentRunStatus.COMPLETED and spec.output_validator is not None:
+            context = PiRunContext(deps=deps, messages=messages)
+            validated = _invoke_output_validator(spec.output_validator, context, output)
+            if inspect.isawaitable(validated):
+                validated = await validated
+            output = validated
+        usage = _usage_dict(raw.get("usage"))
+        failure = str(raw.get("failure")) if raw.get("failure") else None
+        if status is AgentRunStatus.COMPLETED:
             await _emit_progress(
                 spec.progress,
                 "on_final",
@@ -370,291 +372,114 @@ class HarnessAgentRuntime:
                 messages=serialize_messages(messages),
                 status=status.value,
             )
-            await self._record_transition(
-                deps,
-                spec,
-                node="run_finished",
-                node_kind=NodeKind.HARNESS,
-                decision={"status": status.value},
-                after_messages=messages,
-            )
+        await self._record_transition(
+            deps,
+            spec,
+            node="run_finished",
+            node_kind=NodeKind.HARNESS,
+            decision={"status": status.value},
+            after_messages=messages,
+        )
         return AgentRunOutcome(
             status=status,
             output=output,
             messages=messages,
-            usage=_usage_dict(usage),
+            usage=usage,
             tools_used=list(deps.tools_used),
             transitions=list(deps.transitions),
             failure=failure,
         )
 
-    def _final_request_guard(
+    async def _on_event(
         self,
+        deps: AeloonRunDeps,
         spec: AgentRunSpec,
-        *,
-        request_limit: int,
-    ) -> Hooks:
-        """Reserve a configured run's last request for a graceful checkpoint."""
-
-        hooks = Hooks[AeloonRunDeps](id=f"aeloon-final-request-{spec.role}")
-
-        @hooks.on.prepare_tools
-        async def prepare_tools(
-            ctx: RunContext[AeloonRunDeps],
-            tool_defs: list[Any],
-        ) -> list[Any]:
-            if _is_final_model_request(ctx, request_limit):
-                return []
-            return tool_defs
-
-        @hooks.on.before_model_request
-        async def before_model_request(
-            ctx: RunContext[AeloonRunDeps],
-            request_context: ModelRequestContext,
-        ) -> ModelRequestContext:
-            if not _is_final_model_request(ctx, request_limit):
-                return request_context
-            if spec.role == "master":
-                output_guidance = (
-                    "Immediately return the best available final response in plain text. "
-                    "Do not request more work or call a tool. State what was completed, "
-                    "what was verified, and any unresolved work honestly."
-                )
-            else:
-                output_guidance = (
-                    "Immediately return the configured structured output. Do not request "
-                    "more work or call an ordinary tool. Represent only established "
-                    "results and report incomplete or blocked work honestly when the "
-                    "output schema supports it."
-                )
-            final_instruction = InstructionPart(
-                (
-                    "HOST BUDGET NOTICE: This is the final model request in the "
-                    f"configured {request_limit}-request run. Ordinary tools are now "
-                    f"disabled. {output_guidance}"
-                ),
-                dynamic=True,
+        envelope: dict[str, Any],
+    ) -> None:
+        event = envelope.get("event")
+        if event == "text_delta":
+            await _emit_progress(deps.progress, "on_llm_delta", str(envelope.get("delta") or ""))
+            return
+        if event == "thinking_delta":
+            await _emit_progress(
+                deps.progress,
+                "on_llm_reasoning_delta",
+                str(envelope.get("delta") or ""),
             )
-            parameters = request_context.model_request_parameters
-            request_context.model_request_parameters = replace(
-                parameters,
-                instruction_parts=[
-                    *(parameters.instruction_parts or []),
-                    final_instruction,
-                ],
-            )
-            return request_context
-
-        return hooks
-
-    def _hooks(self, spec: AgentRunSpec, deps: AeloonRunDeps) -> Hooks:
-        hooks = Hooks[AeloonRunDeps]()
-
-        @hooks.on.before_model_request
-        async def before_model_request(
-            ctx: RunContext[AeloonRunDeps], request_context: ModelRequestContext
-        ) -> ModelRequestContext:
-            if ctx.deps.prompt_cache is not None and ctx.deps.prompt_cache.disabled:
-                request_context.model_settings = without_prompt_caching(
-                    dict(request_context.model_settings or {})
-                )
-            if ctx.deps.max_tokens is not None:
-                await _apply_hard_token_budget(ctx, request_context)
+            return
+        if event == "model_request":
+            messages = _message_list(envelope.get("messages"))
             await self._record_transition(
                 deps,
                 spec,
                 node="model_request",
                 node_kind=NodeKind.HARNESS,
-                decision={"run_step": ctx.run_step},
-                before_messages=request_context.messages,
-                after_messages=request_context.messages,
+                decision={
+                    "request": int(envelope.get("request_number") or 0),
+                    "tool_names": list(envelope.get("tool_names") or []),
+                    "max_tokens": envelope.get("max_tokens"),
+                },
+                before_messages=messages,
+                after_messages=messages,
             )
-            return request_context
-
-        @hooks.on.model_request
-        async def model_request(
-            _ctx: RunContext[AeloonRunDeps], *, request_context: ModelRequestContext, handler: Any
-        ) -> ModelResponse:
-            try:
-                return await handler(request_context)
-            except ModelHTTPError as exc:
-                cache = deps.prompt_cache
-                settings = dict(request_context.model_settings or {})
-                if (
-                    cache is not None
-                    and not cache.disabled
-                    and prompt_caching_enabled(settings)
-                    and is_prompt_caching_unsupported_error(exc)
-                ):
-                    cache.disabled = True
-                    logger.warning(
-                        "Provider rejected prompt caching; retrying this model request without it"
-                    )
-                    return await handler(
-                        replace(
-                            request_context,
-                            model_settings=without_prompt_caching(settings),
-                        )
-                    )
-                raise
-
-        @hooks.on.after_model_request
-        async def after_model_request(
-            ctx: RunContext[AeloonRunDeps],
-            *,
-            request_context: ModelRequestContext,
-            response: ModelResponse,
-        ) -> ModelResponse:
-            calls = [part for part in response.parts if isinstance(part, ToolCallPart)]
-            _validate_entire_tool_batch(ctx.deps, calls)
-            _reject_repeated_stuck_call(ctx, calls)
-            view = _model_response_view(response)
-            await _emit_progress(
-                ctx.deps.progress,
-                "on_llm_response",
-                view,
-                component=ctx.deps.role,
-            )
+            return
+        if event == "model_response":
+            message = envelope.get("message")
+            if not isinstance(message, dict):
+                return
+            view = _model_response_view(message)
+            await _emit_progress(deps.progress, "on_llm_response", view, component=deps.role)
             await self._record_transition(
                 deps,
                 spec,
                 node="model_response",
                 node_kind=NodeKind.HARNESS,
                 decision={
-                    "finish_reason": response.finish_reason,
-                    "tool_names": [call.tool_name for call in calls],
+                    "finish_reason": message.get("stopReason"),
+                    "tool_names": [call.name for call in view.tool_calls],
                 },
-                usage=_usage_dict(response.usage),
-                before_messages=request_context.messages,
-                after_messages=[*request_context.messages, response],
+                usage=_usage_dict(message.get("usage")),
             )
-            return response
-
-        @hooks.on.before_tool_execute
-        async def before_tool_execute(
-            ctx: RunContext[AeloonRunDeps],
-            *,
-            call: ToolCallPart,
-            tool_def: Any,
-            args: Any,
-        ) -> Any:
-            del tool_def
-            view = _tool_call_view(call)
-            ctx.deps.tool_calls[view.id] = view
-            if view.id not in ctx.deps.progress_call_ids:
-                ctx.deps.progress_call_ids.add(view.id)
-                await _emit_progress(ctx.deps.progress, "on_tool_calls", [view])
+            return
+        if event == "tool_start":
+            call = ToolCallView(
+                id=str(envelope.get("call_id") or ""),
+                name=str(envelope.get("name") or "tool"),
+                arguments=dict(envelope.get("arguments") or {}),
+            )
+            deps.tool_calls[call.id] = call
+            await _emit_progress(deps.progress, "on_tool_calls", [call])
             await self._record_transition(
                 deps,
                 spec,
                 node="tool_call",
                 node_kind=NodeKind.DOMAIN,
-                decision={"id": view.id, "name": view.name, "arguments": view.arguments},
+                decision={"id": call.id, "name": call.name, "arguments": call.arguments},
             )
-            return args
-
-        @hooks.on.after_tool_execute
-        async def after_tool_execute(
-            ctx: RunContext[AeloonRunDeps],
-            *,
-            call: ToolCallPart,
-            tool_def: Any,
-            args: Any,
-            result: Any,
-        ) -> Any:
-            del tool_def, args
-            view = ctx.deps.tool_calls.get(call.tool_call_id) or _tool_call_view(call)
-            result_text = result if isinstance(result, str) else json.dumps(
-                result, ensure_ascii=False, default=str
+            return
+        if event == "tool_end":
+            call_id = str(envelope.get("call_id") or "")
+            call = deps.tool_calls.get(call_id) or ToolCallView(
+                call_id,
+                str(envelope.get("name") or "tool"),
+                dict(envelope.get("arguments") or {}),
             )
-            if ctx.deps.tools.get(view.name) is None:
-                # Harness and other capability tools execute outside
-                # AeloonToolset, so account for them here.
-                ctx.deps.tools_used.append(view.name)
-                ctx.deps.tool_observations.append(
-                    ToolObservation(
-                        name=view.name,
-                        arguments=dict(view.arguments),
-                        result=result_text,
-                    )
-                )
-            if view.id not in ctx.deps.progress_result_ids:
-                ctx.deps.progress_result_ids.add(view.id)
-                await _emit_progress(
-                    ctx.deps.progress,
-                    "on_tool_result",
-                    _execution_record(ctx.deps, view, result_text),
-                )
+            result = str(envelope.get("result") or "")
+            failed = bool(envelope.get("is_error"))
+            if call.name not in deps.terminal_models:
+                deps.tools_used.append(call.name)
+            await _emit_progress(
+                deps.progress,
+                "on_tool_result",
+                _execution_record(deps, call, result, failed=failed),
+            )
             await self._record_transition(
                 deps,
                 spec,
                 node="tool_result",
                 node_kind=NodeKind.DOMAIN,
-                decision={"id": view.id, "name": view.name, "result": result_text},
+                decision={"id": call.id, "name": call.name, "result": result},
             )
-            return result
-
-        @hooks.on.after_output_validate
-        async def after_output_validate(
-            ctx: RunContext[AeloonRunDeps],
-            *,
-            output_context: Any,
-            output: Any,
-        ) -> Any:
-            del ctx, output_context
-            await self._record_transition(
-                deps,
-                spec,
-                node="output",
-                node_kind=NodeKind.HARNESS,
-                decision={"type": type(output).__name__},
-            )
-            return output
-
-        return hooks
-
-    async def _event_stream_handler(
-        self,
-        ctx: RunContext[AeloonRunDeps],
-        events: Any,
-    ) -> None:
-        tool_index = 0
-        async for event in events:
-            if isinstance(event, PartDeltaEvent):
-                delta = event.delta
-                if isinstance(delta, TextPartDelta) and delta.content_delta:
-                    await _emit_progress(ctx.deps.progress, "on_llm_delta", delta.content_delta)
-                elif isinstance(delta, ThinkingPartDelta) and delta.content_delta:
-                    await _emit_progress(
-                        ctx.deps.progress,
-                        "on_llm_reasoning_delta",
-                        delta.content_delta,
-                    )
-                continue
-            if isinstance(event, FunctionToolCallEvent):
-                call = _tool_call_view(event.part)
-                ctx.deps.tool_calls[call.id] = call
-                if call.id not in ctx.deps.progress_call_ids:
-                    ctx.deps.progress_call_ids.add(call.id)
-                    await _emit_progress(ctx.deps.progress, "on_tool_calls", [call])
-                tool_index += 1
-                continue
-            if isinstance(event, FunctionToolResultEvent):
-                part = event.part
-                call = ctx.deps.tool_calls.get(part.tool_call_id)
-                if call is None:
-                    call = ToolCallView(part.tool_call_id, part.tool_name or "tool", {})
-                result = _tool_result_text(part)
-                if call.id not in ctx.deps.progress_result_ids:
-                    ctx.deps.progress_result_ids.add(call.id)
-                    record = _execution_record(
-                        ctx.deps,
-                        call,
-                        result,
-                        index=max(0, tool_index - 1),
-                        failed=isinstance(part, RetryPromptPart),
-                    )
-                    await _emit_progress(ctx.deps.progress, "on_tool_result", record)
 
     async def _record_transition(
         self,
@@ -665,8 +490,8 @@ class HarnessAgentRuntime:
         node_kind: NodeKind,
         decision: Any,
         usage: dict[str, int] | None = None,
-        before_messages: Sequence[ModelMessage] | None = None,
-        after_messages: Sequence[ModelMessage] | None = None,
+        before_messages: Sequence[Mapping[str, Any]] | None = None,
+        after_messages: Sequence[Mapping[str, Any]] | None = None,
     ) -> None:
         if not spec.transition_trace_enabled:
             return
@@ -693,7 +518,7 @@ class HarnessAgentRuntime:
             turn_id=deps.turn_id,
             decision=decision,
             token_usage=usage or {},
-            component="pydantic_ai",
+            component="pi-core",
         )
         deps.transitions.append(record)
         if spec.on_transition is not None:
@@ -702,152 +527,195 @@ class HarnessAgentRuntime:
                 await emitted
 
 
-def output_tools(*specs: tuple[type[BaseModel], str, str]) -> list[ToolOutput[Any]]:
-    """Build typed terminal outputs with stable names and descriptions."""
-
-    return [
-        ToolOutput(model, name=name, description=description, sequential=True)
-        for model, name, description in specs
-    ]
+# Compatibility name retained for the rest of Aeloon's stable Python surface.
+HarnessAgentRuntime = PiAgentRuntime
 
 
-def _is_final_model_request(
-    ctx: RunContext[AeloonRunDeps],
-    request_limit: int,
-) -> bool:
-    return ctx.usage.requests == max(0, request_limit - 1)
+def output_tools(*specs: tuple[type[BaseModel], str, str]) -> list[TerminalOutput]:
+    """Build typed Pi terminal outputs with stable names and descriptions."""
+
+    return [TerminalOutput(model, name, description) for model, name, description in specs]
+
+
+def _terminal_outputs(spec: AgentRunSpec) -> list[TerminalOutput]:
+    if isinstance(spec.output_type, list | tuple) and all(
+        isinstance(item, TerminalOutput) for item in spec.output_type
+    ):
+        terminals = list(spec.output_type)
+    elif isinstance(spec.output_type, type) and issubclass(spec.output_type, BaseModel):
+        if spec.terminal_models:
+            terminals = [
+                TerminalOutput(model, name, f"Return the final {name} structured result.")
+                for name, model in spec.terminal_models.items()
+            ]
+        else:
+            terminals = [
+                TerminalOutput(
+                    spec.output_type,
+                    "final_result",
+                    "Return the final structured result for this stage.",
+                )
+            ]
+    else:
+        terminals = []
+    configured = set(spec.terminal_models)
+    derived = {terminal.name for terminal in terminals}
+    if configured and configured != derived:
+        raise ValueError("terminal_models does not match configured terminal outputs")
+    return terminals
 
 
 def _validate_capability_manifest(
-    spec: AgentRunSpec,
+    registry: ToolRegistry,
+    terminal_models: Mapping[str, type[BaseModel]],
+    builtin_names: Sequence[str],
     manifest: CapabilityManifest,
 ) -> None:
-    exposed = tuple(
-        str(definition["name"]) for definition in spec.tools.get_definitions()
+    exposed = (
+        *(str(definition["name"]) for definition in registry.get_definitions()),
+        *builtin_names,
     )
-    if exposed != manifest.tool_names:
+    if tuple(exposed) != manifest.tool_names:
         raise ValueError("ToolRegistry does not match the host capability manifest")
-    if set(spec.terminal_models) != set(manifest.terminal_names):
+    if set(terminal_models) != set(manifest.terminal_names):
         raise ValueError("typed outputs do not match the host capability manifest")
     if set(exposed) & set(manifest.terminal_names):
         raise ValueError("terminal outputs must not be registered as ordinary tools")
 
 
-def _validate_entire_tool_batch(
+def _preflight(
     deps: AeloonRunDeps,
-    calls: list[ToolCallPart],
-) -> None:
+    payload: dict[str, Any],
+    schemas: Mapping[str, dict[str, Any]],
+) -> dict[str, Any]:
+    raw_calls = payload.get("calls")
+    calls = (
+        [call for call in raw_calls if isinstance(call, dict)]
+        if isinstance(raw_calls, list)
+        else []
+    )
     terminal_names = set(deps.terminal_models)
-    called_terminals = [call for call in calls if call.tool_name in terminal_names]
+    called_terminals = [call for call in calls if call.get("name") in terminal_names]
     if called_terminals and (len(calls) != 1 or len(called_terminals) != 1):
-        raise ModelRetry(
-            "A terminal output must be the response's only tool call. No tool was executed."
+        return _retry_rejection(
+            deps,
+            "A terminal output must be the response's only tool call. No tool was executed.",
         )
+    if deps.max_tool_calls is not None and deps.tool_call_count + len(calls) > deps.max_tool_calls:
+        reason = f"The {deps.max_tool_calls}-tool-call limit would be exceeded by this batch."
+        return {
+            "allowed": False,
+            "reason": reason,
+            "limit_reason": reason,
+            "terminate": True,
+        }
+    usage = _usage_dict(payload.get("usage"))
+    if deps.max_tokens is not None and usage.get("total_tokens", 0) > deps.max_tokens:
+        reason = f"The {deps.max_tokens}-token limit was exceeded before tool execution."
+        return {
+            "allowed": False,
+            "reason": reason,
+            "limit_reason": reason,
+            "terminate": True,
+        }
     errors: list[str] = []
     for call in calls:
-        model = deps.terminal_models.get(call.tool_name)
-        if model is None:
-            tool = deps.tools.get(call.tool_name)
-            model = tool.args_model if tool is not None else None
-        if model is None:
-            # Capability-contributed tools (for example Harness
-            # Harness capability tools are not part of Aeloon's host ToolRegistry.
-            # Pydantic AI owns their schema validation and execution.
+        name = str(call.get("name") or "")
+        arguments = call.get("arguments")
+        if not isinstance(arguments, dict):
+            errors.append(f"{name}: arguments must be an object")
             continue
-        try:
-            arguments = call.args_as_dict(raise_if_invalid=True)
-            model.model_validate(arguments)
-        except (ValueError, ValidationError) as exc:
-            errors.append(f"{call.tool_name}: {exc}")
+        model = deps.terminal_models.get(name)
+        tool = deps.tools.get(name)
+        if model is not None:
+            try:
+                model.model_validate(arguments)
+            except ValidationError as exc:
+                errors.append(f"{name}: {_validation_error(exc)}")
+            continue
+        if tool is not None:
+            try:
+                tool.args_model.model_validate(arguments)
+            except ValidationError as exc:
+                errors.append(f"{name}: {_validation_error(exc)}")
+            continue
+        schema = schemas.get(name)
+        if schema is not None:
+            validation = next(iter(Draft202012Validator(schema).iter_errors(arguments)), None)
+            if validation is not None:
+                errors.append(f"{name}: {validation.message}")
     if errors:
-        raise ModelRetry(
-            "The entire tool batch was rejected before execution: " + "; ".join(errors)
+        return _retry_rejection(
+            deps,
+            "The entire tool batch was rejected before execution: " + "; ".join(errors),
         )
+    if deps.stuck_detection_enabled and calls:
+        messages = _message_list(payload.get("messages"))
+        detection = detect_repeated_tool_exchanges(
+            _legacy_detection_messages(messages),
+            tool_modes=deps.tool_modes,
+            threshold=deps.stuck_detection_threshold,
+        )
+        if detection is not None:
+            repeated = any(
+                _action_digest(str(call.get("name") or ""), dict(call.get("arguments") or {}))
+                == detection.action_digest
+                for call in calls
+            )
+            if repeated:
+                return _retry_rejection(
+                    deps,
+                    "The same successful read-only action and observation repeated "
+                    f"{detection.repetitions} times. Change strategy before another tool call.",
+                )
+    deps.tool_call_count += len(calls)
+    return {"allowed": True}
 
 
-def _reject_repeated_stuck_call(
-    ctx: RunContext[AeloonRunDeps],
-    calls: list[ToolCallPart],
-) -> None:
-    deps = ctx.deps
-    if not deps.stuck_detection_enabled or not calls:
-        return
-    detection = detect_repeated_tool_exchanges(
-        _legacy_detection_messages(ctx.messages),
-        tool_modes=deps.tool_modes,
-        threshold=deps.stuck_detection_threshold,
+def _retry_rejection(deps: AeloonRunDeps, reason: str) -> dict[str, Any]:
+    deps.validation_failures += 1
+    exhausted = deps.validation_failures > deps.max_retries
+    response: dict[str, Any] = {
+        "allowed": False,
+        "reason": reason,
+        "terminate": exhausted,
+    }
+    if exhausted:
+        response["failure_reason"] = (
+            f"Pi tool/output validation failed after {deps.max_retries + 1} attempts: {reason}"
+        )
+    return response
+
+
+def _model_response_view(message: Mapping[str, Any]) -> ModelResponseView:
+    content = message.get("content")
+    parts = content if isinstance(content, list) else []
+    text = "".join(
+        str(part.get("text") or "")
+        for part in parts
+        if isinstance(part, Mapping) and part.get("type") == "text"
     )
-    if detection is None:
-        return
-    repeated = any(
-        _action_digest(call.tool_name, call.args_as_dict()) == detection.action_digest
-        for call in calls
-    )
-    if repeated:
-        raise ModelRetry(
-            f"The same successful read-only action and observation repeated "
-            f"{detection.repetitions} times. Change strategy before calling another tool."
-        )
-
-
-async def _apply_hard_token_budget(
-    ctx: RunContext[AeloonRunDeps],
-    request_context: ModelRequestContext,
-) -> None:
-    limit = ctx.deps.max_tokens
-    assert limit is not None
-    try:
-        counted = await request_context.model.count_tokens(
-            request_context.messages,
-            request_context.model_settings,
-            request_context.model_request_parameters,
-        )
-        next_input = max(0, int(counted.input_tokens))
-    except Exception as exc:
-        logger.warning("Falling back to conservative local token preflight: {}", exc)
-        payload = ModelMessagesTypeAdapter.dump_json(request_context.messages)
-        next_input = max(1, len(payload) // 3 + 512)
-    remaining = limit - ctx.usage.total_tokens - next_input
-    if remaining < 1:
-        raise UsageLimitExceeded(
-            f"The next model request would exceed the hard token budget ({limit})."
-        )
-    settings = dict(request_context.model_settings or {})
-    configured = settings.get("max_tokens")
-    settings["max_tokens"] = min(int(configured), remaining) if configured else remaining
-    request_context.model_settings = settings
-
-
-def _model_response_view(response: ModelResponse) -> ModelResponseView:
-    text = "".join(part.content for part in response.parts if isinstance(part, TextPart))
     reasoning = "".join(
-        part.content for part in response.parts if isinstance(part, ThinkingPart)
+        str(part.get("thinking") or "")
+        for part in parts
+        if isinstance(part, Mapping) and part.get("type") == "thinking"
     )
     calls = tuple(
-        _tool_call_view(part) for part in response.parts if isinstance(part, ToolCallPart)
+        ToolCallView(
+            id=str(part.get("id") or ""),
+            name=str(part.get("name") or "tool"),
+            arguments=dict(part.get("arguments") or {}),
+        )
+        for part in parts
+        if isinstance(part, Mapping) and part.get("type") == "toolCall"
     )
     return ModelResponseView(
         content=text or None,
         reasoning_content=reasoning or None,
         tool_calls=calls,
-        usage=_usage_dict(response.usage),
-        finish_reason=str(response.finish_reason) if response.finish_reason else None,
+        usage=_usage_dict(message.get("usage")),
+        finish_reason=str(message.get("stopReason") or "") or None,
     )
-
-
-def _tool_call_view(part: ToolCallPart) -> ToolCallView:
-    try:
-        arguments = part.args_as_dict()
-    except ValueError:
-        arguments = {}
-    return ToolCallView(id=part.tool_call_id, name=part.tool_name, arguments=arguments)
-
-
-def _tool_result_text(part: ToolReturnPart | RetryPromptPart) -> str:
-    content = part.content
-    if isinstance(content, str):
-        return content
-    return json.dumps(content, ensure_ascii=False, default=str)
 
 
 def _execution_record(
@@ -855,46 +723,45 @@ def _execution_record(
     call: ToolCallView,
     result: str,
     *,
-    index: int | None = None,
-    failed: bool | None = None,
+    failed: bool,
 ) -> ToolExecutionRecord:
-    is_failed = result.lstrip().lower().startswith("error") if failed is None else failed
     tool = deps.tools.get(call.name)
     return ToolExecutionRecord(
-        index=max(0, len(deps.tools_used) - 1) if index is None else index,
+        index=max(0, len(deps.tools_used) - 1),
         call_id=call.id,
         tool_name=call.name,
         arguments=call.arguments,
         mode=tool.concurrency_mode if tool is not None else "exclusive",
-        state=ToolExecutionState.FAILED if is_failed else ToolExecutionState.DONE,
+        state=ToolExecutionState.FAILED if failed else ToolExecutionState.DONE,
         result=result,
-        error=result if is_failed else None,
+        error=result if failed else None,
     )
 
 
 def _usage_dict(usage: Any) -> dict[str, int]:
-    try:
-        values = asdict(usage)
-    except TypeError:
-        values = dict(getattr(usage, "__dict__", {}) or {})
-    normalized = {
-        str(key): max(0, int(value))
-        for key, value in values.items()
-        if isinstance(value, int | float) and not isinstance(value, bool)
+    if not isinstance(usage, Mapping):
+        return {}
+    aliases = {
+        "input": "input_tokens",
+        "output": "output_tokens",
+        "cacheRead": "cache_read_tokens",
+        "cacheWrite": "cache_write_tokens",
+        "reasoning": "reasoning_tokens",
+        "totalTokens": "total_tokens",
+        "requests": "requests",
     }
-    total = getattr(usage, "total_tokens", None)
-    if isinstance(total, int | float):
-        normalized["total_tokens"] = max(0, int(total))
-    return normalized
+    return {
+        normalized: max(0, int(usage[key]))
+        for key, normalized in aliases.items()
+        if isinstance(usage.get(key), int | float) and not isinstance(usage.get(key), bool)
+    }
 
 
 def _invoke_output_validator(
     validator: OutputValidator,
-    ctx: RunContext[AeloonRunDeps],
+    ctx: PiRunContext,
     output: Any,
 ) -> Any:
-    """Call new context-aware validators without breaking one-argument callers."""
-
     try:
         inspect.signature(validator).bind(ctx, output)
     except (TypeError, ValueError):
@@ -917,24 +784,22 @@ async def _emit_progress(progress: Any, name: str, *args: Any, **kwargs: Any) ->
 def _output_text(output: Any) -> str:
     if isinstance(output, str):
         return output
-    final_content = getattr(output, "final_content", None)
-    if isinstance(final_content, str):
-        return final_content
-    summary = getattr(output, "summary", None)
-    return summary if isinstance(summary, str) else ""
+    for field_name in ("final_content", "summary", "answer"):
+        value = getattr(output, field_name, None)
+        if isinstance(value, str):
+            return value
+    return ""
 
 
-def _validation_retry(name: str, exc: ValidationError) -> str:
-    errors = "; ".join(
-        f"{'.'.join(str(part) for part in error.get('loc', ()))}: "
-        f"{error.get('msg', 'invalid value')}"
-        for error in exc.errors()
+def _messages_digest(messages: Sequence[Mapping[str, Any]]) -> str:
+    payload = json.dumps(
+        list(messages),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
     )
-    return f"Invalid arguments for {name}: {errors}"
-
-
-def _messages_digest(messages: Sequence[ModelMessage]) -> str:
-    return hashlib.sha256(ModelMessagesTypeAdapter.dump_json(list(messages))).hexdigest()
+    return hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()
 
 
 def _action_digest(tool_name: str, arguments: dict[str, Any]) -> str:
@@ -948,52 +813,71 @@ def _action_digest(tool_name: str, arguments: dict[str, Any]) -> str:
     return hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()
 
 
-def _legacy_detection_messages(messages: Sequence[ModelMessage]) -> list[dict[str, Any]]:
-    """Project typed history into the detector's bounded compatibility shape."""
-
+def _legacy_detection_messages(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     projected: list[dict[str, Any]] = []
     for message in messages:
-        if isinstance(message, ModelResponse):
+        role = message.get("role")
+        content = message.get("content")
+        if role == "assistant":
             blocks: list[dict[str, Any]] = []
-            for part in message.parts:
-                if isinstance(part, TextPart):
-                    blocks.append({"type": "text", "text": part.content})
-                elif isinstance(part, ToolCallPart):
+            for part in content if isinstance(content, list) else []:
+                if not isinstance(part, Mapping):
+                    continue
+                if part.get("type") == "text":
+                    blocks.append({"type": "text", "text": part.get("text", "")})
+                elif part.get("type") == "toolCall":
                     blocks.append(
                         {
                             "type": "tool_use",
-                            "id": part.tool_call_id,
-                            "name": part.tool_name,
-                            "input": part.args_as_dict(),
+                            "id": part.get("id"),
+                            "name": part.get("name"),
+                            "input": part.get("arguments", {}),
                         }
                     )
             projected.append({"role": "assistant", "content": blocks})
-            continue
-        if not isinstance(message, ModelRequest):
-            continue
-        blocks = []
-        real_user: list[str] = []
-        for part in message.parts:
-            if isinstance(part, ToolReturnPart):
-                blocks.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": part.tool_call_id,
-                        "content": _tool_result_text(part),
-                        "is_error": part.outcome != "success",
-                    }
-                )
-            elif getattr(part, "part_kind", None) == "user-prompt":
-                real_user.append(str(getattr(part, "content", "")))
-        projected.append(
-            {"role": "user", "content": blocks if blocks else "\n".join(real_user)}
-        )
+        elif role == "toolResult":
+            projected.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": message.get("toolCallId"),
+                            "content": content,
+                            "is_error": bool(message.get("isError")),
+                        }
+                    ],
+                }
+            )
+        elif role == "user":
+            projected.append({"role": "user", "content": content})
     return projected
+
+
+def _validation_error(exc: ValidationError) -> str:
+    return "; ".join(
+        f"{'.'.join(str(part) for part in error.get('loc', ()))}: "
+        f"{error.get('msg', 'invalid value')}"
+        for error in exc.errors()
+    )
+
+
+def _message_list(value: Any) -> list[PiMessage]:
+    if not isinstance(value, list):
+        return []
+    return [dict(item) for item in value if isinstance(item, Mapping)]
+
+
+def _strip_titles(node: Any) -> Any:
+    if isinstance(node, dict):
+        return {key: _strip_titles(value) for key, value in node.items() if key != "title"}
+    if isinstance(node, list):
+        return [_strip_titles(item) for item in node]
+    return node
 
 
 __all__ = [
     "AeloonRunDeps",
-    "AeloonToolset",
     "AgentRunOutcome",
     "AgentRunSpec",
     "AgentRunStatus",
@@ -1001,6 +885,9 @@ __all__ = [
     "HarnessAgentRuntime",
     "MESSAGE_FORMAT",
     "MESSAGE_SCHEMA_VERSION",
+    "PiAgentRuntime",
+    "PiRunContext",
+    "TerminalOutput",
     "deserialize_messages",
     "output_tools",
     "serialize_messages",

@@ -1,4 +1,4 @@
-"""Isolated Pydantic AI stage execution for ExpertSkill runners."""
+"""Isolated pi-core stage execution for ExpertSkill runners."""
 
 from __future__ import annotations
 
@@ -17,7 +17,6 @@ from aeloon_core.harness.capabilities import (
 from aeloon_core.harness.execution import (
     AgentRunSpec,
     AgentRunStatus,
-    CapabilityManifest,
     HarnessAgentRuntime,
 )
 from aeloon_core.harness.expert.base import StageOutcome
@@ -139,11 +138,6 @@ class HarnessExpertStageExecutor:
                     tools=tools,
                     output_type=output_type,
                     terminal_models={},
-                    capability_manifest=CapabilityManifest.from_registry(
-                        tools,
-                        namespace=f"expert:{self.expert.id}:{stage_id}",
-                        snapshot_digest=self.expert.digest,
-                    ),
                     request_limit=self.config.experts.stage_request_limit,
                     max_retries=self.config.agents.defaults.runtime.max_retries,
                     max_output_tokens=self.config.agents.defaults.max_output_tokens,
@@ -165,7 +159,6 @@ class HarnessExpertStageExecutor:
                         web_capability_factory=self.web_capability_factory,
                     ),
                     toolsets=self.mcp.expert_toolsets(self.expert),
-                    prompt_cache=binding.prompt_cache,
                 )
             )
         except Exception as exc:
