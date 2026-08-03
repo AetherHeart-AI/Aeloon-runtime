@@ -6,13 +6,16 @@ import argparse
 import asyncio
 import getpass
 import json
+import os
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.table import Table
 
 from aeloon_core.bridge.daemon import (
     bridge_request,
@@ -44,6 +47,7 @@ from aeloon_core.harness import (
     message_to_dict,
 )
 from aeloon_core.providers import UnifiedProviderRegistry, qualify_model_id
+from aeloon_core.version import __version__
 
 CONFIG_PATHS: dict[str, tuple[str, ...]] = {
     "workspace": ("workspace",),
@@ -75,30 +79,195 @@ CONFIG_PATHS: dict[str, tuple[str, ...]] = {
 
 _TOOL_SUMMARY_MAX_CHARS = 240
 
+_KNOWN_COMMANDS = {
+    "run",
+    "resume",
+    "history",
+    "login",
+    "logout",
+    "whoami",
+    "models",
+    "setup",
+    "doctor",
+    "completion",
+    "config",
+    "provider",
+    "system",
+    # Backward-compatible command names. These remain callable but are not
+    # emphasized in the top-level help.
+    "session",
+    "bridge",
+    "cloud",
+}
+
+
+def _add_run_arguments(
+    command: argparse.ArgumentParser,
+    *,
+    allow_session: bool,
+) -> None:
+    command.add_argument("prompt", nargs="*", help="Task to give the coding agent.")
+    source = command.add_mutually_exclusive_group()
+    source.add_argument("--prompt-file", "--file", type=Path, help="Read a UTF-8 task file.")
+    source.add_argument("--stdin", action="store_true", help=argparse.SUPPRESS)
+    command.add_argument(
+        "--output",
+        choices=("text", "json", "stream-json"),
+        default="text",
+        help=argparse.SUPPRESS,
+    )
+    command.add_argument(
+        "--json",
+        action="store_const",
+        const="json",
+        dest="output",
+        help="Print one machine-readable JSON result.",
+    )
+    command.add_argument(
+        "--stream",
+        action="store_const",
+        const="stream-json",
+        dest="output",
+        help=argparse.SUPPRESS,
+    )
+    detail = command.add_mutually_exclusive_group()
+    detail.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="Show concise tool activity on stderr; repeat for lifecycle events.",
+    )
+    detail.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="Show only the final response.",
+    )
+    if allow_session:
+        command.add_argument("--session", help=argparse.SUPPRESS)
+        command.add_argument(
+            "--no-session",
+            "--ephemeral",
+            action="store_true",
+            help="Do not save this task to history.",
+        )
+    else:
+        command.add_argument("--session", help="Resume this session instead of the latest one.")
+        command.set_defaults(no_session=False)
+    command.add_argument("--config", type=Path, help=argparse.SUPPRESS)
+    command.add_argument("-C", "--workspace", type=Path, help="Run in this workspace.")
+    command.add_argument("--data-dir", type=Path, help=argparse.SUPPRESS)
+    command.add_argument("-m", "--model", help="Use this model for the task.")
+
+
+def _add_account_arguments(command: argparse.ArgumentParser, *, login: bool = False) -> None:
+    if login:
+        command.add_argument("username", nargs="?", help="Account username or email.")
+    command.add_argument("--config", type=Path, help=argparse.SUPPRESS)
+    command.add_argument("--data-dir", type=Path, help=argparse.SUPPRESS)
+    command.add_argument("--socket", type=Path, help=argparse.SUPPRESS)
+    command.add_argument(
+        "--json", action="store_const", const="json", dest="output", help="Print JSON output."
+    )
+    command.add_argument(
+        "--output",
+        choices=("text", "json"),
+        default="text",
+        help=argparse.SUPPRESS,
+    )
+
+
+def _add_bridge_commands(parent: argparse.ArgumentParser) -> None:
+    commands = parent.add_subparsers(dest="bridge_command", required=True, metavar="COMMAND")
+    descriptions = {
+        "serve": "Run the Bridge daemon in the foreground.",
+        "ensure": "Start the Bridge daemon when it is not running.",
+        "status": "Show Bridge daemon status.",
+        "stop": "Stop the Bridge daemon.",
+    }
+    for name in ("serve", "ensure", "status", "stop"):
+        command = commands.add_parser(name, help=descriptions[name])
+        command.add_argument("--config", type=Path)
+        command.add_argument("--data-dir", type=Path)
+        command.add_argument("--socket", type=Path)
+        if name in {"serve", "ensure"}:
+            command.add_argument("--max-concurrent-operations", type=int, default=4)
+        if name in {"ensure", "status", "stop"}:
+            command.add_argument("--output", choices=("text", "json"), default="text")
+    commands.add_parser("schema", help="Print the Bridge v2 JSON schema.")
+
+
+def _hide_suppressed_subcommands(commands: Any) -> None:
+    """Keep compatibility commands parseable without cluttering top-level help."""
+
+    commands._choices_actions = [
+        action for action in commands._choices_actions if action.help != argparse.SUPPRESS
+    ]
+
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run the Aeloon coding-agent harness.")
-    commands = parser.add_subparsers(dest="command", required=True)
-
-    run = commands.add_parser("run", help="Run a prompt through the harness.")
-    run.add_argument("prompt", nargs="*", help="Prompt text.")
-    source = run.add_mutually_exclusive_group()
-    source.add_argument("--prompt-file", type=Path, help="Read a UTF-8 prompt file.")
-    source.add_argument("--stdin", action="store_true", help="Read the prompt from stdin.")
-    run.add_argument("--output", choices=("text", "json", "stream-json"), default="text")
-    run.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Show tool execution details on stderr (default: quiet).",
+    parser = argparse.ArgumentParser(
+        prog="aeloon",
+        usage="aeloon [TASK...] | aeloon COMMAND ...",
+        description="A coding agent for the current workspace.",
+        epilog=(
+            "examples:\n"
+            "  aeloon \"fix the failing tests\"\n"
+            "  aeloon resume \"continue with the implementation\"\n"
+            "  aeloon login\n"
+            "  aeloon doctor\n\n"
+            "task options: -C PATH, -m MODEL, --json, -v, --ephemeral\n"
+            "Use `aeloon -- TASK` when TASK starts with a command name.\n"
+            "Run `aeloon COMMAND --help` for command-specific options."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    run.add_argument("--session", help="Continue an existing session id.")
-    run.add_argument("--no-session", action="store_true", help="Do not persist this run.")
-    run.add_argument("--config", type=Path)
-    run.add_argument("--workspace", type=Path)
-    run.add_argument("--data-dir", type=Path)
-    run.add_argument("--model")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    commands = parser.add_subparsers(dest="command", metavar="COMMAND")
 
-    session = commands.add_parser("session", help="Inspect harness sessions.")
+    run = commands.add_parser("run", help=argparse.SUPPRESS)
+    _add_run_arguments(run, allow_session=True)
+
+    resume = commands.add_parser("resume", help="Continue the latest task in this workspace.")
+    _add_run_arguments(resume, allow_session=False)
+
+    history = commands.add_parser("history", help="Show recent tasks and sessions.")
+    history.add_argument("session_id", nargs="?", help="Show one session in detail.")
+    history.add_argument("--all", action="store_true", help="Include every workspace.")
+    history.add_argument("-C", "--workspace", type=Path, help="Filter by workspace.")
+    history.add_argument("--config", type=Path, help=argparse.SUPPRESS)
+    history.add_argument("--data-dir", type=Path, help=argparse.SUPPRESS)
+    history.add_argument("--json", action="store_true", help="Print JSON output.")
+
+    login = commands.add_parser("login", help="Sign in to Aeloon Cloud.")
+    _add_account_arguments(login, login=True)
+    logout = commands.add_parser("logout", help=argparse.SUPPRESS)
+    _add_account_arguments(logout)
+    whoami = commands.add_parser("whoami", help=argparse.SUPPRESS)
+    _add_account_arguments(whoami)
+
+    models = commands.add_parser("models", help="List available models.")
+    models.add_argument("--config", type=Path, help=argparse.SUPPRESS)
+    models.add_argument("--data-dir", type=Path, help=argparse.SUPPRESS)
+    models.add_argument("--json", action="store_true", help="Print JSON output.")
+
+    setup = commands.add_parser("setup", help="Configure an account or DeepSeek API key.")
+    setup.add_argument("--provider", choices=("cloud", "deepseek"))
+    setup.add_argument("--model")
+    setup.add_argument("--username")
+    setup.add_argument("-C", "--workspace", type=Path)
+    setup.add_argument("--config", type=Path, help=argparse.SUPPRESS)
+
+    doctor = commands.add_parser("doctor", help="Check configuration and show suggested fixes.")
+    doctor.add_argument("--config", type=Path, help=argparse.SUPPRESS)
+    doctor.add_argument("--data-dir", type=Path, help=argparse.SUPPRESS)
+    doctor.add_argument("--json", action="store_true", help="Print JSON output.")
+
+    completion = commands.add_parser("completion", help=argparse.SUPPRESS)
+    completion.add_argument("shell", choices=("bash", "zsh", "fish"))
+
+    session = commands.add_parser("session", help=argparse.SUPPRESS)
     session_commands = session.add_subparsers(dest="session_command", required=True)
     session_list = session_commands.add_parser("list", help="List saved sessions.")
     session_list.add_argument("--config", type=Path)
@@ -126,20 +295,15 @@ def build_parser() -> argparse.ArgumentParser:
     config_set.add_argument("value")
     config_set.add_argument("--config", type=Path)
 
-    bridge = commands.add_parser("bridge", help="Manage the local Bridge v2 daemon.")
-    bridge_commands = bridge.add_subparsers(dest="bridge_command", required=True)
-    for name in ("serve", "ensure", "status", "stop"):
-        command = bridge_commands.add_parser(name)
-        command.add_argument("--config", type=Path)
-        command.add_argument("--data-dir", type=Path)
-        command.add_argument("--socket", type=Path)
-        if name in {"serve", "ensure"}:
-            command.add_argument("--max-concurrent-operations", type=int, default=4)
-        if name in {"ensure", "status", "stop"}:
-            command.add_argument("--output", choices=("text", "json"), default="text")
-    bridge_commands.add_parser("schema")
+    bridge = commands.add_parser("bridge", help=argparse.SUPPRESS)
+    _add_bridge_commands(bridge)
 
-    cloud = commands.add_parser("cloud", help="Manage the Aeloon Cloud account.")
+    system = commands.add_parser("system", help=argparse.SUPPRESS)
+    system_commands = system.add_subparsers(dest="system_command", required=True, metavar="COMMAND")
+    system_bridge = system_commands.add_parser("bridge", help="Manage the local Bridge daemon.")
+    _add_bridge_commands(system_bridge)
+
+    cloud = commands.add_parser("cloud", help=argparse.SUPPRESS)
     cloud_commands = cloud.add_subparsers(dest="cloud_command", required=True)
     cloud_login = cloud_commands.add_parser("login", help="Sign in to Aeloon Cloud.")
     cloud_login.add_argument("username", nargs="?", help="Account username or email.")
@@ -156,7 +320,7 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--socket", type=Path)
         command.add_argument("--output", choices=("text", "json"), default="text")
 
-    provider = commands.add_parser("provider", help="Manage cloud and local API providers.")
+    provider = commands.add_parser("provider", help=argparse.SUPPRESS)
     provider_commands = provider.add_subparsers(dest="provider_command", required=True)
     provider_login = provider_commands.add_parser("login", help="Sign in to Aeloon Cloud.")
     provider_login.add_argument("username", nargs="?", help="Account username or email.")
@@ -183,26 +347,47 @@ def build_parser() -> argparse.ArgumentParser:
         elif command_name == "remove":
             command = provider_remove
         else:
-            command = provider_commands.add_parser(command_name)
+            command = provider_commands.add_parser(
+                command_name,
+                help={
+                    "status": "Show the current Aeloon Cloud account.",
+                    "logout": "Sign out of Aeloon Cloud.",
+                    "list": "List configured API providers.",
+                }[command_name],
+            )
         command.add_argument("--config", type=Path)
         command.add_argument("--data-dir", type=Path)
         command.add_argument("--socket", type=Path)
         command.add_argument("--output", choices=("text", "json"), default="text")
+    _hide_suppressed_subcommands(commands)
     return parser
 
 
 class RunRenderer:
     """Render events while collecting a stable final JSON result."""
 
-    def __init__(self, output: str, *, verbose: bool = False) -> None:
+    def __init__(self, output: str, *, verbose: bool | int = False, quiet: bool = False) -> None:
         self.output = output
-        self.verbose = verbose
+        self.verbose = int(verbose)
+        self.quiet = quiet
         self.tools_used: list[str] = []
         self._tool_started_at: dict[str, float] = {}
         self._tool_args: dict[str, dict[str, Any]] = {}
+        self._status_visible = False
 
     async def __call__(self, event: HarnessEvent) -> None:
-        if event.type == "tool_execution_start":
+        if self.verbose >= 2 and self.output == "text" and event.type in {
+            "agent_start",
+            "agent_end",
+            "auto_retry_start",
+            "auto_retry_end",
+            "compaction_start",
+            "compaction_end",
+        }:
+            print(f"[debug] {event.type}", file=sys.stderr)
+        if event.type == "agent_start":
+            self._render_status("Working…")
+        elif event.type == "tool_execution_start":
             name = str(event.data.get("toolName") or "")
             call_id = str(event.data.get("toolCallId") or "")
             if name and name not in self.tools_used:
@@ -213,9 +398,26 @@ class RunRenderer:
                     dict(event.data["args"]) if isinstance(event.data.get("args"), dict) else {}
                 )
             if self.verbose and self.output == "text":
+                self._clear_status()
                 self._render_tool_start(name, event.data.get("args"))
+                if self.verbose >= 2 and call_id:
+                    print(f"[debug] tool call {call_id}", file=sys.stderr)
+            elif self.output == "text":
+                action, _ = _tool_invocation_summary(
+                    name,
+                    event.data.get("args") if isinstance(event.data.get("args"), dict) else {},
+                )
+                statuses = {
+                    "run": "Running a command…",
+                    "read": "Reading files…",
+                    "write": "Updating files…",
+                    "search": "Searching the workspace…",
+                }
+                self._render_status(statuses.get(action, "Working…"))
         elif event.type == "tool_execution_end" and self.verbose and self.output == "text":
             self._render_tool_end(event)
+        elif event.type in {"agent_end", "abort", "settled"}:
+            self._clear_status()
         if self.output == "stream-json":
             print(_json(event.to_dict()), flush=True)
             return
@@ -226,6 +428,24 @@ class RunRenderer:
         args = raw_args if isinstance(raw_args, dict) else {}
         action, summary = _tool_invocation_summary(name, args)
         print(f"[{action}] {summary}", file=sys.stderr)
+
+    def _render_status(self, value: str) -> None:
+        if (
+            self.output != "text"
+            or self.quiet
+            or self.verbose
+            or not _is_interactive_stderr()
+        ):
+            return
+        summary = _one_line_summary(value, max_chars=100)
+        print(f"\r\x1b[2K{summary}", end="", file=sys.stderr, flush=True)
+        self._status_visible = True
+
+    def _clear_status(self) -> None:
+        if not self._status_visible:
+            return
+        print("\r\x1b[2K", end="", file=sys.stderr, flush=True)
+        self._status_visible = False
 
     def _render_tool_end(self, event: HarnessEvent) -> None:
         name = str(event.data.get("toolName") or "unknown")
@@ -255,6 +475,7 @@ class RunRenderer:
         print(f"[{label}] {name}{suffix}", file=sys.stderr)
 
     def finish_text(self, final_text: str) -> None:
+        self._clear_status()
         if self.output != "text":
             return
         if not final_text:
@@ -399,6 +620,16 @@ def _is_interactive_terminal() -> bool:
     return bool(isatty and isatty())
 
 
+def _is_interactive_stderr() -> bool:
+    isatty = getattr(sys.stderr, "isatty", None)
+    return bool(isatty and isatty())
+
+
+def _stdin_is_interactive() -> bool:
+    isatty = getattr(sys.stdin, "isatty", None)
+    return bool(isatty and isatty())
+
+
 def _format_duration(seconds: float) -> str:
     if seconds < 1:
         return f"{round(seconds * 1_000)}ms"
@@ -480,12 +711,17 @@ async def run_command(args: argparse.Namespace) -> int:
         shell_path=config.tools.shell_path,
         auto_resize_images=config.tools.auto_resize_images,
     )
-    renderer = RunRenderer(args.output, verbose=args.verbose)
+    renderer = RunRenderer(
+        args.output,
+        verbose=args.verbose,
+        quiet=bool(getattr(args, "quiet", False)),
+    )
     harness.subscribe(renderer)
     started = time.monotonic()
     try:
         message = await harness.prompt(prompt)
     finally:
+        renderer._clear_status()
         await harness.close()
         await cloud_account.close()
     result = {
@@ -506,6 +742,375 @@ async def run_command(args: argparse.Namespace) -> int:
     if message.error_message:
         print(message.error_message, file=sys.stderr)
     return 0 if message.stop_reason not in {"error", "aborted"} else 1
+
+
+async def resume_command(args: argparse.Namespace) -> int:
+    """Resume an explicit session or the newest session for the active workspace."""
+
+    if not args.prompt and not args.prompt_file and not args.stdin:
+        if _stdin_is_interactive():
+            args.prompt = ["Continue the previous task."]
+        else:
+            args.stdin = True
+    if args.session is None:
+        config = _with_run_overrides(load_config(args.config), args)
+        repository = JsonlSessionRepository(config.data_dir)
+        sessions = await repository.list(cwd=config.workspace)
+        if not sessions:
+            raise SessionError(
+                "not_found",
+                f"No saved task was found for {config.workspace}",
+            )
+        args.session = max(sessions, key=_session_mtime).id
+    return await run_command(args)
+
+
+async def history_command(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    data_dir = args.data_dir or config.data_dir
+    repository = JsonlSessionRepository(data_dir)
+    if args.session_id:
+        session_id = await _resolve_session_id(repository, args.session_id)
+        session = await repository.open(session_id)
+        context = await session.build_context()
+        result = {
+            "id": session.id,
+            "created_at": session.metadata.created_at,
+            "workspace": session.metadata.cwd,
+            "name": await session.get_name(),
+            "messages": [message_to_dict(message) for message in context.messages],
+            "stats": await session.stats(),
+        }
+        if args.json:
+            print(_json(result))
+        else:
+            title = result["name"] or _session_summary(context.messages) or "Untitled task"
+            stats = result["stats"]
+            print(title)
+            print(f"Session: {session.id}")
+            print(f"Workspace: {session.metadata.cwd}")
+            print(
+                f"Messages: {stats['messageCount']} · Tokens: {stats['totalTokens']}"
+            )
+        return 0
+
+    workspace = None if args.all else (args.workspace or config.workspace)
+    sessions = await repository.list(cwd=workspace)
+    sessions.sort(key=_session_mtime, reverse=True)
+    payload: list[dict[str, Any]] = []
+    for metadata in sessions:
+        session = await repository.open(metadata.id)
+        context = await session.build_context()
+        payload.append(
+            {
+                "id": metadata.id,
+                "created_at": metadata.created_at,
+                "updated_at": datetime.fromtimestamp(_session_mtime(metadata))
+                .astimezone()
+                .isoformat(),
+                "workspace": metadata.cwd,
+                "summary": await session.get_name()
+                or _session_summary(context.messages)
+                or "Untitled task",
+            }
+        )
+    if args.json:
+        print(_json(payload))
+        return 0
+    if not payload:
+        scope = "any workspace" if args.all else str(workspace)
+        print(f"No saved tasks found for {scope}.")
+        return 0
+    _print_table(
+        ("UPDATED", "WORKSPACE", "SUMMARY", "SESSION"),
+        [
+            (
+                _format_history_time(str(item["updated_at"])),
+                Path(str(item["workspace"])).name or str(item["workspace"]),
+                _one_line_summary(str(item["summary"]), max_chars=48),
+                str(item["id"])[:8],
+            )
+            for item in payload
+        ],
+    )
+    return 0
+
+
+async def _resolve_session_id(repository: JsonlSessionRepository, value: str) -> str:
+    sessions = await repository.list()
+    matches = [item.id for item in sessions if item.id.startswith(value)]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise SessionError("not_found", f"Session {value} not found")
+    raise SessionError("invalid_argument", f"Session prefix {value} is ambiguous")
+
+
+def _format_history_time(value: str) -> str:
+    return value[:16].replace("T", " ") if len(value) >= 16 else value
+
+
+def _session_mtime(metadata: Any) -> float:
+    try:
+        return metadata.path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _session_summary(messages: Any) -> str:
+    for message in messages:
+        if getattr(message, "role", None) != "user":
+            continue
+        content = getattr(message, "content", "")
+        if isinstance(content, str):
+            return _one_line_summary(content, max_chars=80)
+        text = " ".join(str(getattr(part, "text", "")) for part in content)
+        if text.strip():
+            return _one_line_summary(text, max_chars=80)
+    return ""
+
+
+async def models_command(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    if args.data_dir is not None:
+        config = config.model_copy(update={"data_dir": args.data_dir}).normalized()
+    account = CloudAccountService(config.cloud, data_dir=config.data_dir)
+    registry = UnifiedProviderRegistry(config, account)
+    try:
+        models = await registry.models()
+    finally:
+        await account.close()
+    payload = [
+        {
+            "id": model.id,
+            "name": model.name,
+            "provider": model.provider,
+            "context_window": model.context_window,
+            "selected": model.id == config.agent.model,
+        }
+        for model in models.values()
+    ]
+    if args.json:
+        print(_json(payload))
+        return 0
+    _print_table(
+        ("", "MODEL", "PROVIDER", "CONTEXT"),
+        [
+            (
+                "*" if item["selected"] else "",
+                str(item["id"]),
+                str(item["provider"]),
+                f"{int(item['context_window']):,}",
+            )
+            for item in payload
+        ],
+    )
+    return 0
+
+
+async def doctor_command(args: argparse.Namespace) -> int:
+    path = resolve_config_path(args.config)
+    config = load_config(path)
+    if args.data_dir is not None:
+        config = config.model_copy(update={"data_dir": args.data_dir}).normalized()
+    checks: list[dict[str, str]] = []
+
+    def add(name: str, status: str, message: str, fix: str = "") -> None:
+        checks.append({"name": name, "status": status, "message": message, "fix": fix})
+
+    if path.is_file():
+        add("config", "ok", str(path))
+    else:
+        add(
+            "config",
+            "warning",
+            "Using built-in defaults",
+            "Run `aeloon setup` to configure Aeloon.",
+        )
+    if config.workspace.is_dir():
+        add("workspace", "ok", str(config.workspace))
+    else:
+        add(
+            "workspace",
+            "error",
+            f"Directory does not exist: {config.workspace}",
+            "Run Aeloon in a project directory or pass `-C PATH`.",
+        )
+
+    account = CloudAccountService(config.cloud, data_dir=config.data_dir)
+    registry = UnifiedProviderRegistry(config, account)
+    try:
+        try:
+            model = await registry.model(config.agent.model)
+        except (KeyError, RuntimeError, PermissionError, CloudError) as exc:
+            add("model", "error", str(exc), "Run `aeloon models` or `aeloon setup`.")
+        else:
+            add("model", "ok", f"{model.id} ({model.name})")
+            if model.provider == "deepseek" and config.deepseek.api_key == "no-key":
+                add(
+                    "credential",
+                    "error",
+                    "DeepSeek API key is not configured",
+                    "Run `aeloon setup --provider deepseek` or set DEEPSEEK_API_KEY.",
+                )
+            else:
+                add("credential", "ok", "Credentials are configured")
+    finally:
+        await account.close()
+
+    socket_path = default_socket_path(config.data_dir)
+    bridge = await daemon_status(socket_path)
+    bridge_status = str(bridge.get("status") or "stopped")
+    add(
+        "bridge",
+        "ok" if bridge_status == "running" else "warning",
+        bridge_status,
+        "The Bridge starts automatically when account or UI features need it."
+        if bridge_status != "running"
+        else "",
+    )
+    if args.json:
+        print(
+            _json(
+                {
+                    "ok": not any(item["status"] == "error" for item in checks),
+                    "checks": checks,
+                }
+            )
+        )
+    else:
+        symbols = {"ok": "✓", "warning": "!", "error": "✗"}
+        for item in checks:
+            print(f"{symbols[item['status']]} {item['name']}: {item['message']}")
+            if item["fix"]:
+                print(f"  {item['fix']}")
+    return 1 if any(item["status"] == "error" for item in checks) else 0
+
+
+async def setup_command(args: argparse.Namespace) -> int:
+    path = resolve_config_path(args.config)
+    config = load_config(path, use_environment=False) if path.is_file() else Config().normalized()
+    if args.workspace is not None:
+        config = config.model_copy(update={"workspace": args.workspace}).normalized()
+    provider = args.provider
+    if provider is None:
+        if _stdin_is_interactive():
+            print("Choose a model provider:")
+            print("  1. Aeloon Cloud")
+            print("  2. DeepSeek API")
+            choice = input("Provider [1]: ").strip() or "1"
+            provider = "cloud" if choice == "1" else "deepseek" if choice == "2" else ""
+        if provider not in {"cloud", "deepseek"}:
+            raise ValueError("Choose `--provider cloud` or `--provider deepseek`")
+
+    if provider == "deepseek":
+        api_key = os.environ.get("DEEPSEEK_API_KEY") or config.deepseek.api_key
+        if not api_key or api_key == "no-key":
+            try:
+                api_key = getpass.getpass("DeepSeek API key: ")
+            except EOFError:
+                raise ValueError("DeepSeek API key must be entered from a terminal") from None
+        if not api_key:
+            raise ValueError("DeepSeek API key is required")
+        model_id = args.model or (
+            config.agent.model
+            if config.agent.model.startswith("deepseek/")
+            else "deepseek/deepseek-v4-flash"
+        )
+        if model_id in {"deepseek-v4-flash", "deepseek-v4-pro"}:
+            model_id = f"deepseek/{model_id}"
+        if model_id not in {
+            "deepseek/deepseek-v4-flash",
+            "deepseek/deepseek-v4-pro",
+        }:
+            raise ValueError(
+                "DeepSeek setup model must be deepseek-v4-flash or deepseek-v4-pro"
+            )
+        config = config.model_copy(
+            update={
+                "deepseek": config.deepseek.model_copy(update={"api_key": api_key}),
+                "agent": config.agent.model_copy(update={"model": model_id}),
+            }
+        ).normalized()
+        save_config(config, path)
+        print(f"Configured {model_id} in {path}.")
+        print("Try: aeloon \"inspect this repository\"")
+        return 0
+
+    # Persist the workspace before the daemon reads the configuration, then use
+    # the same account path as `aeloon login` so credentials remain in the vault.
+    save_config(config, path)
+    login_args = argparse.Namespace(
+        config=path,
+        data_dir=None,
+        socket=None,
+        output="text",
+        username=args.username,
+        cloud_command="login",
+    )
+    await cloud_command(login_args)
+    configured = load_config(path, use_environment=False)
+    socket_path = default_socket_path(configured.data_dir)
+    daemon = await ensure_daemon(config_path=path, socket_path=socket_path)
+    catalog = await bridge_request(Path(str(daemon["socket_path"])), "catalog.get", {})
+    cloud_models = [
+        item
+        for item in catalog.get("models") or []
+        if isinstance(item, dict) and item.get("provider_id") == "aeloon-cloud"
+    ]
+    selected = args.model or (str(cloud_models[0]["id"]) if cloud_models else "")
+    if not selected or selected not in {str(item.get("id")) for item in cloud_models}:
+        raise ValueError("No matching Aeloon Cloud model is available for this account")
+    settings = await bridge_request(Path(str(daemon["socket_path"])), "settings.get", {})
+    await bridge_request(
+        Path(str(daemon["socket_path"])),
+        "settings.update",
+        {
+            "revision": settings["revision"],
+            "patch": {"default_model_id": selected},
+        },
+    )
+    print(f"Selected {selected}.")
+    print("Try: aeloon \"inspect this repository\"")
+    return 0
+
+
+def _print_table(headers: tuple[str, ...], rows: list[tuple[str, ...]]) -> None:
+    if _is_interactive_terminal():
+        table = Table(show_header=True, header_style="bold", box=None)
+        for header in headers:
+            table.add_column(header)
+        for row in rows:
+            table.add_row(*row)
+        Console(file=sys.stdout, highlight=False).print(table)
+        return
+    print("\t".join(headers))
+    for row in rows:
+        print("\t".join(row))
+
+
+def completion_command(args: argparse.Namespace) -> int:
+    commands = "resume history login logout whoami models setup doctor config provider system"
+    scripts = {
+        "bash": (
+            "_aeloon_complete() {\n"
+            "  local current\n"
+            "  current=\"${COMP_WORDS[COMP_CWORD]}\"\n"
+            f"  COMPREPLY=($(compgen -W \"{commands}\" -- \"$current\"))\n"
+            "}\n"
+            "complete -F _aeloon_complete aeloon aeloon-core"
+        ),
+        "zsh": (
+            "#compdef aeloon aeloon-core\n"
+            f"_arguments '1:command:({commands})' '*::argument:->args'"
+        ),
+        "fish": "\n".join(
+            f"complete -c aeloon -f -n '__fish_use_subcommand' -a {command}"
+            for command in commands.split()
+        ),
+    }
+    print(scripts[args.shell])
+    return 0
 
 
 async def session_command(args: argparse.Namespace) -> int:
@@ -808,12 +1413,33 @@ def _json(value: Any) -> str:
 
 
 async def async_main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    raw = list(sys.argv[1:] if argv is None else argv)
+    normalized = _normalize_argv(raw)
+    parser = build_parser()
+    args = parser.parse_args(normalized)
+    if args.command is None:
+        parser.print_help()
+        return 0
     if args.command == "run":
         return await run_command(args)
+    if args.command == "resume":
+        return await resume_command(args)
+    if args.command == "history":
+        return await history_command(args)
+    if args.command in {"login", "logout", "whoami"}:
+        args.cloud_command = "status" if args.command == "whoami" else args.command
+        return await cloud_command(args)
+    if args.command == "models":
+        return await models_command(args)
+    if args.command == "setup":
+        return await setup_command(args)
+    if args.command == "doctor":
+        return await doctor_command(args)
+    if args.command == "completion":
+        return completion_command(args)
     if args.command == "session":
         return await session_command(args)
-    if args.command == "bridge":
+    if args.command in {"bridge", "system"}:
         return await bridge_command(args)
     if args.command == "cloud":
         return await cloud_command(args)
@@ -822,14 +1448,52 @@ async def async_main(argv: list[str] | None = None) -> int:
     return config_command(args)
 
 
+def _normalize_argv(argv: list[str]) -> list[str]:
+    """Make the task itself the default command while retaining legacy verbs."""
+
+    if not argv:
+        return [] if _stdin_is_interactive() else ["run", "--stdin"]
+    if argv[0] == "--":
+        return ["run", *argv[1:]]
+    if argv[0] in {"-h", "--help", "--version"} or argv[0] in _KNOWN_COMMANDS:
+        return argv
+    return ["run", *argv]
+
+
+def _json_errors_for(argv: list[str]) -> bool:
+    if "--json" in argv or "--stream" in argv:
+        return True
+    for index, value in enumerate(argv[:-1]):
+        if value == "--output" and argv[index + 1] in {"json", "stream-json"}:
+            return True
+    # Preserve the historical JSON error contract for explicit legacy entry points.
+    return bool(argv and argv[0] in {"run", "session", "config", "bridge", "cloud", "provider"})
+
+
+def _print_cli_error(code: str, message: str, *, as_json: bool) -> None:
+    if as_json:
+        print(_json({"error": code, "message": message}), file=sys.stderr)
+        return
+    print(f"Error: {message}", file=sys.stderr)
+    suggestions = {
+        "auth": "Run `aeloon login` or `aeloon setup` to configure credentials.",
+        "model_not_found": "Run `aeloon models` to see available models.",
+        "not_found": "Run `aeloon history` to see saved tasks.",
+    }
+    if code in suggestions:
+        print(suggestions[code], file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
+    raw = list(sys.argv[1:] if argv is None else argv)
+    json_errors = _json_errors_for(raw)
     try:
-        return asyncio.run(async_main(argv))
+        return asyncio.run(async_main(raw))
     except (BridgeError, HarnessError, SessionError) as exc:
-        print(_json({"error": exc.code, "message": str(exc)}), file=sys.stderr)
+        _print_cli_error(exc.code, str(exc), as_json=json_errors)
         return 2
     except (OSError, ValueError, json.JSONDecodeError) as exc:
-        print(_json({"error": "invalid_argument", "message": str(exc)}), file=sys.stderr)
+        _print_cli_error("invalid_argument", str(exc), as_json=json_errors)
         return 2
 
 

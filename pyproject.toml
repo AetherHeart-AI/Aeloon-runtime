@@ -28,6 +28,7 @@ dev = [
 ]
 
 [project.scripts]
+aeloon = "aeloon_core.__main__:main"
 aeloon-core = "aeloon_core.__main__:main"
 
 [tool.hatch.build.targets.wheel]

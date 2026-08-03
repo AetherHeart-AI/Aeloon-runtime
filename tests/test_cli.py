@@ -99,6 +99,27 @@ async def test_text_renderer_is_quiet_by_default(capsys) -> None:
 
 
 @pytest.mark.asyncio
+async def test_text_renderer_uses_one_status_line_in_a_terminal(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(cli, "_is_interactive_stderr", lambda: True)
+    renderer = cli.RunRenderer("text")
+
+    await renderer(cli.HarnessEvent("agent_start"))
+    await renderer(
+        cli.HarnessEvent(
+            "tool_execution_start",
+            {"toolCallId": "call-1", "toolName": "read", "args": {"path": "private.txt"}},
+        )
+    )
+    await renderer(cli.HarnessEvent("agent_end"))
+
+    rendered = capsys.readouterr().err
+    assert "Working…" in rendered
+    assert "Reading files…" in rendered
+    assert "private.txt" not in rendered
+    assert "\x1b[2K" in rendered
+
+
+@pytest.mark.asyncio
 async def test_text_renderer_summarizes_tool_command_and_result(capsys) -> None:
     renderer = cli.RunRenderer("text", verbose=True)
     await renderer(
@@ -323,6 +344,272 @@ def test_config_path_init_show_and_set(tmp_path: Path, monkeypatch, capsys) -> N
     assert shown["deepseek"]["api_key"] == "***"
     persisted = json.loads(path.read_text(encoding="utf-8"))
     assert persisted["deepseek"]["api_key"] == "no-key"
+
+
+def test_top_level_help_focuses_on_user_tasks() -> None:
+    help_text = cli.build_parser().format_help()
+
+    assert 'aeloon "fix the failing tests"' in help_text
+    assert "resume" in help_text
+    assert "history" in help_text
+    assert "doctor" in help_text
+    assert "bridge    " not in help_text
+    assert "session   " not in help_text
+    assert "==SUPPRESS==" not in help_text
+
+
+def test_default_task_command_and_explicit_separator_are_normalized() -> None:
+    assert cli._normalize_argv(["fix", "the", "tests"]) == ["run", "fix", "the", "tests"]
+    assert cli._normalize_argv(["--json", "inspect"]) == ["run", "--json", "inspect"]
+    assert cli._normalize_argv(["--", "models"]) == ["run", "models"]
+    assert cli._normalize_argv(["resume", "continue"]) == ["resume", "continue"]
+
+
+def test_new_commands_use_actionable_errors_while_legacy_run_keeps_json(
+    tmp_path: Path, capsys
+) -> None:
+    assert (
+        cli.main(
+            [
+                "resume",
+                "continue",
+                "-C",
+                str(tmp_path),
+                "--data-dir",
+                str(tmp_path / "data"),
+            ]
+        )
+        == 2
+    )
+    human = capsys.readouterr().err
+    assert human.startswith("Error: No saved task")
+    assert "aeloon history" in human
+
+    assert cli.main(["run"]) == 2
+    legacy = json.loads(capsys.readouterr().err)
+    assert legacy["error"] == "invalid_argument"
+
+
+@pytest.mark.asyncio
+async def test_default_task_runs_without_run_verb(tmp_path: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(cli, "DeepSeekProvider", lambda **_kwargs: _provider("direct"))
+
+    code = await cli.async_main(
+        [
+            "inspect this repository",
+            "--workspace",
+            str(tmp_path),
+            "--data-dir",
+            str(tmp_path / "data"),
+            "--ephemeral",
+        ]
+    )
+
+    assert code == 0
+    assert capsys.readouterr().out == "direct\n"
+
+
+@pytest.mark.asyncio
+async def test_resume_uses_latest_session_in_workspace(tmp_path: Path, monkeypatch, capsys) -> None:
+    data_dir = tmp_path / "data"
+    monkeypatch.setattr(cli, "DeepSeekProvider", lambda **_kwargs: _provider("saved"))
+    await cli.async_main(
+        [
+            "first task",
+            "-C",
+            str(tmp_path),
+            "--data-dir",
+            str(data_dir),
+            "--json",
+        ]
+    )
+    first = json.loads(capsys.readouterr().out)
+
+    await cli.async_main(
+        [
+            "newer task",
+            "-C",
+            str(tmp_path),
+            "--data-dir",
+            str(data_dir),
+            "--json",
+        ]
+    )
+    second = json.loads(capsys.readouterr().out)
+    assert second["session_id"] != first["session_id"]
+
+    repository = cli.JsonlSessionRepository(data_dir)
+    first_session = await repository.open(first["session_id"])
+    await first_session.append_custom_message(custom_type="note", content="recent activity")
+
+    monkeypatch.setattr(cli, "DeepSeekProvider", lambda **_kwargs: _provider("continued"))
+    await cli.async_main(
+        [
+            "resume",
+            "continue",
+            "-C",
+            str(tmp_path),
+            "--data-dir",
+            str(data_dir),
+            "--json",
+        ]
+    )
+    resumed = json.loads(capsys.readouterr().out)
+
+    assert resumed["session_id"] == first["session_id"]
+    assert resumed["final_content"] == "continued"
+
+
+@pytest.mark.asyncio
+async def test_history_is_human_readable_and_supports_json(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    data_dir = tmp_path / "data"
+    monkeypatch.setattr(cli, "DeepSeekProvider", lambda **_kwargs: _provider("done"))
+    await cli.async_main(
+        ["remember this task", "-C", str(tmp_path), "--data-dir", str(data_dir)]
+    )
+    capsys.readouterr()
+
+    assert (
+        await cli.async_main(
+            ["history", "-C", str(tmp_path), "--data-dir", str(data_dir)]
+        )
+        == 0
+    )
+    human = capsys.readouterr().out
+    assert "UPDATED\tWORKSPACE\tSUMMARY\tSESSION" in human
+    assert "remember this task" in human
+
+    await cli.async_main(
+        ["history", "-C", str(tmp_path), "--data-dir", str(data_dir), "--json"]
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload[0]["summary"] == "remember this task"
+
+    await cli.async_main(
+        ["history", payload[0]["id"][:8], "--data-dir", str(data_dir)]
+    )
+    detail = capsys.readouterr().out
+    assert "remember this task" in detail
+    assert f"Session: {payload[0]['id']}" in detail
+
+
+@pytest.mark.asyncio
+async def test_models_and_doctor_offer_human_and_machine_views(tmp_path: Path, capsys) -> None:
+    config_path = tmp_path / "config.json"
+    cli.save_config(cli.Config(workspace=tmp_path, data_dir=tmp_path / "data"), config_path)
+
+    assert await cli.async_main(["models", "--config", str(config_path)]) == 0
+    models = capsys.readouterr().out
+    assert "MODEL\tPROVIDER\tCONTEXT" in models
+    assert "deepseek/deepseek-v4-flash" in models
+
+    assert await cli.async_main(["doctor", "--config", str(config_path), "--json"]) == 1
+    diagnosis = json.loads(capsys.readouterr().out)
+    assert diagnosis["ok"] is False
+    credential = next(item for item in diagnosis["checks"] if item["name"] == "credential")
+    assert credential["status"] == "error"
+    assert "aeloon setup" in credential["fix"]
+
+
+@pytest.mark.asyncio
+async def test_setup_configures_deepseek_without_exposing_key(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    config_path = tmp_path / "config.json"
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "setup-secret")
+
+    assert (
+        await cli.async_main(
+            [
+                "setup",
+                "--provider",
+                "deepseek",
+                "--model",
+                "deepseek-v4-pro",
+                "--config",
+                str(config_path),
+                "-C",
+                str(tmp_path),
+            ]
+        )
+        == 0
+    )
+
+    output = capsys.readouterr().out
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert "setup-secret" not in output
+    assert saved["deepseek"]["api_key"] == "setup-secret"
+    assert saved["agent"]["model"] == "deepseek/deepseek-v4-pro"
+
+
+@pytest.mark.asyncio
+async def test_setup_cloud_selects_an_account_model(tmp_path: Path, monkeypatch, capsys) -> None:
+    config_path = tmp_path / "config.json"
+    socket_path = tmp_path / "bridge.sock"
+    calls: list[str] = []
+
+    async def fake_cloud_command(args):
+        calls.append(args.cloud_command)
+        return 0
+
+    async def fake_ensure_daemon(**_kwargs):
+        return {"socket_path": str(socket_path), "status": "running"}
+
+    async def fake_bridge_request(_path, method, params=None, **_kwargs):
+        if method == "catalog.get":
+            return {
+                "models": [
+                    {
+                        "id": "aeloon-cloud/reasoner",
+                        "provider_id": "aeloon-cloud",
+                    }
+                ]
+            }
+        if method == "settings.get":
+            return {"revision": 1}
+        assert method == "settings.update"
+        assert params == {
+            "revision": 1,
+            "patch": {"default_model_id": "aeloon-cloud/reasoner"},
+        }
+        persisted = json.loads(config_path.read_text(encoding="utf-8"))
+        persisted["agent"]["model"] = "aeloon-cloud/reasoner"
+        config_path.write_text(json.dumps(persisted), encoding="utf-8")
+        return {"revision": 2}
+
+    monkeypatch.setattr(cli, "cloud_command", fake_cloud_command)
+    monkeypatch.setattr(cli, "ensure_daemon", fake_ensure_daemon)
+    monkeypatch.setattr(cli, "bridge_request", fake_bridge_request)
+
+    assert (
+        await cli.async_main(
+            [
+                "setup",
+                "--provider",
+                "cloud",
+                "--username",
+                "alice",
+                "--config",
+                str(config_path),
+                "-C",
+                str(tmp_path),
+            ]
+        )
+        == 0
+    )
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert calls == ["login"]
+    assert saved["agent"]["model"] == "aeloon-cloud/reasoner"
+    assert "Selected aeloon-cloud/reasoner" in capsys.readouterr().out
+
+
+def test_completion_command_emits_shell_script(capsys) -> None:
+    assert cli.main(["completion", "zsh"]) == 0
+    rendered = capsys.readouterr().out
+    assert rendered.startswith("#compdef aeloon aeloon-core")
+    assert "resume history login" in rendered
 
 
 @pytest.mark.asyncio

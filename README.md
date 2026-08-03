@@ -12,11 +12,11 @@ this version and will be redesigned separately.
 
 ```bash
 uv sync
-export DEEPSEEK_API_KEY="your API key"
+export DEEPSEEK_API_KEY="your API key"  # or run: uv run aeloon setup
 
-uv run aeloon-core run "Inspect this repository and explain its entry points"
-uv run aeloon-core run --prompt-file task.md --output json
-printf 'Fix the failing tests' | uv run aeloon-core run --stdin --output stream-json
+uv run aeloon "Inspect this repository and explain its entry points"
+uv run aeloon --file task.md --json
+printf 'Fix the failing tests' | uv run aeloon
 ```
 
 The default model is `deepseek/deepseek-v4-flash`; `deepseek/deepseek-v4-pro` is also built in.
@@ -136,8 +136,74 @@ used for both compaction and branch summaries.
 
 ## CLI
 
+The task is the default command. A normal workflow only needs the task itself and, when needed,
+`resume`:
+
 ```bash
-# New session, existing session, or ephemeral run
+# Start a saved task in the current workspace
+uv run aeloon "fix the failing tests"
+
+# Continue the newest task for this workspace; no session id is needed
+uv run aeloon resume "continue with the implementation"
+
+# Read a task from a file or pipe
+uv run aeloon --file task.md
+printf 'review this change' | uv run aeloon
+
+# Common task options
+uv run aeloon -C ../project -m deepseek/deepseek-v4-pro "review the repository"
+uv run aeloon --ephemeral "answer without saving a session"
+uv run aeloon --json "return one machine-readable result"
+uv run aeloon -v "show concise tool activity"
+uv run aeloon -vv "also show lifecycle events"
+```
+
+Account, discovery, setup, and recovery commands are intentionally task-oriented:
+
+```bash
+uv run aeloon setup
+uv run aeloon login
+uv run aeloon whoami
+uv run aeloon logout
+uv run aeloon models
+uv run aeloon history
+uv run aeloon doctor
+```
+
+`history` and `models` render compact tables for people and accept `--json` for automation.
+`doctor` checks the config, workspace, selected model, credentials, and optional Bridge daemon,
+then prints a concrete recovery command for each problem. `setup` stores secrets in the mode-0600
+config or the account vault and never accepts a secret as a command-line argument.
+
+Shell completion scripts can be generated without an additional runtime dependency:
+
+```bash
+uv run aeloon completion zsh > ~/.zfunc/_aeloon
+uv run aeloon completion bash > ~/.local/share/bash-completion/completions/aeloon
+uv run aeloon completion fish > ~/.config/fish/completions/aeloon.fish
+```
+
+Advanced configuration and local-provider management remain available:
+
+```bash
+uv run aeloon config show
+uv run aeloon config set model deepseek/deepseek-v4-pro
+uv run aeloon provider add ollama \
+  --name Ollama \
+  --base-url http://127.0.0.1:11434/v1 \
+  --model qwen3-coder
+uv run aeloon provider list
+uv run aeloon provider remove ollama
+
+# Bridge administration is grouped under the advanced system surface
+uv run aeloon system bridge status
+uv run aeloon system bridge stop
+```
+
+The former command surface remains as a compatibility layer for existing scripts:
+
+```bash
+# Explicit new session, existing session, or ephemeral run
 uv run aeloon-core run "task"
 uv run aeloon-core run "continue" --session <id>
 uv run aeloon-core run "one shot" --no-session
@@ -166,16 +232,11 @@ uv run aeloon-core cloud login <username>
 uv run aeloon-core cloud status
 uv run aeloon-core cloud logout
 
-# Unified Provider commands (`cloud ...` remains a compatibility alias)
+# Unified Provider commands (`cloud ...` is a compatibility alias)
 uv run aeloon-core provider login <username>
-uv run aeloon-core provider add ollama \
-  --name Ollama \
-  --base-url http://127.0.0.1:11434/v1 \
-  --model qwen3-coder
 uv run aeloon-core provider list
-uv run aeloon-core provider remove ollama
 
-# User-level Bridge v2 daemon
+# Original Bridge v2 path
 uv run aeloon-core bridge ensure --output json
 uv run aeloon-core bridge status --output json
 uv run aeloon-core bridge schema
@@ -183,10 +244,10 @@ uv run aeloon-core bridge stop
 ```
 
 `stream-json` writes one typed harness event per line followed by a `result` object. `json` writes
-only the result object to stdout. Text mode runs quietly by default: only the final response is
-buffered and rendered as Markdown when stdout is an interactive terminal (redirected text output
-remains plain text). Pass `--verbose` to also write concise run/read/write/search summaries to
-stderr as the tools execute.
+only the result object to stdout. In an interactive terminal, normal text mode keeps a single
+status line updated on stderr and renders the final Markdown response on stdout. Redirected output
+remains stable and quiet. Pass `--quiet` to suppress interactive status, `-v` for concise
+run/read/write/search summaries, or `-vv` for additional lifecycle events.
 
 ## Bridge v2
 
