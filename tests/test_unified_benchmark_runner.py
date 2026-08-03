@@ -293,7 +293,7 @@ def test_hermes_uses_scripted_oneshot_mode(tmp_path: Path) -> None:
     }
 
 
-def test_pi_uses_text_mode_without_json_event_history(tmp_path: Path) -> None:
+def test_pi_uses_json_mode_and_normalizes_token_usage(tmp_path: Path) -> None:
     harness = object.__new__(PiHarness)
     harness.executable = "/fake/pi"
     harness.model = "deepseek-v4-flash"
@@ -308,15 +308,38 @@ def test_pi_uses_text_mode_without_json_event_history(tmp_path: Path) -> None:
     result = harness.interpret(
         ProcessOutcome(
             returncode=0,
-            stdout="```python\nprint(1)\n```\n",
+            stdout="\n".join(
+                [
+                    '{"type":"session","id":"pi-session"}',
+                    '{"type":"message_end","message":{"role":"assistant",'
+                    '"content":[{"type":"text","text":"done"}],'
+                    '"provider":"deepseek","model":"deepseek-v4-flash",'
+                    '"usage":{"input":12,"output":3,"cost":{"total":0.01}},'
+                    '"stopReason":"stop"}}',
+                    '{"type":"agent_end","messages":[]}',
+                ]
+            ),
             stderr="",
             duration_ms=1,
         )
     )
 
-    assert invocation.command[:4] == ["/fake/pi", "--print", "--mode", "text"]
-    assert result["status"] == "completed"
-    assert result["final_content"] == "```python\nprint(1)\n```"
+    assert invocation.command[:4] == ["/fake/pi", "--print", "--mode", "json"]
+    assert result == {
+        "status": "completed",
+        "session_id": "pi-session",
+        "final_content": "done",
+        "usage": {
+            "input": 12,
+            "output": 3,
+            "input_tokens": 12,
+            "output_tokens": 3,
+            "cost": {"total": 0.01},
+        },
+        "cost_usd": 0.01,
+        "models": {"provider": "deepseek", "model": "deepseek-v4-flash"},
+        "payload_error": None,
+    }
 
 
 def test_harness_run_bounds_raw_process_output(tmp_path: Path, monkeypatch) -> None:
