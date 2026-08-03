@@ -13,8 +13,10 @@ METHODS = (
     "session.create", "session.list", "session.get", "session.delete", "session.rename",
     "session.configure", "session.tree", "session.navigate", "session.compact",
     "session.next_turn", "turn.start", "turn.cancel", "turn.steer", "turn.follow_up",
-    "catalog.get", "settings.get", "settings.update",
+    "catalog.get", "provider.list", "provider.local.add", "provider.local.remove",
+    "settings.get", "settings.update",
     "cloud.account.status", "cloud.account.login", "cloud.account.logout",
+    "provider.cloud.status", "provider.cloud.login", "provider.cloud.logout",
 )
 EVENTS = (
     "operation.queued", "operation.started", "operation.completed", "operation.failed",
@@ -22,12 +24,12 @@ EVENTS = (
     "content.completed", "tool.started", "tool.updated", "tool.completed",
     "usage.updated", "queue.updated", "retry.started", "retry.completed",
     "resources.updated", "session.compacted", "session.navigated", "settings.updated",
-    "cloud.account.updated", "log.entry", "system.shutdown",
+    "cloud.account.updated", "provider.updated", "log.entry", "system.shutdown",
 )
 CAPABILITIES = (
     "daemon", "sessions", "turn-queue", "ordered-events", "event-replay",
     "session-snapshots", "attachments", "revisioned-settings", "dynamic-catalog",
-    "cloud-account",
+    "cloud-account", "unified-providers",
 )
 
 RPC_CODES = {

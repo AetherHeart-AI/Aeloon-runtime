@@ -20,6 +20,32 @@ class DeepSeekConfig(BaseModel):
     extra_headers: dict[str, str] = Field(default_factory=dict)
 
 
+class LocalModelConfig(BaseModel):
+    """One model exposed by an OpenAI-compatible local API provider."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1)
+    name: str | None = None
+    reasoning: bool = False
+    supports_image: bool = False
+    context_window: int = Field(default=128_000, ge=1)
+    max_tokens: int = Field(default=32_768, ge=1)
+
+
+class LocalProviderConfig(BaseModel):
+    """A user-added OpenAI-compatible API endpoint."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    base_url: str
+    api_key: str = "no-key"
+    proxy: str | None = None
+    extra_headers: dict[str, str] = Field(default_factory=dict)
+    models: list[LocalModelConfig] = Field(min_length=1)
+
+
 class CloudConfig(BaseModel):
     """Aeloon's optional account-backed model service."""
 
@@ -52,7 +78,7 @@ class CompactionConfig(BaseModel):
 class AgentConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    model: str = "deepseek-v4-flash"
+    model: str = "deepseek/deepseek-v4-flash"
     thinking_level: Literal["off", "minimal", "low", "medium", "high", "max"] = "off"
     max_tokens: int | None = Field(default=None, ge=1)
     temperature: float | None = None
@@ -87,6 +113,7 @@ class Config(BaseModel):
     workspace: Path = Field(default_factory=Path.cwd)
     data_dir: Path = Field(default_factory=lambda: Path("~/.aeloon-core").expanduser())
     deepseek: DeepSeekConfig = Field(default_factory=DeepSeekConfig)
+    local_providers: dict[str, LocalProviderConfig] = Field(default_factory=dict)
     cloud: CloudConfig = Field(default_factory=CloudConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
     resources: ResourceConfig = Field(default_factory=ResourceConfig)
@@ -94,6 +121,9 @@ class Config(BaseModel):
 
     def normalized(self) -> Config:
         workspace = self.workspace.expanduser().resolve(strict=False)
+        model_id = self.agent.model.strip()
+        if model_id in {"deepseek-v4-flash", "deepseek-v4-pro"}:
+            model_id = f"deepseek/{model_id}"
         roots = [
             (root.expanduser() if root.expanduser().is_absolute() else workspace / root).resolve(
                 strict=False
@@ -104,6 +134,7 @@ class Config(BaseModel):
             update={
                 "workspace": workspace,
                 "data_dir": self.data_dir.expanduser().resolve(strict=False),
+                "agent": self.agent.model_copy(update={"model": model_id}),
                 "resources": self.resources.model_copy(update={"roots": roots}),
             }
         )
@@ -165,9 +196,21 @@ def save_config(config: Config, path: Path | str | None = None, *, force: bool =
 
 def public_config(config: Config, *, show_secrets: bool = False) -> dict[str, Any]:
     value = config.model_dump(mode="json")
-    if not show_secrets and value["deepseek"]["api_key"] != "no-key":
-        value["deepseek"]["api_key"] = "***"
+    if not show_secrets:
+        if value["deepseek"]["api_key"] != "no-key":
+            value["deepseek"]["api_key"] = "***"
+        _redact_secret_headers(value["deepseek"]["extra_headers"])
+        for provider in value["local_providers"].values():
+            if provider["api_key"] != "no-key":
+                provider["api_key"] = "***"
+            _redact_secret_headers(provider["extra_headers"])
     return value
+
+
+def _redact_secret_headers(headers: dict[str, str]) -> None:
+    for name in tuple(headers):
+        if name.lower() in {"authorization", "api-key", "x-api-key"}:
+            headers[name] = "***"
 
 
 __all__ = [
@@ -176,6 +219,8 @@ __all__ = [
     "Config",
     "CloudConfig",
     "DeepSeekConfig",
+    "LocalModelConfig",
+    "LocalProviderConfig",
     "ResourceConfig",
     "RetryConfig",
     "ToolConfig",

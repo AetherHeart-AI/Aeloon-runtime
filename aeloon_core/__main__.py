@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import getpass
 import json
 import sys
 import time
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +15,7 @@ from rich.console import Console
 from rich.markdown import Markdown
 
 from aeloon_core.bridge.daemon import (
+    bridge_request,
     daemon_status,
     default_socket_path,
     ensure_daemon,
@@ -22,6 +23,7 @@ from aeloon_core.bridge.daemon import (
     stop_daemon,
 )
 from aeloon_core.bridge.protocol import BridgeError, load_schema
+from aeloon_core.cloud import CloudAccountService, CloudError
 from aeloon_core.config import (
     Config,
     load_config,
@@ -39,9 +41,9 @@ from aeloon_core.harness import (
     ResourceLoader,
     SessionError,
     StreamOptions,
-    get_deepseek_model,
     message_to_dict,
 )
+from aeloon_core.providers import UnifiedProviderRegistry, qualify_model_id
 
 CONFIG_PATHS: dict[str, tuple[str, ...]] = {
     "workspace": ("workspace",),
@@ -136,6 +138,56 @@ def build_parser() -> argparse.ArgumentParser:
         if name in {"ensure", "status", "stop"}:
             command.add_argument("--output", choices=("text", "json"), default="text")
     bridge_commands.add_parser("schema")
+
+    cloud = commands.add_parser("cloud", help="Manage the Aeloon Cloud account.")
+    cloud_commands = cloud.add_subparsers(dest="cloud_command", required=True)
+    cloud_login = cloud_commands.add_parser("login", help="Sign in to Aeloon Cloud.")
+    cloud_login.add_argument("username", nargs="?", help="Account username or email.")
+    for command_name in ("login", "status", "logout"):
+        command = cloud_login if command_name == "login" else cloud_commands.add_parser(
+            command_name,
+            help={
+                "status": "Show the current Aeloon Cloud account.",
+                "logout": "Sign out of Aeloon Cloud.",
+            }[command_name],
+        )
+        command.add_argument("--config", type=Path)
+        command.add_argument("--data-dir", type=Path)
+        command.add_argument("--socket", type=Path)
+        command.add_argument("--output", choices=("text", "json"), default="text")
+
+    provider = commands.add_parser("provider", help="Manage cloud and local API providers.")
+    provider_commands = provider.add_subparsers(dest="provider_command", required=True)
+    provider_login = provider_commands.add_parser("login", help="Sign in to Aeloon Cloud.")
+    provider_login.add_argument("username", nargs="?", help="Account username or email.")
+    provider_add = provider_commands.add_parser("add", help="Add a local API provider.")
+    provider_add.add_argument("provider_id", help="Stable prefix used in provider/model ids.")
+    provider_add.add_argument("--name")
+    provider_add.add_argument("--base-url", required=True)
+    provider_add.add_argument(
+        "--model",
+        action="append",
+        dest="models",
+        help="Model id (repeatable); omit to discover models from GET /models.",
+    )
+    provider_add.add_argument(
+        "--no-api-key", action="store_true", help="The local endpoint does not require a key."
+    )
+    provider_remove = provider_commands.add_parser("remove", help="Remove a local API provider.")
+    provider_remove.add_argument("provider_id")
+    for command_name in ("login", "status", "logout", "list", "add", "remove"):
+        if command_name == "login":
+            command = provider_login
+        elif command_name == "add":
+            command = provider_add
+        elif command_name == "remove":
+            command = provider_remove
+        else:
+            command = provider_commands.add_parser(command_name)
+        command.add_argument("--config", type=Path)
+        command.add_argument("--data-dir", type=Path)
+        command.add_argument("--socket", type=Path)
+        command.add_argument("--output", choices=("text", "json"), default="text")
     return parser
 
 
@@ -368,21 +420,32 @@ async def run_command(args: argparse.Namespace) -> int:
                 update={"workspace": Path(session.metadata.cwd)}
             ).normalized()
         restored_model = (await session.build_context()).model
-        if restored_model is not None and restored_model[0] == "deepseek" and args.model is None:
+        if restored_model is not None and args.model is None:
+            restored_id = restored_model[1]
+            if "/" not in restored_id:
+                restored_id = qualify_model_id(restored_model[0], restored_id)
             config = config.model_copy(
-                update={"agent": config.agent.model_copy(update={"model": restored_model[1]})}
+                update={"agent": config.agent.model_copy(update={"model": restored_id})}
             )
-    model = replace(get_deepseek_model(config.agent.model), base_url=config.deepseek.base_url)
+    cloud_account = CloudAccountService(config.cloud, data_dir=config.data_dir)
+    registry = UnifiedProviderRegistry(
+        config,
+        cloud_account,
+        local_provider_factory=DeepSeekProvider,
+    )
+    try:
+        model = await registry.model(config.agent.model)
+    except PermissionError as exc:
+        await cloud_account.close()
+        raise HarnessError("auth", str(exc)) from None
+    except (KeyError, RuntimeError, CloudError) as exc:
+        await cloud_account.close()
+        raise HarnessError("model_not_found", str(exc)) from None
     if session is None and not args.no_session:
         assert repository is not None
         session = await repository.create(cwd=config.workspace)
 
-    provider = DeepSeekProvider(
-        api_key=config.deepseek.api_key,
-        base_url=config.deepseek.base_url,
-        proxy=config.deepseek.proxy,
-        headers=config.deepseek.extra_headers,
-    )
+    provider = registry.provider(model)
     resources = ResourceLoader(
         cwd=config.workspace,
         agent_dir=Path("~/.aeloon-core"),
@@ -424,6 +487,7 @@ async def run_command(args: argparse.Namespace) -> int:
         message = await harness.prompt(prompt)
     finally:
         await harness.close()
+        await cloud_account.close()
     result = {
         "type": "result",
         "status": _status(message.stop_reason),
@@ -547,6 +611,149 @@ async def bridge_command(args: argparse.Namespace) -> int:
     return 0
 
 
+async def cloud_command(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    if args.data_dir is not None:
+        config = config.model_copy(update={"data_dir": args.data_dir}).normalized()
+    socket_path = args.socket or default_socket_path(config.data_dir)
+
+    params: dict[str, Any] = {}
+    method = f"cloud.account.{args.cloud_command}"
+    timeout = 3.0
+    if args.cloud_command == "login":
+        username = (args.username or _read_cloud_username()).strip()
+        if not username:
+            raise ValueError("Aeloon Cloud username is required")
+        password = _read_cloud_password()
+        params = {"username": username, "password": password}
+        timeout = 60.0
+
+    daemon = await ensure_daemon(
+        config_path=args.config,
+        data_dir=args.data_dir,
+        socket_path=socket_path,
+    )
+    result = await bridge_request(
+        Path(str(daemon["socket_path"])),
+        method,
+        params,
+        timeout=timeout,
+    )
+    _print_cloud_result(args.cloud_command, result, output=args.output)
+    return 0
+
+
+def _read_cloud_username() -> str:
+    print("Aeloon Cloud username: ", end="", file=sys.stderr, flush=True)
+    value = sys.stdin.readline()
+    if not value:
+        raise ValueError("Aeloon Cloud username is required") from None
+    return value
+
+
+def _read_cloud_password() -> str:
+    try:
+        password = getpass.getpass("Aeloon Cloud password: ")
+    except EOFError:
+        raise ValueError("Aeloon Cloud password must be entered from a terminal") from None
+    if not password:
+        raise ValueError("Aeloon Cloud password is required")
+    return password
+
+
+def _print_cloud_result(command: str, result: dict[str, Any], *, output: str) -> None:
+    if output == "json":
+        print(_json(result))
+        return
+    if command == "logout":
+        print("Signed out of Aeloon Cloud.")
+        return
+    user = result.get("user")
+    if not result.get("authenticated") or not isinstance(user, dict):
+        print("Not signed in to Aeloon Cloud.")
+        return
+    username = str(user.get("username") or "").strip()
+    display_name = str(user.get("display_name") or username or "Aeloon user").strip()
+    identity = f" (@{username})" if username and username != display_name else ""
+    print(f"Signed in to Aeloon Cloud as {display_name}{identity}.")
+
+
+async def provider_command(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    if args.data_dir is not None:
+        config = config.model_copy(update={"data_dir": args.data_dir}).normalized()
+    socket_path = args.socket or default_socket_path(config.data_dir)
+
+    command = args.provider_command
+    params: dict[str, Any] = {}
+    timeout = 3.0
+    if command == "login":
+        username = (args.username or _read_cloud_username()).strip()
+        if not username:
+            raise ValueError("Aeloon Cloud username is required")
+        params = {"username": username, "password": _read_cloud_password()}
+        method = "cloud.account.login"
+        timeout = 60.0
+    elif command in {"status", "logout"}:
+        method = f"cloud.account.{command}"
+    elif command == "list":
+        method = "provider.list"
+    elif command == "add":
+        api_key = "no-key" if args.no_api_key else _read_local_api_key()
+        params = {
+            "provider_id": args.provider_id,
+            "name": args.name or args.provider_id,
+            "base_url": args.base_url,
+            "api_key": api_key,
+        }
+        if args.models:
+            params["models"] = args.models
+        method = "provider.local.add"
+    else:
+        params = {"provider_id": args.provider_id}
+        method = "provider.local.remove"
+
+    required_methods = () if method.startswith("cloud.account.") else (method,)
+    daemon = await ensure_daemon(
+        config_path=args.config,
+        data_dir=args.data_dir,
+        socket_path=socket_path,
+        required_methods=required_methods,
+    )
+    result = await bridge_request(
+        Path(str(daemon["socket_path"])), method, params, timeout=timeout
+    )
+    _print_provider_result(command, result, output=args.output)
+    return 0
+
+
+def _read_local_api_key() -> str:
+    try:
+        value = getpass.getpass("Local API key (leave empty for none): ")
+    except EOFError:
+        raise ValueError("Local API key must be entered from a terminal") from None
+    return value or "no-key"
+
+
+def _print_provider_result(command: str, result: dict[str, Any], *, output: str) -> None:
+    if output == "json":
+        print(_json(result))
+        return
+    if command in {"login", "status", "logout"}:
+        _print_cloud_result(command, result, output="text")
+        return
+    if command == "list":
+        for provider in result.get("providers") or []:
+            status = "signed in" if provider.get("authenticated") else provider.get("kind")
+            print(f"{provider['id']}\t{provider['name']}\t{status}")
+        return
+    if command == "add":
+        provider = result["provider"]
+        print(f"Added local provider {provider['id']} ({provider['base_url']}).")
+        return
+    print(f"Removed local provider {result['provider_id']}.")
+
+
 def _with_run_overrides(config: Config, args: argparse.Namespace) -> Config:
     updates: dict[str, Any] = {}
     if args.workspace is not None:
@@ -608,6 +815,10 @@ async def async_main(argv: list[str] | None = None) -> int:
         return await session_command(args)
     if args.command == "bridge":
         return await bridge_command(args)
+    if args.command == "cloud":
+        return await cloud_command(args)
+    if args.command == "provider":
+        return await provider_command(args)
     return config_command(args)
 
 

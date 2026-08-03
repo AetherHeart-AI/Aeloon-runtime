@@ -11,10 +11,12 @@ import time
 import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+import httpx
 
 from aeloon_core.bridge.protocol import (
     CAPABILITIES,
@@ -24,26 +26,37 @@ from aeloon_core.bridge.protocol import (
     PROTOCOL_VERSION,
     BridgeError,
 )
-from aeloon_core.cloud import CloudAccountService, CloudError, CloudProvider
-from aeloon_core.cloud.account import CLOUD_PROVIDER_ID
-from aeloon_core.config import Config, load_config, resolve_config_path, save_config
+from aeloon_core.cloud import CloudAccountService, CloudError
+from aeloon_core.config import (
+    Config,
+    LocalModelConfig,
+    LocalProviderConfig,
+    load_config,
+    resolve_config_path,
+    save_config,
+)
 from aeloon_core.harness import (
     ALL_TOOL_NAMES,
-    DEEPSEEK_MODELS,
     DEFAULT_ACTIVE_TOOLS,
     AgentHarness,
     CompactionSettings,
-    DeepSeekProvider,
     HarnessError,
     HarnessEvent,
     ImageContent,
     JsonlSessionRepository,
     Model,
-    Provider,
     ResourceLoader,
     Session,
     SessionError,
     StreamOptions,
+)
+from aeloon_core.providers import (
+    DEEPSEEK_PROVIDER_ID,
+    UnifiedProviderRegistry,
+    normalize_model_id,
+    qualify_model_id,
+    split_model_id,
+    validate_provider_id,
 )
 from aeloon_core.version import __version__
 
@@ -160,11 +173,17 @@ class CoreService:
             "turn.steer": self.turn_steer,
             "turn.follow_up": self.turn_follow_up,
             "catalog.get": self.catalog_get,
+            "provider.list": self.provider_list,
+            "provider.local.add": self.provider_local_add,
+            "provider.local.remove": self.provider_local_remove,
             "settings.get": self.settings_get,
             "settings.update": self.settings_update,
             "cloud.account.status": self.cloud_account_status,
             "cloud.account.login": self.cloud_account_login,
             "cloud.account.logout": self.cloud_account_logout,
+            "provider.cloud.status": self.cloud_account_status,
+            "provider.cloud.login": self.cloud_account_login,
+            "provider.cloud.logout": self.cloud_account_logout,
         }
         handler = routes.get(method)
         if handler is None:
@@ -472,6 +491,7 @@ class CoreService:
         resources = await asyncio.to_thread(loader.reload)
         models = await self._models()
         return {
+            "providers": await self._provider_registry().providers(),
             "models": [
                 {
                     "id": model.id,
@@ -518,6 +538,18 @@ class CoreService:
                 "base_url": config.deepseek.base_url,
                 "proxy": config.deepseek.proxy,
                 "credential_configured": bool(config.deepseek.api_key and config.deepseek.api_key != "no-key"),
+            },
+            "local_providers": {
+                provider_id: {
+                    "name": provider.name,
+                    "base_url": provider.base_url,
+                    "proxy": provider.proxy,
+                    "credential_configured": bool(
+                        provider.api_key and provider.api_key != "no-key"
+                    ),
+                    "models": [model.model_dump(mode="json") for model in provider.models],
+                }
+                for provider_id, provider in config.local_providers.items()
             },
             "cloud": {
                 "enabled": config.cloud.enabled,
@@ -602,12 +634,112 @@ class CoreService:
         except CloudError as exc:
             raise BridgeError("authentication_failed", self._sanitize(str(exc))) from None
         await self._emit("cloud.account.updated", None, None, result)
+        await self._emit(
+            "provider.updated",
+            None,
+            None,
+            {"provider_id": "aeloon-cloud", "action": "login"},
+        )
         return result
 
     async def cloud_account_logout(self, _params: Mapping[str, Any]) -> dict[str, Any]:
         result = self.cloud_account.logout()
         await self._emit("cloud.account.updated", None, None, result)
+        await self._emit(
+            "provider.updated",
+            None,
+            None,
+            {"provider_id": "aeloon-cloud", "action": "logout"},
+        )
         return result
+
+    async def provider_list(self, _params: Mapping[str, Any]) -> dict[str, Any]:
+        return {"providers": await self._provider_registry().providers()}
+
+    async def provider_local_add(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        provider_id = validate_provider_id(self._required_string(params, "provider_id"))
+        if provider_id in {DEEPSEEK_PROVIDER_ID, "aeloon-cloud"}:
+            raise BridgeError("invalid_argument", f"Provider id is reserved: {provider_id}")
+        base_url = self._http_base_url(self._required_string(params, "base_url"))
+        name = str(params.get("name") or provider_id).strip() or provider_id
+        api_key = str(params.get("api_key") or "no-key")
+        proxy = str(params["proxy"]) if params.get("proxy") else None
+        extra_headers = self._string_mapping(params.get("extra_headers"))
+        raw_models = params.get("models")
+        if raw_models is None:
+            raw_models = await self._discover_local_models(
+                base_url,
+                api_key=api_key,
+                proxy=proxy,
+                extra_headers=extra_headers,
+            )
+        if not isinstance(raw_models, list) or not raw_models:
+            raise BridgeError("invalid_argument", "models must be a non-empty list")
+        models: list[LocalModelConfig] = []
+        model_ids: set[str] = set()
+        for raw_model in raw_models:
+            value = {"id": raw_model} if isinstance(raw_model, str) else raw_model
+            if not isinstance(value, Mapping):
+                raise BridgeError("invalid_argument", "each model must be a string or object")
+            parsed_model = LocalModelConfig.model_validate(dict(value))
+            canonical = qualify_model_id(provider_id, parsed_model.id)
+            if canonical in model_ids:
+                raise BridgeError("invalid_argument", f"Duplicate model: {canonical}")
+            model_ids.add(canonical)
+            models.append(parsed_model.model_copy(update={"id": split_model_id(canonical)[1]}))
+        provider = LocalProviderConfig(
+            name=name,
+            base_url=base_url,
+            api_key=api_key,
+            proxy=proxy,
+            extra_headers=extra_headers,
+            models=models,
+        )
+        revision = params.get("revision")
+        async with self._settings_lock:
+            if revision is not None and revision != self._revision:
+                raise BridgeError("revision_conflict", "Core settings changed; refresh and try again")
+            if provider_id in self.config.local_providers:
+                raise BridgeError("invalid_argument", f"Provider already exists: {provider_id}")
+            raw = load_config(self.config_path, use_environment=False).model_dump(mode="json")
+            raw["local_providers"][provider_id] = provider.model_dump(mode="json")
+            await asyncio.to_thread(
+                save_config, Config.model_validate(raw).normalized(), self.config_path
+            )
+            self._reload_config()
+            self._revision += 1
+        await self._emit(
+            "provider.updated", None, None, {"provider_id": provider_id, "action": "added"}
+        )
+        await self._emit("settings.updated", None, None, {"revision": self._revision})
+        return await self._provider_result(provider_id)
+
+    async def provider_local_remove(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        provider_id = validate_provider_id(self._required_string(params, "provider_id"))
+        revision = params.get("revision")
+        async with self._settings_lock:
+            if revision is not None and revision != self._revision:
+                raise BridgeError("revision_conflict", "Core settings changed; refresh and try again")
+            if provider_id not in self.config.local_providers:
+                raise BridgeError("invalid_argument", f"Unknown local provider: {provider_id}")
+            raw = load_config(self.config_path, use_environment=False).model_dump(mode="json")
+            del raw["local_providers"][provider_id]
+            fallback = self.config.agent.model
+            try:
+                if normalize_model_id(fallback).startswith(f"{provider_id}/"):
+                    raw["agent"]["model"] = "deepseek/deepseek-v4-flash"
+            except ValueError:
+                pass
+            await asyncio.to_thread(
+                save_config, Config.model_validate(raw).normalized(), self.config_path
+            )
+            self._reload_config()
+            self._revision += 1
+        await self._emit(
+            "provider.updated", None, None, {"provider_id": provider_id, "action": "removed"}
+        )
+        await self._emit("settings.updated", None, None, {"revision": self._revision})
+        return {"provider_id": provider_id, "removed": True, "revision": self._revision}
 
     async def _execute_turn(
         self, session: Session, runtime: SessionRuntime, operation: Operation
@@ -714,18 +846,9 @@ class CoreService:
         if self._harness_factory is not None:
             value = self._harness_factory(effective, session)
             return await value if inspect.isawaitable(value) else value
-        model = await self._model(effective.agent.model)
-        provider: Provider
-        if model.provider == CLOUD_PROVIDER_ID:
-            provider = CloudProvider(self.cloud_account)
-        else:
-            model = replace(model, base_url=effective.deepseek.base_url)
-            provider = DeepSeekProvider(
-                api_key=effective.deepseek.api_key,
-                base_url=effective.deepseek.base_url,
-                proxy=effective.deepseek.proxy,
-                headers=effective.deepseek.extra_headers,
-            )
+        registry = self._provider_registry(effective)
+        model = await self._model(effective.agent.model, registry=registry)
+        provider = registry.provider(model)
         active_tools = overrides.get("active_tools")
         return AgentHarness(
             provider=provider,
@@ -756,35 +879,125 @@ class CoreService:
         )
 
     async def _models(self) -> dict[str, Model]:
-        models = dict(DEEPSEEK_MODELS)
-        status = self.cloud_account.status()
-        if not status["enabled"] or not status["authenticated"]:
-            return models
-        try:
-            models.update(await self.cloud_account.models())
-        except CloudError:
-            # A transient account/catalog failure must not make the local model
-            # catalog or settings screen unavailable.
-            pass
-        return models
+        return await self._provider_registry().models()
 
-    async def _model(self, model_id: str) -> Model:
-        if model_id in DEEPSEEK_MODELS:
-            return DEEPSEEK_MODELS[model_id]
-        if not model_id.startswith(f"{CLOUD_PROVIDER_ID}/"):
-            raise BridgeError("invalid_argument", f"Unknown model: {model_id}")
-        status = self.cloud_account.status()
-        if not status["enabled"]:
-            raise BridgeError("invalid_state", "Aeloon Cloud is disabled in Core settings")
-        if not status["authenticated"]:
-            raise BridgeError("authentication_failed", "Sign in to Aeloon Cloud first")
+    async def _model(
+        self, model_id: str, *, registry: UnifiedProviderRegistry | None = None
+    ) -> Model:
         try:
-            model = (await self.cloud_account.models()).get(model_id)
+            return await (registry or self._provider_registry()).model(model_id)
+        except PermissionError as exc:
+            raise BridgeError("authentication_failed", str(exc)) from None
+        except RuntimeError as exc:
+            raise BridgeError("invalid_state", str(exc)) from None
         except CloudError as exc:
             raise BridgeError("authentication_failed", self._sanitize(str(exc))) from None
-        if model is None:
-            raise BridgeError("invalid_argument", f"Unknown model: {model_id}")
-        return model
+        except KeyError:
+            raise BridgeError("invalid_argument", f"Unknown model: {model_id}") from None
+
+    def _provider_registry(self, config: Config | None = None) -> UnifiedProviderRegistry:
+        return UnifiedProviderRegistry(config or self.config, self.cloud_account)
+
+    async def _provider_result(self, provider_id: str) -> dict[str, Any]:
+        providers = await self._provider_registry().providers()
+        provider = next(item for item in providers if item["id"] == provider_id)
+        return {"provider": provider, "revision": self._revision}
+
+    async def _discover_local_models(
+        self,
+        base_url: str,
+        *,
+        api_key: str,
+        proxy: str | None,
+        extra_headers: Mapping[str, str],
+    ) -> list[dict[str, Any]]:
+        headers = dict(extra_headers)
+        if api_key and api_key != "no-key":
+            headers.setdefault("authorization", f"Bearer {api_key}")
+        try:
+            async with httpx.AsyncClient(proxy=proxy, timeout=15) as client:
+                response = await client.get(f"{base_url}/models", headers=headers)
+            response.raise_for_status()
+            payload = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise BridgeError(
+                "invalid_argument",
+                self._sanitize(f"Could not load models from the local API: {exc}"),
+            ) from None
+        if not isinstance(payload, Mapping):
+            raise BridgeError("invalid_argument", "Local API /models returned an invalid payload")
+        raw_models = payload.get("data", payload.get("models"))
+        if not isinstance(raw_models, list):
+            raise BridgeError("invalid_argument", "Local API /models returned no model list")
+        models: list[dict[str, Any]] = []
+        for raw in raw_models:
+            if isinstance(raw, str):
+                models.append({"id": raw})
+                continue
+            if not isinstance(raw, Mapping):
+                continue
+            model_id = str(
+                raw.get("id")
+                or raw.get("model")
+                or raw.get("model_key")
+                or raw.get("name")
+                or ""
+            ).strip()
+            if not model_id:
+                continue
+            model: dict[str, Any] = {"id": model_id}
+            display_name = raw.get("display_name") or raw.get("displayName")
+            if display_name:
+                model["name"] = str(display_name)
+            for source, target in (
+                ("context_window", "context_window"),
+                ("contextWindow", "context_window"),
+                ("max_tokens", "max_tokens"),
+                ("maxTokens", "max_tokens"),
+            ):
+                if source in raw and target not in model:
+                    model[target] = raw[source]
+            model["reasoning"] = bool(
+                raw.get("reasoning") or raw.get("supports_reasoning")
+            )
+            model["supports_image"] = bool(
+                raw.get("supports_image") or raw.get("supportsImage")
+            )
+            models.append(model)
+        if not models:
+            raise BridgeError("invalid_argument", "Local API /models returned no usable models")
+        return models
+
+    def _reload_config(self) -> None:
+        config = load_config(self.config_path)
+        if self._data_dir_override is not None:
+            config = config.model_copy(update={"data_dir": self._data_dir_override}).normalized()
+        self.config = config
+
+    @staticmethod
+    def _http_base_url(value: str) -> str:
+        from urllib.parse import urlsplit
+
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise BridgeError("invalid_argument", "base_url must be an HTTP(S) URL")
+        if parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise BridgeError(
+                "invalid_argument",
+                "base_url must not contain credentials, a query, or a fragment",
+            )
+        return value.rstrip("/")
+
+    @staticmethod
+    def _string_mapping(value: Any) -> dict[str, str]:
+        if value is None:
+            return {}
+        if not isinstance(value, Mapping):
+            raise BridgeError("invalid_argument", "extra_headers must be an object")
+        result = {str(key): str(item) for key, item in value.items()}
+        if any(not key.strip() for key in result):
+            raise BridgeError("invalid_argument", "extra_headers contains an empty name")
+        return result
 
     def _resource_loader(self, config: Config) -> ResourceLoader:
         return ResourceLoader(
@@ -1149,9 +1362,13 @@ class CoreService:
         if unknown:
             raise BridgeError("invalid_argument", f"Unknown settings fields: {', '.join(sorted(unknown))}")
         if "default_model_id" in patch:
-            model_id = str(patch["default_model_id"])
+            requested_model_id = str(patch["default_model_id"])
+            try:
+                model_id = normalize_model_id(requested_model_id)
+            except ValueError:
+                model_id = requested_model_id
             if model_id not in valid_model_ids:
-                raise BridgeError("invalid_argument", f"Unknown model: {model_id}")
+                raise BridgeError("invalid_argument", f"Unknown model: {requested_model_id}")
             raw["agent"]["model"] = model_id
         if "default_thinking_level" in patch:
             raw["agent"]["thinking_level"] = self._thinking_level(patch["default_thinking_level"])
@@ -1205,9 +1422,13 @@ class CoreService:
 
     def _sanitize(self, message: str) -> str:
         value = message[:4_000]
-        secret = self.config.deepseek.api_key
-        if secret and secret != "no-key":
-            value = value.replace(secret, "***")
+        secrets = [
+            self.config.deepseek.api_key,
+            *(provider.api_key for provider in self.config.local_providers.values()),
+        ]
+        for secret in secrets:
+            if secret and secret != "no-key":
+                value = value.replace(secret, "***")
         return value
 
     @staticmethod

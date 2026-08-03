@@ -33,9 +33,10 @@ from aeloon_core.harness.types import (
 )
 
 _DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+_DEEPSEEK_PROVIDER_ID = "deepseek"
 
 DEEPSEEK_V4_FLASH = Model(
-    id="deepseek-v4-flash",
+    id="deepseek/deepseek-v4-flash",
     name="DeepSeek V4 Flash",
     provider="deepseek",
     base_url=_DEEPSEEK_BASE_URL,
@@ -60,7 +61,7 @@ DEEPSEEK_V4_FLASH = Model(
 
 DEEPSEEK_V4_PRO = replace(
     DEEPSEEK_V4_FLASH,
-    id="deepseek-v4-pro",
+    id="deepseek/deepseek-v4-pro",
     name="DeepSeek V4 Pro",
     cost={"input": 0.435, "output": 0.87, "cacheRead": 0.003625, "cacheWrite": 0.0},
 )
@@ -72,10 +73,20 @@ DEEPSEEK_MODELS: dict[str, Model] = {
 
 
 def get_deepseek_model(model_id: str) -> Model:
+    canonical = (
+        model_id
+        if model_id.startswith(f"{_DEEPSEEK_PROVIDER_ID}/")
+        else f"{_DEEPSEEK_PROVIDER_ID}/{model_id}"
+    )
     try:
-        return DEEPSEEK_MODELS[model_id]
+        return DEEPSEEK_MODELS[canonical]
     except KeyError as exc:
         raise ProviderError("model_not_found", f"Unknown DeepSeek model: {model_id}") from exc
+
+
+def _request_model_id(model: Model) -> str:
+    prefix = f"{model.provider}/"
+    return model.id.removeprefix(prefix)
 
 
 class DeepSeekProvider:
@@ -91,6 +102,7 @@ class DeepSeekProvider:
         client: httpx.AsyncClient | None = None,
         chat_path: str = "/chat/completions",
         display_name: str = "DeepSeek",
+        requires_api_key: bool = True,
         request_model_id: Callable[[Model], str] | None = None,
         prepare_payload: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     ) -> None:
@@ -100,7 +112,8 @@ class DeepSeekProvider:
         self.headers = dict(headers or {})
         self.chat_path = "/" + chat_path.lstrip("/")
         self.display_name = display_name
-        self.request_model_id = request_model_id
+        self.requires_api_key = requires_api_key
+        self.request_model_id = request_model_id or _request_model_id
         self.prepare_payload = prepare_payload
         self._client = client
         self._owns_client = client is None
@@ -124,20 +137,16 @@ class DeepSeekProvider:
         context: ProviderContext,
         options: StreamOptions,
     ) -> AsyncIterator[AssistantStreamEvent]:
-        if not self.api_key or self.api_key == "no-key":
+        if self.requires_api_key and (not self.api_key or self.api_key == "no-key"):
             raise ProviderError("auth", "DEEPSEEK_API_KEY is required")
 
         payload = _openai_payload(model, context, options)
-        if self.request_model_id is not None:
-            payload["model"] = self.request_model_id(model)
+        payload["model"] = self.request_model_id(model)
         if self.prepare_payload is not None:
             payload = self.prepare_payload(payload)
-        headers = {
-            "authorization": f"Bearer {self.api_key}",
-            "content-type": "application/json",
-            **self.headers,
-            **options.headers,
-        }
+        headers = {"content-type": "application/json", **self.headers, **options.headers}
+        if self.api_key and self.api_key != "no-key":
+            headers["authorization"] = f"Bearer {self.api_key}"
         max_retries = 3 if options.max_retries is None else max(0, options.max_retries)
         timeout = None if options.timeout_ms is None else options.timeout_ms / 1000
         client = await self._get_client()

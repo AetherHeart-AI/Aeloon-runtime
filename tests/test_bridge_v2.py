@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+import aeloon_core.bridge.daemon as bridge_daemon
 from aeloon_core.bridge.daemon import (
     BridgeDaemon,
     bridge_request,
@@ -180,7 +181,7 @@ async def test_revisioned_settings_never_return_secret(tmp_path: Path) -> None:
             ],
         }
     )
-    assert updated["default_model_id"] == "deepseek-v4-pro"
+    assert updated["default_model_id"] == "deepseek/deepseek-v4-pro"
     assert updated["deepseek"]["credential_configured"] is True
     assert "very-secret" not in json.dumps(updated)
     assert (tmp_path / "config.json").stat().st_mode & 0o777 == 0o600
@@ -275,6 +276,92 @@ async def test_daemon_socket_permissions_and_multi_client_handshake(tmp_path: Pa
     with contextlib.suppress(TimeoutError):
         await asyncio.wait_for(writer.wait_closed(), 1)
     runtime.rmdir()
+
+
+@pytest.mark.asyncio
+async def test_ensure_daemon_upgrades_idle_daemon_missing_required_method(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.json"
+    data_dir = tmp_path / "data"
+    socket_path = tmp_path / "bridge.sock"
+    save_config(Config(workspace=tmp_path, data_dir=data_dir), config_path)
+    identity = {
+        "status": "running",
+        "config_path": str(config_path),
+        "data_dir": str(data_dir),
+        "active_operations": 0,
+    }
+    states = iter(
+        [
+            {**identity, "methods": ["system.handshake", "system.shutdown"]},
+            None,
+            {**identity, "methods": ["system.handshake", "provider.local.add"]},
+        ]
+    )
+    requests: list[str] = []
+    launches: list[list[str]] = []
+
+    async def fake_existing(_path: Path):
+        return next(states)
+
+    async def fake_request(_path: Path, method: str, *_args, **_kwargs):
+        requests.append(method)
+        return {}
+
+    async def no_sleep(_delay: float) -> None:
+        return None
+
+    def fake_popen(command: list[str], **_kwargs):
+        launches.append(command)
+        return object()
+
+    monkeypatch.setattr(bridge_daemon, "_existing", fake_existing)
+    monkeypatch.setattr(bridge_daemon, "bridge_request", fake_request)
+    monkeypatch.setattr(bridge_daemon.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(bridge_daemon.subprocess, "Popen", fake_popen)
+
+    result = await bridge_daemon.ensure_daemon(
+        config_path=config_path,
+        data_dir=data_dir,
+        socket_path=socket_path,
+        required_methods=("provider.local.add",),
+    )
+
+    assert result["status"] == "started"
+    assert requests == ["system.shutdown"]
+    assert launches and "bridge" in launches[0] and "serve" in launches[0]
+
+
+@pytest.mark.asyncio
+async def test_ensure_daemon_does_not_upgrade_while_operation_is_active(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.json"
+    data_dir = tmp_path / "data"
+    socket_path = tmp_path / "bridge.sock"
+    save_config(Config(workspace=tmp_path, data_dir=data_dir), config_path)
+
+    async def fake_existing(_path: Path):
+        return {
+            "status": "running",
+            "config_path": str(config_path),
+            "data_dir": str(data_dir),
+            "active_operations": 1,
+            "methods": ["system.handshake"],
+        }
+
+    monkeypatch.setattr(bridge_daemon, "_existing", fake_existing)
+
+    with pytest.raises(BridgeError, match="wait for active operations"):
+        await bridge_daemon.ensure_daemon(
+            config_path=config_path,
+            data_dir=data_dir,
+            socket_path=socket_path,
+            required_methods=("provider.local.add",),
+        )
 
 
 class TrackingProvider:

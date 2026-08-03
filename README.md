@@ -19,13 +19,17 @@ uv run aeloon-core run --prompt-file task.md --output json
 printf 'Fix the failing tests' | uv run aeloon-core run --stdin --output stream-json
 ```
 
-The default model is `deepseek-v4-flash`; `deepseek-v4-pro` is also built in. Both use Pi 0.83.0's
-1M context-window and 384K output-ceiling metadata. Thinking defaults to `off`.
+The default model is `deepseek/deepseek-v4-flash`; `deepseek/deepseek-v4-pro` is also built in.
+Every model has a stable `provider/model` ID, so local API and cloud models can appear in one
+catalog without collisions. Legacy unprefixed DeepSeek IDs are upgraded when existing config or
+sessions are loaded. Both built-in models use Pi 0.83.0's 1M context-window and 384K
+output-ceiling metadata. Thinking defaults to `off`.
 
 Aeloon Cloud is an optional account-backed provider. Core owns the account session and refresh
 credential; UI clients receive only public account status and provider-qualified model IDs such as
-`aeloon-cloud/reasoner`. Sign-in is exposed through Bridge v2, and cloud models are added to the
-dynamic catalog only while the account is authenticated.
+`aeloon-cloud/reasoner`. The unified Provider registry also accepts user-added OpenAI-compatible
+local APIs. Sign-in is exposed through the Core CLI and Bridge v2, and cloud models are added to
+the dynamic catalog only while the account is authenticated.
 
 ## Python API
 
@@ -44,7 +48,7 @@ session = await repository.create(cwd=workspace)
 provider = DeepSeekProvider(api_key="...")
 harness = AgentHarness(
     provider=provider,
-    model=get_deepseek_model("deepseek-v4-flash"),
+    model=get_deepseek_model("deepseek/deepseek-v4-flash"),
     cwd=workspace,
     session=session,
     resource_loader=ResourceLoader(cwd=workspace),
@@ -154,8 +158,22 @@ uv run aeloon-core session show <id>
 uv run aeloon-core config path
 uv run aeloon-core config init
 uv run aeloon-core config show
-uv run aeloon-core config set model deepseek-v4-pro
+uv run aeloon-core config set model deepseek/deepseek-v4-pro
 uv run aeloon-core config set max-retries 5
+
+# Aeloon Cloud account (the password is read from a hidden terminal prompt)
+uv run aeloon-core cloud login <username>
+uv run aeloon-core cloud status
+uv run aeloon-core cloud logout
+
+# Unified Provider commands (`cloud ...` remains a compatibility alias)
+uv run aeloon-core provider login <username>
+uv run aeloon-core provider add ollama \
+  --name Ollama \
+  --base-url http://127.0.0.1:11434/v1 \
+  --model qwen3-coder
+uv run aeloon-core provider list
+uv run aeloon-core provider remove ollama
 
 # User-level Bridge v2 daemon
 uv run aeloon-core bridge ensure --output json
@@ -181,6 +199,23 @@ raw configuration, system prompts or provider payloads.
 directory is mode `0700`, the socket and daemon metadata are `0600`, and conflicting config,
 data-directory or socket parameters never kill an existing daemon. `--socket`, `--config` and
 `--data-dir` are supported by the daemon-management commands.
+
+The `cloud login`, `cloud status`, and `cloud logout` commands use the same daemon account methods
+as UI clients, keeping the in-memory account state, credential vault, events, and dynamic model
+catalog synchronized. `cloud login` never accepts a password argument; it reads the password with
+terminal echo disabled. All three commands support `--output json`, `--config`, `--data-dir`, and
+`--socket`.
+
+`provider login/status/logout` expose the same cloud account through the unified Provider surface.
+`provider add` registers an OpenAI-compatible local endpoint and prompts for its API key without
+placing the key in shell history; pass `--no-api-key` for endpoints such as an unauthenticated
+Ollama server. It discovers models from `GET /models` when `--model` is omitted; repeat `--model`
+to register them explicitly. Core stores the key only in the mode-`0600` config, returns redacted
+Provider DTOs, and strips the provider prefix before sending the model key to the upstream API.
+
+Bridge clients use `provider.list`, `provider.local.add`, `provider.local.remove`, and
+`provider.cloud.login/status/logout`. `catalog.get` returns both `providers` and the merged `models`
+array; every model in that array uses the same `provider/model` namespace.
 
 An explicit `system.shutdown` first publishes a `system.shutdown` event with
 `intentional: true`. `status` and `stop` are idempotent: a missing daemon, refused connection or

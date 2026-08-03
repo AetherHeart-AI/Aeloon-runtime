@@ -267,6 +267,7 @@ async def ensure_daemon(
     data_dir: Path | str | None = None,
     socket_path: Path | str | None = None,
     max_concurrent_operations: int = 4,
+    required_methods: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     config = load_config(config_path)
     if data_dir is not None:
@@ -300,7 +301,26 @@ async def ensure_daemon(
                     break
         if existing is not None:
             _verify_identity(existing, resolved_config, resolved_data, resolved_socket)
-            return {"socket_path": str(resolved_socket), **existing, "status": "running"}
+            missing_methods = sorted(set(required_methods) - set(existing.get("methods") or ()))
+            if missing_methods:
+                if int(existing.get("active_operations") or 0) > 0:
+                    raise BridgeError(
+                        "invalid_state",
+                        "The running Bridge daemon must be upgraded before using "
+                        f"{', '.join(missing_methods)}; wait for active operations to finish",
+                    )
+                await bridge_request(resolved_socket, "system.shutdown")
+                for _ in range(100):
+                    await asyncio.sleep(0.05)
+                    existing = await _existing(resolved_socket)
+                    if existing is None:
+                        break
+                if existing is not None:
+                    raise BridgeError(
+                        "internal_error", "Timed out upgrading the Aeloon Core daemon"
+                    )
+            else:
+                return {"socket_path": str(resolved_socket), **existing, "status": "running"}
         if resolved_socket.exists():
             resolved_socket.unlink()
         command = [

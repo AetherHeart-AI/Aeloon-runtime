@@ -323,3 +323,211 @@ def test_config_path_init_show_and_set(tmp_path: Path, monkeypatch, capsys) -> N
     assert shown["deepseek"]["api_key"] == "***"
     persisted = json.loads(path.read_text(encoding="utf-8"))
     assert persisted["deepseek"]["api_key"] == "no-key"
+
+
+@pytest.mark.asyncio
+async def test_cloud_login_reads_hidden_password_and_uses_bridge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    socket_path = tmp_path / "bridge.sock"
+    calls: dict[str, object] = {}
+
+    async def fake_ensure_daemon(**kwargs):
+        calls["ensure"] = kwargs
+        return {"socket_path": str(socket_path), "status": "running"}
+
+    async def fake_bridge_request(path, method, params=None, *, timeout=3.0):
+        calls["request"] = {
+            "path": path,
+            "method": method,
+            "params": params,
+            "timeout": timeout,
+        }
+        return {
+            "enabled": True,
+            "authenticated": True,
+            "user": {"id": "alice", "username": "alice", "display_name": "Alice"},
+            "base_url": "https://cloud.example",
+            "vault_kind": "test",
+        }
+
+    monkeypatch.setattr(cli, "ensure_daemon", fake_ensure_daemon)
+    monkeypatch.setattr(cli, "bridge_request", fake_bridge_request)
+    monkeypatch.setattr(cli.getpass, "getpass", lambda _prompt: "terminal-secret")
+
+    code = await cli.async_main(
+        [
+            "cloud",
+            "login",
+            "alice",
+            "--data-dir",
+            str(tmp_path / "data"),
+            "--socket",
+            str(socket_path),
+            "--output",
+            "json",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert code == 0
+    assert json.loads(captured.out)["user"]["username"] == "alice"
+    assert "terminal-secret" not in captured.out
+    assert calls["request"] == {
+        "path": socket_path,
+        "method": "cloud.account.login",
+        "params": {"username": "alice", "password": "terminal-secret"},
+        "timeout": 60.0,
+    }
+    assert not hasattr(cli.build_parser().parse_args(["cloud", "login", "alice"]), "password")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("command", "result", "expected"),
+    [
+        (
+            "status",
+            {
+                "authenticated": True,
+                "user": {"username": "alice", "display_name": "Alice"},
+            },
+            "Signed in to Aeloon Cloud as Alice (@alice).\n",
+        ),
+        ("status", {"authenticated": False, "user": None}, "Not signed in to Aeloon Cloud.\n"),
+        ("logout", {"authenticated": False, "user": None}, "Signed out of Aeloon Cloud.\n"),
+    ],
+)
+async def test_cloud_status_and_logout_use_bridge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+    result: dict[str, object],
+    expected: str,
+) -> None:
+    socket_path = tmp_path / "bridge.sock"
+    requested: list[str] = []
+
+    async def fake_ensure_daemon(**_kwargs):
+        return {"socket_path": str(socket_path), "status": "running"}
+
+    async def fake_bridge_request(_path, method, _params=None, *, timeout=3.0):
+        requested.append(method)
+        assert timeout == 3.0
+        return result
+
+    monkeypatch.setattr(cli, "ensure_daemon", fake_ensure_daemon)
+    monkeypatch.setattr(cli, "bridge_request", fake_bridge_request)
+
+    assert await cli.async_main(["cloud", command, "--socket", str(socket_path)]) == 0
+    assert capsys.readouterr().out == expected
+    assert requested == [f"cloud.account.{command}"]
+
+
+@pytest.mark.asyncio
+async def test_provider_add_reads_api_key_privately_and_uses_unified_bridge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    socket_path = tmp_path / "bridge.sock"
+    request: dict[str, object] = {}
+
+    async def fake_ensure_daemon(**_kwargs):
+        return {"socket_path": str(socket_path), "status": "running"}
+
+    async def fake_bridge_request(path, method, params=None, *, timeout=3.0):
+        request.update(path=path, method=method, params=params, timeout=timeout)
+        return {
+            "provider": {
+                "id": "ollama",
+                "name": "Ollama",
+                "kind": "local",
+                "base_url": "http://127.0.0.1:11434/v1",
+                "model_ids": ["ollama/qwen3-coder"],
+            },
+            "revision": 2,
+        }
+
+    monkeypatch.setattr(cli, "ensure_daemon", fake_ensure_daemon)
+    monkeypatch.setattr(cli, "bridge_request", fake_bridge_request)
+    monkeypatch.setattr(cli.getpass, "getpass", lambda _prompt: "private-local-key")
+
+    assert (
+        await cli.async_main(
+            [
+                "provider",
+                "add",
+                "ollama",
+                "--name",
+                "Ollama",
+                "--base-url",
+                "http://127.0.0.1:11434/v1",
+                "--model",
+                "qwen3-coder",
+                "--socket",
+                str(socket_path),
+                "--output",
+                "json",
+            ]
+        )
+        == 0
+    )
+
+    assert request == {
+        "path": socket_path,
+        "method": "provider.local.add",
+        "params": {
+            "provider_id": "ollama",
+            "name": "Ollama",
+            "base_url": "http://127.0.0.1:11434/v1",
+            "api_key": "private-local-key",
+            "models": ["qwen3-coder"],
+        },
+        "timeout": 3.0,
+    }
+    assert "private-local-key" not in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_provider_login_uses_cloud_rpc_compatible_with_existing_daemon(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    socket_path = tmp_path / "bridge.sock"
+    calls: dict[str, object] = {}
+
+    async def fake_ensure_daemon(**kwargs):
+        calls["ensure"] = kwargs
+        return {"socket_path": str(socket_path), "status": "running"}
+
+    async def fake_bridge_request(path, method, params=None, *, timeout=3.0):
+        calls["request"] = (path, method, params, timeout)
+        return {
+            "authenticated": True,
+            "user": {"username": "alice", "display_name": "Alice"},
+        }
+
+    monkeypatch.setattr(cli, "ensure_daemon", fake_ensure_daemon)
+    monkeypatch.setattr(cli, "bridge_request", fake_bridge_request)
+    monkeypatch.setattr(cli.getpass, "getpass", lambda _prompt: "secret")
+
+    assert (
+        await cli.async_main(
+            ["provider", "login", "alice", "--socket", str(socket_path), "--output", "json"]
+        )
+        == 0
+    )
+
+    assert calls["request"] == (
+        socket_path,
+        "cloud.account.login",
+        {"username": "alice", "password": "secret"},
+        60.0,
+    )
+    assert calls["ensure"]["required_methods"] == ()  # type: ignore[index]
+    assert "secret" not in capsys.readouterr().out
