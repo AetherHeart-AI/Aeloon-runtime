@@ -65,8 +65,42 @@ async def test_run_output_modes_are_stable_and_network_free(
 
 
 @pytest.mark.asyncio
-async def test_text_renderer_summarizes_tool_command_and_result(capsys) -> None:
+async def test_text_renderer_is_quiet_by_default(capsys) -> None:
     renderer = cli.RunRenderer("text")
+    await renderer(
+        cli.HarnessEvent(
+            "tool_execution_start",
+            {
+                "toolCallId": "call-1",
+                "toolName": "bash",
+                "args": {"command": "printf 'hello\\n'"},
+            },
+        )
+    )
+    await renderer(
+        cli.HarnessEvent(
+            "tool_execution_end",
+            {
+                "toolCallId": "call-1",
+                "toolName": "bash",
+                "result": {
+                    "content": [{"type": "text", "text": "hello"}],
+                    "details": {"exitCode": 0, "truncated": False},
+                    "isError": False,
+                },
+                "isError": False,
+            },
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+@pytest.mark.asyncio
+async def test_text_renderer_summarizes_tool_command_and_result(capsys) -> None:
+    renderer = cli.RunRenderer("text", verbose=True)
     await renderer(
         cli.HarnessEvent(
             "tool_execution_start",
@@ -102,7 +136,7 @@ async def test_text_renderer_summarizes_tool_command_and_result(capsys) -> None:
 
 @pytest.mark.asyncio
 async def test_text_renderer_reports_read_size_without_echoing_content(capsys) -> None:
-    renderer = cli.RunRenderer("text")
+    renderer = cli.RunRenderer("text", verbose=True)
     await renderer(
         cli.HarnessEvent(
             "tool_execution_start",
@@ -135,7 +169,7 @@ async def test_text_renderer_reports_read_size_without_echoing_content(capsys) -
 
 @pytest.mark.asyncio
 async def test_text_renderer_marks_nonzero_bash_exit_as_failed(capsys) -> None:
-    renderer = cli.RunRenderer("text")
+    renderer = cli.RunRenderer("text", verbose=True)
     await renderer(
         cli.HarnessEvent(
             "tool_execution_start",
@@ -168,7 +202,7 @@ async def test_text_renderer_marks_nonzero_bash_exit_as_failed(capsys) -> None:
 
 @pytest.mark.asyncio
 async def test_text_renderer_summarizes_mutation_arguments_and_shows_errors(capsys) -> None:
-    renderer = cli.RunRenderer("text")
+    renderer = cli.RunRenderer("text", verbose=True)
     await renderer(
         cli.HarnessEvent(
             "tool_execution_start",

@@ -138,6 +138,9 @@ uv run aeloon-core run "task" --output text
 uv run aeloon-core run "task" --output json
 uv run aeloon-core run "task" --output stream-json
 
+# Show tool execution details on stderr (default is quiet)
+uv run aeloon-core run "task" --verbose
+
 # Session inspection
 uv run aeloon-core session list
 uv run aeloon-core session show <id>
@@ -157,9 +160,10 @@ uv run aeloon-core bridge stop
 ```
 
 `stream-json` writes one typed harness event per line followed by a `result` object. `json` writes
-only the result object to stdout. Text mode writes concise run/read/write/search summaries to
-stderr, buffers the final response, and renders it as Markdown when stdout is an interactive
-terminal. Redirected text output remains plain text.
+only the result object to stdout. Text mode runs quietly by default: only the final response is
+buffered and rendered as Markdown when stdout is an interactive terminal (redirected text output
+remains plain text). Pass `--verbose` to also write concise run/read/write/search summaries to
+stderr as the tools execute.
 
 ## Bridge v2
 

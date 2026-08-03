@@ -84,6 +84,11 @@ def build_parser() -> argparse.ArgumentParser:
     source.add_argument("--prompt-file", type=Path, help="Read a UTF-8 prompt file.")
     source.add_argument("--stdin", action="store_true", help="Read the prompt from stdin.")
     run.add_argument("--output", choices=("text", "json", "stream-json"), default="text")
+    run.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Show tool execution details on stderr (default: quiet).",
+    )
     run.add_argument("--session", help="Continue an existing session id.")
     run.add_argument("--no-session", action="store_true", help="Do not persist this run.")
     run.add_argument("--config", type=Path)
@@ -137,8 +142,9 @@ def build_parser() -> argparse.ArgumentParser:
 class RunRenderer:
     """Render events while collecting a stable final JSON result."""
 
-    def __init__(self, output: str) -> None:
+    def __init__(self, output: str, *, verbose: bool = False) -> None:
         self.output = output
+        self.verbose = verbose
         self.tools_used: list[str] = []
         self._tool_started_at: dict[str, float] = {}
         self._tool_args: dict[str, dict[str, Any]] = {}
@@ -149,14 +155,14 @@ class RunRenderer:
             call_id = str(event.data.get("toolCallId") or "")
             if name and name not in self.tools_used:
                 self.tools_used.append(name)
-            if call_id and self.output == "text":
+            if call_id and self.verbose and self.output == "text":
                 self._tool_started_at[call_id] = time.monotonic()
                 self._tool_args[call_id] = (
                     dict(event.data["args"]) if isinstance(event.data.get("args"), dict) else {}
                 )
-            if self.output == "text":
+            if self.verbose and self.output == "text":
                 self._render_tool_start(name, event.data.get("args"))
-        elif event.type == "tool_execution_end" and self.output == "text":
+        elif event.type == "tool_execution_end" and self.verbose and self.output == "text":
             self._render_tool_end(event)
         if self.output == "stream-json":
             print(_json(event.to_dict()), flush=True)
@@ -411,7 +417,7 @@ async def run_command(args: argparse.Namespace) -> int:
         shell_path=config.tools.shell_path,
         auto_resize_images=config.tools.auto_resize_images,
     )
-    renderer = RunRenderer(args.output)
+    renderer = RunRenderer(args.output, verbose=args.verbose)
     harness.subscribe(renderer)
     started = time.monotonic()
     try:
