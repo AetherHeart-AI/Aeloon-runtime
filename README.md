@@ -22,6 +22,11 @@ printf 'Fix the failing tests' | uv run aeloon-core run --stdin --output stream-
 The default model is `deepseek-v4-flash`; `deepseek-v4-pro` is also built in. Both use Pi 0.83.0's
 1M context-window and 384K output-ceiling metadata. Thinking defaults to `off`.
 
+Aeloon Cloud is an optional account-backed provider. Core owns the account session and refresh
+credential; UI clients receive only public account status and provider-qualified model IDs such as
+`aeloon-cloud/reasoner`. Sign-in is exposed through Bridge v2, and cloud models are added to the
+dynamic catalog only while the account is authenticated.
+
 ## Python API
 
 ```python

@@ -20,6 +20,18 @@ class DeepSeekConfig(BaseModel):
     extra_headers: dict[str, str] = Field(default_factory=dict)
 
 
+class CloudConfig(BaseModel):
+    """Aeloon's optional account-backed model service."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    base_url: str = "https://api.aetherheart.com"
+    proxy: str | None = None
+    device_name: str = "Aeloon Core"
+    allow_insecure_http: bool = False
+
+
 class RetryConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -75,6 +87,7 @@ class Config(BaseModel):
     workspace: Path = Field(default_factory=Path.cwd)
     data_dir: Path = Field(default_factory=lambda: Path("~/.aeloon-core").expanduser())
     deepseek: DeepSeekConfig = Field(default_factory=DeepSeekConfig)
+    cloud: CloudConfig = Field(default_factory=CloudConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
     resources: ResourceConfig = Field(default_factory=ResourceConfig)
     tools: ToolConfig = Field(default_factory=ToolConfig)
@@ -161,6 +174,7 @@ __all__ = [
     "AgentConfig",
     "CompactionConfig",
     "Config",
+    "CloudConfig",
     "DeepSeekConfig",
     "ResourceConfig",
     "RetryConfig",

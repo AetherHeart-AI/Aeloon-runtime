@@ -24,6 +24,8 @@ from aeloon_core.bridge.protocol import (
     PROTOCOL_VERSION,
     BridgeError,
 )
+from aeloon_core.cloud import CloudAccountService, CloudError, CloudProvider
+from aeloon_core.cloud.account import CLOUD_PROVIDER_ID
 from aeloon_core.config import Config, load_config, resolve_config_path, save_config
 from aeloon_core.harness import (
     ALL_TOOL_NAMES,
@@ -36,11 +38,12 @@ from aeloon_core.harness import (
     HarnessEvent,
     ImageContent,
     JsonlSessionRepository,
+    Model,
+    Provider,
     ResourceLoader,
     Session,
     SessionError,
     StreamOptions,
-    get_deepseek_model,
 )
 from aeloon_core.version import __version__
 
@@ -91,6 +94,7 @@ class CoreService:
         data_dir: Path | str | None = None,
         max_concurrent_operations: int = 4,
         harness_factory: HarnessFactory | None = None,
+        cloud_account_service: CloudAccountService | None = None,
     ) -> None:
         self.config_path = resolve_config_path(config_path).resolve(strict=False)
         self._data_dir_override = Path(data_dir).expanduser().resolve(strict=False) if data_dir is not None else None
@@ -112,6 +116,11 @@ class CoreService:
         self._seq = 0
         self._listeners: set[EventListener] = set()
         self._settings_lock = asyncio.Lock()
+        self._owns_cloud_account = cloud_account_service is None
+        self.cloud_account = cloud_account_service or CloudAccountService(
+            config.cloud,
+            data_dir=self.data_dir,
+        )
         self.shutdown_requested = asyncio.Event()
         self.shutdown_signal = asyncio.Event()
 
@@ -153,6 +162,9 @@ class CoreService:
             "catalog.get": self.catalog_get,
             "settings.get": self.settings_get,
             "settings.update": self.settings_update,
+            "cloud.account.status": self.cloud_account_status,
+            "cloud.account.login": self.cloud_account_login,
+            "cloud.account.logout": self.cloud_account_logout,
         }
         handler = routes.get(method)
         if handler is None:
@@ -315,8 +327,7 @@ class CoreService:
         patch: dict[str, Any] = {}
         if "model_id" in params:
             model_id = self._required_string(params, "model_id")
-            if model_id not in DEEPSEEK_MODELS:
-                raise BridgeError("invalid_argument", f"Unknown model: {model_id}")
+            await self._model(model_id)
             patch["model_id"] = model_id
         if "thinking_level" in params:
             level = self._thinking_level(params["thinking_level"])
@@ -459,17 +470,19 @@ class CoreService:
             workspace = Path(session.metadata.cwd)
         loader = self._resource_loader(self.config.model_copy(update={"workspace": workspace}).normalized())
         resources = await asyncio.to_thread(loader.reload)
+        models = await self._models()
         return {
             "models": [
                 {
                     "id": model.id,
                     "name": model.name,
                     "description": f"{model.context_window:,} token context",
+                    "provider_id": model.provider,
                     "thinking_levels": ["off", "minimal", "low", "medium", "high", "max"],
                     "context_window": model.context_window,
                     "max_tokens": model.max_tokens,
                 }
-                for model in DEEPSEEK_MODELS.values()
+                for model in models.values()
             ],
             "tools": [
                 {"id": name, "name": name, "description": "Core-managed local tool"}
@@ -506,6 +519,12 @@ class CoreService:
                 "proxy": config.deepseek.proxy,
                 "credential_configured": bool(config.deepseek.api_key and config.deepseek.api_key != "no-key"),
             },
+            "cloud": {
+                "enabled": config.cloud.enabled,
+                "base_url": config.cloud.base_url,
+                "proxy": config.cloud.proxy,
+                "device_name": config.cloud.device_name,
+            },
         }
 
     async def settings_update(self, params: Mapping[str, Any]) -> dict[str, Any]:
@@ -516,11 +535,13 @@ class CoreService:
         actions = params.get("secret_actions") or []
         if not isinstance(patch, Mapping) or not isinstance(actions, list):
             raise BridgeError("invalid_argument", "patch and secret_actions are invalid")
+        valid_model_ids = set((await self._models()).keys())
+        valid_model_ids.add(self.config.agent.model)
         async with self._settings_lock:
             if revision != self._revision:
                 raise BridgeError("revision_conflict", "Core settings changed; refresh and try again")
             raw = load_config(self.config_path, use_environment=False).model_dump(mode="json")
-            self._apply_settings_patch(raw, patch)
+            self._apply_settings_patch(raw, patch, valid_model_ids=valid_model_ids)
             for action in actions:
                 if not isinstance(action, Mapping) or action.get("path") != "deepseek.api_key":
                     raise BridgeError("invalid_argument", "Unsupported secret action")
@@ -540,7 +561,18 @@ class CoreService:
                 next_config = next_config.model_copy(
                     update={"data_dir": self._data_dir_override}
                 ).normalized()
+            cloud_changed = next_config.cloud != self.config.cloud
+            previous_cloud_base_url = self.config.cloud.base_url.rstrip("/")
             self.config = next_config
+            if self._owns_cloud_account and cloud_changed:
+                previous_cloud = self.cloud_account
+                if next_config.cloud.base_url.rstrip("/") != previous_cloud_base_url:
+                    previous_cloud.logout()
+                self.cloud_account = CloudAccountService(
+                    next_config.cloud,
+                    data_dir=self.data_dir,
+                )
+                await previous_cloud.close()
             self._revision += 1
         await self._emit("settings.updated", None, None, {"revision": self._revision})
         return await self.settings_get({})
@@ -556,6 +588,26 @@ class CoreService:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        if self._owns_cloud_account:
+            await self.cloud_account.close()
+
+    async def cloud_account_status(self, _params: Mapping[str, Any]) -> dict[str, Any]:
+        return self.cloud_account.status()
+
+    async def cloud_account_login(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        username = self._required_string(params, "username")
+        password = self._required_string(params, "password")
+        try:
+            result = await self.cloud_account.login(username=username, password=password)
+        except CloudError as exc:
+            raise BridgeError("authentication_failed", self._sanitize(str(exc))) from None
+        await self._emit("cloud.account.updated", None, None, result)
+        return result
+
+    async def cloud_account_logout(self, _params: Mapping[str, Any]) -> dict[str, Any]:
+        result = self.cloud_account.logout()
+        await self._emit("cloud.account.updated", None, None, result)
+        return result
 
     async def _execute_turn(
         self, session: Session, runtime: SessionRuntime, operation: Operation
@@ -662,13 +714,18 @@ class CoreService:
         if self._harness_factory is not None:
             value = self._harness_factory(effective, session)
             return await value if inspect.isawaitable(value) else value
-        model = replace(get_deepseek_model(effective.agent.model), base_url=effective.deepseek.base_url)
-        provider = DeepSeekProvider(
-            api_key=effective.deepseek.api_key,
-            base_url=effective.deepseek.base_url,
-            proxy=effective.deepseek.proxy,
-            headers=effective.deepseek.extra_headers,
-        )
+        model = await self._model(effective.agent.model)
+        provider: Provider
+        if model.provider == CLOUD_PROVIDER_ID:
+            provider = CloudProvider(self.cloud_account)
+        else:
+            model = replace(model, base_url=effective.deepseek.base_url)
+            provider = DeepSeekProvider(
+                api_key=effective.deepseek.api_key,
+                base_url=effective.deepseek.base_url,
+                proxy=effective.deepseek.proxy,
+                headers=effective.deepseek.extra_headers,
+            )
         active_tools = overrides.get("active_tools")
         return AgentHarness(
             provider=provider,
@@ -697,6 +754,37 @@ class CoreService:
             shell_path=effective.tools.shell_path,
             auto_resize_images=effective.tools.auto_resize_images,
         )
+
+    async def _models(self) -> dict[str, Model]:
+        models = dict(DEEPSEEK_MODELS)
+        status = self.cloud_account.status()
+        if not status["enabled"] or not status["authenticated"]:
+            return models
+        try:
+            models.update(await self.cloud_account.models())
+        except CloudError:
+            # A transient account/catalog failure must not make the local model
+            # catalog or settings screen unavailable.
+            pass
+        return models
+
+    async def _model(self, model_id: str) -> Model:
+        if model_id in DEEPSEEK_MODELS:
+            return DEEPSEEK_MODELS[model_id]
+        if not model_id.startswith(f"{CLOUD_PROVIDER_ID}/"):
+            raise BridgeError("invalid_argument", f"Unknown model: {model_id}")
+        status = self.cloud_account.status()
+        if not status["enabled"]:
+            raise BridgeError("invalid_state", "Aeloon Cloud is disabled in Core settings")
+        if not status["authenticated"]:
+            raise BridgeError("authentication_failed", "Sign in to Aeloon Cloud first")
+        try:
+            model = (await self.cloud_account.models()).get(model_id)
+        except CloudError as exc:
+            raise BridgeError("authentication_failed", self._sanitize(str(exc))) from None
+        if model is None:
+            raise BridgeError("invalid_argument", f"Unknown model: {model_id}")
+        return model
 
     def _resource_loader(self, config: Config) -> ResourceLoader:
         return ResourceLoader(
@@ -1049,14 +1137,20 @@ class CoreService:
                 value = dict(entry["config"])
         return value
 
-    def _apply_settings_patch(self, raw: dict[str, Any], patch: Mapping[str, Any]) -> None:
-        allowed = {"default_model_id", "default_thinking_level", "retry", "compaction", "resources", "tools", "deepseek"}
+    def _apply_settings_patch(
+        self,
+        raw: dict[str, Any],
+        patch: Mapping[str, Any],
+        *,
+        valid_model_ids: set[str],
+    ) -> None:
+        allowed = {"default_model_id", "default_thinking_level", "retry", "compaction", "resources", "tools", "deepseek", "cloud"}
         unknown = set(patch) - allowed
         if unknown:
             raise BridgeError("invalid_argument", f"Unknown settings fields: {', '.join(sorted(unknown))}")
         if "default_model_id" in patch:
             model_id = str(patch["default_model_id"])
-            if model_id not in DEEPSEEK_MODELS:
+            if model_id not in valid_model_ids:
                 raise BridgeError("invalid_argument", f"Unknown model: {model_id}")
             raw["agent"]["model"] = model_id
         if "default_thinking_level" in patch:
@@ -1076,7 +1170,7 @@ class CoreService:
                 "no_prompt_templates": not bool(value.get("load_prompt_templates", not raw["resources"]["no_prompt_templates"])),
                 "no_context_files": not bool(value.get("load_context_files", not raw["resources"]["no_context_files"])),
             })
-        for key in ("tools", "deepseek"):
+        for key in ("tools", "deepseek", "cloud"):
             if key in patch:
                 if not isinstance(patch[key], Mapping):
                     raise BridgeError("invalid_argument", f"{key} must be an object")

@@ -7,7 +7,7 @@ import inspect
 import json
 import math
 import uuid
-from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -89,11 +89,19 @@ class DeepSeekProvider:
         proxy: str | None = None,
         headers: Mapping[str, str] | None = None,
         client: httpx.AsyncClient | None = None,
+        chat_path: str = "/chat/completions",
+        display_name: str = "DeepSeek",
+        request_model_id: Callable[[Model], str] | None = None,
+        prepare_payload: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     ) -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.proxy = proxy
         self.headers = dict(headers or {})
+        self.chat_path = "/" + chat_path.lstrip("/")
+        self.display_name = display_name
+        self.request_model_id = request_model_id
+        self.prepare_payload = prepare_payload
         self._client = client
         self._owns_client = client is None
 
@@ -120,6 +128,10 @@ class DeepSeekProvider:
             raise ProviderError("auth", "DEEPSEEK_API_KEY is required")
 
         payload = _openai_payload(model, context, options)
+        if self.request_model_id is not None:
+            payload["model"] = self.request_model_id(model)
+        if self.prepare_payload is not None:
+            payload = self.prepare_payload(payload)
         headers = {
             "authorization": f"Bearer {self.api_key}",
             "content-type": "application/json",
@@ -129,7 +141,7 @@ class DeepSeekProvider:
         max_retries = 3 if options.max_retries is None else max(0, options.max_retries)
         timeout = None if options.timeout_ms is None else options.timeout_ms / 1000
         client = await self._get_client()
-        url = f"{self.base_url or model.base_url}/chat/completions"
+        url = f"{self.base_url or model.base_url}{self.chat_path}"
 
         response: httpx.Response | None = None
         retrying = False
@@ -169,7 +181,7 @@ class DeepSeekProvider:
                         )
                     raise ProviderError(
                         "http_error",
-                        f"DeepSeek returned HTTP {response.status_code}: {body}",
+                        f"{self.display_name} returned HTTP {response.status_code}: {body}",
                     )
                 delay = _retry_delay(
                     response,
@@ -198,7 +210,7 @@ class DeepSeekProvider:
                             error=str(exc),
                         )
                     raise ProviderError(
-                        "transport", f"DeepSeek request failed: {exc}", cause=exc
+                        "transport", f"{self.display_name} request failed: {exc}", cause=exc
                     ) from exc
                 delay = min(
                     options.base_delay_ms / 1000 * (2**attempt),
@@ -234,14 +246,20 @@ class DeepSeekProvider:
                     chunk = json.loads(data)
                 except json.JSONDecodeError as exc:
                     raise ProviderError(
-                        "invalid_response", "DeepSeek emitted invalid SSE JSON", cause=exc
+                        "invalid_response",
+                        f"{self.display_name} emitted invalid SSE JSON",
+                        cause=exc,
                     ) from exc
                 saw_chunk = True
                 if isinstance(chunk.get("error"), Mapping):
                     error = chunk["error"]
                     raise ProviderError(
                         "provider_error",
-                        str(error.get("message") or error.get("code") or "DeepSeek stream error"),
+                        str(
+                            error.get("message")
+                            or error.get("code")
+                            or f"{self.display_name} stream error"
+                        ),
                     )
                 if isinstance(chunk.get("usage"), Mapping):
                     usage = _price_usage(Usage.from_dict(chunk["usage"]), model)
@@ -280,12 +298,17 @@ class DeepSeekProvider:
         except ProviderError:
             raise
         except httpx.HTTPError as exc:
-            raise ProviderError("transport", f"DeepSeek stream failed: {exc}", cause=exc) from exc
+            raise ProviderError(
+                "transport", f"{self.display_name} stream failed: {exc}", cause=exc
+            ) from exc
         finally:
             await response.aclose()
 
         if not saw_chunk:
-            raise ProviderError("invalid_response", "DeepSeek stream ended without any chunks")
+            raise ProviderError(
+                "invalid_response",
+                f"{self.display_name} stream ended without any chunks",
+            )
 
         assistant_content: list[TextContent | ThinkingContent | ToolCall] = []
         if thinking_parts:

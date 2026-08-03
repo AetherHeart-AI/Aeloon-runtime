@@ -369,7 +369,7 @@ async def _existing(socket_path: Path) -> dict[str, Any] | None:
         handshake = await bridge_request(
             socket_path,
             "system.handshake",
-            {"protocol_versions": [PROTOCOL_VERSION], "client": {"name": "aeloon-core-cli", "version": "0.2.0"}, "attachment_roots": []},
+            {"protocol_versions": [PROTOCOL_VERSION], "client": {"name": "aeloon-core-cli", "version": "0.3.0"}, "attachment_roots": []},
             timeout=0.5,
         )
         health = await bridge_request(socket_path, "system.health", timeout=0.5)
