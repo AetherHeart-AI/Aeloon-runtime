@@ -59,6 +59,60 @@ def test_default_selects_new_v6_slice_and_both_scenarios(tmp_path: Path) -> None
     assert args.release_version == "v6"
     assert args.all is False
     assert args.scenario is None
+    assert args.model == "deepseek-v4-flash"
+
+
+def test_agent_invocation_forwards_model_and_config(
+    tmp_path: Path, monkeypatch
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run_process(command, *, cwd, timeout, input_text=None):
+        captured["command"] = command
+        captured["input_text"] = input_text
+        return ProcessOutcome(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "status": "completed",
+                    "final_content": "```python\nprint(1)\n```",
+                }
+            ),
+            stderr="",
+            duration_ms=1,
+        )
+
+    monkeypatch.setattr(runner, "_run_process", fake_run_process)
+    config_path = tmp_path / "config.json"
+    args = build_parser().parse_args(
+        [
+            "--livecodebench-root",
+            str(tmp_path / "LiveCodeBench"),
+            "--model",
+            "studio/coder",
+            "--config",
+            str(config_path),
+            "--workspace-dir",
+            str(tmp_path / "workspaces"),
+            "--results",
+            str(tmp_path / "results.jsonl"),
+        ]
+    )
+
+    generation = runner._invoke_agent(
+        "solve it",
+        case=_case(),
+        scenario="code-generation",
+        args=args,
+        release_version="v6",
+    )
+
+    command = captured["command"]
+    assert isinstance(command, list)
+    assert command[command.index("--model") + 1] == "studio/coder"
+    assert command[command.index("--config") + 1] == str(config_path.resolve())
+    assert captured["input_text"] == "solve it"
+    assert generation.code == "print(1)"
 
 
 def test_default_adapter_python_comes_from_current_worktree(

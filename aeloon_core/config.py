@@ -123,8 +123,6 @@ class Config(BaseModel):
     def normalized(self) -> Config:
         workspace = self.workspace.expanduser().resolve(strict=False)
         model_id = self.agent.model.strip()
-        if model_id in {"deepseek-v4-flash", "deepseek-v4-pro"}:
-            model_id = f"deepseek/{model_id}"
         roots = [
             (root.expanduser() if root.expanduser().is_absolute() else workspace / root).resolve(
                 strict=False

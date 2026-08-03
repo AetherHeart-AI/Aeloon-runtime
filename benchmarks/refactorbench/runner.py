@@ -40,6 +40,7 @@ CACHE_MARKER = ".aeloon-refactorbench-cache.json"
 MAX_CAPTURE_CHARS = 20_000
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RESULTS_ROOT = PROJECT_ROOT / "benchmarks" / "results" / "refactorbench"
+DEFAULT_MODEL = "deepseek-v4-flash"
 
 
 @dataclass(frozen=True)
@@ -367,6 +368,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "benchmark": "refactorbench",
         "refactorbench_root": str(benchmark_root),
         "instruction_set": args.instruction_set,
+        "model": args.model,
         "harnesses": harness_metadata,
         "cases": [case.instance_id for case in cases],
         "aeloon_core_commit": _git_revision(PROJECT_ROOT),
@@ -401,6 +403,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                     cli_version=versions[harness],
                     workspace=workspace,
                     baseline=baseline,
+                    model=args.model,
                     config_path=args.config,
                     archive_root=archive_root,
                     artifacts=harness_artifacts,
@@ -459,6 +462,7 @@ def _run_case(
     cli_version: str | None,
     workspace: Path,
     baseline: str,
+    model: str,
     config_path: Path | None,
     archive_root: Path,
     artifacts: HarnessArtifacts,
@@ -474,6 +478,7 @@ def _run_case(
         workspace=workspace,
         prompt=prompt,
         data_dir=artifacts.session_root / safe_id,
+        model=model,
         config_path=config_path,
     )
     agent_process = _run_process(
@@ -697,6 +702,7 @@ def _build_harness_invocation(
     workspace: Path,
     prompt: str,
     data_dir: Path,
+    model: str,
     config_path: Path | None,
 ) -> HarnessInvocation:
     if harness == "aeloon":
@@ -712,6 +718,8 @@ def _build_harness_invocation(
             "--stdin",
             "--output",
             "json",
+            "--model",
+            model,
         ]
         if config_path is not None:
             command.extend(["--config", str(config_path.expanduser().resolve())])
@@ -1369,6 +1377,11 @@ def build_parser() -> argparse.ArgumentParser:
             "Harness to run; repeat to compare several, or use 'all'. "
             "Defaults to aeloon."
         ),
+    )
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help=f"Aeloon model name (default: {DEFAULT_MODEL}).",
     )
     parser.add_argument(
         "--config",

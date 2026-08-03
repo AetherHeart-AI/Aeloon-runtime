@@ -45,7 +45,11 @@ from aeloon_core.harness import (
     StreamOptions,
     message_to_dict,
 )
-from aeloon_core.providers import UnifiedProviderRegistry, normalize_model_id, qualify_model_id
+from aeloon_core.providers import (
+    UnifiedProviderRegistry,
+    qualify_model_id,
+    resolve_model_id,
+)
 from aeloon_core.version import __version__
 
 CONFIG_PATHS: dict[str, tuple[str, ...]] = {
@@ -941,7 +945,14 @@ async def models_command(args: argparse.Namespace) -> int:
         models = _available_cli_models(config, await registry.models())
     finally:
         await account.close()
-    effective_id = config.agent.model or (models[0].id if models else "")
+    effective_id = models[0].id if models else ""
+    if config.agent.model:
+        try:
+            effective_id = resolve_model_id(
+                config.agent.model, (model.id for model in models)
+            )
+        except KeyError:
+            effective_id = config.agent.model
     payload = [
         {
             "id": model.id,
@@ -1000,7 +1011,7 @@ async def model_use_command(args: argparse.Namespace) -> int:
     )
     resolved_socket = Path(str(daemon["socket_path"]))
     catalog = await bridge_request(resolved_socket, "catalog.get", {})
-    available = {
+    available = [
         str(item.get("id"))
         for item in catalog.get("models") or []
         if isinstance(item, dict)
@@ -1009,17 +1020,15 @@ async def model_use_command(args: argparse.Namespace) -> int:
             item.get("provider_id") == "deepseek"
             and config.deepseek.api_key == "no-key"
         )
-    }
+    ]
     requested = args.model_id.strip()
     try:
-        candidate = normalize_model_id(requested)
-    except ValueError:
-        candidate = requested
-    if candidate not in available:
+        candidate = resolve_model_id(requested, available)
+    except KeyError:
         raise HarnessError(
             "model_not_found",
             f"Model is not available: {requested}",
-        )
+        ) from None
     settings = await bridge_request(resolved_socket, "settings.get", {})
     result = await bridge_request(
         resolved_socket,

@@ -538,6 +538,7 @@ class LiveCodeBenchAdapter(BenchmarkAdapter):
                         self.run.output_dir / harness.name / "sessions" / scenario / safe_id
                     ),
                     project_root=self.project_root,
+                    config_path=self.config_path,
                 )
             )
 

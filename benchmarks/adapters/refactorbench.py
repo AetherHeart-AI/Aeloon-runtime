@@ -235,6 +235,7 @@ class RefactorBenchAdapter(BenchmarkAdapter):
                 workspace=workspace,
                 session_dir=session_dir,
                 project_root=self.project_root,
+                config_path=self.config_path,
             )
         )
 

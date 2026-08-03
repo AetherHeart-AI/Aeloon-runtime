@@ -21,6 +21,7 @@ def get_adapter(
     project_root: Path,
     limit: int | None = None,
     workers: int = 1,
+    config_path: Path | None = None,
 ) -> BenchmarkAdapter:
     try:
         module_name, type_name = ADAPTER_PATHS[name].split(":", maxsplit=1)
@@ -31,4 +32,9 @@ def get_adapter(
         ) from None
     module = import_module(module_name)
     adapter_type = getattr(module, type_name)
-    return adapter_type(project_root=project_root, limit=limit, workers=workers)
+    return adapter_type(
+        project_root=project_root,
+        limit=limit,
+        workers=workers,
+        config_path=config_path,
+    )

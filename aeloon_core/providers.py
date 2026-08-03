@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import replace
 from typing import Any
 
@@ -60,6 +60,25 @@ def normalize_model_id(model_id: str) -> str:
     raise ValueError("model id must use the provider/model format")
 
 
+def resolve_model_id(model_id: str, available_model_ids: Iterable[str]) -> str:
+    """Resolve a canonical id or the first matching provider-local model id."""
+
+    requested = model_id.strip()
+    if not requested:
+        raise KeyError("model id is required")
+    candidates = list(available_model_ids)
+    if requested in candidates:
+        return requested
+    for candidate in candidates:
+        try:
+            _, provider_model_id = split_model_id(candidate)
+        except ValueError:
+            continue
+        if provider_model_id == requested:
+            return candidate
+    raise KeyError(f"Unknown model: {requested}")
+
+
 class UnifiedProviderRegistry:
     """Resolve every provider and model through one qualified namespace."""
 
@@ -88,25 +107,41 @@ class UnifiedProviderRegistry:
         return models
 
     async def model(self, model_id: str) -> Model:
-        try:
-            canonical = normalize_model_id(model_id)
-        except ValueError as exc:
-            raise KeyError(str(exc)) from exc
-        local = self._local_models().get(canonical)
+        requested = model_id.strip()
+        local_models = self._local_models()
+        local = local_models.get(requested)
         if local is not None:
             return local
-        provider_id, _ = split_model_id(canonical)
-        if provider_id != CLOUD_PROVIDER_ID:
-            raise KeyError(f"Unknown model: {canonical}")
-        status = self.cloud_account.status()
-        if not status["enabled"]:
-            raise RuntimeError("Aeloon Cloud is disabled in Core settings")
-        if not status["authenticated"]:
-            raise PermissionError("Sign in to Aeloon Cloud first")
-        cloud_model = (await self.cloud_account.models()).get(canonical)
-        if cloud_model is None:
-            raise KeyError(f"Unknown model: {canonical}")
-        return cloud_model
+
+        provider_id, separator, _ = requested.partition("/")
+        local_provider_ids = self._local_providers()
+        if separator and provider_id in local_provider_ids:
+            raise KeyError(f"Unknown model: {requested}")
+        if separator and provider_id == CLOUD_PROVIDER_ID:
+            status = self.cloud_account.status()
+            if not status["enabled"]:
+                raise RuntimeError("Aeloon Cloud is disabled in Core settings")
+            if not status["authenticated"]:
+                raise PermissionError("Sign in to Aeloon Cloud first")
+            cloud_model = (await self.cloud_account.models()).get(requested)
+            if cloud_model is None:
+                raise KeyError(f"Unknown model: {requested}")
+            return cloud_model
+
+        models = await self.models()
+        connected_model_ids = [
+            candidate.id
+            for candidate in models.values()
+            if candidate.provider != DEEPSEEK_PROVIDER_ID
+            or self.config.deepseek.api_key != "no-key"
+        ]
+        try:
+            canonical = resolve_model_id(requested, connected_model_ids)
+        except KeyError:
+            # Keep legacy short DeepSeek ids useful when no connected provider
+            # exposes the requested name; the provider then reports the missing key.
+            canonical = resolve_model_id(requested, models)
+        return models[canonical]
 
     def provider(self, model: Model) -> Provider:
         provider_id, _ = split_model_id(model.id)

@@ -28,9 +28,10 @@ Fresh installations have no pinned default model and never read `DEEPSEEK_API_KE
 connect a local API or sign in to Aeloon Cloud, runs automatically use the first model shown by
 `aeloon models`. Use `aeloon models use MODEL` only when you want to pin a different default.
 Every model has a stable `provider/model` ID, so local API and cloud models can appear in one
-catalog without collisions. Existing explicitly configured DeepSeek providers and sessions remain
-compatible, but DeepSeek is not selected or shown as an available CLI model without a stored key.
-Thinking defaults to `off`.
+catalog without collisions. `--model` and `models use` also accept the provider-local model name;
+if more than one provider exposes that name, Core selects the first match in catalog order.
+Existing explicitly configured DeepSeek providers and sessions remain compatible, but DeepSeek is
+not selected or shown as an available CLI model without a stored key. Thinking defaults to `off`.
 
 Aeloon Cloud is an optional account-backed provider. Core owns the account session and refresh
 credential; UI clients receive only public account status and provider-qualified model IDs such as
@@ -195,8 +196,8 @@ uv run aeloon doctor
 then prints a concrete recovery command for each problem. `local add` reads an optional API key
 from a hidden prompt and stores it in the mode-0600 config; `login` stores cloud credentials in the
 account vault. Neither command accepts a secret as a command-line argument.
-`-m PROVIDER/MODEL` overrides either the automatic or pinned default for one run without changing
-the saved selection.
+`-m MODEL` overrides either the automatic or pinned default for one run without changing the saved
+selection. Use the full `PROVIDER/MODEL` ID when you need to disambiguate providers.
 
 Shell completion scripts can be generated without an additional runtime dependency:
 

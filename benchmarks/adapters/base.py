@@ -46,12 +46,16 @@ class BenchmarkAdapter(ABC):
         project_root: Path,
         limit: int | None = None,
         workers: int = 1,
+        config_path: Path | None = None,
     ) -> None:
         if workers <= 0:
             raise ValueError("workers must be positive")
         self.project_root = project_root.expanduser().resolve()
         self.limit = limit
         self.workers = workers
+        self.config_path = (
+            config_path.expanduser().resolve() if config_path is not None else None
+        )
         self._result_lock = threading.Lock()
         workspace_root = self.project_root / ".benchmark-workspaces"
         source_dir = workspace_root / "sources" / self.name

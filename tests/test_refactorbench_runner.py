@@ -118,6 +118,7 @@ def test_list_mode_has_no_workspace_or_result_side_effects(tmp_path: Path) -> No
 
     summary = run_benchmark(args)
 
+    assert args.model == "deepseek-v4-flash"
     assert [case["instance_id"] for case in summary["cases"]] == [
         "demo_refactor/change"
     ]
@@ -158,10 +159,15 @@ def test_harness_selection_and_invocations_use_noninteractive_modes(
         workspace=workspace,
         prompt="do the task",
         data_dir=data_dir,
-        config_path=None,
+        model="studio/coder",
+        config_path=tmp_path / "config.json",
     )
     assert "--stdin" in aeloon.command
     assert aeloon.input_text == "do the task"
+    assert aeloon.command[aeloon.command.index("--model") + 1] == "studio/coder"
+    assert aeloon.command[aeloon.command.index("--config") + 1] == str(
+        (tmp_path / "config.json").resolve()
+    )
 
     pi = _build_harness_invocation(
         "pi",
@@ -169,6 +175,7 @@ def test_harness_selection_and_invocations_use_noninteractive_modes(
         workspace=workspace,
         prompt="do the task",
         data_dir=data_dir,
+        model="studio/coder",
         config_path=None,
     )
     assert pi.command[:4] == ["/fake/pi", "--print", "--mode", "json"]
@@ -180,6 +187,7 @@ def test_harness_selection_and_invocations_use_noninteractive_modes(
         workspace=workspace,
         prompt="do the task",
         data_dir=data_dir,
+        model="studio/coder",
         config_path=None,
     )
     assert codex.command[:2] == ["/fake/codex", "exec"]
@@ -192,6 +200,7 @@ def test_harness_selection_and_invocations_use_noninteractive_modes(
         workspace=workspace,
         prompt="do the task",
         data_dir=data_dir,
+        model="studio/coder",
         config_path=None,
     )
     assert "--output-format" in claude.command

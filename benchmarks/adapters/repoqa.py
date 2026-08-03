@@ -263,6 +263,7 @@ class RepoQAAdapter(BenchmarkAdapter):
                 workspace=workspace,
                 session_dir=harness_root / "sessions" / safe_id,
                 project_root=self.project_root,
+                config_path=self.config_path,
             )
         )
 

@@ -613,6 +613,53 @@ async def test_first_listed_model_is_automatic_default(
 
 
 @pytest.mark.asyncio
+async def test_explicit_short_model_uses_first_matching_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = tmp_path / "config.json"
+    cli.save_config(
+        cli.Config(
+            workspace=tmp_path,
+            data_dir=tmp_path / "data",
+            local_providers={
+                "studio": {
+                    "name": "Studio",
+                    "base_url": "http://127.0.0.1:8000/v1",
+                    "models": [{"id": "deepseek-v4-flash"}],
+                },
+                "backup": {
+                    "name": "Backup",
+                    "base_url": "http://127.0.0.1:9000/v1",
+                    "models": [{"id": "deepseek-v4-flash"}],
+                },
+            },
+        ),
+        config_path,
+    )
+    provider = _provider("matched")
+    monkeypatch.setattr(cli, "DeepSeekProvider", lambda **_kwargs: provider)
+
+    assert (
+        await cli.async_main(
+            [
+                "matched task",
+                "--config",
+                str(config_path),
+                "--model",
+                "deepseek-v4-flash",
+                "--ephemeral",
+                "--json",
+            ]
+        )
+        == 0
+    )
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["final_content"] == "matched"
+    assert provider.requests[0][0].id == "studio/deepseek-v4-flash"
+
+
+@pytest.mark.asyncio
 async def test_setup_configures_deepseek_without_exposing_key(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
@@ -943,7 +990,7 @@ async def test_models_use_sets_default_through_bridge(tmp_path: Path, monkeypatc
 
     assert (
         await cli.async_main(
-            ["models", "use", "studio/coder", "--socket", str(socket_path), "--json"]
+            ["models", "use", "coder", "--socket", str(socket_path), "--json"]
         )
         == 0
     )

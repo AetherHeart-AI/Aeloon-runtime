@@ -55,6 +55,7 @@ from aeloon_core.providers import (
     UnifiedProviderRegistry,
     normalize_model_id,
     qualify_model_id,
+    resolve_model_id,
     split_model_id,
     validate_provider_id,
 )
@@ -567,8 +568,21 @@ class CoreService:
         actions = params.get("secret_actions") or []
         if not isinstance(patch, Mapping) or not isinstance(actions, list):
             raise BridgeError("invalid_argument", "patch and secret_actions are invalid")
-        valid_model_ids = set((await self._models()).keys())
-        valid_model_ids.add(self.config.agent.model)
+        models = await self._models()
+        valid_model_ids = [
+            model.id
+            for model in models.values()
+            if model.provider != DEEPSEEK_PROVIDER_ID
+            or self.config.deepseek.api_key != "no-key"
+        ]
+        valid_model_ids.extend(
+            model_id for model_id in models if model_id not in valid_model_ids
+        )
+        if (
+            "/" in self.config.agent.model
+            and self.config.agent.model not in valid_model_ids
+        ):
+            valid_model_ids.append(self.config.agent.model)
         async with self._settings_lock:
             if revision != self._revision:
                 raise BridgeError("revision_conflict", "Core settings changed; refresh and try again")
@@ -1355,7 +1369,7 @@ class CoreService:
         raw: dict[str, Any],
         patch: Mapping[str, Any],
         *,
-        valid_model_ids: set[str],
+        valid_model_ids: list[str],
     ) -> None:
         allowed = {"default_model_id", "default_thinking_level", "retry", "compaction", "resources", "tools", "deepseek", "cloud"}
         unknown = set(patch) - allowed
@@ -1364,11 +1378,11 @@ class CoreService:
         if "default_model_id" in patch:
             requested_model_id = str(patch["default_model_id"])
             try:
-                model_id = normalize_model_id(requested_model_id)
-            except ValueError:
-                model_id = requested_model_id
-            if model_id not in valid_model_ids:
-                raise BridgeError("invalid_argument", f"Unknown model: {requested_model_id}")
+                model_id = resolve_model_id(requested_model_id, valid_model_ids)
+            except KeyError:
+                raise BridgeError(
+                    "invalid_argument", f"Unknown model: {requested_model_id}"
+                ) from None
             raw["agent"]["model"] = model_id
         if "default_thinking_level" in patch:
             raw["agent"]["thinking_level"] = self._thinking_level(patch["default_thinking_level"])

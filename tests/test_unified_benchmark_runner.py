@@ -116,12 +116,14 @@ def test_cli_exposes_harness_benchmark_model_workers_and_limit() -> None:
     assert args.harness == [["aeloon", "pi"]]
     assert args.benchmark == "refactorbench"
     assert args.model == "deepseek-v4-flash"
+    assert args.config is None
     assert args.workers == 1
     assert args.limit is None
     assert {action.dest for action in parser._actions if action.dest != "help"} == {
         "harness",
         "benchmark",
         "model",
+        "config",
         "workers",
         "limit",
     }
@@ -168,6 +170,26 @@ def test_harness_invocations_forward_selected_model(
 
     model_option = command.index("--model")
     assert command[model_option + 1] == "deepseek-v4-pro"
+
+
+def test_aeloon_harness_forwards_explicit_config_path(tmp_path: Path) -> None:
+    harness = object.__new__(AeloonHarness)
+    harness.executable = "/fake/python"
+    harness.model = "coder"
+    config_path = tmp_path / "config.json"
+
+    command = harness.build_invocation(
+        HarnessRequest(
+            prompt="solve it",
+            workspace=tmp_path,
+            session_dir=tmp_path / "sessions",
+            project_root=tmp_path,
+            config_path=config_path,
+        )
+    ).command
+
+    config_option = command.index("--config")
+    assert command[config_option + 1] == str(config_path.resolve())
 
 
 def test_harness_registry_includes_openclaw_and_hermes() -> None:
@@ -468,7 +490,10 @@ def test_unified_runner_prepares_before_execute(monkeypatch, tmp_path: Path) -> 
     monkeypatch.setattr(
         unified,
         "get_adapter",
-        lambda name, **kwargs: events.append(("adapter", name, kwargs["workers"])) or FakeAdapter(),
+        lambda name, **kwargs: events.append(
+            ("adapter", name, kwargs["workers"], kwargs["config_path"])
+        )
+        or FakeAdapter(),
     )
     args = unified.build_parser().parse_args(
         [
@@ -482,13 +507,15 @@ def test_unified_runner_prepares_before_execute(monkeypatch, tmp_path: Path) -> 
             "3",
             "--model",
             "deepseek-v4-pro",
+            "--config",
+            str(tmp_path / "config.json"),
         ]
     )
 
     assert unified.run(args) == {"ok": True}
     assert events == [
         ("harnesses", ["aeloon", "codex"], "deepseek-v4-pro"),
-        ("adapter", "livecodebench", 3),
+        ("adapter", "livecodebench", 3, tmp_path / "config.json"),
         "prepare",
         ("execute", harnesses),
     ]
@@ -511,6 +538,22 @@ def test_refactorbench_adapter_runs_through_shared_harness(tmp_path: Path) -> No
     assert records[0]["evaluation"]["passed"] is True
     assert records[0]["agent"]["harness"] == "fake"
     assert (adapter.run.output_dir / records[0]["patch_path"]).is_file()
+
+
+def test_benchmark_adapter_forwards_aeloon_config_to_harness(tmp_path: Path) -> None:
+    config_path = tmp_path / "aeloon.json"
+    adapter = RefactorBenchAdapter(project_root=tmp_path, config_path=config_path)
+    _make_refactorbench(adapter.run.source_dir)
+    requests: list[HarnessRequest] = []
+
+    class CapturingHarness(FakeHarness):
+        def run(self, request: HarnessRequest) -> HarnessResult:
+            requests.append(request)
+            return super().run(request)
+
+    adapter.execute([CapturingHarness()])  # type: ignore[list-item]
+
+    assert requests[0].config_path == config_path.resolve()
 
 
 def test_refactorbench_parallelizes_isolated_repositories(tmp_path: Path) -> None:

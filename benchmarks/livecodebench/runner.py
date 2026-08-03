@@ -21,6 +21,7 @@ DEFAULT_SCENARIOS = ("code-generation", "self-repair")
 RELEASE_V6_NEW = "v6"
 RELEASE_V6_ALL = "release_v6"
 MAX_CAPTURE_CHARS = 20_000
+DEFAULT_MODEL = "deepseek-v4-flash"
 
 
 @dataclass(frozen=True)
@@ -370,6 +371,8 @@ def _invoke_agent(
         "json",
         "--data-dir",
         str(session_root),
+        "--model",
+        args.model,
     ]
     if args.config is not None:
         command.extend(["--config", str(args.config.expanduser().resolve())])
@@ -1063,6 +1066,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--list",
         action="store_true",
         help="List selected cases without creating workspaces or running agents.",
+    )
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help=f"Aeloon model name (default: {DEFAULT_MODEL}).",
     )
     parser.add_argument(
         "--config",

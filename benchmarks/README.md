@@ -6,6 +6,7 @@ The benchmark runner has one public command:
 uv run python run_bench.py \
   --harness aeloon \
   --model deepseek-v4-flash \
+  --config ~/.aeloon-core/config.json \
   --benchmark refactorbench
 ```
 
@@ -26,6 +27,12 @@ Supported harnesses are `aeloon`, `pi`, `codex`, `claude`, `openclaw`, and
 `--model MODEL` passes the same explicit model selection to every harness and
 defaults to `deepseek-v4-flash`. This keeps comparisons on the same model
 instead of inheriting each CLI's configured default.
+
+`--config PATH` is forwarded to the Aeloon harness, so benchmark runs can use
+an explicit provider configuration instead of depending on the process
+environment or the machine-wide default config. The compatibility
+`run_refactorbench.py` and `run_livecodebench.py` runners accept the same
+`--model` and `--config` options.
 
 `--workers N` enables opt-in case concurrency and defaults to `1`. RefactorBench
 assigns each source repository to one writable lane, so cases that share a

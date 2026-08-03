@@ -14,6 +14,7 @@ from aeloon_core.providers import (
     UnifiedProviderRegistry,
     normalize_model_id,
     qualify_model_id,
+    resolve_model_id,
     split_model_id,
 )
 from aeloon_core.service import CoreService
@@ -36,6 +37,48 @@ def test_model_ids_use_one_provider_prefix_and_upgrade_legacy_deepseek() -> None
     assert normalize_model_id("deepseek-v4-pro") == "deepseek/deepseek-v4-pro"
     with pytest.raises(ValueError, match="provider/model"):
         normalize_model_id("unqualified-model")
+
+
+def test_unqualified_model_id_uses_first_matching_provider() -> None:
+    available = ["studio/coder", "backup/coder", "studio/org/model"]
+
+    assert resolve_model_id("coder", available) == "studio/coder"
+    assert resolve_model_id("org/model", available) == "studio/org/model"
+    assert resolve_model_id("backup/coder", available) == "backup/coder"
+
+
+@pytest.mark.asyncio
+async def test_registry_resolves_unqualified_model_to_first_provider() -> None:
+    config = Config(
+        local_providers={
+            "studio": LocalProviderConfig(
+                name="Studio",
+                base_url="http://127.0.0.1:8000/v1",
+                models=[
+                    LocalModelConfig(id="coder"),
+                    LocalModelConfig(id="deepseek-v4-flash"),
+                ],
+            ),
+            "backup": LocalProviderConfig(
+                name="Backup",
+                base_url="http://127.0.0.1:9000/v1",
+                models=[
+                    LocalModelConfig(id="coder"),
+                    LocalModelConfig(id="deepseek-v4-flash"),
+                ],
+            ),
+        }
+    ).normalized()
+    registry = UnifiedProviderRegistry(
+        config,
+        OfflineCloudAccount(),  # type: ignore[arg-type]
+    )
+
+    assert (await registry.model("coder")).id == "studio/coder"
+    assert (
+        await registry.model("deepseek-v4-flash")
+    ).id == "studio/deepseek-v4-flash"
+    assert (await registry.model("backup/coder")).id == "backup/coder"
 
 
 @pytest.mark.asyncio

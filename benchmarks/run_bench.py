@@ -58,6 +58,12 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Model name passed to every selected harness (default: {DEFAULT_MODEL}).",
     )
     parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Aeloon Core config JSON path (used by the aeloon harness).",
+    )
+    parser.add_argument(
         "--workers",
         type=_positive_int,
         default=1,
@@ -93,6 +99,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         project_root=PROJECT_ROOT,
         limit=args.limit,
         workers=args.workers,
+        config_path=args.config,
     )
     info("Preparing benchmark environment...")
     adapter.prepare()
