@@ -369,7 +369,7 @@ def _invoke_agent(
         "--stdin",
         "--output",
         "json",
-        "--data-dir",
+        "--session-dir",
         str(session_root),
         "--model",
         args.model,

@@ -109,6 +109,8 @@ def test_agent_invocation_forwards_model_and_config(
 
     command = captured["command"]
     assert isinstance(command, list)
+    assert "--session-dir" in command
+    assert "--data-dir" not in command
     assert command[command.index("--model") + 1] == "studio/coder"
     assert command[command.index("--config") + 1] == str(config_path.resolve())
     assert captured["input_text"] == "solve it"

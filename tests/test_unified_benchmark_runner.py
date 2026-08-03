@@ -170,6 +170,11 @@ def test_harness_invocations_forward_selected_model(
 
     model_option = command.index("--model")
     assert command[model_option + 1] == "deepseek-v4-pro"
+    if harness_type is AeloonHarness:
+        assert command[command.index("--session-dir") + 1] == str(
+            request.session_dir
+        )
+        assert "--data-dir" not in command
 
 
 def test_aeloon_harness_forwards_explicit_config_path(tmp_path: Path) -> None:

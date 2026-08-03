@@ -713,7 +713,7 @@ def _build_harness_invocation(
             "run",
             "--workspace",
             str(workspace),
-            "--data-dir",
+            "--session-dir",
             str(data_dir),
             "--stdin",
             "--output",

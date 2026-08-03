@@ -164,6 +164,8 @@ def test_harness_selection_and_invocations_use_noninteractive_modes(
     )
     assert "--stdin" in aeloon.command
     assert aeloon.input_text == "do the task"
+    assert aeloon.command[aeloon.command.index("--session-dir") + 1] == str(data_dir)
+    assert "--data-dir" not in aeloon.command
     assert aeloon.command[aeloon.command.index("--model") + 1] == "studio/coder"
     assert aeloon.command[aeloon.command.index("--config") + 1] == str(
         (tmp_path / "config.json").resolve()

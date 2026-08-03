@@ -34,6 +34,10 @@ environment or the machine-wide default config. The compatibility
 `run_refactorbench.py` and `run_livecodebench.py` runners accept the same
 `--model` and `--config` options.
 
+Aeloon benchmark calls store per-case history through `--session-dir`. This
+keeps result artifacts isolated without overriding Core's configured
+`data_dir`, where Aeloon Cloud account state and credentials are resolved.
+
 `--workers N` enables opt-in case concurrency and defaults to `1`. RefactorBench
 assigns each source repository to one writable lane, so cases that share a
 repository never mutate the same workspace concurrently. LiveCodeBench runs

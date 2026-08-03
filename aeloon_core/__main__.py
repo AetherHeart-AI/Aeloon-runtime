@@ -162,6 +162,7 @@ def _add_run_arguments(
     command.add_argument("--config", type=Path, help=argparse.SUPPRESS)
     command.add_argument("-C", "--workspace", type=Path, help="Run in this workspace.")
     command.add_argument("--data-dir", type=Path, help=argparse.SUPPRESS)
+    command.add_argument("--session-dir", type=Path, help=argparse.SUPPRESS)
     command.add_argument("-m", "--model", help="Use this model for the task.")
 
 
@@ -688,7 +689,8 @@ async def run_command(args: argparse.Namespace) -> int:
         raise HarnessError("invalid_argument", "--session and --no-session cannot be combined")
     prompt = _read_prompt(args)
     config = _with_run_overrides(load_config(args.config), args)
-    repository = None if args.no_session else JsonlSessionRepository(config.data_dir)
+    session_dir = args.session_dir or config.data_dir
+    repository = None if args.no_session else JsonlSessionRepository(session_dir)
     session = None
     if args.session:
         assert repository is not None
@@ -817,7 +819,7 @@ async def resume_command(args: argparse.Namespace) -> int:
             args.stdin = True
     if args.session is None:
         config = _with_run_overrides(load_config(args.config), args)
-        repository = JsonlSessionRepository(config.data_dir)
+        repository = JsonlSessionRepository(args.session_dir or config.data_dir)
         sessions = await repository.list(cwd=config.workspace)
         if not sessions:
             raise SessionError(

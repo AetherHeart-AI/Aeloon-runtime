@@ -322,6 +322,55 @@ async def test_run_session_list_show_and_no_session(tmp_path: Path, monkeypatch,
     assert set((data_dir / "harness-sessions").glob("*.jsonl")) == before
 
 
+@pytest.mark.asyncio
+async def test_session_dir_does_not_change_cloud_account_data_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    config_path = tmp_path / "config.json"
+    configured_data_dir = tmp_path / "core-data"
+    session_dir = tmp_path / "benchmark-sessions"
+    cli.save_config(
+        cli.Config(
+            workspace=tmp_path,
+            data_dir=configured_data_dir,
+            deepseek={"api_key": "configured-key"},
+        ),
+        config_path,
+    )
+    account_data_dirs: list[Path] = []
+    account_type = cli.CloudAccountService
+
+    def cloud_account(config, *, data_dir):
+        account_data_dirs.append(data_dir)
+        return account_type(config, data_dir=data_dir)
+
+    monkeypatch.setattr(cli, "CloudAccountService", cloud_account)
+    monkeypatch.setattr(cli, "DeepSeekProvider", lambda **_kwargs: _provider("isolated"))
+
+    assert (
+        await cli.async_main(
+            [
+                "run",
+                "task",
+                "--config",
+                str(config_path),
+                "--session-dir",
+                str(session_dir),
+                "--model",
+                "deepseek/deepseek-v4-flash",
+                "--output",
+                "json",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    assert account_data_dirs == [configured_data_dir.resolve()]
+    assert len(list((session_dir / "harness-sessions").glob("*.jsonl"))) == 1
+    assert not (configured_data_dir / "harness-sessions").exists()
+
+
 def test_config_path_init_show_and_set(tmp_path: Path, monkeypatch, capsys) -> None:
     path = tmp_path / "config.json"
     assert cli.main(["config", "path", "--config", str(path)]) == 0

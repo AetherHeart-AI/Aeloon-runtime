@@ -41,7 +41,7 @@ class AeloonHarness(Harness):
             "run",
             "--workspace",
             str(request.workspace),
-            "--data-dir",
+            "--session-dir",
             str(request.session_dir),
             "--stdin",
             "--output",
