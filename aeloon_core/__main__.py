@@ -11,6 +11,9 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from rich.console import Console
+from rich.markdown import Markdown
+
 from aeloon_core.config import (
     Config,
     load_config,
@@ -60,10 +63,7 @@ CONFIG_PATHS: dict[str, tuple[str, ...]] = {
     "no-context-files": ("resources", "no_context_files"),
 }
 
-_TOOL_COMMAND_MAX_LINES = 20
-_TOOL_COMMAND_MAX_CHARS = 2_000
-_TOOL_RESULT_MAX_LINES = 80
-_TOOL_RESULT_MAX_CHARS = 8_000
+_TOOL_SUMMARY_MAX_CHARS = 240
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -119,8 +119,8 @@ class RunRenderer:
     def __init__(self, output: str) -> None:
         self.output = output
         self.tools_used: list[str] = []
-        self._printed_text = False
         self._tool_started_at: dict[str, float] = {}
+        self._tool_args: dict[str, dict[str, Any]] = {}
 
     async def __call__(self, event: HarnessEvent) -> None:
         if event.type == "tool_execution_start":
@@ -128,8 +128,11 @@ class RunRenderer:
             call_id = str(event.data.get("toolCallId") or "")
             if name and name not in self.tools_used:
                 self.tools_used.append(name)
-            if call_id:
+            if call_id and self.output == "text":
                 self._tool_started_at[call_id] = time.monotonic()
+                self._tool_args[call_id] = (
+                    dict(event.data["args"]) if isinstance(event.data.get("args"), dict) else {}
+                )
             if self.output == "text":
                 self._render_tool_start(name, event.data.get("args"))
         elif event.type == "tool_execution_end" and self.output == "text":
@@ -137,18 +140,13 @@ class RunRenderer:
         if self.output == "stream-json":
             print(_json(event.to_dict()), flush=True)
             return
-        if self.output != "text" or event.type != "message_update":
-            return
-        update = event.data.get("assistantMessageEvent") or {}
-        if update.get("type") == "text_delta":
-            print(str(update.get("delta") or ""), end="", flush=True)
-            self._printed_text = True
+        # Text output is intentionally buffered until the complete assistant message is
+        # available. Rendering partial Markdown produces noisy, malformed terminal output.
 
     def _render_tool_start(self, name: str, raw_args: Any) -> None:
         args = raw_args if isinstance(raw_args, dict) else {}
-        print(f"[tool] {name or 'unknown'}", file=sys.stderr)
-        for line in _tool_invocation_lines(name, args):
-            print(f"  {line}", file=sys.stderr)
+        action, summary = _tool_invocation_summary(name, args)
+        print(f"[{action}] {summary}", file=sys.stderr)
 
     def _render_tool_end(self, event: HarnessEvent) -> None:
         name = str(event.data.get("toolName") or "unknown")
@@ -157,86 +155,128 @@ class RunRenderer:
         result = raw_result if isinstance(raw_result, dict) else {}
         details_value = result.get("details")
         details = details_value if isinstance(details_value, dict) else {}
-        is_error = bool(event.data.get("isError") or result.get("isError"))
-        qualifiers: list[str] = []
-        if name == "bash" and details.get("exitCode") is not None:
-            qualifiers.append(f"exit {details['exitCode']}")
+        args = self._tool_args.pop(call_id, {})
+        exit_code = details.get("exitCode")
+        is_error = bool(
+            event.data.get("isError")
+            or result.get("isError")
+            or (name == "bash" and isinstance(exit_code, int) and exit_code != 0)
+        )
+        qualifiers = _tool_result_summary(name, args, result, details, is_error=is_error)
         started_at = self._tool_started_at.pop(call_id, None)
         if started_at is not None:
             qualifiers.append(_format_duration(time.monotonic() - started_at))
-        if details.get("truncated"):
+        truncation = details.get("truncation")
+        if details.get("truncated") or (
+            isinstance(truncation, dict) and truncation.get("truncated")
+        ):
             qualifiers.append("truncated")
+        label = "failed" if is_error else "ok"
         suffix = f" · {' · '.join(qualifiers)}" if qualifiers else ""
-        label = "tool error" if is_error else "tool result"
         print(f"[{label}] {name}{suffix}", file=sys.stderr)
-
-        preview = _tool_result_text(result)
-        preview, truncated = _truncate_terminal_text(
-            preview,
-            max_lines=_TOOL_RESULT_MAX_LINES,
-            max_chars=_TOOL_RESULT_MAX_CHARS,
-            keep_tail=name == "bash",
-        )
-        if truncated:
-            marker = (
-                "[... terminal preview truncated; showing tail ...]"
-                if name == "bash"
-                else ("[... terminal preview truncated ...]")
-            )
-            preview = f"{marker}\n{preview}" if name == "bash" else f"{preview}\n{marker}"
-        for line in (preview or "(no output)").splitlines():
-            print(f"  {line}", file=sys.stderr)
 
     def finish_text(self, final_text: str) -> None:
         if self.output != "text":
             return
-        if not self._printed_text:
-            print(final_text)
-        elif final_text:
+        if not final_text:
             print()
+            return
+        if _is_interactive_terminal():
+            Console(file=sys.stdout, highlight=False, soft_wrap=True).print(Markdown(final_text))
+        else:
+            print(final_text)
 
 
-def _tool_invocation_lines(name: str, args: dict[str, Any]) -> list[str]:
+def _tool_invocation_summary(name: str, args: dict[str, Any]) -> tuple[str, str]:
     if name == "bash":
-        command, truncated = _truncate_terminal_text(
-            str(args.get("command") or ""),
-            max_lines=_TOOL_COMMAND_MAX_LINES,
-            max_chars=_TOOL_COMMAND_MAX_CHARS,
-        )
-        lines = command.splitlines() or [""]
-        rendered = [f"$ {lines[0]}", *(f"> {line}" for line in lines[1:])]
-        if truncated:
-            rendered.append("[... command preview truncated ...]")
+        command = _one_line_summary(str(args.get("command") or ""))
+        summary = f"$ {command or '(empty command)'}"
         if args.get("timeout") is not None:
-            rendered.append(f"timeout={args['timeout']}s")
-        return rendered
+            summary += f" · timeout {args['timeout']}s"
+        return "run", summary
     if name == "write":
         content = str(args.get("content") or "")
-        return [f"path={args.get('path', '')} ({len(content.encode('utf-8'))} bytes)"]
+        return "write", f"{args.get('path', '')} · {_format_bytes(len(content.encode('utf-8')))}"
     if name == "edit":
         edits = args.get("edits")
         count = len(edits) if isinstance(edits, list) else 0
-        return [f"path={args.get('path', '')} ({count} replacement(s))"]
+        return "write", f"{args.get('path', '')} · {_count_label(count, 'replacement')}"
     if name == "read":
-        return [_format_selected_args(args, ("path", "offset", "limit"))]
+        line_range = ""
+        if args.get("offset") is not None or args.get("limit") is not None:
+            offset = int(args.get("offset") or 1)
+            limit = args.get("limit")
+            line_range = (
+                f" · lines {offset}-{offset + int(limit) - 1}"
+                if limit
+                else f" · from line {offset}"
+            )
+        return "read", f"{args.get('path', '')}{line_range}"
     if name == "grep":
-        return [_format_selected_args(args, ("pattern", "path", "glob", "limit"))]
+        return "search", _search_summary(args, noun="matches")
     if name == "find":
-        return [_format_selected_args(args, ("pattern", "path", "limit"))]
+        return "search", _search_summary(args, noun="files")
     if name == "ls":
-        return [_format_selected_args(args, ("path", "limit")) or "path=."]
-    rendered, truncated = _truncate_terminal_text(
-        _json(args),
-        max_lines=_TOOL_COMMAND_MAX_LINES,
-        max_chars=_TOOL_COMMAND_MAX_CHARS,
-    )
-    if truncated:
-        rendered += "\n[... arguments preview truncated ...]"
-    return rendered.splitlines() or ["{}"]
+        return "read", str(args.get("path") or ".")
+    return "run", name or "unknown"
 
 
-def _format_selected_args(args: dict[str, Any], keys: tuple[str, ...]) -> str:
-    return " ".join(f"{key}={args[key]!r}" for key in keys if args.get(key) is not None)
+def _search_summary(args: dict[str, Any], *, noun: str) -> str:
+    pattern = repr(str(args.get("pattern") or ""))
+    path = str(args.get("path") or ".")
+    return _one_line_summary(f"{pattern} in {path} ({noun})")
+
+
+def _tool_result_summary(
+    name: str,
+    args: dict[str, Any],
+    result: dict[str, Any],
+    details: dict[str, Any],
+    *,
+    is_error: bool,
+) -> list[str]:
+    if name == "bash" and isinstance(details.get("exitCode"), int):
+        summary: list[str] = []
+        summary.append(f"exit {details['exitCode']}")
+        output_bytes = details.get("outputBytes")
+        if isinstance(output_bytes, int):
+            summary.append(f"{_format_bytes(output_bytes)} output")
+        return summary
+    if is_error:
+        error = _one_line_summary(_tool_result_text(result))
+        return [error] if error else []
+    if name == "read":
+        summary = []
+        size = details.get("sizeBytes")
+        if isinstance(size, int):
+            summary.append(_format_bytes(size))
+        selected_lines = details.get("selectedLines")
+        if isinstance(selected_lines, int):
+            summary.append(_count_label(selected_lines, "line"))
+        mime = details.get("mimeType")
+        if mime:
+            summary.append(str(mime))
+        return summary
+    if name == "write":
+        size = details.get("sizeBytes")
+        if not isinstance(size, int):
+            size = len(str(args.get("content") or "").encode("utf-8"))
+        return [_format_bytes(size)]
+    if name == "edit":
+        count = details.get("replacements")
+        if not isinstance(count, int):
+            edits = args.get("edits")
+            count = len(edits) if isinstance(edits, list) else 0
+        summary = [_count_label(count, "replacement")]
+        size = details.get("sizeAfterBytes")
+        if isinstance(size, int):
+            summary.append(_format_bytes(size))
+        return summary
+    if name in {"grep", "find", "ls"}:
+        count = details.get("resultCount")
+        noun = {"grep": "result", "find": "file", "ls": "entry"}[name]
+        return [_count_label(count, noun)] if isinstance(count, int) else []
+    return []
 
 
 def _tool_result_text(result: dict[str, Any]) -> str:
@@ -254,25 +294,30 @@ def _tool_result_text(result: dict[str, Any]) -> str:
     return "\n".join(rendered)
 
 
-def _truncate_terminal_text(
-    value: str,
-    *,
-    max_lines: int,
-    max_chars: int,
-    keep_tail: bool = False,
-) -> tuple[str, bool]:
-    lines = value.splitlines()
-    too_many_lines = len(lines) > max_lines
-    selected = lines[-max_lines:] if keep_tail else lines[:max_lines]
-    rendered = "\n".join(selected)
-    too_many_chars = len(rendered) > max_chars
-    if too_many_chars:
-        rendered = rendered[-max_chars:] if keep_tail else rendered[:max_chars]
-        if keep_tail:
-            rendered = rendered.split("\n", 1)[-1]
-        else:
-            rendered = rendered.rsplit("\n", 1)[0] or rendered
-    return rendered, too_many_lines or too_many_chars
+def _one_line_summary(value: str, *, max_chars: int = _TOOL_SUMMARY_MAX_CHARS) -> str:
+    rendered = " ".join(value.split())
+    if len(rendered) <= max_chars:
+        return rendered
+    return rendered[: max_chars - 1].rstrip() + "…"
+
+
+def _format_bytes(size: int) -> str:
+    units = ("B", "KB", "MB", "GB")
+    value = float(max(0, size))
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{int(value)} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    raise AssertionError("unreachable")
+
+
+def _count_label(count: int, noun: str) -> str:
+    return f"{count} {noun}{'' if count == 1 else 's'}"
+
+
+def _is_interactive_terminal() -> bool:
+    isatty = getattr(sys.stdout, "isatty", None)
+    return bool(isatty and isatty())
 
 
 def _format_duration(seconds: float) -> str:

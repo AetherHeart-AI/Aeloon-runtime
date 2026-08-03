@@ -25,6 +25,8 @@ async def test_read_text_truncation_continuation_and_absolute_paths(tmp_path: Pa
     assert "line-1999" in text
     assert "line-2000" not in text
     assert "Continue with offset=2001" in text
+    assert result.details["sizeBytes"] == path.stat().st_size
+    assert result.details["selectedLines"] == 2_000
     continued = await tool.execute("call", {"path": "large.txt", "offset": 2001}, None)
     assert "line-2000" in continued.content[0].text
 
@@ -41,15 +43,18 @@ async def test_read_returns_image_attachment_and_resizes_large_images(tmp_path: 
     with Image.open(io.BytesIO(decoded)) as image:
         assert max(image.size) == 2_000
     assert "resized from 2100x20" in result.content[0].text
+    assert result.details["sizeBytes"] == path.stat().st_size
+    assert result.details["mimeType"] == "image/png"
 
 
 @pytest.mark.asyncio
 async def test_write_creates_parents_and_edit_preserves_bom_crlf(tmp_path: Path) -> None:
     tools = create_all_tools(tmp_path)
-    await tools["write"].execute(
+    written = await tools["write"].execute(
         "write", {"path": "nested/new.txt", "content": "alpha\nbeta\n"}, None
     )
     assert (tmp_path / "nested/new.txt").read_text(encoding="utf-8") == "alpha\nbeta\n"
+    assert written.details["sizeBytes"] == 11
 
     path = tmp_path / "source.txt"
     path.write_bytes(b"\xef\xbb\xbfalpha\r\nbeta\r\ngamma\r\n")
@@ -67,6 +72,8 @@ async def test_write_creates_parents_and_edit_preserves_bom_crlf(tmp_path: Path)
 
     assert path.read_bytes() == b"\xef\xbb\xbfALPHA\r\nbeta\r\nGAMMA\r\n"
     assert result.details["firstChangedLine"] == 1
+    assert result.details["replacements"] == 2
+    assert result.details["sizeAfterBytes"] == len(path.read_bytes())
     assert "-alpha" in result.details["diff"]
     assert "+GAMMA" in result.details["patch"]
 
@@ -130,6 +137,8 @@ async def test_bash_streams_updates_times_out_and_retains_large_output(tmp_path:
 
     result = await tool.execute("bash", {"command": "printf hello"}, update)
     assert result.content[0].text == "hello"
+    assert result.details["outputBytes"] == 5
+    assert result.details["exitCode"] == 0
     assert "hello" in "".join(updates)
 
     with pytest.raises(TimeoutError, match="timed out"):
@@ -159,9 +168,12 @@ async def test_optional_grep_find_and_ls_tools(tmp_path: Path) -> None:
     listed = await tools["ls"].execute("ls", {}, None)
 
     assert "src/app.py:1:needle" in grep.content[0].text
+    assert grep.details["resultCount"] == 1
     assert "src/app.py" in found.content[0].text
+    assert found.details["resultCount"] == 1
     assert ".hidden" in listed.content[0].text
     assert "src/" in listed.content[0].text
+    assert listed.details["resultCount"] == 2
 
 
 def test_tool_names_schemas_and_default_activation_match_pi() -> None:

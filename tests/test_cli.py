@@ -65,7 +65,7 @@ async def test_run_output_modes_are_stable_and_network_free(
 
 
 @pytest.mark.asyncio
-async def test_text_renderer_shows_tool_command_and_result(capsys) -> None:
+async def test_text_renderer_summarizes_tool_command_and_result(capsys) -> None:
     renderer = cli.RunRenderer("text")
     await renderer(
         cli.HarnessEvent(
@@ -95,10 +95,75 @@ async def test_text_renderer_shows_tool_command_and_result(capsys) -> None:
 
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert "[tool] bash" in captured.err
-    assert "$ printf 'hello\\n'" in captured.err
-    assert "[tool result] bash · exit 0" in captured.err
-    assert "  hello" in captured.err
+    assert "[run] $ printf 'hello\\n'" in captured.err
+    assert "[ok] bash · exit 0" in captured.err
+    assert "hello" not in captured.err.splitlines()[-1]
+
+
+@pytest.mark.asyncio
+async def test_text_renderer_reports_read_size_without_echoing_content(capsys) -> None:
+    renderer = cli.RunRenderer("text")
+    await renderer(
+        cli.HarnessEvent(
+            "tool_execution_start",
+            {
+                "toolCallId": "call-read",
+                "toolName": "read",
+                "args": {"path": "large.md", "offset": 11, "limit": 30},
+            },
+        )
+    )
+    await renderer(
+        cli.HarnessEvent(
+            "tool_execution_end",
+            {
+                "toolCallId": "call-read",
+                "toolName": "read",
+                "result": {
+                    "content": [{"type": "text", "text": "private file contents"}],
+                    "details": {"sizeBytes": 2_048, "selectedLines": 30},
+                },
+            },
+        )
+    )
+
+    rendered = capsys.readouterr().err
+    assert "[read] large.md · lines 11-40" in rendered
+    assert "[ok] read · 2.0 KB · 30 lines" in rendered
+    assert "private file contents" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_text_renderer_marks_nonzero_bash_exit_as_failed(capsys) -> None:
+    renderer = cli.RunRenderer("text")
+    await renderer(
+        cli.HarnessEvent(
+            "tool_execution_start",
+            {
+                "toolCallId": "call-failed",
+                "toolName": "bash",
+                "args": {"command": "false"},
+            },
+        )
+    )
+    await renderer(
+        cli.HarnessEvent(
+            "tool_execution_end",
+            {
+                "toolCallId": "call-failed",
+                "toolName": "bash",
+                "result": {
+                    "content": [{"type": "text", "text": "Command exited with code 1"}],
+                    "details": {"exitCode": 1, "outputBytes": 0},
+                    "isError": False,
+                },
+                "isError": False,
+            },
+        )
+    )
+
+    rendered = capsys.readouterr().err
+    assert "[failed] bash · exit 1 · 0 B output" in rendered
 
 
 @pytest.mark.asyncio
@@ -130,10 +195,24 @@ async def test_text_renderer_summarizes_mutation_arguments_and_shows_errors(caps
     )
 
     captured = capsys.readouterr()
-    assert "path=result.txt (24 bytes)" in captured.err
+    assert "[write] result.txt · 24 B" in captured.err
     assert "do not echo this content" not in captured.err
-    assert "[tool error] write" in captured.err
+    assert "[failed] write" in captured.err
     assert "permission denied" in captured.err
+
+
+def test_text_renderer_renders_final_markdown_in_interactive_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(cli, "_is_interactive_terminal", lambda: True)
+
+    cli.RunRenderer("text").finish_text("# Result\n\n- first\n- second")
+
+    rendered = capsys.readouterr().out
+    assert "# Result" not in rendered
+    assert "Result" in rendered
+    assert "• first" in rendered
 
 
 @pytest.mark.asyncio

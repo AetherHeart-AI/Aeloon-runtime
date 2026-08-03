@@ -153,15 +153,23 @@ def create_read_tool(cwd: Path, *, auto_resize_images: bool = True) -> AgentTool
             raise FileNotFoundError(f"Could not read file: {raw_path}")
         mime = _IMAGE_MIME.get(path.suffix.lower())
         if mime:
-            data, processed_mime, hints = await asyncio.to_thread(
+            data, processed_mime, hints, size = await asyncio.to_thread(
                 _read_image, path, mime, auto_resize_images
             )
             note = f"Read image file [{processed_mime}]"
             if hints:
                 note += "\n" + "\n".join(hints)
-            return ToolResult((TextContent(note), ImageContent(data, processed_mime)))
+            return ToolResult(
+                (TextContent(note), ImageContent(data, processed_mime)),
+                details={
+                    "path": str(path),
+                    "sizeBytes": size,
+                    "mimeType": processed_mime,
+                },
+            )
 
         text = await asyncio.to_thread(path.read_text, encoding="utf-8", errors="replace")
+        size = (await asyncio.to_thread(path.stat)).st_size
         all_lines = text.splitlines() or [""]
         offset = int(params.get("offset") or 1)
         limit_value = params.get("limit")
@@ -188,6 +196,8 @@ def create_read_tool(cwd: Path, *, auto_resize_images: bool = True) -> AgentTool
             )
         details = {
             "path": str(path),
+            "sizeBytes": size,
+            "selectedLines": int(truncation["outputLines"]),
             "lineRange": {"start": start + 1, "total": len(all_lines)},
             "truncation": truncation,
         }
@@ -210,8 +220,9 @@ def create_read_tool(cwd: Path, *, auto_resize_images: bool = True) -> AgentTool
     )
 
 
-def _read_image(path: Path, mime: str, resize: bool) -> tuple[str, str, list[str]]:
+def _read_image(path: Path, mime: str, resize: bool) -> tuple[str, str, list[str], int]:
     raw = path.read_bytes()
+    original_size = len(raw)
     hints: list[str] = []
     if resize:
         with Image.open(io.BytesIO(raw)) as image:
@@ -228,7 +239,7 @@ def _read_image(path: Path, mime: str, resize: bool) -> tuple[str, str, list[str
                 hints.append(
                     f"Image resized from {width}x{height} to {image.width}x{image.height}."
                 )
-    return base64.b64encode(raw).decode("ascii"), mime, hints
+    return base64.b64encode(raw).decode("ascii"), mime, hints, original_size
 
 
 def create_write_tool(cwd: Path) -> AgentTool:
@@ -252,7 +263,10 @@ def create_write_tool(cwd: Path) -> AgentTool:
             encoded = content.encode("utf-8")
             await asyncio.to_thread(path.write_bytes, encoded)
         size = len(encoded)
-        return ToolResult.text(f"Successfully wrote {size} bytes to {raw_path}")
+        return ToolResult.text(
+            f"Successfully wrote {size} bytes to {raw_path}",
+            details={"path": str(path), "sizeBytes": size},
+        )
 
     return AgentTool(
         name="write",
@@ -321,6 +335,7 @@ def create_edit_tool(cwd: Path) -> AgentTool:
         path = _resolve(cwd, raw_path)
         async with _mutation_lock(path):
             raw = await asyncio.to_thread(path.read_bytes)
+            size_before = len(raw)
             bom = b"\xef\xbb\xbf" if raw.startswith(b"\xef\xbb\xbf") else b""
             decoded = raw[len(bom) :].decode("utf-8")
             line_ending = "\r\n" if "\r\n" in decoded else "\n"
@@ -345,7 +360,8 @@ def create_edit_tool(cwd: Path) -> AgentTool:
             for start, end, new in reversed(ordered):
                 changed = changed[:start] + new + changed[end:]
             rendered = changed.replace("\n", line_ending)
-            await asyncio.to_thread(path.write_bytes, bom + rendered.encode("utf-8"))
+            encoded = bom + rendered.encode("utf-8")
+            await asyncio.to_thread(path.write_bytes, encoded)
         diff = "".join(
             difflib.unified_diff(
                 original.splitlines(keepends=True),
@@ -357,7 +373,15 @@ def create_edit_tool(cwd: Path) -> AgentTool:
         first_line = min((original.count("\n", 0, start) + 1 for start, _, _ in ordered), default=1)
         return ToolResult.text(
             f"Successfully replaced {len(edits)} block(s) in {raw_path}.",
-            details={"diff": diff, "patch": diff, "firstChangedLine": first_line},
+            details={
+                "diff": diff,
+                "patch": diff,
+                "firstChangedLine": first_line,
+                "path": str(path),
+                "replacements": len(edits),
+                "sizeBeforeBytes": size_before,
+                "sizeAfterBytes": len(encoded),
+            },
         )
 
     return AgentTool(
@@ -478,6 +502,8 @@ def create_bash_tool(cwd: Path, *, shell_path: str | None = None) -> AgentTool:
             details={
                 "command": command,
                 "output": visible,
+                "outputBytes": len(output.encode("utf-8")),
+                "outputLines": len(output.splitlines()),
                 "exitCode": process.returncode,
                 "cancelled": cancelled,
                 "truncated": truncated,
@@ -556,8 +582,12 @@ def create_grep_tool(cwd: Path) -> AgentTool:
         arguments.extend([str(params["pattern"]), str(params.get("path") or ".")])
         output, _ = await _run_rg(arguments, cwd)
         limit = max(1, int(params.get("limit") or 100))
-        visible, truncation = _truncate_limited(output.splitlines(), limit)
-        return ToolResult.text(visible or "No matches found", details={"truncation": truncation})
+        result_lines = output.splitlines()
+        visible, truncation = _truncate_limited(result_lines, limit)
+        return ToolResult.text(
+            visible or "No matches found",
+            details={"resultCount": len(result_lines), "truncation": truncation},
+        )
 
     return AgentTool(
         name="grep",
@@ -594,8 +624,12 @@ def create_find_tool(cwd: Path) -> AgentTool:
         base = str(params.get("path") or ".")
         output, _ = await _run_rg(["--files", "--glob", str(params["pattern"]), base], cwd)
         limit = max(1, int(params.get("limit") or 1_000))
-        visible, truncation = _truncate_limited(output.splitlines(), limit)
-        return ToolResult.text(visible or "No files found", details={"truncation": truncation})
+        result_lines = output.splitlines()
+        visible, truncation = _truncate_limited(result_lines, limit)
+        return ToolResult.text(
+            visible or "No files found",
+            details={"resultCount": len(result_lines), "truncation": truncation},
+        )
 
     return AgentTool(
         name="find",
@@ -631,7 +665,10 @@ def create_ls_tool(cwd: Path) -> AgentTool:
         entries = sorted(path.iterdir(), key=lambda item: item.name.lower())
         lines = [item.name + ("/" if item.is_dir() else "") for item in entries]
         visible, truncation = _truncate_limited(lines, limit)
-        return ToolResult.text(visible or "(empty directory)", details={"truncation": truncation})
+        return ToolResult.text(
+            visible or "(empty directory)",
+            details={"resultCount": len(entries), "truncation": truncation},
+        )
 
     return AgentTool(
         name="ls",

@@ -149,7 +149,9 @@ uv run aeloon-core config set max-retries 5
 ```
 
 `stream-json` writes one typed harness event per line followed by a `result` object. `json` writes
-only the result object to stdout. Diagnostics and text-mode tool notices go to stderr.
+only the result object to stdout. Text mode writes concise run/read/write/search summaries to
+stderr, buffers the final response, and renders it as Markdown when stdout is an interactive
+terminal. Redirected text output remains plain text.
 
 ## Development
 
