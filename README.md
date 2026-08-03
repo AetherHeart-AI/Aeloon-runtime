@@ -107,7 +107,9 @@ chain from outermost to innermost. In each directory, only the first matching fi
 New sessions are stored under `<data-dir>/harness-sessions/`; the legacy `sessions/` directory is
 neither changed nor read. Each session is a version-3 JSONL file with an immutable header and
 append-only tree entries for messages, model/thinking/tool changes, compactions, branch summaries,
-custom messages, labels, session info, and leaf navigation.
+custom messages, labels, session info, leaf navigation, and Bridge v2 `run_start`/`run_end`
+boundaries. Run boundaries are ignored by model context but allow stable turn reconstruction and
+daemon-crash interruption detection. Compaction retains the `run_start` paired with kept messages.
 
 Every `message_end` is persisted and fsynced immediately. Restarting therefore restores the last
 save point instead of a cumulative turn snapshot. `navigate_tree()` can return to any entry and can
@@ -146,12 +148,43 @@ uv run aeloon-core config init
 uv run aeloon-core config show
 uv run aeloon-core config set model deepseek-v4-pro
 uv run aeloon-core config set max-retries 5
+
+# User-level Bridge v2 daemon
+uv run aeloon-core bridge ensure --output json
+uv run aeloon-core bridge status --output json
+uv run aeloon-core bridge schema
+uv run aeloon-core bridge stop
 ```
 
 `stream-json` writes one typed harness event per line followed by a `result` object. `json` writes
 only the result object to stdout. Text mode writes concise run/read/write/search summaries to
 stderr, buffers the final response, and renders it as Markdown when stdout is an interactive
 terminal. Redirected text output remains plain text.
+
+## Bridge v2
+
+`CoreService` is the application boundary between the private harness/session/config layers and
+external clients. The Bridge transport is JSON-RPC 2.0 over NDJSON on a Unix domain socket; it
+exposes stable session, operation, catalog and revisioned settings DTOs rather than Python types,
+raw configuration, system prompts or provider payloads.
+
+`bridge ensure` is concurrency-safe and starts a detached daemon only when needed. The runtime
+directory is mode `0700`, the socket and daemon metadata are `0600`, and conflicting config,
+data-directory or socket parameters never kill an existing daemon. `--socket`, `--config` and
+`--data-dir` are supported by the daemon-management commands.
+
+An explicit `system.shutdown` first publishes a `system.shutdown` event with
+`intentional: true`. `status` and `stop` are idempotent: a missing daemon, refused connection or
+stale socket returns `status: stopped`; `stop --output json` is available for automation.
+
+The daemon serializes operations within a session and limits cross-session concurrency. It retains
+5,000 ordered public events for cursor replay. Client disconnects do not cancel work; clients
+reconcile with `session.get` when the daemon instance changes or replay has a gap. Attachments are
+validated against roots declared during handshake and copied into Core-owned per-session storage
+before an operation is queued.
+
+Bridge v2 is intentionally incompatible with Bridge v1. Expert, MCP and the former capability mode
+are not part of this protocol.
 
 ## Development
 

@@ -14,6 +14,14 @@ from typing import Any
 from rich.console import Console
 from rich.markdown import Markdown
 
+from aeloon_core.bridge.daemon import (
+    daemon_status,
+    default_socket_path,
+    ensure_daemon,
+    run_daemon,
+    stop_daemon,
+)
+from aeloon_core.bridge.protocol import BridgeError, load_schema
 from aeloon_core.config import (
     Config,
     load_config,
@@ -110,6 +118,19 @@ def build_parser() -> argparse.ArgumentParser:
     config_set.add_argument("key", choices=sorted(CONFIG_PATHS))
     config_set.add_argument("value")
     config_set.add_argument("--config", type=Path)
+
+    bridge = commands.add_parser("bridge", help="Manage the local Bridge v2 daemon.")
+    bridge_commands = bridge.add_subparsers(dest="bridge_command", required=True)
+    for name in ("serve", "ensure", "status", "stop"):
+        command = bridge_commands.add_parser(name)
+        command.add_argument("--config", type=Path)
+        command.add_argument("--data-dir", type=Path)
+        command.add_argument("--socket", type=Path)
+        if name in {"serve", "ensure"}:
+            command.add_argument("--max-concurrent-operations", type=int, default=4)
+        if name in {"ensure", "status", "stop"}:
+            command.add_argument("--output", choices=("text", "json"), default="text")
+    bridge_commands.add_parser("schema")
     return parser
 
 
@@ -486,6 +507,40 @@ def config_command(args: argparse.Namespace) -> int:
     return 0
 
 
+async def bridge_command(args: argparse.Namespace) -> int:
+    if args.bridge_command == "schema":
+        print(json.dumps(load_schema(), ensure_ascii=False, separators=(",", ":")))
+        return 0
+    config = load_config(args.config)
+    if args.data_dir is not None:
+        config = config.model_copy(update={"data_dir": args.data_dir}).normalized()
+    socket_path = args.socket or default_socket_path(config.data_dir)
+    if args.bridge_command == "serve":
+        await run_daemon(
+            config_path=args.config,
+            data_dir=args.data_dir,
+            socket_path=socket_path,
+            max_concurrent_operations=args.max_concurrent_operations,
+        )
+        return 0
+    if args.bridge_command == "ensure":
+        result = await ensure_daemon(
+            config_path=args.config,
+            data_dir=args.data_dir,
+            socket_path=socket_path,
+            max_concurrent_operations=args.max_concurrent_operations,
+        )
+    elif args.bridge_command == "status":
+        result = await daemon_status(socket_path)
+    else:
+        result = await stop_daemon(socket_path)
+    if getattr(args, "output", "text") == "json":
+        print(_json(result))
+    else:
+        print(f"Aeloon Core bridge: {result.get('status', 'ok')} ({socket_path})")
+    return 0
+
+
 def _with_run_overrides(config: Config, args: argparse.Namespace) -> Config:
     updates: dict[str, Any] = {}
     if args.workspace is not None:
@@ -545,13 +600,15 @@ async def async_main(argv: list[str] | None = None) -> int:
         return await run_command(args)
     if args.command == "session":
         return await session_command(args)
+    if args.command == "bridge":
+        return await bridge_command(args)
     return config_command(args)
 
 
 def main(argv: list[str] | None = None) -> int:
     try:
         return asyncio.run(async_main(argv))
-    except (HarnessError, SessionError) as exc:
+    except (BridgeError, HarnessError, SessionError) as exc:
         print(_json({"error": exc.code, "message": str(exc)}), file=sys.stderr)
         return 2
     except (OSError, ValueError, json.JSONDecodeError) as exc:

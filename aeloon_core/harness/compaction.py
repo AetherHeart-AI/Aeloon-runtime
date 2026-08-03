@@ -198,6 +198,11 @@ async def prepare_compaction(
         if isinstance(message, UserMessage):
             break
         cut -= 1
+    # Public clients correlate persisted messages through the run marker that
+    # immediately precedes a prompt. Keep that marker whenever its first user
+    # message survives compaction; the marker is ignored by model context.
+    if cut > start and entries[cut - 1].get("type") == "run_start":
+        cut -= 1
     first_kept = entries[cut] if cut < len(entries) else None
     if first_kept is None:
         return None

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from pathlib import Path
 from typing import Any, Literal
 
@@ -129,10 +130,23 @@ def save_config(config: Config, path: Path | str | None = None, *, force: bool =
         raise FileExistsError(resolved)
     resolved.parent.mkdir(parents=True, exist_ok=True)
     normalized = config.normalized()
-    resolved.write_text(
-        json.dumps(normalized.model_dump(mode="json"), ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    payload = json.dumps(normalized.model_dump(mode="json"), ensure_ascii=False, indent=2) + "\n"
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{resolved.name}.", dir=resolved.parent)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, resolved)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            Path(temporary).unlink()
+        except FileNotFoundError:
+            pass
     return resolved
 
 

@@ -167,6 +167,54 @@ class Session:
             details=details,
         )
 
+    async def append_run_start(
+        self,
+        *,
+        run_id: str,
+        input: dict[str, Any],
+        model_id: str,
+        thinking_level: str,
+    ) -> str:
+        """Record a public prompt-run boundary without affecting model context."""
+
+        return await self._append_entry(
+            "run_start",
+            runId=run_id,
+            input=input,
+            modelId=model_id,
+            thinkingLevel=thinking_level,
+        )
+
+    async def append_run_end(
+        self,
+        *,
+        run_id: str,
+        status: str,
+        duration_ms: int | None = None,
+        error: str | None = None,
+    ) -> str:
+        """Record the terminal state for a public prompt run."""
+
+        payload: dict[str, Any] = {"runId": run_id, "status": status}
+        if duration_ms is not None:
+            payload["durationMs"] = duration_ms
+        if error:
+            payload["error"] = error
+        return await self._append_entry("run_end", **payload)
+
+    async def append_session_config(self, config: dict[str, Any]) -> str:
+        """Persist Bridge session overrides without adding model context."""
+
+        return await self._append_entry("session_config", config=config)
+
+    async def append_next_turn_input(self, input: dict[str, Any]) -> str:
+        """Persist input that should precede the next prompt."""
+
+        return await self._append_entry("next_turn_input", input=input)
+
+    async def append_next_turn_consumed(self, entry_ids: list[str]) -> str:
+        return await self._append_entry("next_turn_consumed", entryIds=entry_ids)
+
     async def set_label(self, target_id: str, label: str | None) -> str:
         if target_id not in self._by_id:
             raise SessionError("not_found", f"Entry {target_id} not found")
