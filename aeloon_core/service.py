@@ -572,7 +572,7 @@ class CoreService:
         async with self._settings_lock:
             if revision != self._revision:
                 raise BridgeError("revision_conflict", "Core settings changed; refresh and try again")
-            raw = load_config(self.config_path, use_environment=False).model_dump(mode="json")
+            raw = load_config(self.config_path).model_dump(mode="json")
             self._apply_settings_patch(raw, patch, valid_model_ids=valid_model_ids)
             for action in actions:
                 if not isinstance(action, Mapping) or action.get("path") != "deepseek.api_key":
@@ -701,7 +701,7 @@ class CoreService:
                 raise BridgeError("revision_conflict", "Core settings changed; refresh and try again")
             if provider_id in self.config.local_providers:
                 raise BridgeError("invalid_argument", f"Provider already exists: {provider_id}")
-            raw = load_config(self.config_path, use_environment=False).model_dump(mode="json")
+            raw = load_config(self.config_path).model_dump(mode="json")
             raw["local_providers"][provider_id] = provider.model_dump(mode="json")
             await asyncio.to_thread(
                 save_config, Config.model_validate(raw).normalized(), self.config_path
@@ -722,12 +722,12 @@ class CoreService:
                 raise BridgeError("revision_conflict", "Core settings changed; refresh and try again")
             if provider_id not in self.config.local_providers:
                 raise BridgeError("invalid_argument", f"Unknown local provider: {provider_id}")
-            raw = load_config(self.config_path, use_environment=False).model_dump(mode="json")
+            raw = load_config(self.config_path).model_dump(mode="json")
             del raw["local_providers"][provider_id]
             fallback = self.config.agent.model
             try:
                 if normalize_model_id(fallback).startswith(f"{provider_id}/"):
-                    raw["agent"]["model"] = "deepseek/deepseek-v4-flash"
+                    raw["agent"]["model"] = ""
             except ValueError:
                 pass
             await asyncio.to_thread(

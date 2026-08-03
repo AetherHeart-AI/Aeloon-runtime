@@ -138,7 +138,7 @@ class DeepSeekProvider:
         options: StreamOptions,
     ) -> AsyncIterator[AssistantStreamEvent]:
         if self.requires_api_key and (not self.api_key or self.api_key == "no-key"):
-            raise ProviderError("auth", "DEEPSEEK_API_KEY is required")
+            raise ProviderError("auth", "An API key is required for the selected provider")
 
         payload = _openai_payload(model, context, options)
         payload["model"] = self.request_model_id(model)

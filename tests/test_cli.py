@@ -41,6 +41,8 @@ async def test_run_output_modes_are_stable_and_network_free(
             "--data-dir",
             str(tmp_path / "data"),
             "--no-session",
+            "--model",
+            "deepseek/deepseek-v4-flash",
             "--output",
             output,
         ]
@@ -282,6 +284,8 @@ async def test_run_session_list_show_and_no_session(tmp_path: Path, monkeypatch,
             str(tmp_path),
             "--data-dir",
             str(data_dir),
+            "--model",
+            "deepseek/deepseek-v4-flash",
             "--output",
             "json",
         ]
@@ -309,6 +313,8 @@ async def test_run_session_list_show_and_no_session(tmp_path: Path, monkeypatch,
             "--data-dir",
             str(data_dir),
             "--no-session",
+            "--model",
+            "deepseek/deepseek-v4-flash",
             "--output",
             "json",
         ]
@@ -341,9 +347,41 @@ def test_config_path_init_show_and_set(tmp_path: Path, monkeypatch, capsys) -> N
     assert cli.main(["config", "show", "--config", str(path)]) == 0
     shown = json.loads(capsys.readouterr().out)
     assert shown["agent"]["retry"]["max_retries"] == 5
-    assert shown["deepseek"]["api_key"] == "***"
+    assert shown["agent"]["model"] == ""
+    assert shown["deepseek"]["api_key"] == "no-key"
     persisted = json.loads(path.read_text(encoding="utf-8"))
     assert persisted["deepseek"]["api_key"] == "no-key"
+
+
+def test_fresh_config_ignores_deepseek_environment_and_has_no_default_model(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "must-not-be-read")
+
+    config = cli.load_config(tmp_path / "missing.json")
+
+    assert config.deepseek.api_key == "no-key"
+    assert config.agent.model == ""
+
+
+def test_run_without_any_connected_model_explains_setup(tmp_path: Path, capsys) -> None:
+    assert (
+        cli.main(
+            [
+                "inspect this project",
+                "--config",
+                str(tmp_path / "missing.json"),
+                "--data-dir",
+                str(tmp_path / "data"),
+                "--ephemeral",
+            ]
+        )
+        == 2
+    )
+    error = capsys.readouterr().err
+    assert "No connected model is available" in error
+    assert "aeloon local add" in error
+    assert "first available model automatically" in error
 
 
 def test_top_level_help_focuses_on_user_tasks() -> None:
@@ -402,6 +440,8 @@ async def test_default_task_runs_without_run_verb(tmp_path: Path, monkeypatch, c
             "--data-dir",
             str(tmp_path / "data"),
             "--ephemeral",
+            "--model",
+            "deepseek/deepseek-v4-flash",
         ]
     )
 
@@ -420,6 +460,8 @@ async def test_resume_uses_latest_session_in_workspace(tmp_path: Path, monkeypat
             str(tmp_path),
             "--data-dir",
             str(data_dir),
+            "--model",
+            "deepseek/deepseek-v4-flash",
             "--json",
         ]
     )
@@ -432,6 +474,8 @@ async def test_resume_uses_latest_session_in_workspace(tmp_path: Path, monkeypat
             str(tmp_path),
             "--data-dir",
             str(data_dir),
+            "--model",
+            "deepseek/deepseek-v4-flash",
             "--json",
         ]
     )
@@ -467,7 +511,15 @@ async def test_history_is_human_readable_and_supports_json(
     data_dir = tmp_path / "data"
     monkeypatch.setattr(cli, "DeepSeekProvider", lambda **_kwargs: _provider("done"))
     await cli.async_main(
-        ["remember this task", "-C", str(tmp_path), "--data-dir", str(data_dir)]
+        [
+            "remember this task",
+            "-C",
+            str(tmp_path),
+            "--data-dir",
+            str(data_dir),
+            "--model",
+            "deepseek/deepseek-v4-flash",
+        ]
     )
     capsys.readouterr()
 
@@ -502,15 +554,62 @@ async def test_models_and_doctor_offer_human_and_machine_views(tmp_path: Path, c
 
     assert await cli.async_main(["models", "--config", str(config_path)]) == 0
     models = capsys.readouterr().out
-    assert "MODEL\tPROVIDER\tCONTEXT" in models
-    assert "deepseek/deepseek-v4-flash" in models
+    assert "No models are connected" in models
+    assert "deepseek/deepseek-v4-flash" not in models
 
     assert await cli.async_main(["doctor", "--config", str(config_path), "--json"]) == 1
     diagnosis = json.loads(capsys.readouterr().out)
     assert diagnosis["ok"] is False
-    credential = next(item for item in diagnosis["checks"] if item["name"] == "credential")
-    assert credential["status"] == "error"
-    assert "aeloon setup" in credential["fix"]
+    model = next(item for item in diagnosis["checks"] if item["name"] == "model")
+    assert model["status"] == "error"
+    assert "aeloon local add" in model["fix"]
+
+
+@pytest.mark.asyncio
+async def test_first_listed_model_is_automatic_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = tmp_path / "config.json"
+    cli.save_config(
+        cli.Config(
+            workspace=tmp_path,
+            data_dir=tmp_path / "data",
+            local_providers={
+                "studio": {
+                    "name": "Studio",
+                    "base_url": "http://127.0.0.1:8000/v1",
+                    "models": [{"id": "first"}, {"id": "second"}],
+                }
+            },
+        ),
+        config_path,
+    )
+    provider = _provider("automatic")
+    monkeypatch.setattr(cli, "DeepSeekProvider", lambda **_kwargs: provider)
+
+    assert (
+        await cli.async_main(
+            ["automatic task", "--config", str(config_path), "--ephemeral", "--json"]
+        )
+        == 0
+    )
+    result = json.loads(capsys.readouterr().out)
+    assert result["final_content"] == "automatic"
+    assert provider.requests[0][0].id == "studio/first"
+
+    assert await cli.async_main(["models", "--config", str(config_path), "--json"]) == 0
+    models = json.loads(capsys.readouterr().out)
+    assert [item["id"] for item in models] == ["studio/first", "studio/second"]
+    assert models[0]["selected"] is True
+    assert models[0]["automatic"] is True
+    assert models[1]["selected"] is False
+    assert models[1]["automatic"] is False
+
+    assert await cli.async_main(["doctor", "--config", str(config_path), "--json"]) == 0
+    diagnosis = json.loads(capsys.readouterr().out)
+    model_check = next(item for item in diagnosis["checks"] if item["name"] == "model")
+    assert model_check["status"] == "warning"
+    assert "automatically use studio/first" in model_check["message"]
 
 
 @pytest.mark.asyncio
@@ -518,7 +617,8 @@ async def test_setup_configures_deepseek_without_exposing_key(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
     config_path = tmp_path / "config.json"
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "setup-secret")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "ignored-environment-secret")
+    monkeypatch.setattr(cli.getpass, "getpass", lambda _prompt: "setup-secret")
 
     assert (
         await cli.async_main(
@@ -541,6 +641,7 @@ async def test_setup_configures_deepseek_without_exposing_key(
     saved = json.loads(config_path.read_text(encoding="utf-8"))
     assert "setup-secret" not in output
     assert saved["deepseek"]["api_key"] == "setup-secret"
+    assert saved["deepseek"]["api_key"] != "ignored-environment-secret"
     assert saved["agent"]["model"] == "deepseek/deepseek-v4-pro"
 
 
@@ -609,7 +710,7 @@ def test_completion_command_emits_shell_script(capsys) -> None:
     assert cli.main(["completion", "zsh"]) == 0
     rendered = capsys.readouterr().out
     assert rendered.startswith("#compdef aeloon aeloon-core")
-    assert "resume history login" in rendered
+    assert "resume history local login" in rendered
 
 
 @pytest.mark.asyncio
@@ -715,7 +816,7 @@ async def test_cloud_status_and_logout_use_bridge(
 
 
 @pytest.mark.asyncio
-async def test_provider_add_reads_api_key_privately_and_uses_unified_bridge(
+async def test_local_add_reads_api_key_privately_and_uses_unified_bridge(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -746,7 +847,7 @@ async def test_provider_add_reads_api_key_privately_and_uses_unified_bridge(
     assert (
         await cli.async_main(
             [
-                "provider",
+                "local",
                 "add",
                 "ollama",
                 "--name",
@@ -757,8 +858,6 @@ async def test_provider_add_reads_api_key_privately_and_uses_unified_bridge(
                 "qwen3-coder",
                 "--socket",
                 str(socket_path),
-                "--output",
-                "json",
             ]
         )
         == 0
@@ -776,7 +875,9 @@ async def test_provider_add_reads_api_key_privately_and_uses_unified_bridge(
         },
         "timeout": 3.0,
     }
-    assert "private-local-key" not in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "private-local-key" not in output
+    assert "aeloon models use ollama/qwen3-coder" in output
 
 
 @pytest.mark.asyncio
@@ -805,7 +906,7 @@ async def test_provider_login_uses_cloud_rpc_compatible_with_existing_daemon(
 
     assert (
         await cli.async_main(
-            ["provider", "login", "alice", "--socket", str(socket_path), "--output", "json"]
+            ["login", "alice", "--socket", str(socket_path), "--output", "json"]
         )
         == 0
     )
@@ -816,5 +917,38 @@ async def test_provider_login_uses_cloud_rpc_compatible_with_existing_daemon(
         {"username": "alice", "password": "secret"},
         60.0,
     )
-    assert calls["ensure"]["required_methods"] == ()  # type: ignore[index]
+    assert "required_methods" not in calls["ensure"]
     assert "secret" not in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_models_use_sets_default_through_bridge(tmp_path: Path, monkeypatch, capsys) -> None:
+    socket_path = tmp_path / "bridge.sock"
+    requests: list[tuple[str, object]] = []
+
+    async def fake_ensure_daemon(**_kwargs):
+        return {"socket_path": str(socket_path), "status": "running"}
+
+    async def fake_bridge_request(_path, method, params=None, **_kwargs):
+        requests.append((method, params))
+        if method == "catalog.get":
+            return {"models": [{"id": "studio/coder", "provider_id": "studio"}]}
+        if method == "settings.get":
+            return {"revision": 7}
+        assert method == "settings.update"
+        return {"revision": 8, "default_model_id": "studio/coder"}
+
+    monkeypatch.setattr(cli, "ensure_daemon", fake_ensure_daemon)
+    monkeypatch.setattr(cli, "bridge_request", fake_bridge_request)
+
+    assert (
+        await cli.async_main(
+            ["models", "use", "studio/coder", "--socket", str(socket_path), "--json"]
+        )
+        == 0
+    )
+    assert requests[-1] == (
+        "settings.update",
+        {"revision": 7, "patch": {"default_model_id": "studio/coder"}},
+    )
+    assert json.loads(capsys.readouterr().out)["default_model_id"] == "studio/coder"

@@ -12,18 +12,25 @@ this version and will be redesigned separately.
 
 ```bash
 uv sync
-export DEEPSEEK_API_KEY="your API key"  # or run: uv run aeloon setup
 
+# Connect an OpenAI-compatible local API. The key is read from a hidden prompt;
+# use --no-api-key for Ollama or another unauthenticated endpoint.
+uv run aeloon local add studio \
+  --base-url http://127.0.0.1:8000/v1 \
+  --model qwen3-coder \
+  --no-api-key
 uv run aeloon "Inspect this repository and explain its entry points"
 uv run aeloon --file task.md --json
 printf 'Fix the failing tests' | uv run aeloon
 ```
 
-The default model is `deepseek/deepseek-v4-flash`; `deepseek/deepseek-v4-pro` is also built in.
+Fresh installations have no pinned default model and never read `DEEPSEEK_API_KEY`. After you
+connect a local API or sign in to Aeloon Cloud, runs automatically use the first model shown by
+`aeloon models`. Use `aeloon models use MODEL` only when you want to pin a different default.
 Every model has a stable `provider/model` ID, so local API and cloud models can appear in one
-catalog without collisions. Legacy unprefixed DeepSeek IDs are upgraded when existing config or
-sessions are loaded. Both built-in models use Pi 0.83.0's 1M context-window and 384K
-output-ceiling metadata. Thinking defaults to `off`.
+catalog without collisions. Existing explicitly configured DeepSeek providers and sessions remain
+compatible, but DeepSeek is not selected or shown as an available CLI model without a stored key.
+Thinking defaults to `off`.
 
 Aeloon Cloud is an optional account-backed provider. Core owns the account session and refresh
 credential; UI clients receive only public account status and provider-qualified model IDs such as
@@ -151,29 +158,45 @@ uv run aeloon --file task.md
 printf 'review this change' | uv run aeloon
 
 # Common task options
-uv run aeloon -C ../project -m deepseek/deepseek-v4-pro "review the repository"
+uv run aeloon -C ../project -m studio/qwen3-coder "review the repository"
 uv run aeloon --ephemeral "answer without saving a session"
 uv run aeloon --json "return one machine-readable result"
 uv run aeloon -v "show concise tool activity"
 uv run aeloon -vv "also show lifecycle events"
 ```
 
-Account, discovery, setup, and recovery commands are intentionally task-oriented:
+Local API, cloud account, model selection, and recovery commands are intentionally explicit:
 
 ```bash
-uv run aeloon setup
+# Local OpenAI-compatible API; omit --model to discover GET /models
+uv run aeloon local add ollama \
+  --base-url http://127.0.0.1:11434/v1 \
+  --model qwen3-coder \
+  --no-api-key
+uv run aeloon local list
+
+# Or connect Aeloon Cloud
 uv run aeloon login
 uv run aeloon whoami
 uv run aeloon logout
+
+# With no pinned default, the first model in this list is used automatically
 uv run aeloon models
+# Optionally pin a local or cloud model as the default
+uv run aeloon models use ollama/qwen3-coder
+uv run aeloon models use aeloon-cloud/reasoner
+
 uv run aeloon history
 uv run aeloon doctor
 ```
 
 `history` and `models` render compact tables for people and accept `--json` for automation.
-`doctor` checks the config, workspace, selected model, credentials, and optional Bridge daemon,
-then prints a concrete recovery command for each problem. `setup` stores secrets in the mode-0600
-config or the account vault and never accepts a secret as a command-line argument.
+`doctor` checks the config, workspace, effective model, credentials, and optional Bridge daemon,
+then prints a concrete recovery command for each problem. `local add` reads an optional API key
+from a hidden prompt and stores it in the mode-0600 config; `login` stores cloud credentials in the
+account vault. Neither command accepts a secret as a command-line argument.
+`-m PROVIDER/MODEL` overrides either the automatic or pinned default for one run without changing
+the saved selection.
 
 Shell completion scripts can be generated without an additional runtime dependency:
 
@@ -183,17 +206,12 @@ uv run aeloon completion bash > ~/.local/share/bash-completion/completions/aeloo
 uv run aeloon completion fish > ~/.config/fish/completions/aeloon.fish
 ```
 
-Advanced configuration and local-provider management remain available:
+Advanced configuration and compatibility provider commands remain available:
 
 ```bash
 uv run aeloon config show
-uv run aeloon config set model deepseek/deepseek-v4-pro
-uv run aeloon provider add ollama \
-  --name Ollama \
-  --base-url http://127.0.0.1:11434/v1 \
-  --model qwen3-coder
+uv run aeloon config set model studio/qwen3-coder
 uv run aeloon provider list
-uv run aeloon provider remove ollama
 
 # Bridge administration is grouped under the advanced system surface
 uv run aeloon system bridge status
@@ -268,11 +286,12 @@ terminal echo disabled. All three commands support `--output json`, `--config`, 
 `--socket`.
 
 `provider login/status/logout` expose the same cloud account through the unified Provider surface.
-`provider add` registers an OpenAI-compatible local endpoint and prompts for its API key without
-placing the key in shell history; pass `--no-api-key` for endpoints such as an unauthenticated
-Ollama server. It discovers models from `GET /models` when `--model` is omitted; repeat `--model`
-to register them explicitly. Core stores the key only in the mode-`0600` config, returns redacted
-Provider DTOs, and strips the provider prefix before sending the model key to the upstream API.
+`local add` (and its compatibility alias `provider add`) registers an OpenAI-compatible endpoint
+and prompts for its API key without placing the key in shell history; pass `--no-api-key` for
+endpoints such as an unauthenticated Ollama server. It discovers models from `GET /models` when
+`--model` is omitted; repeat `--model` to register them explicitly. Core stores the key only in the
+mode-`0600` config, returns redacted Provider DTOs, and strips the provider prefix before sending
+the model key to the upstream API.
 
 Bridge clients use `provider.list`, `provider.local.add`, `provider.local.remove`, and
 `provider.cloud.login/status/logout`. `catalog.get` returns both `providers` and the merged `models`
@@ -303,5 +322,5 @@ uv build
 git diff --check
 ```
 
-An optional live DeepSeek smoke test should be run only when a real `DEEPSEEK_API_KEY` is supplied;
-it is not part of default CI.
+Provider credentials used for optional live tests must be written to an explicit test config; Core
+does not import API keys from the process environment. Live tests are not part of default CI.

@@ -144,7 +144,7 @@ async def test_deepseek_retries_retryable_http_and_honors_retry_after() -> None:
 @pytest.mark.asyncio
 async def test_deepseek_reports_auth_and_nonretryable_http_errors() -> None:
     provider = DeepSeekProvider(api_key="no-key")
-    with pytest.raises(ProviderError, match="DEEPSEEK_API_KEY"):
+    with pytest.raises(ProviderError, match="API key is required"):
         await collect_assistant(
             provider,
             DEEPSEEK_V4_FLASH,

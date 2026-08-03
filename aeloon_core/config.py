@@ -78,7 +78,8 @@ class CompactionConfig(BaseModel):
 class AgentConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    model: str = "deepseek/deepseek-v4-flash"
+    # Empty means "use the first connected model". A non-empty value pins a default.
+    model: str = ""
     thinking_level: Literal["off", "minimal", "low", "medium", "high", "max"] = "off"
     max_tokens: int | None = Field(default=None, ge=1)
     temperature: float | None = None
@@ -151,8 +152,6 @@ def resolve_config_path(path: Path | str | None = None) -> Path:
 
 def load_config(
     path: Path | str | None = None,
-    *,
-    use_environment: bool = True,
 ) -> Config:
     resolved = resolve_config_path(path)
     if resolved.is_file():
@@ -160,11 +159,6 @@ def load_config(
         config = Config.model_validate(raw)
     else:
         config = Config()
-    api_key = os.environ.get("DEEPSEEK_API_KEY") if use_environment else None
-    if api_key:
-        config = config.model_copy(
-            update={"deepseek": config.deepseek.model_copy(update={"api_key": api_key})}
-        )
     return config.normalized()
 
 

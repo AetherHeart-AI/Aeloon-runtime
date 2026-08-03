@@ -34,7 +34,14 @@ from aeloon_core.service import CoreService
 
 def scripted_service(tmp_path: Path, text: str = "bridge answer") -> CoreService:
     config_path = tmp_path / "config.json"
-    save_config(Config(workspace=tmp_path, data_dir=tmp_path / "data"), config_path)
+    save_config(
+        Config(
+            workspace=tmp_path,
+            data_dir=tmp_path / "data",
+            agent={"model": "deepseek/deepseek-v4-flash"},
+        ),
+        config_path,
+    )
 
     def factory(config: Config, session: Any) -> AgentHarness:
         message = AssistantMessage(
@@ -89,7 +96,14 @@ async def test_stable_turn_projection_and_replay(tmp_path: Path) -> None:
 async def test_session_serialization_and_cross_session_concurrency(tmp_path: Path) -> None:
     tracker = TrackingProvider()
     config_path = tmp_path / "config.json"
-    save_config(Config(workspace=tmp_path, data_dir=tmp_path / "data"), config_path)
+    save_config(
+        Config(
+            workspace=tmp_path,
+            data_dir=tmp_path / "data",
+            agent={"model": "deepseek/deepseek-v4-flash"},
+        ),
+        config_path,
+    )
 
     def factory(config: Config, session: Any) -> AgentHarness:
         return AgentHarness(
