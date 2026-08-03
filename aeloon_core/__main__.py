@@ -1,4 +1,4 @@
-"""CLI entry point for Aeloon Core."""
+"""Command-line interface for the pure-Python Aeloon harness."""
 
 from __future__ import annotations
 
@@ -6,680 +6,513 @@ import argparse
 import asyncio
 import json
 import sys
+import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from aeloon_core.config import Config, load_config, resolve_config_path, save_config
-from aeloon_core.orchestrator import AeloonCoreOrchestrator
-from aeloon_core.web.events import TurnEventProgress
-from aeloon_core.web.launcher import WebLaunchError, run_web_ui
+from aeloon_core.config import (
+    Config,
+    load_config,
+    public_config,
+    resolve_config_path,
+    save_config,
+)
+from aeloon_core.harness import (
+    AgentHarness,
+    CompactionSettings,
+    DeepSeekProvider,
+    HarnessError,
+    HarnessEvent,
+    JsonlSessionRepository,
+    ResourceLoader,
+    SessionError,
+    StreamOptions,
+    get_deepseek_model,
+    message_to_dict,
+)
 
-LOG_LEVELS = {"TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"}
-COMMANDS = {"run", "serve", "web", "config"}
-REMOVED_COMMANDS = {"profile", "webui", "chat", "tui"}
-WEB_ONLY_OPTIONS = {
-    "--no-open",
-    "--port",
-    "--gateway-log-level",
-}
-CONFIG_SETTERS = {
-    "mode": ("mode",),
+CONFIG_PATHS: dict[str, tuple[str, ...]] = {
     "workspace": ("workspace",),
     "data-dir": ("data_dir",),
-    "provider": ("agents", "defaults", "provider"),
-    "model": ("agents", "defaults", "model"),
-    "master-model": ("agents", "routing", "master"),
-    "research-expert-model": (
-        "agents",
-        "routing",
-        "experts",
-        "builtin:research",
-    ),
-    "coding-expert-model": (
-        "agents",
-        "routing",
-        "experts",
-        "builtin:coding",
-    ),
-    "reasoning-effort": ("agents", "defaults", "reasoning_effort"),
-    "max-output-tokens": ("agents", "defaults", "max_output_tokens"),
-    "max-iterations": ("agents", "defaults", "max_iterations"),
-    "experts-enabled": ("experts", "enabled"),
-    "experts-max-calls-per-turn": ("experts", "max_calls_per_turn"),
-    "experts-max-concurrency": ("experts", "max_concurrency"),
-    "experts-stage-request-limit": ("experts", "stage_request_limit"),
-    "experts-timeout-seconds": ("experts", "timeout_seconds"),
-    "experts-max-upstream-chars": ("experts", "max_upstream_chars"),
-    "mcp-config-path": ("mcp", "config_path"),
-    "mcp-master-allowlist": ("mcp", "master_allowlist"),
-    "tools-master-capabilities": ("tools", "master_capabilities"),
-    "context-compaction-enabled": ("agents", "defaults", "context_compaction", "enabled"),
-    "context-compaction-trigger-ratio": (
-        "agents",
-        "defaults",
-        "context_compaction",
-        "trigger_ratio",
-    ),
-    "context-compaction-preserve-recent-tokens": (
-        "agents",
-        "defaults",
-        "context_compaction",
-        "preserve_recent_tokens",
-    ),
-    "runtime-transition-trace-enabled": (
-        "agents",
-        "defaults",
-        "runtime",
-        "transition_trace_enabled",
-    ),
-    "runtime-stuck-detection-enabled": (
-        "agents",
-        "defaults",
-        "runtime",
-        "stuck_detection_enabled",
-    ),
-    "runtime-stuck-detection-threshold": (
-        "agents",
-        "defaults",
-        "runtime",
-        "stuck_detection_threshold",
-    ),
-    "runtime-max-retries": (
-        "agents",
-        "defaults",
-        "runtime",
-        "max_retries",
-    ),
+    "api-key": ("deepseek", "api_key"),
+    "base-url": ("deepseek", "base_url"),
+    "proxy": ("deepseek", "proxy"),
+    "model": ("agent", "model"),
+    "thinking": ("agent", "thinking_level"),
+    "max-tokens": ("agent", "max_tokens"),
+    "temperature": ("agent", "temperature"),
+    "timeout-ms": ("agent", "timeout_ms"),
+    "steering-mode": ("agent", "steering_mode"),
+    "follow-up-mode": ("agent", "follow_up_mode"),
+    "retry-enabled": ("agent", "retry", "enabled"),
+    "max-retries": ("agent", "retry", "max_retries"),
+    "base-delay-ms": ("agent", "retry", "base_delay_ms"),
+    "max-retry-delay-ms": ("agent", "retry", "max_retry_delay_ms"),
+    "compaction-enabled": ("agent", "compaction", "enabled"),
+    "reserve-tokens": ("agent", "compaction", "reserve_tokens"),
+    "keep-recent-tokens": ("agent", "compaction", "keep_recent_tokens"),
+    "shell-path": ("tools", "shell_path"),
+    "auto-resize-images": ("tools", "auto_resize_images"),
+    "resource-roots": ("resources", "roots"),
+    "no-skills": ("resources", "no_skills"),
+    "no-prompt-templates": ("resources", "no_prompt_templates"),
+    "no-context-files": ("resources", "no_context_files"),
 }
-DYNAMIC_PROVIDER_SETTERS = {
-    "api-key": "api_key",
-}
-CONFIG_KEYS = {*CONFIG_SETTERS, *DYNAMIC_PROVIDER_SETTERS}
-SECRET_KEYS = {"api_key"}
+
+_TOOL_COMMAND_MAX_LINES = 20
+_TOOL_COMMAND_MAX_CHARS = 2_000
+_TOOL_RESULT_MAX_LINES = 80
+_TOOL_RESULT_MAX_CHARS = 8_000
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Build the CLI parser."""
+    parser = argparse.ArgumentParser(description="Run the Aeloon coding-agent harness.")
+    commands = parser.add_subparsers(dest="command", required=True)
 
-    parser = argparse.ArgumentParser(description="Run Aeloon Core.")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    run = commands.add_parser("run", help="Run a prompt through the harness.")
+    run.add_argument("prompt", nargs="*", help="Prompt text.")
+    source = run.add_mutually_exclusive_group()
+    source.add_argument("--prompt-file", type=Path, help="Read a UTF-8 prompt file.")
+    source.add_argument("--stdin", action="store_true", help="Read the prompt from stdin.")
+    run.add_argument("--output", choices=("text", "json", "stream-json"), default="text")
+    run.add_argument("--session", help="Continue an existing session id.")
+    run.add_argument("--no-session", action="store_true", help="Do not persist this run.")
+    run.add_argument("--config", type=Path)
+    run.add_argument("--workspace", type=Path)
+    run.add_argument("--data-dir", type=Path)
+    run.add_argument("--model")
 
-    run_parser = subparsers.add_parser("run", help="Run one agent turn.")
-    _add_run_args(run_parser)
+    session = commands.add_parser("session", help="Inspect harness sessions.")
+    session_commands = session.add_subparsers(dest="session_command", required=True)
+    session_list = session_commands.add_parser("list", help="List saved sessions.")
+    session_list.add_argument("--config", type=Path)
+    session_list.add_argument("--data-dir", type=Path)
+    session_list.add_argument("--workspace", type=Path)
+    session_show = session_commands.add_parser("show", help="Show one saved session.")
+    session_show.add_argument("session_id")
+    session_show.add_argument("--config", type=Path)
+    session_show.add_argument("--data-dir", type=Path)
 
-    serve_parser = subparsers.add_parser("serve", help="Start the local Web UI.")
-    _add_web_args(serve_parser)
-
-    web_parser = subparsers.add_parser("web", help="Alias for serve.")
-    _add_web_args(web_parser)
-
-    config_parser = subparsers.add_parser("config", help="Manage persistent config.")
-    config_subparsers = config_parser.add_subparsers(dest="config_command", required=True)
-
-    config_path_parser = config_subparsers.add_parser("path", help="Print config path.")
-    config_path_parser.add_argument(
-        "--config", type=Path, default=None, help="Optional config JSON path."
-    )
-
-    config_show_parser = config_subparsers.add_parser("show", help="Print effective config.")
-    config_show_parser.add_argument(
-        "--config", type=Path, default=None, help="Optional config JSON path."
-    )
-    config_show_parser.add_argument(
-        "--show-secrets",
-        action="store_true",
-        help="Print secrets instead of masking them.",
-    )
-
-    config_init_parser = config_subparsers.add_parser(
-        "init",
-        help="Write a persistent config file.",
-    )
-    _add_config_write_args(config_init_parser)
-    config_init_parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Overwrite an existing config file.",
-    )
-
-    config_set_parser = config_subparsers.add_parser("set", help="Set one config value.")
-    config_set_parser.add_argument(
-        "--config", type=Path, default=None, help="Optional config JSON path."
-    )
-    config_set_parser.add_argument("key", choices=sorted(CONFIG_KEYS))
-    config_set_parser.add_argument("value")
-
+    config = commands.add_parser("config", help="Manage persistent configuration.")
+    config_commands = config.add_subparsers(dest="config_command", required=True)
+    config_path = config_commands.add_parser("path", help="Print the config path.")
+    config_path.add_argument("--config", type=Path)
+    config_show = config_commands.add_parser("show", help="Print the effective config.")
+    config_show.add_argument("--config", type=Path)
+    config_show.add_argument("--show-secrets", action="store_true")
+    config_init = config_commands.add_parser("init", help="Create a config file.")
+    config_init.add_argument("--config", type=Path)
+    config_init.add_argument("--workspace", type=Path)
+    config_init.add_argument("--data-dir", type=Path)
+    config_init.add_argument("--force", action="store_true")
+    config_set = config_commands.add_parser("set", help="Set one config value.")
+    config_set.add_argument("key", choices=sorted(CONFIG_PATHS))
+    config_set.add_argument("value")
+    config_set.add_argument("--config", type=Path)
     return parser
 
 
-def build_legacy_run_parser() -> argparse.ArgumentParser:
-    """Build the legacy prompt-first parser."""
+class RunRenderer:
+    """Render events while collecting a stable final JSON result."""
 
-    parser = argparse.ArgumentParser(description="Run one Aeloon Core agent turn.")
-    _add_run_args(parser)
-    return parser
+    def __init__(self, output: str) -> None:
+        self.output = output
+        self.tools_used: list[str] = []
+        self._printed_text = False
+        self._tool_started_at: dict[str, float] = {}
 
+    async def __call__(self, event: HarnessEvent) -> None:
+        if event.type == "tool_execution_start":
+            name = str(event.data.get("toolName") or "")
+            call_id = str(event.data.get("toolCallId") or "")
+            if name and name not in self.tools_used:
+                self.tools_used.append(name)
+            if call_id:
+                self._tool_started_at[call_id] = time.monotonic()
+            if self.output == "text":
+                self._render_tool_start(name, event.data.get("args"))
+        elif event.type == "tool_execution_end" and self.output == "text":
+            self._render_tool_end(event)
+        if self.output == "stream-json":
+            print(_json(event.to_dict()), flush=True)
+            return
+        if self.output != "text" or event.type != "message_update":
+            return
+        update = event.data.get("assistantMessageEvent") or {}
+        if update.get("type") == "text_delta":
+            print(str(update.get("delta") or ""), end="", flush=True)
+            self._printed_text = True
 
-def _add_path_args(parser: argparse.ArgumentParser, *, session: bool = False) -> None:
-    parser.add_argument("--config", type=Path, default=None, help="Optional config JSON path.")
-    if session:
-        parser.add_argument("--session", default=None, help="Existing session id to continue.")
-    parser.add_argument("--workspace", type=Path, default=None, help="Override workspace.")
-    parser.add_argument("--data-dir", type=Path, default=None, help="Override data dir.")
+    def _render_tool_start(self, name: str, raw_args: Any) -> None:
+        args = raw_args if isinstance(raw_args, dict) else {}
+        print(f"[tool] {name or 'unknown'}", file=sys.stderr)
+        for line in _tool_invocation_lines(name, args):
+            print(f"  {line}", file=sys.stderr)
 
+    def _render_tool_end(self, event: HarnessEvent) -> None:
+        name = str(event.data.get("toolName") or "unknown")
+        call_id = str(event.data.get("toolCallId") or "")
+        raw_result = event.data.get("result")
+        result = raw_result if isinstance(raw_result, dict) else {}
+        details_value = result.get("details")
+        details = details_value if isinstance(details_value, dict) else {}
+        is_error = bool(event.data.get("isError") or result.get("isError"))
+        qualifiers: list[str] = []
+        if name == "bash" and details.get("exitCode") is not None:
+            qualifiers.append(f"exit {details['exitCode']}")
+        started_at = self._tool_started_at.pop(call_id, None)
+        if started_at is not None:
+            qualifiers.append(_format_duration(time.monotonic() - started_at))
+        if details.get("truncated"):
+            qualifiers.append("truncated")
+        suffix = f" · {' · '.join(qualifiers)}" if qualifiers else ""
+        label = "tool error" if is_error else "tool result"
+        print(f"[{label}] {name}{suffix}", file=sys.stderr)
 
-def _add_run_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "prompt",
-        nargs="*",
-        help="Prompt text to send to the agent (omit with --prompt-file or --stdin).",
-    )
-    parser.add_argument(
-        "--prompt-file",
-        type=Path,
-        default=None,
-        help="Read the prompt from a UTF-8 text file.",
-    )
-    parser.add_argument(
-        "--stdin",
-        action="store_true",
-        help="Read the prompt from standard input.",
-    )
-    parser.add_argument(
-        "--output",
-        choices=("text", "json"),
-        default="text",
-        help="Output format. JSON suppresses streaming progress.",
-    )
-    parser.add_argument(
-        "--model",
-        default=None,
-        help="Override the model for this run.",
-    )
-    _add_path_args(parser, session=True)
+        preview = _tool_result_text(result)
+        preview, truncated = _truncate_terminal_text(
+            preview,
+            max_lines=_TOOL_RESULT_MAX_LINES,
+            max_chars=_TOOL_RESULT_MAX_CHARS,
+            keep_tail=name == "bash",
+        )
+        if truncated:
+            marker = (
+                "[... terminal preview truncated; showing tail ...]"
+                if name == "bash"
+                else ("[... terminal preview truncated ...]")
+            )
+            preview = f"{marker}\n{preview}" if name == "bash" else f"{preview}\n{marker}"
+        for line in (preview or "(no output)").splitlines():
+            print(f"  {line}", file=sys.stderr)
 
-
-def _add_web_args(parser: argparse.ArgumentParser) -> None:
-    _add_path_args(parser, session=True)
-    parser.add_argument(
-        "--no-open",
-        action="store_true",
-        help="Do not open the browser automatically.",
-    )
-    parser.add_argument("--port", type=int, default=7331, help="Local port (default: 7331).")
-    parser.add_argument(
-        "--gateway-log-level",
-        choices=sorted(LOG_LEVELS),
-        default="INFO",
-        help="Minimum level retained by the Web diagnostics view.",
-    )
-
-
-def _add_config_write_args(parser: argparse.ArgumentParser) -> None:
-    _add_path_args(parser)
-    parser.add_argument(
-        "--mode",
-        choices=("normal", "expert"),
-        default=None,
-        help="Capability policy mode (default: normal).",
-    )
-    parser.add_argument(
-        "--provider",
-        choices=("deepseek",),
-        default=None,
-        help="pi-ai model provider (default: deepseek).",
-    )
-    parser.add_argument(
-        "--api-key",
-        default=None,
-        help="DeepSeek API key.",
-    )
-    parser.add_argument(
-        "--model",
-        default=None,
-        help="Default model name.",
-    )
-
-
-class _PlainTextProgressSink:
-    """Render TurnEventProgress events as plain stdout lines for the `run` command."""
-
-    def __init__(self) -> None:
-        self._block_types: dict[str, str] = {}
-        self._block_names: dict[str, str] = {}
-        self._streaming = False
-
-    async def emit(self, event: str, payload: dict[str, Any]) -> None:
-        if event == "chat.status":
-            self._break_stream()
-            prefix = "tools" if payload.get("kind") == "tool_hint" else "status"
-            print(f"[{prefix}] {payload.get('text', '')}")
-        elif event == "chat.block.add":
-            block = payload.get("block", {})
-            block_id = block.get("id")
-            self._block_types[block_id] = block.get("type")
-            self._block_names[block_id] = block.get("name")
-            if block.get("type") == "tool_call":
-                self._break_stream()
-                print(f"[tool call] {block.get('name')}")
-        elif event == "chat.block.delta":
-            if self._block_types.get(payload.get("block_id")) == "text":
-                print(payload.get("delta", ""), end="", flush=True)
-                self._streaming = True
-        elif event == "chat.block.update":
-            block_id = payload.get("block_id")
-            patch = payload.get("patch", {})
-            if "result" in patch and self._block_types.get(block_id) == "tool_call":
-                self._break_stream()
-                result = str(patch.get("result") or "")
-                preview = result[:500] + ("..." if len(result) > 500 else "")
-                print(f"[tool result] {self._block_names.get(block_id)}: {preview}")
-        elif event == "chat.turn.end":
-            self._break_stream()
-            print(f"\n[final]\n{payload.get('final', '')}")
-
-    def _break_stream(self) -> None:
-        if self._streaming:
+    def finish_text(self, final_text: str) -> None:
+        if self.output != "text":
+            return
+        if not self._printed_text:
+            print(final_text)
+        elif final_text:
             print()
-            self._streaming = False
 
 
-class _SilentProgressSink:
-    """Consume progress events without mixing them into machine-readable stdout."""
-
-    async def emit(self, event: str, payload: dict[str, Any]) -> None:
-        del event, payload
-
-
-async def _run_prompt(args: argparse.Namespace) -> None:
-    prompt = _resolve_run_prompt(args)
-    config = _load_with_path_overrides(
-        args.config,
-        workspace=getattr(args, "workspace", None),
-        data_dir=getattr(args, "data_dir", None),
-        model=getattr(args, "model", None),
+def _tool_invocation_lines(name: str, args: dict[str, Any]) -> list[str]:
+    if name == "bash":
+        command, truncated = _truncate_terminal_text(
+            str(args.get("command") or ""),
+            max_lines=_TOOL_COMMAND_MAX_LINES,
+            max_chars=_TOOL_COMMAND_MAX_CHARS,
+        )
+        lines = command.splitlines() or [""]
+        rendered = [f"$ {lines[0]}", *(f"> {line}" for line in lines[1:])]
+        if truncated:
+            rendered.append("[... command preview truncated ...]")
+        if args.get("timeout") is not None:
+            rendered.append(f"timeout={args['timeout']}s")
+        return rendered
+    if name == "write":
+        content = str(args.get("content") or "")
+        return [f"path={args.get('path', '')} ({len(content.encode('utf-8'))} bytes)"]
+    if name == "edit":
+        edits = args.get("edits")
+        count = len(edits) if isinstance(edits, list) else 0
+        return [f"path={args.get('path', '')} ({count} replacement(s))"]
+    if name == "read":
+        return [_format_selected_args(args, ("path", "offset", "limit"))]
+    if name == "grep":
+        return [_format_selected_args(args, ("pattern", "path", "glob", "limit"))]
+    if name == "find":
+        return [_format_selected_args(args, ("pattern", "path", "limit"))]
+    if name == "ls":
+        return [_format_selected_args(args, ("path", "limit")) or "path=."]
+    rendered, truncated = _truncate_terminal_text(
+        _json(args),
+        max_lines=_TOOL_COMMAND_MAX_LINES,
+        max_chars=_TOOL_COMMAND_MAX_CHARS,
     )
-    if not config.workspace.exists():
-        raise SystemExit(f"Workspace does not exist: {config.workspace}")
-    if not config.workspace.is_dir():
-        raise SystemExit(f"Workspace is not a directory: {config.workspace}")
-
-    orchestrator = AeloonCoreOrchestrator(config)
-    try:
-        session_id = args.session or orchestrator.sessions.new_session()
-        output_format = getattr(args, "output", "text")
-        sink = _SilentProgressSink() if output_format == "json" else _PlainTextProgressSink()
-        progress = TurnEventProgress(session_id=session_id, emit=sink.emit)
-        await progress.on_turn_start()
-        result = await orchestrator.run_turn(
-            prompt,
-            session_id=session_id,
-            on_progress=progress,
-        )
-        if output_format == "json":
-            _print_json(_turn_result_payload(result, config=config))
-        else:
-            print(f"\n[session] {result.session_id}")
-            if result.tools_used:
-                print(f"[tools used] {', '.join(result.tools_used)}")
-    finally:
-        await orchestrator.close()
+    if truncated:
+        rendered += "\n[... arguments preview truncated ...]"
+    return rendered.splitlines() or ["{}"]
 
 
-def _resolve_run_prompt(args: argparse.Namespace) -> str:
-    positional = " ".join(getattr(args, "prompt", [])).strip()
-    prompt_file = getattr(args, "prompt_file", None)
-    use_stdin = bool(getattr(args, "stdin", False))
-    source_count = int(bool(positional)) + int(prompt_file is not None) + int(use_stdin)
-    if source_count != 1:
-        raise SystemExit(
-            "Provide exactly one prompt source: prompt text, --prompt-file, or --stdin."
-        )
-
-    if prompt_file is not None:
-        path = Path(prompt_file).expanduser().resolve()
-        if not path.is_file():
-            raise SystemExit(f"Prompt file does not exist or is not a file: {path}")
-        try:
-            prompt = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeError) as exc:
-            raise SystemExit(f"Could not read prompt file {path}: {exc}") from None
-    elif use_stdin:
-        prompt = sys.stdin.read()
-    else:
-        prompt = positional
-
-    if not prompt.strip():
-        raise SystemExit("Prompt must not be empty.")
-    return prompt
+def _format_selected_args(args: dict[str, Any], keys: tuple[str, ...]) -> str:
+    return " ".join(f"{key}={args[key]!r}" for key in keys if args.get(key) is not None)
 
 
-def _turn_result_payload(result: Any, *, config: Config) -> dict[str, Any]:
-    default_model = config.agents.defaults.model_ref()
-    return {
-        "schema_version": 1,
-        "session_id": result.session_id,
-        "turn_id": result.turn_id,
-        "status": result.status,
-        "final_content": result.final_content,
-        "tools_used": list(result.tools_used),
-        "usage": dict(result.usage),
-        "duration_ms": result.duration_ms,
-        "transitions": list(result.transitions),
-        "workspace": str(config.workspace),
-        "models": {
-            "default": default_model,
-            "master": config.agents.routing.master or default_model,
-            "experts": dict(config.agents.routing.experts),
-        },
-    }
+def _tool_result_text(result: dict[str, Any]) -> str:
+    content = result.get("content")
+    if not isinstance(content, list):
+        return ""
+    rendered: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            rendered.append(str(block.get("text") or ""))
+        elif block.get("type") == "image":
+            rendered.append(f"[image attachment: {block.get('mimeType') or 'unknown type'}]")
+    return "\n".join(rendered)
 
 
-async def _run_web(args: argparse.Namespace) -> None:
-    config = _load_with_path_overrides(
-        args.config,
-        workspace=getattr(args, "workspace", None),
-        data_dir=getattr(args, "data_dir", None),
-    )
-    try:
-        await run_web_ui(
-            config,
-            session_id=args.session,
-            port=args.port,
-            open_browser=not args.no_open,
-            gateway_log_level=args.gateway_log_level,
-        )
-    except WebLaunchError as exc:
-        raise SystemExit(str(exc)) from None
-
-
-def _run_config(args: argparse.Namespace) -> None:
-    if args.config_command == "path":
-        print(resolve_config_path(args.config))
-        return
-    if args.config_command == "show":
-        config = load_config(args.config)
-        print(json.dumps(_config_dump(config, show_secrets=args.show_secrets), indent=2))
-        return
-    if args.config_command == "init":
-        path = resolve_config_path(args.config)
-        if path.exists() and not args.force:
-            raise SystemExit(f"Config already exists: {path}. Use --force to overwrite.")
-        config = _config_with_write_args(load_config(args.config), args)
-        written = save_config(config, path)
-        print(f"Wrote config: {written}")
-        return
-    if args.config_command == "set":
-        config = load_config(args.config)
-        data = config.model_dump(mode="json")
-        value = _coerce_config_value(args.key, args.value)
-        if args.key == "model":
-            value = _normalize_default_model_value(data, value)
-        _set_nested_value(
-            data,
-            _config_setter_path(data, args.key),
-            value,
-        )
-        written = save_config(Config.model_validate(data), args.config)
-        print(f"Updated {args.key} in {written}")
-        return
-    raise SystemExit(f"Unknown config command: {args.config_command}")
-
-
-def _print_json(value: Any) -> None:
-    print(json.dumps(value, ensure_ascii=False, indent=2, default=str))
-
-
-def _load_with_path_overrides(
-    config_path: Path | None,
+def _truncate_terminal_text(
+    value: str,
     *,
-    workspace: Path | None,
-    data_dir: Path | None,
-    model: str | None = None,
-) -> Config:
-    config = load_config(config_path)
-    if model is not None:
-        model = model.strip()
-        if not model:
-            raise SystemExit("Model name must not be empty.")
-        data = config.model_dump(mode="json")
-        normalized_model = _normalize_default_model_value(data, model)
-        _set_nested_value(data, CONFIG_SETTERS["model"], normalized_model)
-        _set_nested_value(data, CONFIG_SETTERS["master-model"], None)
-        _set_nested_value(data, ("agents", "routing", "experts"), {})
-        config = Config.model_validate(data)
-    updates: dict[str, Any] = {
-        "workspace": workspace if workspace is not None else Path.cwd(),
+    max_lines: int,
+    max_chars: int,
+    keep_tail: bool = False,
+) -> tuple[str, bool]:
+    lines = value.splitlines()
+    too_many_lines = len(lines) > max_lines
+    selected = lines[-max_lines:] if keep_tail else lines[:max_lines]
+    rendered = "\n".join(selected)
+    too_many_chars = len(rendered) > max_chars
+    if too_many_chars:
+        rendered = rendered[-max_chars:] if keep_tail else rendered[:max_chars]
+        if keep_tail:
+            rendered = rendered.split("\n", 1)[-1]
+        else:
+            rendered = rendered.rsplit("\n", 1)[0] or rendered
+    return rendered, too_many_lines or too_many_chars
+
+
+def _format_duration(seconds: float) -> str:
+    if seconds < 1:
+        return f"{round(seconds * 1_000)}ms"
+    return f"{seconds:.2f}s"
+
+
+async def run_command(args: argparse.Namespace) -> int:
+    if args.session and args.no_session:
+        raise HarnessError("invalid_argument", "--session and --no-session cannot be combined")
+    prompt = _read_prompt(args)
+    config = _with_run_overrides(load_config(args.config), args)
+    repository = None if args.no_session else JsonlSessionRepository(config.data_dir)
+    session = None
+    if args.session:
+        assert repository is not None
+        session = await repository.open(args.session)
+        if args.workspace is None:
+            config = config.model_copy(
+                update={"workspace": Path(session.metadata.cwd)}
+            ).normalized()
+        restored_model = (await session.build_context()).model
+        if restored_model is not None and restored_model[0] == "deepseek" and args.model is None:
+            config = config.model_copy(
+                update={"agent": config.agent.model_copy(update={"model": restored_model[1]})}
+            )
+    model = replace(get_deepseek_model(config.agent.model), base_url=config.deepseek.base_url)
+    if session is None and not args.no_session:
+        assert repository is not None
+        session = await repository.create(cwd=config.workspace)
+
+    provider = DeepSeekProvider(
+        api_key=config.deepseek.api_key,
+        base_url=config.deepseek.base_url,
+        proxy=config.deepseek.proxy,
+        headers=config.deepseek.extra_headers,
+    )
+    resources = ResourceLoader(
+        cwd=config.workspace,
+        agent_dir=Path("~/.aeloon-core"),
+        additional_roots=tuple(config.resources.roots),
+        no_skills=config.resources.no_skills,
+        no_prompt_templates=config.resources.no_prompt_templates,
+        no_context_files=config.resources.no_context_files,
+    )
+    harness = AgentHarness(
+        provider=provider,
+        model=model,
+        cwd=str(config.workspace),
+        session=session,
+        resource_loader=resources,
+        thinking_level=config.agent.thinking_level,
+        stream_options=StreamOptions(
+            timeout_ms=config.agent.timeout_ms,
+            max_tokens=config.agent.max_tokens,
+            temperature=config.agent.temperature,
+            thinking_level=config.agent.thinking_level,
+            max_retries=config.agent.retry.max_retries if config.agent.retry.enabled else 0,
+            base_delay_ms=config.agent.retry.base_delay_ms,
+            max_retry_delay_ms=config.agent.retry.max_retry_delay_ms,
+        ),
+        steering_mode=config.agent.steering_mode,
+        follow_up_mode=config.agent.follow_up_mode,
+        compaction=CompactionSettings(
+            enabled=config.agent.compaction.enabled,
+            reserve_tokens=config.agent.compaction.reserve_tokens,
+            keep_recent_tokens=config.agent.compaction.keep_recent_tokens,
+        ),
+        shell_path=config.tools.shell_path,
+        auto_resize_images=config.tools.auto_resize_images,
+    )
+    renderer = RunRenderer(args.output)
+    harness.subscribe(renderer)
+    started = time.monotonic()
+    try:
+        message = await harness.prompt(prompt)
+    finally:
+        await harness.close()
+    result = {
+        "type": "result",
+        "status": _status(message.stop_reason),
+        "session_id": session.id if session else None,
+        "duration_ms": round((time.monotonic() - started) * 1000),
+        "final_content": message.text,
+        "message": message_to_dict(message),
+        "usage": message.usage.to_dict(),
+        "tools_used": renderer.tools_used,
+        "model": message.model,
+        "workspace": str(config.workspace),
     }
-    if data_dir is not None:
-        updates["data_dir"] = data_dir
+    renderer.finish_text(message.text)
+    if args.output in {"json", "stream-json"}:
+        print(_json(result), flush=True)
+    if message.error_message:
+        print(message.error_message, file=sys.stderr)
+    return 0 if message.stop_reason not in {"error", "aborted"} else 1
+
+
+async def session_command(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    data_dir = args.data_dir or config.data_dir
+    repository = JsonlSessionRepository(data_dir)
+    if args.session_command == "list":
+        metadata = await repository.list(cwd=args.workspace)
+        print(
+            _json(
+                [
+                    {
+                        "id": item.id,
+                        "created_at": item.created_at,
+                        "cwd": item.cwd,
+                        "path": str(item.path),
+                        "parent_session_path": item.parent_session_path,
+                        "metadata": item.metadata,
+                    }
+                    for item in metadata
+                ]
+            )
+        )
+        return 0
+    session = await repository.open(args.session_id)
+    context = await session.build_context()
+    print(
+        _json(
+            {
+                "id": session.id,
+                "created_at": session.metadata.created_at,
+                "cwd": session.metadata.cwd,
+                "path": str(session.path),
+                "leaf_id": await session.get_leaf_id(),
+                "name": await session.get_name(),
+                "entries": await session.get_entries(),
+                "context": [message_to_dict(message) for message in context.messages],
+                "stats": await session.stats(),
+            }
+        )
+    )
+    return 0
+
+
+def config_command(args: argparse.Namespace) -> int:
+    path = resolve_config_path(args.config)
+    if args.config_command == "path":
+        print(path)
+        return 0
+    if args.config_command == "show":
+        print(_json(public_config(load_config(path), show_secrets=args.show_secrets)))
+        return 0
+    if args.config_command == "init":
+        config = Config()
+        updates: dict[str, Any] = {}
+        if args.workspace is not None:
+            updates["workspace"] = args.workspace
+        if args.data_dir is not None:
+            updates["data_dir"] = args.data_dir
+        if updates:
+            config = config.model_copy(update=updates)
+        print(save_config(config.normalized(), path, force=args.force))
+        return 0
+    config = load_config(path, use_environment=False)
+    raw = config.model_dump(mode="json")
+    _set_nested(raw, CONFIG_PATHS[args.key], _parse_value(args.value))
+    validated = Config.model_validate(raw).normalized()
+    print(save_config(validated, path))
+    return 0
+
+
+def _with_run_overrides(config: Config, args: argparse.Namespace) -> Config:
+    updates: dict[str, Any] = {}
+    if args.workspace is not None:
+        updates["workspace"] = args.workspace
+    if args.data_dir is not None:
+        updates["data_dir"] = args.data_dir
+    if args.model is not None:
+        updates["agent"] = config.agent.model_copy(update={"model": args.model})
     return config.model_copy(update=updates).normalized()
 
 
-def _config_with_write_args(config: Config, args: argparse.Namespace) -> Config:
-    # Map each --init flag to the same nested config path the `set` command uses.
-    data = config.model_dump(mode="json")
-    if args.mode is not None:
-        _set_nested_value(data, CONFIG_SETTERS["mode"], args.mode)
-    if args.provider is not None:
-        _set_nested_value(data, CONFIG_SETTERS["provider"], args.provider)
-    write_arg_keys = {
-        "workspace": "workspace",
-        "data_dir": "data-dir",
-        "api_key": "api-key",
-        "model": "model",
-    }
-    for attr, key in write_arg_keys.items():
-        raw = getattr(args, attr, None)
-        if raw is None:
-            continue
-        value = _coerce_config_value(key, str(raw))
-        if key == "model":
-            value = _normalize_default_model_value(data, value)
-        _set_nested_value(
-            data,
-            _config_setter_path(data, key),
-            value,
-        )
-    return Config.model_validate(data)
-
-
-def _config_setter_path(data: dict[str, Any], key: str) -> tuple[str, ...]:
-    if field := DYNAMIC_PROVIDER_SETTERS.get(key):
-        provider = _default_provider_from_data(data)
-        return ("providers", provider, field)
-    return CONFIG_SETTERS[key]
-
-
-def _default_provider_from_data(data: dict[str, Any]) -> str:
-    agents = data.get("agents")
-    defaults = agents.get("defaults") if isinstance(agents, dict) else None
-    provider = defaults.get("provider") if isinstance(defaults, dict) else None
-    if provider not in {"deepseek"}:
-        return "deepseek"
-    return provider
-
-
-def _normalize_default_model_value(data: dict[str, Any], value: Any) -> Any:
-    """Accept `provider/model` for defaults and split it into provider + model."""
-
-    if not isinstance(value, str) or "/" not in value:
-        return value
-    provider_candidate, _, model = value.partition("/")
-    if provider_candidate not in {"deepseek"} or not model.strip():
-        return value
-    _set_nested_value(data, CONFIG_SETTERS["provider"], provider_candidate)
-    return model.strip()
-
-
-def _config_dump(config: Config, *, show_secrets: bool) -> dict[str, Any]:
-    data = config.model_dump(mode="json")
-    if not show_secrets:
-        _mask_secrets(data)
-    return data
-
-
-def _mask_secrets(value: Any) -> None:
-    if isinstance(value, dict):
-        for key, child in value.items():
-            if key in SECRET_KEYS and isinstance(child, str) and child:
-                value[key] = _mask_secret(child)
-            else:
-                _mask_secrets(child)
-    elif isinstance(value, list):
-        for child in value:
-            _mask_secrets(child)
-
-
-def _mask_secret(value: str) -> str:
-    if value == "no-key":
-        return value
-    if len(value) <= 8:
-        return "***"
-    return f"{value[:4]}...{value[-4:]}"
-
-
-def _set_nested_value(data: dict[str, Any], path: tuple[str, ...], value: Any) -> None:
-    current = data
-    for key in path[:-1]:
-        nested = current.setdefault(key, {})
-        if not isinstance(nested, dict):
-            nested = {}
-            current[key] = nested
-        current = nested
-    current[path[-1]] = value
-
-
-def _coerce_config_value(key: str, value: str) -> Any:
-    if key in {
-        "experts-enabled",
-        "mcp-master-allowlist",
-        "tools-master-capabilities",
-    }:
-        return [item.strip() for item in value.split(",") if item.strip()]
-    if key == "max-iterations" and value.strip().lower() in {
-        "none",
-        "null",
-        "unlimited",
-    }:
-        return None
-    if key == "context-compaction-preserve-recent-tokens":
-        if value.strip().lower() in {"auto", "none", "null"}:
-            return None
-        return int(value)
-    if key in {
-        "max-iterations",
-        "max-output-tokens",
-        "experts-max-calls-per-turn",
-        "experts-max-concurrency",
-        "experts-stage-request-limit",
-        "experts-max-upstream-chars",
-        "runtime-stuck-detection-threshold",
-        "runtime-max-retries",
-    }:
-        return int(value)
-    if key in {"context-compaction-trigger-ratio", "experts-timeout-seconds"}:
-        return float(value)
-    if key in {
-        "context-compaction-enabled",
-        "runtime-transition-trace-enabled",
-        "runtime-stuck-detection-enabled",
-    }:
-        return _parse_bool(value)
+def _read_prompt(args: argparse.Namespace) -> str:
+    if args.prompt and (args.prompt_file or args.stdin):
+        raise HarnessError("invalid_argument", "Use exactly one prompt source")
+    if args.prompt_file:
+        value = args.prompt_file.read_text(encoding="utf-8")
+    elif args.stdin:
+        value = sys.stdin.read()
+    else:
+        value = " ".join(args.prompt)
+    if not value.strip():
+        raise HarnessError("invalid_argument", "Prompt must not be empty")
     return value
 
 
-def _parse_bool(value: str) -> bool:
-    normalized = value.strip().lower()
-    if normalized in {"1", "true", "yes", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "off"}:
-        return False
-    raise SystemExit(f"Expected boolean value, got: {value}")
+def _status(stop_reason: str) -> str:
+    if stop_reason == "error":
+        return "error"
+    if stop_reason == "aborted":
+        return "aborted"
+    return "completed"
 
 
-def _looks_like_legacy_run(argv: list[str]) -> bool:
-    first = _first_positional(argv)
-    return first is not None and first not in COMMANDS and first not in REMOVED_COMMANDS
+def _set_nested(value: dict[str, Any], path: tuple[str, ...], replacement: Any) -> None:
+    target = value
+    for part in path[:-1]:
+        target = target[part]
+    target[path[-1]] = replacement
 
 
-def _first_positional(argv: list[str]) -> str | None:
-    skip_next = False
-    for token in argv:
-        if skip_next:
-            skip_next = False
-            continue
-        if token in {
-            "--config",
-            "--session",
-            "--workspace",
-            "--data-dir",
-            "--prompt-file",
-            "--output",
-            "--model",
-            "--gateway-log-level",
-            "--port",
-        }:
-            skip_next = True
-            continue
-        if token.startswith("-"):
-            continue
-        return token
-    return None
-
-
-def _looks_like_implicit_web(argv: list[str]) -> bool:
-    if any(token in {"-h", "--help"} for token in argv):
-        return False
-    first = _first_positional(argv)
-    if first is None:
-        return True
-    if first in COMMANDS or first in REMOVED_COMMANDS:
-        return False
-    return any(_is_web_only_option(token) for token in argv)
-
-
-def _is_web_only_option(token: str) -> bool:
-    return token in WEB_ONLY_OPTIONS or any(
-        token.startswith(f"{option}=") for option in WEB_ONLY_OPTIONS
-    )
-
-
-def main(argv: list[str] | None = None) -> None:
-    """Run the CLI."""
-
-    raw_args = list(sys.argv[1:] if argv is None else argv)
-    if not raw_args:
-        _run_async(_run_web(build_parser().parse_args(["serve"])))
-        return
-    if _looks_like_implicit_web(raw_args):
-        _run_async(_run_web(build_parser().parse_args(["serve", *raw_args])))
-        return
-    if _looks_like_legacy_run(raw_args):
-        _run_async(_run_prompt(build_legacy_run_parser().parse_args(raw_args)))
-        return
-
-    args = build_parser().parse_args(raw_args)
-    if args.command == "run":
-        _run_async(_run_prompt(args))
-        return
-    if args.command in {"serve", "web"}:
-        _run_async(_run_web(args))
-        return
-    if args.command == "config":
-        _run_config(args)
-        return
-    raise SystemExit(f"Unknown command: {args.command}")
-
-
-def _run_async(awaitable: Any) -> None:
-    """Run one CLI coroutine without printing a traceback for Ctrl-C."""
-
+def _parse_value(value: str) -> Any:
+    if value.lower() == "null":
+        return None
     try:
-        asyncio.run(awaitable)
-    except KeyboardInterrupt:
-        return
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+
+
+def _json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+async def async_main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.command == "run":
+        return await run_command(args)
+    if args.command == "session":
+        return await session_command(args)
+    return config_command(args)
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        return asyncio.run(async_main(argv))
+    except (HarnessError, SessionError) as exc:
+        print(_json({"error": exc.code, "message": str(exc)}), file=sys.stderr)
+        return 2
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(_json({"error": "invalid_argument", "message": str(exc)}), file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

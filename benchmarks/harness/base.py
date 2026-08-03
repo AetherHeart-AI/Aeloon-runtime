@@ -63,11 +63,10 @@ class HarnessResult:
     status: str
     final_content: str | None
     session_id: str | None = None
-    turn_id: str | None = None
     usage: dict[str, Any] = field(default_factory=dict)
+    model: str | None = None
     models: dict[str, Any] = field(default_factory=dict)
     tools_used: list[Any] = field(default_factory=list)
-    transitions: list[Any] = field(default_factory=list)
     cost_usd: int | float | None = None
     payload_error: str | None = None
     duration_ms: int | float | None = None
@@ -80,12 +79,11 @@ class HarnessResult:
             "version": self.version,
             "status": self.status,
             "session_id": self.session_id,
-            "turn_id": self.turn_id,
             "duration_ms": self.duration_ms,
             "final_content": self.final_content,
             "tools_used": self.tools_used,
             "usage": self.usage,
-            "transitions": self.transitions,
+            "model": self.model,
             "models": self.models,
             "cost_usd": self.cost_usd,
             "payload_error": self.payload_error,

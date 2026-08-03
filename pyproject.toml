@@ -5,21 +5,15 @@ build-backend = "hatchling.build"
 [project]
 name = "aeloon-core"
 version = "0.1.0"
-description = "Ultra Master and isolated ExpertSkills powered by pi-ai and pi-core."
+description = "A stateful, pure-Python coding-agent harness inspired by Pi."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "httpx>=0.28",
   "jsonschema>=4.26,<5",
-  "loguru>=0.7",
-  "mcp>=1.29,<2",
+  "pillow>=11.0",
   "pydantic>=2.11",
   "pyyaml>=6.0,<7",
-]
-
-[project.optional-dependencies]
-langgraph = [
-  "langgraph>=1.2,<2",
 ]
 
 [dependency-groups]

@@ -799,13 +799,11 @@ def _agent_record(generation: AgentGeneration) -> dict[str, Any]:
         "timed_out": generation.process.timed_out,
         "wall_time_ms": generation.process.duration_ms,
         "session_id": payload.get("session_id"),
-        "turn_id": payload.get("turn_id"),
         "duration_ms": payload.get("duration_ms"),
         "final_content": payload.get("final_content"),
         "tools_used": payload.get("tools_used", []),
         "usage": payload.get("usage", {}),
-        "transitions": payload.get("transitions", []),
-        "models": payload.get("models", {}),
+        "model": payload.get("model"),
         "stdout": _bounded(generation.process.stdout) if generation.payload_error else None,
         "stderr": _bounded(generation.process.stderr),
         "payload_error": generation.payload_error,
@@ -1118,4 +1116,3 @@ def main(argv: list[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
-

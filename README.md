@@ -1,305 +1,167 @@
 # Aeloon Core
 
-Aeloon Core is a conversation-scoped Python agent runtime whose provider layer
-uses `pi-ai` and whose tool loop uses `pi-agent-core` (Pi Core).
-It has two explicit capability-policy modes:
+Aeloon Core is a stateful coding-agent harness implemented entirely in Python. Its behavior is
+modeled after Pi Coding Agent 0.83.0: natural tool-loop completion, Pi-style system prompts and
+resources, steer/follow-up queues, append-only session trees, retries, and semantic compaction.
 
-- `normal`: Master can use every discovered plain Skill, every configured MCP
-  server, and the full workspace capability surface;
-- `expert`: Master and predefined ExpertSkills receive explicit Skill, MCP, and
-  host-capability scopes.
-
-> **Normal 放开 Master；Expert 模式收紧 Master 与 ExpertSkill 的能力边界。**
-
-The Master owns the user conversation, final answer, filesystem mutation, shell
-execution, repository context, and planning. It can also call enabled
-`ExpertSkill`s:
-
-```text
-Master = Ultra Worker
-           + ExpertSkill calls
-           ├── research: plan → 2–4 explorers → primary docs → reduce
-           └── coding:   plan → build → review → one fix → one re-review
-```
-
-Expert work is ephemeral. It must finish inside the current turn and has no
-checkpoint, resume, detached runner, background task, or cross-turn state. Core
-does not provide a generic DAG interface.
+It does not depend on `pi-ai`, `pi-agent-core`, Node, or Bun at runtime, during development, or in
+CI. Expert routing, Expert implementations, MCP, and the former Web UI are intentionally outside
+this version and will be redesigned separately.
 
 ## Quick start
 
 ```bash
 uv sync
-bun --version  # requires Bun >= 1.3
-bun install --cwd aeloon_core/pi_runtime --frozen-lockfile
-
 export DEEPSEEK_API_KEY="your API key"
-export EXA_API_KEY="your Exa API key"  # only needed by builtin:research
 
-uv run aeloon-core
+uv run aeloon-core run "Inspect this repository and explain its entry points"
+uv run aeloon-core run --prompt-file task.md --output json
+printf 'Fix the failing tests' | uv run aeloon-core run --stdin --output stream-json
 ```
 
-The default command starts the local Web UI on `127.0.0.1:7331`. Other useful
-forms:
+The default model is `deepseek-v4-flash`; `deepseek-v4-pro` is also built in. Both use Pi 0.83.0's
+1M context-window and 384K output-ceiling metadata. Thinking defaults to `off`.
 
-```bash
-uv run aeloon-core serve --no-open
-uv run aeloon-core run "Inspect the repository and explain its entry points"
-uv run aeloon-core run --workspace /path/to/repo --prompt-file task.txt --output json
-```
-
-## Modes, Skills, and isolation
-
-A Skill is passive, lazily loaded instructions and resources. An ExpertSkill is
-also a Skill, but adds a registered runner, capability declaration, dependencies,
-and execution policy.
-
-Discovery is intentionally narrow:
-
-1. package built-ins;
-2. `<workspace>/.aeloon-core/skills`;
-3. roots explicitly listed in config.
-
-Aeloon does not implicitly scan `~/.codex`, `~/.claude`, or `~/.agents`. Canonical
-IDs are `<root-id>:<name>`, so equal names in different roots do not override each
-other.
-
-`normal` is the default. Master sees all plain Skills found in the discovery
-roots, all MCP servers in the explicit MCP config, and all standard workspace
-capabilities. In `expert` mode, Master sees only:
-
-- plain Skills in `skills.master_allowlist`;
-- MCP servers in `mcp.master_allowlist`;
-- host capability groups in `tools.master_capabilities`;
-- ExpertSkills in `experts.enabled`.
-
-In both modes Master can use:
-
-- `skill_search`
-- `skill_load`
-- `skill_read`
-- `expert_run`
-
-An expert sees only itself, its declared plain-Skill dependencies, declared MCP
-servers, and declared host capabilities. It never receives `expert_run`, and
-expert nesting is rejected by the registry.
-Standard passive metadata such as `license`, `compatibility`, `metadata`, and
-`allowed-tools` is accepted, but it never grants runtime capabilities.
-
-This isolates discovery, prompt context, and Skill tools. It is not an operating
-system confidentiality boundary against a generally authorized shell.
-
-## `SKILL.md`
-
-Plain Skill:
-
-```markdown
----
-name: project-conventions
-description: Project-specific implementation and verification conventions.
----
-# Project conventions
-
-Read references/checks.md before changing production code.
-```
-
-ExpertSkill:
-
-```markdown
----
-name: ppt-builder
-description: Build and verify a presentation.
-kind: expert
-runner: project.ppt
-dependencies:
-  - workspace:slide-style
-capabilities:
-  - filesystem
-  - shell
-  - repo_context
-  - planning
-mcp-servers:
-  - github
-model_tier: strong
-concurrency_mode: exclusive
-max_calls_per_turn: 2
----
-# PPT builder
-
-Create the deck, render it, inspect the result, and report artifact paths.
-```
-
-Manifests reference a registered runner ID; they cannot import arbitrary Python.
-Trusted project runner extensions live in `.aeloon-core/catalog.py`:
+## Python API
 
 ```python
-from my_project.experts import PptExpertRunner
+from aeloon_core.harness import (
+    AgentHarness,
+    DeepSeekProvider,
+    JsonlSessionRepository,
+    ResourceLoader,
+    get_deepseek_model,
+)
 
-EXPERT_RUNNERS = {
-    "project.ppt": PptExpertRunner(),
-}
+workspace = "/path/to/repository"
+repository = JsonlSessionRepository("~/.aeloon-core")
+session = await repository.create(cwd=workspace)
+provider = DeepSeekProvider(api_key="...")
+harness = AgentHarness(
+    provider=provider,
+    model=get_deepseek_model("deepseek-v4-flash"),
+    cwd=workspace,
+    session=session,
+    resource_loader=ResourceLoader(cwd=workspace),
+)
+
+try:
+    response = await harness.prompt("Implement the requested change")
+    print(response.text)
+finally:
+    await harness.close()
 ```
 
-The old `ROLES` and `WORKFLOWS` entries are rejected with a migration error.
-Custom one-agent experts can use `runner: builtin.prompt`. A trusted compiled
-LangGraph can be registered directly or wrapped with `LangGraphExpertRunner`;
-install the optional adapter dependency with:
+`aeloon_core.harness` exports provider-neutral messages and content blocks, `AgentTool`,
+`ToolResult`, models and stream options, typed harness events, resources, sessions, and the
+deterministic `ScriptedProvider` used by tests and offline integrations.
 
-```bash
-uv sync --extra langgraph
-```
+`AgentHarness` owns a strict `idle / turn / compaction / branch_summary / retry` state machine.
+Normal prompts are rejected with `HarnessError(code="busy")` while it is active. During a turn,
+`steer()` injects input after the current tool batch, `follow_up()` continues after natural
+completion, and `next_turn()` queues input for the next explicit prompt. Queue modes support
+`one-at-a-time` and `all`.
 
-LangGraph remains an implementation detail of that expert. Core only calls its
-runner and normalizes the final `ExpertResult`.
+## Tool loop and tools
 
-## MCP
+An assistant response with no tool calls completes naturally. Tool results—including errors—are
+returned to the model and the loop continues. A `length` stop containing tool calls skips the
+entire batch because its arguments may be truncated. Calls run in parallel by default; mutations
+to the same file are serialized and tool results remain in call order.
 
-MCP servers use the standard `mcpServers` JSON shape:
+The built-in tools are:
 
-```json
-{
-  "mcpServers": {
-    "github": {"url": "http://127.0.0.1:8000/mcp"},
-    "local": {
-      "command": "python",
-      "args": ["server.py"]
-    }
-  }
-}
-```
+- active by default: `read`, `bash`, `edit`, `write`;
+- available but inactive by default: `grep`, `find`, `ls`.
 
-Set `mcp.config_path` to this file. Normal mode exposes every server and every
-tool returned by those servers to Master. Expert mode applies the configured
-server scopes. MCP and Skill discovery never generates ExpertSkills; executable
-experts must already have a manifest and registered runner.
+`read` supports text continuation and image attachments. `bash` streams updates, has no default
+timeout, and stores complete output in a temporary file when its visible tail is truncated.
+`edit` performs one or more unique, non-overlapping exact replacements against the original file,
+preserving UTF-8 BOM and line-ending style. `write` creates parents and overwrites the target.
 
-## Built-in experts
+> **Security boundary:** these tools are deliberately not a sandbox. Like Pi, they accept absolute
+> paths, inherit the complete environment, and allow arbitrary shell commands. Run Aeloon only in
+> an environment whose filesystem, credentials, and processes the model is allowed to access.
 
-`builtin:research` runs a bounded research pipeline:
+## System prompt and resources
 
-1. a planner emits two to four independent assignments;
-2. explorers fan out with Aeloon's scoped Exa tool;
-3. a docs stage verifies key claims against official or primary sources;
-4. a reducer produces direct URLs, uncertainty, and unresolved points.
-
-If Exa is unavailable or `EXA_API_KEY` is missing, the expert returns `blocked`;
-the Master turn does not crash.
-
-`builtin:coding` runs:
-
-1. a read-only plan;
-2. a workspace build and verification;
-3. an independent read-only review;
-4. at most one fix and one re-review.
-
-Remaining findings produce `partial`; there is no unbounded repair loop.
-
-## Configuration
-
-```json
-{
-  "mode": "expert",
-  "agents": {
-    "defaults": {
-      "provider": "deepseek",
-      "model": "deepseek-v4-flash",
-      "max_iterations": null,
-      "max_output_tokens": 32768,
-      "runtime": {
-        "max_retries": 3
-      }
-    },
-    "routing": {
-      "master": null,
-      "experts": {
-        "builtin:research/reduce": "deepseek/deepseek-v4-pro"
-      }
-    }
-  },
-  "skills": {
-    "roots": [
-      {"id": "team", "path": "/opt/team-skills"}
-    ],
-    "master_allowlist": []
-  },
-  "mcp": {
-    "config_path": ".aeloon-core/mcp.json",
-    "master_allowlist": ["github"]
-  },
-  "tools": {
-    "master_capabilities": [
-      "filesystem",
-      "shell",
-      "repo_context",
-      "planning"
-    ]
-  },
-  "experts": {
-    "enabled": ["builtin:research", "builtin:coding"],
-    "max_calls_per_turn": 8,
-    "max_concurrency": 4,
-    "stage_request_limit": 25,
-    "timeout_seconds": 1800,
-    "max_upstream_chars": 32000,
-    "web_backend": "exa"
-  }
-}
-```
-
-Master follows Pi's natural tool loop by default: it continues until it returns
-plain text, is cancelled, or another runtime guard stops it. Set
-`agents.defaults.max_iterations` to an integer for an optional hard model-request
-limit. A bounded run reserves its final request for a tool-free progress
-checkpoint instead of failing immediately after the last tool call. Expert
-stages remain bounded by `experts.stage_request_limit`.
-
-```bash
-uv run aeloon-core config set max-iterations unlimited
-uv run aeloon-core config set max-iterations 100
-```
-
-An exact `<expert-id>/<stage-id>` route wins over the expert route, then the
-default model is used.
-
-Use `uv run aeloon-core config show`, `config init`, and `config set`. The planned
-command that scans arbitrary installed Skill collections and asks a model to
-generate disabled ExpertSkill drafts is intentionally not part of this MVP.
-
-```bash
-uv run aeloon-core config set mode normal
-uv run aeloon-core config set mode expert
-```
-
-## Runtime boundaries
+Resources use `~/.aeloon-core` globally and `<workspace>/.aeloon-core` for the project:
 
 ```text
-aeloon_core/
-├── harness/
-│   ├── skill/          # manifest parsing, discovery, scopes, lazy tools
-│   ├── expert/         # contracts, registry, runtime, runners, adapters
-│   ├── agent/          # Master prompt
-│   ├── capabilities.py # Ultra and Expert capability policy
-│   ├── execution/      # Python ↔ Pi Core bridge, run policy, and tracing
-│   ├── model/          # Master/expert-stage routing
-│   ├── mcp/            # configured MCP loading and per-agent scopes
-│   ├── provider/       # pi-ai provider/model construction
-│   └── tool/           # host tool contracts and observation tools
-├── conversation/       # persisted Master turns only
-├── web/                # transport and live lifecycle projection
-├── orchestrator.py     # composition root
-└── config.py
+.aeloon-core/
+├── SYSTEM.md
+├── APPEND_SYSTEM.md
+├── skills/<name>/SKILL.md
+└── prompts/<name>.md
 ```
 
-Only completed Master turns are persisted. Expert prompts, reports, stage state,
-and tools live only in memory for the current turn.
+`SYSTEM.md` replaces the generated base prompt. `APPEND_SYSTEM.md`, project instructions, Skills
+XML, and the current working directory are still appended in Pi order. Project resources override
+same-named global resources. Resources are reloaded at every turn boundary.
+
+Project context is loaded from a global `AGENTS.md`/`CLAUDE.md`, then from the workspace's ancestor
+chain from outermost to innermost. In each directory, only the first matching filename is used.
+
+## Sessions and compaction
+
+New sessions are stored under `<data-dir>/harness-sessions/`; the legacy `sessions/` directory is
+neither changed nor read. Each session is a version-3 JSONL file with an immutable header and
+append-only tree entries for messages, model/thinking/tool changes, compactions, branch summaries,
+custom messages, labels, session info, and leaf navigation.
+
+Every `message_end` is persisted and fsynced immediately. Restarting therefore restores the last
+save point instead of a cumulative turn snapshot. `navigate_tree()` can return to any entry and can
+optionally summarize the abandoned branch.
+
+Automatic semantic compaction is enabled by default with:
+
+```json
+{"reserve_tokens": 16384, "keep_recent_tokens": 20000}
+```
+
+The cut point is turn-safe. Summaries preserve goals, decisions, progress, exact paths and errors,
+include file read/write summaries, and merge an earlier compaction summary. The current model is
+used for both compaction and branch summaries.
+
+## CLI
+
+```bash
+# New session, existing session, or ephemeral run
+uv run aeloon-core run "task"
+uv run aeloon-core run "continue" --session <id>
+uv run aeloon-core run "one shot" --no-session
+
+# Output modes
+uv run aeloon-core run "task" --output text
+uv run aeloon-core run "task" --output json
+uv run aeloon-core run "task" --output stream-json
+
+# Session inspection
+uv run aeloon-core session list
+uv run aeloon-core session show <id>
+
+# Configuration
+uv run aeloon-core config path
+uv run aeloon-core config init
+uv run aeloon-core config show
+uv run aeloon-core config set model deepseek-v4-pro
+uv run aeloon-core config set max-retries 5
+```
+
+`stream-json` writes one typed harness event per line followed by a `result` object. `json` writes
+only the result object to stdout. Diagnostics and text-mode tool notices go to stderr.
 
 ## Development
+
+The default test suite is offline and uses only Python behavior specifications—no Pi install,
+generated Pi fixtures, or network access.
 
 ```bash
 uv run pytest -q
 uv run ruff check .
-(cd aeloon_core/pi_runtime && bun install --frozen-lockfile)
-(cd aeloon_core/web && bun test)
 uv build
 git diff --check
 ```
+
+An optional live DeepSeek smoke test should be run only when a real `DEEPSEEK_API_KEY` is supplied;
+it is not part of default CI.

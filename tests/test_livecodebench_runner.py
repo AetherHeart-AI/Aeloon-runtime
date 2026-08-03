@@ -34,7 +34,6 @@ def _generation(prompt: str, code: str) -> AgentGeneration:
     payload = {
         "status": "completed",
         "session_id": "session",
-        "turn_id": "turn",
         "final_content": final_content,
     }
     return AgentGeneration(

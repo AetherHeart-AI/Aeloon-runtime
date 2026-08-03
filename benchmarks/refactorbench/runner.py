@@ -780,13 +780,11 @@ def _interpret_harness_output(
         return {
             "status": _agent_status(outcome, payload),
             "session_id": (payload or {}).get("session_id"),
-            "turn_id": (payload or {}).get("turn_id"),
             "duration_ms": (payload or {}).get("duration_ms"),
             "final_content": (payload or {}).get("final_content"),
             "tools_used": (payload or {}).get("tools_used", []),
             "usage": (payload or {}).get("usage", {}),
-            "transitions": (payload or {}).get("transitions", []),
-            "models": (payload or {}).get("models", {}),
+            "model": (payload or {}).get("model"),
             "payload_error": payload_error,
         }
 
@@ -1430,4 +1428,3 @@ def main(argv: list[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -86,13 +86,11 @@ class AeloonHarness(Harness):
                 else str(payload.get("status") or "agent_error")
             ),
             "session_id": _string(payload, "session_id"),
-            "turn_id": _string(payload, "turn_id"),
             "duration_ms": payload.get("duration_ms"),
             "final_content": _string(payload, "final_content"),
             "tools_used": _list(payload, "tools_used"),
             "usage": _dict(payload, "usage"),
-            "transitions": _list(payload, "transitions"),
-            "models": _dict(payload, "models"),
+            "model": _string(payload, "model"),
             "payload_error": None,
         }
 

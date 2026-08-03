@@ -3,92 +3,44 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-PACKAGE_ROOT = Path(__file__).resolve().parents[1] / "aeloon_core"
-EXPECTED_ROOT_MODULES = {
-    "__init__.py",
-    "__main__.py",
-    "config.py",
-    "orchestrator.py",
-}
-EXPECTED_HARNESS_MODULES = {"__init__.py", "capabilities.py"}
-EXPECTED_HARNESS_FEATURES = {
-    "agent": {"__init__.py", "prompt.py"},
-    "expert": {
-        "__init__.py",
-        "base.py",
-        "langgraph.py",
-        "registry.py",
-        "runtime.py",
-        "stage.py",
-        "tools.py",
-    },
-    "execution": {
-        "__init__.py",
-        "bridge.py",
-        "engine.py",
-        "events.py",
-        "stuck.py",
-        "transitions.py",
-    },
-    "model": {"__init__.py", "router.py"},
-    "mcp": {"__init__.py", "registry.py"},
-    "provider": {"__init__.py", "base.py", "deepseek.py"},
-    "skill": {"__init__.py", "base.py", "registry.py", "tools.py"},
-    "tool": {"__init__.py", "base.py", "filesystem.py", "registry.py", "search.py"},
-}
-EXPECTED_SUPPORT_FEATURES = {
-    "conversation": {"__init__.py", "history.py", "session.py"},
-    "web": {"__init__.py", "bridge.py", "events.py", "launcher.py", "output.py"},
-}
+ROOT = Path(__file__).resolve().parents[1]
+PACKAGE = ROOT / "aeloon_core"
 
 
-def test_harness_is_grouped_by_feature() -> None:
-    harness_root = PACKAGE_ROOT / "harness"
-
-    assert {path.name for path in harness_root.glob("*.py")} == EXPECTED_HARNESS_MODULES
-    assert {
-        path.name
-        for path in harness_root.iterdir()
-        if path.is_dir() and not path.name.startswith("__") and any(path.glob("*.py"))
-    } == set(EXPECTED_HARNESS_FEATURES)
-    for feature, expected_files in EXPECTED_HARNESS_FEATURES.items():
-        assert {path.name for path in (harness_root / feature).glob("*.py")} == expected_files
-
-
-def test_support_code_is_grouped_by_feature() -> None:
-    for feature, expected_files in EXPECTED_SUPPORT_FEATURES.items():
-        assert {path.name for path in (PACKAGE_ROOT / feature).glob("*.py")} == expected_files
-
-
-def test_feature_packages_do_not_import_removed_horizontal_layers() -> None:
-    imports = _imports_under(PACKAGE_ROOT / "harness")
-
-    assert not {
-        module
-        for module in imports
-        if module.startswith(("aeloon_core.customization", "aeloon_core.tools"))
-    }
-    assert not {module for module in imports if module.startswith("aeloon_core.harness.workflow")}
+def test_runtime_is_python_only_and_removed_subsystems_are_absent() -> None:
+    forbidden_paths = (
+        PACKAGE / "pi_runtime",
+        PACKAGE / "web",
+        PACKAGE / "orchestrator.py",
+        PACKAGE / "harness" / "expert",
+        PACKAGE / "harness" / "mcp",
+        PACKAGE / "harness" / "model",
+        PACKAGE / "harness" / "execution",
+    )
+    assert all(not path.exists() for path in forbidden_paths)
+    assert not list(PACKAGE.rglob("*.js"))
+    assert not list(PACKAGE.rglob("*.ts"))
+    assert not list(PACKAGE.rglob("package.json"))
+    assert not list(PACKAGE.rglob("bun.lock"))
 
 
-def test_removed_role_and_workflow_surfaces_are_absent() -> None:
-    assert not (PACKAGE_ROOT / "harness" / "agent" / "base.py").exists()
-    assert not (PACKAGE_ROOT / "harness" / "agent" / "factory.py").exists()
-    assert not (PACKAGE_ROOT / "harness" / "workflow" / "__init__.py").exists()
-    assert not (PACKAGE_ROOT / "harness" / "catalog.py").exists()
-
-
-def test_package_root_contains_only_entrypoints_and_composition_modules() -> None:
-    assert {path.name for path in PACKAGE_ROOT.glob("*.py")} == EXPECTED_ROOT_MODULES
-
-
-def _imports_under(root: Path) -> set[str]:
-    imported: set[str] = set()
-    for path in root.rglob("*.py"):
+def test_package_imports_have_no_removed_runtime_edges() -> None:
+    imports: set[str] = set()
+    for path in PACKAGE.rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom) and node.module:
-                imported.add(node.module)
+                imports.add(node.module)
             elif isinstance(node, ast.Import):
-                imported.update(alias.name for alias in node.names)
-    return imported
+                imports.update(alias.name for alias in node.names)
+    forbidden = ("mcp", "langgraph", "aeloon_core.web", "aeloon_core.orchestrator")
+    assert not {name for name in imports if name.startswith(forbidden)}
+
+
+def test_dependency_manifest_has_no_pi_bun_mcp_or_langgraph() -> None:
+    manifest = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert "@earendil-works" not in manifest
+    assert "pi-agent-core" not in manifest
+    assert '"mcp' not in manifest
+    assert "langgraph" not in manifest
+    assert "pillow" in manifest
