@@ -167,12 +167,14 @@ async def test_cloud_provider_strips_provider_prefix_and_refreshes_after_401() -
         name="Cloud Reasoner",
         provider="aeloon-cloud",
         base_url="https://cloud.example",
+        reasoning=True,
+        thinking_level_map={"high": "high", "max": "max"},
     )
     message = await collect_assistant(
         provider,
         model,
         ProviderContext("", (UserMessage("hello"),), (), "session"),
-        StreamOptions(max_retries=0),
+        StreamOptions(max_retries=0, thinking_level="high"),
     )
     await client.aclose()
 
@@ -181,5 +183,6 @@ async def test_cloud_provider_strips_provider_prefix_and_refreshes_after_401() -
     assert [request.url.path for request in requests] == ["/proxy/v1/chat", "/proxy/v1/chat"]
     payload = json.loads(requests[-1].content)
     assert payload["model"] == "reasoner"
+    assert payload["reasoning_effort"] == "high"
     assert payload["task_id"].startswith("cloud_")
     assert "stream_options" not in payload

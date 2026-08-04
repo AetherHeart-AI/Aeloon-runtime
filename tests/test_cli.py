@@ -499,6 +499,33 @@ async def test_default_task_runs_without_run_verb(tmp_path: Path, monkeypatch, c
 
 
 @pytest.mark.asyncio
+async def test_effort_flag_overrides_reasoning_effort_for_one_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    provider = _provider("reasoned")
+    monkeypatch.setattr(cli, "DeepSeekProvider", lambda **_kwargs: provider)
+
+    code = await cli.async_main(
+        [
+            "inspect this repository",
+            "--workspace",
+            str(tmp_path),
+            "--data-dir",
+            str(tmp_path / "data"),
+            "--ephemeral",
+            "--model",
+            "deepseek/deepseek-v4-flash",
+            "--effort",
+            "max",
+        ]
+    )
+
+    assert code == 0
+    assert provider.requests[0][2].thinking_level == "max"
+    assert capsys.readouterr().out == "reasoned\n"
+
+
+@pytest.mark.asyncio
 async def test_resume_uses_latest_session_in_workspace(tmp_path: Path, monkeypatch, capsys) -> None:
     data_dir = tmp_path / "data"
     monkeypatch.setattr(cli, "DeepSeekProvider", lambda **_kwargs: _provider("saved"))

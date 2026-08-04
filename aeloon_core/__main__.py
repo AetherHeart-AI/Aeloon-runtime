@@ -164,6 +164,11 @@ def _add_run_arguments(
     command.add_argument("--data-dir", type=Path, help=argparse.SUPPRESS)
     command.add_argument("--session-dir", type=Path, help=argparse.SUPPRESS)
     command.add_argument("-m", "--model", help="Use this model for the task.")
+    command.add_argument(
+        "--effort",
+        choices=("off", "minimal", "low", "medium", "high", "max"),
+        help="Set the model reasoning effort for this task.",
+    )
 
 
 def _add_account_arguments(command: argparse.ArgumentParser, *, login: bool = False) -> None:
@@ -1547,8 +1552,13 @@ def _with_run_overrides(config: Config, args: argparse.Namespace) -> Config:
         updates["workspace"] = args.workspace
     if args.data_dir is not None:
         updates["data_dir"] = args.data_dir
+    agent_updates: dict[str, Any] = {}
     if args.model is not None:
-        updates["agent"] = config.agent.model_copy(update={"model": args.model})
+        agent_updates["model"] = args.model
+    if args.effort is not None:
+        agent_updates["thinking_level"] = args.effort
+    if agent_updates:
+        updates["agent"] = config.agent.model_copy(update=agent_updates)
     return config.model_copy(update=updates).normalized()
 
 
