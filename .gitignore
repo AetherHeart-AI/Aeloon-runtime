@@ -5,7 +5,6 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 /.test/
-/docs/
 
 aeloon_core/web/node_modules/
 aeloon_core/pi_runtime/node_modules/
@@ -17,3 +16,4 @@ benchmarks/results/
 .env
 .env.*
 .worktrees
+*.old
