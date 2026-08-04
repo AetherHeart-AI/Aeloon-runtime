@@ -1,4 +1,4 @@
-"""Pi-compatible local coding tools implemented in Python."""
+"""Local coding tools implemented in Python."""
 
 from __future__ import annotations
 

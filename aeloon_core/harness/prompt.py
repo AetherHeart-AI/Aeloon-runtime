@@ -1,6 +1,6 @@
-"""Pi Coding Agent-compatible system-prompt construction."""
+"""System-prompt construction for the Aeloon harness."""
 
-# Prompt prose is kept in Pi-compatible full lines for stable string snapshots.
+# Prompt prose uses full lines to keep string snapshots stable.
 # ruff: noqa: E501
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ def build_system_prompt(
     resources: Resources,
     custom_prompt: str | None = None,
 ) -> str:
-    """Build the effective prompt using Pi's ordering and override semantics."""
+    """Build the effective prompt using deterministic ordering and overrides."""
 
     prompt_cwd = str(Path(cwd).expanduser().resolve(strict=False)).replace("\\", "/")
     selected_names = [tool.name for tool in tools]

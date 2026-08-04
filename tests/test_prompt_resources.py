@@ -1,4 +1,4 @@
-# Full prompt snapshots intentionally preserve Pi-compatible prose line lengths.
+# Full prompt snapshots intentionally preserve stable prose line lengths.
 # ruff: noqa: E501
 
 from __future__ import annotations

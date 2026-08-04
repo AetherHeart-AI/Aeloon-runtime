@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "aeloon-core"
 version = "0.3.0"
-description = "A stateful, pure-Python coding-agent harness inspired by Pi."
+description = "A stateful, pure-Python coding harness."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

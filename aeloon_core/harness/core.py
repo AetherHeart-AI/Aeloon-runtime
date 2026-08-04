@@ -1,4 +1,4 @@
-"""Stateful Pi-compatible Python agent harness."""
+"""Stateful Python coding harness."""
 
 from __future__ import annotations
 

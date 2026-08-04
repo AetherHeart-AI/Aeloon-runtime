@@ -1,4 +1,4 @@
-"""Aeloon-namespaced resource discovery with Pi-compatible precedence."""
+"""Aeloon-namespaced resource discovery with deterministic precedence."""
 
 from __future__ import annotations
 

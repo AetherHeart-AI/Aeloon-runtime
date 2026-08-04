@@ -1,4 +1,4 @@
-"""Append-only Pi-style JSONL session tree."""
+"""Append-only JSONL session tree."""
 
 from __future__ import annotations
 

@@ -1,6 +1,6 @@
 """Semantic compaction and branch-summary helpers."""
 
-# Summarization prompts intentionally mirror Pi's human-readable line wrapping.
+# Summarization prompts use readable, stable line wrapping.
 # ruff: noqa: E501
 
 from __future__ import annotations

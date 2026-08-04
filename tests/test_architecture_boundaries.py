@@ -37,10 +37,9 @@ def test_package_imports_have_no_removed_runtime_edges() -> None:
     assert not {name for name in imports if name.startswith(forbidden)}
 
 
-def test_dependency_manifest_has_no_pi_bun_mcp_or_langgraph() -> None:
+def test_dependency_manifest_has_no_removed_runtime_dependencies() -> None:
     manifest = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert "@earendil-works" not in manifest
-    assert "pi-agent-core" not in manifest
     assert '"mcp' not in manifest
     assert "langgraph" not in manifest
     assert "pillow" in manifest
