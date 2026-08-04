@@ -9,6 +9,7 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from aeloon_core.harness.context_stats import estimate_context_tokens, estimate_tokens
 from aeloon_core.harness.providers import collect_assistant
 from aeloon_core.harness.session import Session
 from aeloon_core.harness.types import (
@@ -21,7 +22,6 @@ from aeloon_core.harness.types import (
     TextContent,
     ThinkingContent,
     ToolCall,
-    ToolResultMessage,
     Usage,
     UserMessage,
     message_from_dict,
@@ -121,42 +121,6 @@ class CompactionResult:
     retained_tail: tuple[AgentMessage, ...]
     usage: Usage
     details: dict[str, Any]
-
-
-def estimate_tokens(message: AgentMessage) -> int:
-    chars = 0
-    if isinstance(message, UserMessage):
-        if isinstance(message.content, str):
-            chars = len(message.content)
-        else:
-            for part in message.content:
-                chars += len(part.text) if isinstance(part, TextContent) else 4_800
-    elif isinstance(message, AssistantMessage):
-        for part in message.content:
-            if isinstance(part, TextContent):
-                chars += len(part.text)
-            elif isinstance(part, ThinkingContent):
-                chars += len(part.thinking)
-            elif isinstance(part, ToolCall):
-                chars += len(part.name) + len(json.dumps(part.arguments, ensure_ascii=False))
-    elif isinstance(message, ToolResultMessage):
-        for part in message.content:
-            chars += len(part.text) if isinstance(part, TextContent) else 4_800
-    return (chars + 3) // 4
-
-
-def estimate_context_tokens(messages: tuple[AgentMessage, ...] | list[AgentMessage]) -> int:
-    for index in range(len(messages) - 1, -1, -1):
-        message = messages[index]
-        if (
-            isinstance(message, AssistantMessage)
-            and message.stop_reason not in {"error", "aborted"}
-            and message.usage.total_tokens > 0
-        ):
-            return message.usage.total_tokens + sum(
-                estimate_tokens(trailing) for trailing in messages[index + 1 :]
-            )
-    return sum(estimate_tokens(message) for message in messages)
 
 
 def should_compact(context_tokens: int, context_window: int, settings: CompactionSettings) -> bool:

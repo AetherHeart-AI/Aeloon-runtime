@@ -311,14 +311,29 @@ class CoreService:
                 if operation.status in {"queued", "active"}:
                     active.append(self._operation_dto(operation))
         overrides = self._session_overrides(entries)
+        restored_model = (await session.build_context()).model
+        model_id = str(
+            overrides.get("model_id")
+            or (restored_model[1] if restored_model is not None else None)
+            or self.config.agent.model
+        )
+        context_window: int | None = None
+        if model_id:
+            try:
+                context_window = (await self._model(model_id)).context_window
+            except BridgeError:
+                # A saved session remains readable when its provider or model is no
+                # longer connected. Token totals are still useful without a limit.
+                pass
         return {
             "metadata": await self._session_metadata(session),
             "state": {
                 "leaf_id": await session.get_leaf_id(),
-                "model_id": overrides.get("model_id", self.config.agent.model),
+                "model_id": model_id,
                 "thinking_level": overrides.get("thinking_level", self.config.agent.thinking_level),
                 "active_tools": overrides.get("active_tools", list(DEFAULT_ACTIVE_TOOLS)),
             },
+            "stats": await session.stats(context_window=context_window),
             "timeline": self._project_timeline(branch, active_ids={item["operation_id"] for item in active}),
             "active_operations": active,
         }
@@ -1083,7 +1098,18 @@ class CoreService:
                     await self._emit(name, session, operation, {"block_id": block["id"], "patch": self._clean_block(block)})
                 usage = message.get("usage") or {}
                 operation.usage = dict(usage) if isinstance(usage, Mapping) else {}
-                await self._emit("usage.updated", session, operation, {"usage": operation.usage})
+                context_window = (
+                    operation.harness.model.context_window if operation.harness else None
+                )
+                await self._emit(
+                    "usage.updated",
+                    session,
+                    operation,
+                    {
+                        "usage": operation.usage,
+                        "stats": await session.stats(context_window=context_window),
+                    },
+                )
         elif event.type == "tool_execution_start":
             block_id = str(data.get("toolCallId") or "tool")
             block = next((item for item in operation.blocks if item["id"] == block_id), None)

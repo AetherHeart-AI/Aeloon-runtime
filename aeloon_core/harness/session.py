@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from aeloon_core.harness.context_stats import cache_statistics, context_statistics
 from aeloon_core.harness.types import (
     AgentMessage,
     SessionError,
@@ -341,10 +342,13 @@ class Session:
                 raise SessionError("invalid_session", f"Entry {parent_id} not found")
         return [dict(entry) for entry in path]
 
-    async def stats(self) -> dict[str, Any]:
+    async def stats(self, *, context_window: int | None = None) -> dict[str, Any]:
+        """Return lifetime totals plus statistics for the effective context branch."""
+
         message_count = 0
         total_tokens = 0
         cost = 0.0
+        usages: list[dict[str, Any]] = []
         for entry in self._entries:
             usage: dict[str, Any] | None = None
             if entry.get("type") == "message":
@@ -357,7 +361,15 @@ class Session:
             if usage:
                 total_tokens += int(usage.get("totalTokens") or 0)
                 cost += float((usage.get("cost") or {}).get("total") or 0)
-        return {"messageCount": message_count, "totalTokens": total_tokens, "costTotal": cost}
+                usages.append(usage)
+        context = await self.build_context()
+        return {
+            "messageCount": message_count,
+            "totalTokens": total_tokens,
+            "costTotal": cost,
+            **context_statistics(context.messages, context_window=context_window),
+            "cache": cache_statistics(usages),
+        }
 
     async def _append_entry(self, entry_type: str, **payload: Any) -> str:
         entry = {

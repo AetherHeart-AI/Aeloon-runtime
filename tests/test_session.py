@@ -13,6 +13,7 @@ from aeloon_core.harness import (
     JsonlSessionRepository,
     ScriptedProvider,
     TextContent,
+    ToolResultMessage,
     Usage,
     UserMessage,
 )
@@ -25,6 +26,85 @@ def _assistant(text: str) -> AssistantMessage:
         model="deepseek-v4-flash",
         usage=Usage(input=4, output=2, total_tokens=6),
     )
+
+
+@pytest.mark.asyncio
+async def test_session_stats_report_context_mix_and_cache_hits(tmp_path: Path) -> None:
+    session = await JsonlSessionRepository(tmp_path).create(cwd=tmp_path)
+    await session.append_message(UserMessage("u" * 8))
+    await session.append_message(
+        AssistantMessage(
+            (TextContent("a" * 8),),
+            provider="deepseek",
+            model="deepseek-v4-flash",
+            usage=Usage(
+                input=6,
+                output=2,
+                cache_read=4,
+                cache_write=2,
+                total_tokens=12,
+                cost={"total": 1.25},
+            ),
+        )
+    )
+    await session.append_message(
+        ToolResultMessage("call", "read", (TextContent("t" * 8),))
+    )
+    await session.append_message(UserMessage("u" * 4))
+
+    stats = await session.stats(context_window=100)
+
+    assert stats["messageCount"] == 4
+    assert stats["totalTokens"] == 12
+    assert stats["costTotal"] == 1.25
+    assert stats["contextWindow"] == {
+        "usedTokens": 15,
+        "windowTokens": 100,
+        "remainingTokens": 85,
+        "usagePercent": 15.0,
+    }
+    message_types = stats["messageTypes"]
+    assert sum(item["estimatedTokens"] for item in message_types.values()) == 15
+    assert message_types["system"] == {
+        "messageCount": 0,
+        "estimatedTokens": 8,
+        "percentage": 53.34,
+    }
+    assert sum(item["percentage"] for item in message_types.values()) == 100.0
+    assert message_types["user"]["messageCount"] == 2
+    assert message_types["user"]["percentage"] == 20.0
+    assert message_types["assistant"]["messageCount"] == 1
+    assert message_types["toolResult"]["messageCount"] == 1
+    assert stats["cache"] == {
+        "inputTokens": 6,
+        "readTokens": 4,
+        "writeTokens": 2,
+        "cacheableTokens": 10,
+        "hitTokenPercent": 40.0,
+        "requestCount": 1,
+        "hitRequestCount": 1,
+        "hitRequestPercent": 100.0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_session_stats_handle_empty_context_and_unknown_window(tmp_path: Path) -> None:
+    session = await JsonlSessionRepository(tmp_path).create(cwd=tmp_path)
+
+    stats = await session.stats()
+
+    assert stats["contextWindow"] == {
+        "usedTokens": 0,
+        "windowTokens": None,
+        "remainingTokens": None,
+        "usagePercent": None,
+    }
+    assert all(
+        item == {"messageCount": 0, "estimatedTokens": 0, "percentage": 0.0}
+        for item in stats["messageTypes"].values()
+    )
+    assert stats["cache"]["hitTokenPercent"] == 0.0
+    assert stats["cache"]["hitRequestPercent"] == 0.0
 
 
 @pytest.mark.asyncio

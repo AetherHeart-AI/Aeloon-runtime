@@ -81,6 +81,15 @@ async def test_stable_turn_projection_and_replay(tmp_path: Path) -> None:
     assert turn["status"] == "completed"
     assert turn["final_content"] == "bridge answer"
     assert turn["usage"]["totalTokens"] == 5
+    assert snapshot["stats"]["contextWindow"] == {
+        "usedTokens": 5,
+        "windowTokens": 1_000_000,
+        "remainingTokens": 999_995,
+        "usagePercent": 0.0,
+    }
+    assert snapshot["stats"]["messageTypes"]["user"]["messageCount"] == 1
+    assert snapshot["stats"]["messageTypes"]["assistant"]["messageCount"] == 1
+    assert snapshot["stats"]["cache"]["requestCount"] == 1
     assert snapshot["active_operations"] == []
 
     replay = await service.events_subscribe(
@@ -89,6 +98,9 @@ async def test_stable_turn_projection_and_replay(tmp_path: Path) -> None:
     assert replay["replay_complete"] is True
     assert replay["events"][0]["name"] == "operation.queued"
     assert replay["events"][-2]["name"] == "operation.completed"
+    usage_event = next(event for event in replay["events"] if event["name"] == "usage.updated")
+    assert usage_event["payload"]["stats"]["contextWindow"]["usedTokens"] == 5
+    assert usage_event["payload"]["stats"]["contextWindow"]["windowTokens"] == 1_000_000
     assert all("traceback" not in json.dumps(event).lower() for event in replay["events"])
 
 

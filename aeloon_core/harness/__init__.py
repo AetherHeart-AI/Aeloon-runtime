@@ -3,7 +3,12 @@
 from aeloon_core.harness.compaction import (
     CompactionResult,
     CompactionSettings,
+)
+from aeloon_core.harness.context_stats import (
+    cache_statistics,
+    context_statistics,
     estimate_context_tokens,
+    estimate_tokens,
 )
 from aeloon_core.harness.core import AgentHarness, AgentHarnessPhase
 from aeloon_core.harness.prompt import build_system_prompt, format_skills_for_system_prompt
@@ -99,9 +104,12 @@ __all__ = [
     "Usage",
     "UserMessage",
     "build_system_prompt",
+    "cache_statistics",
     "content_from_dict",
+    "context_statistics",
     "create_all_tools",
     "estimate_context_tokens",
+    "estimate_tokens",
     "format_skills_for_system_prompt",
     "get_deepseek_model",
     "message_from_dict",

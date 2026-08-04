@@ -84,6 +84,12 @@ Automatic semantic compaction keeps a recent turn-safe tail and summarizes older
 summary preserves goals, decisions, progress, paths, errors, and file-operation history, and can
 merge an earlier summary.
 
+Session snapshots expose lifetime token and cost totals alongside effective-branch context
+statistics. Context statistics report window occupancy, estimated token share for system, user,
+assistant, and tool-result messages, plus cache token and request hit rates. Provider-reported
+usage is preferred for the current context total; messages after the last response use the same
+estimator as automatic compaction.
+
 ## Bridge v2
 
 Bridge v2 uses JSON-RPC 2.0 over NDJSON on a Unix domain socket. The runtime directory is mode
