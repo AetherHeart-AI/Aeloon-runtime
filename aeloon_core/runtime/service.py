@@ -1,5 +1,5 @@
 # ruff: noqa: E501
-"""Application boundary shared by the CLI and Bridge v2 transport."""
+"""Provider-neutral application runtime for sessions and agent operations."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ import inspect
 import shutil
 import time
 import uuid
-from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -18,15 +17,6 @@ from typing import Any
 
 import httpx
 
-from aeloon_core.bridge.protocol import (
-    CAPABILITIES,
-    EVENTS,
-    METHODS,
-    PROTOCOL_NAME,
-    PROTOCOL_VERSION,
-    BridgeError,
-)
-from aeloon_core.cloud import CloudAccountService, CloudError
 from aeloon_core.config import (
     Config,
     LocalModelConfig,
@@ -35,42 +25,45 @@ from aeloon_core.config import (
     resolve_config_path,
     save_config,
 )
-from aeloon_core.harness import (
+from aeloon_core.core import (
     ALL_TOOL_NAMES,
     DEFAULT_ACTIVE_TOOLS,
-    AgentHarness,
-    CompactionSettings,
-    HarnessError,
-    HarnessEvent,
     ImageContent,
-    JsonlSessionRepository,
     Model,
-    ResourceLoader,
-    Session,
-    SessionError,
+    RunEvent,
     StreamOptions,
 )
-from aeloon_core.providers import (
+from aeloon_core.runtime.agent import SessionAgent, SessionAgentFactory
+from aeloon_core.runtime.catalog import (
     DEEPSEEK_PROVIDER_ID,
-    UnifiedProviderRegistry,
+    CatalogFactory,
+    ProviderCatalog,
     normalize_model_id,
     qualify_model_id,
     resolve_model_id,
     split_model_id,
     validate_provider_id,
 )
-from aeloon_core.rename_session import is_generic_session_title, rename_session
-from aeloon_core.version import __version__
+from aeloon_core.runtime.ports import AccountGateway, NullAccountGateway
+from aeloon_core.runtime.rename import is_generic_session_title, rename_session
+from aeloon_core.runtime.resources import ResourceLoader
+from aeloon_core.runtime.session import JsonlSessionRepository, Session
+from aeloon_core.runtime.types import (
+    OperationSnapshot,
+    RuntimeEvent,
+    RuntimeEventListener,
+    RuntimeFailure,
+    SessionInfo,
+    SessionSnapshot,
+    TurnInput,
+)
 
 PROMPT_LIMIT = 100_000
 ATTACHMENT_LIMIT = 8
 IMAGE_LIMIT = 10 * 1024 * 1024
 FILE_LIMIT = 25 * 1024 * 1024
 TOOL_OUTPUT_LIMIT = 20_000
-EVENT_LIMIT = 5_000
-
-EventListener = Callable[[dict[str, Any]], Awaitable[None] | None]
-HarnessFactory = Callable[[Config, Session], AgentHarness | Awaitable[AgentHarness]]
+RuntimeFailure = RuntimeFailure
 
 
 def _now() -> str:
@@ -89,7 +82,8 @@ class Operation:
     blocks: list[dict[str, Any]] = field(default_factory=list)
     usage: dict[str, Any] = field(default_factory=dict)
     task: asyncio.Task[None] | None = None
-    harness: AgentHarness | None = None
+    agent: SessionAgent | None = None
+    model: Model | None = None
 
 
 @dataclass(slots=True)
@@ -99,8 +93,8 @@ class SessionRuntime:
     active: Operation | None = None
 
 
-class CoreService:
-    """Provider-neutral, transport-free application service for Core workflows."""
+class RuntimeService:
+    """Provider-neutral, transport-free application service for runtime workflows."""
 
     def __init__(
         self,
@@ -108,8 +102,9 @@ class CoreService:
         config_path: Path | str | None = None,
         data_dir: Path | str | None = None,
         max_concurrent_operations: int = 4,
-        harness_factory: HarnessFactory | None = None,
-        cloud_account_service: CloudAccountService | None = None,
+        agent_factory: SessionAgentFactory | None = None,
+        catalog_factory: CatalogFactory | None = None,
+        account_gateway: AccountGateway | None = None,
     ) -> None:
         self.config_path = resolve_config_path(config_path).resolve(strict=False)
         self._data_dir_override = Path(data_dir).expanduser().resolve(strict=False) if data_dir is not None else None
@@ -121,25 +116,17 @@ class CoreService:
         self.repository = JsonlSessionRepository(self.data_dir)
         self.attachment_dir = self.data_dir / "session-attachments"
         self.attachment_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self.server_instance_id = uuid.uuid4().hex
         self.started_at = _now()
         self._revision = 1
-        self._harness_factory = harness_factory
+        self._agent_factory = agent_factory
+        self._catalog_factory = catalog_factory or (lambda value: ProviderCatalog(value))
         self._semaphore = asyncio.Semaphore(max(1, max_concurrent_operations))
         self._runtimes: dict[str, SessionRuntime] = {}
-        self._events: deque[dict[str, Any]] = deque(maxlen=EVENT_LIMIT)
-        self._seq = 0
-        self._listeners: set[EventListener] = set()
+        self._listeners: set[RuntimeEventListener] = set()
         self._settings_lock = asyncio.Lock()
-        self._owns_cloud_account = cloud_account_service is None
-        self.cloud_account = cloud_account_service or CloudAccountService(
-            config.cloud,
-            data_dir=self.data_dir,
-        )
-        self.shutdown_requested = asyncio.Event()
-        self.shutdown_signal = asyncio.Event()
+        self.account = account_gateway or NullAccountGateway()
 
-    def add_event_listener(self, listener: EventListener) -> Callable[[], None]:
+    def add_event_listener(self, listener: RuntimeEventListener) -> Callable[[], None]:
         self._listeners.add(listener)
 
         def remove() -> None:
@@ -147,134 +134,53 @@ class CoreService:
 
         return remove
 
-    async def dispatch(
+    @property
+    def active_operation_count(self) -> int:
+        return sum(1 for runtime in self._runtimes.values() if runtime.active is not None)
+
+    async def create_session(self, *, workspace: str, title: str | None = None) -> SessionInfo:
+        value = await self.session_create({"workspace": workspace, "title": title})
+        return SessionInfo.from_dict(value)
+
+    async def list_sessions(self, *, workspace: str | None = None) -> tuple[SessionInfo, ...]:
+        value = await self.session_list({"workspace": workspace})
+        return tuple(SessionInfo.from_dict(item) for item in value["sessions"])
+
+    async def get_session(self, session_id: str) -> SessionSnapshot:
+        value = await self.session_get({"session_id": session_id})
+        return SessionSnapshot(
+            metadata=dict(value["metadata"]),
+            state=dict(value["state"]),
+            stats=dict(value["stats"]),
+            timeline=tuple(value["timeline"]),
+            active_operations=tuple(value["active_operations"]),
+        )
+
+    async def start_turn(
         self,
-        method: str,
-        params: Mapping[str, Any] | None = None,
         *,
+        session_id: str,
+        input: TurnInput,
         attachment_roots: tuple[Path, ...] = (),
-    ) -> Any:
-        value = dict(params or {})
-        routes: dict[str, Callable[..., Awaitable[Any]]] = {
-            "system.handshake": self.handshake,
-            "system.health": self.health,
-            "system.shutdown": self.shutdown,
-            "events.subscribe": self.events_subscribe,
-            "session.create": self.session_create,
-            "session.list": self.session_list,
-            "session.get": self.session_get,
-            "session.delete": self.session_delete,
-            "session.rename": self.session_rename,
-            "session.configure": self.session_configure,
-            "session.tree": self.session_tree,
-            "session.navigate": self.session_navigate,
-            "session.compact": self.session_compact,
-            "session.next_turn": self.session_next_turn,
-            "turn.start": self.turn_start,
-            "turn.cancel": self.turn_cancel,
-            "turn.steer": self.turn_steer,
-            "turn.follow_up": self.turn_follow_up,
-            "catalog.get": self.catalog_get,
-            "provider.list": self.provider_list,
-            "provider.local.add": self.provider_local_add,
-            "provider.local.remove": self.provider_local_remove,
-            "settings.get": self.settings_get,
-            "settings.update": self.settings_update,
-            "cloud.account.status": self.cloud_account_status,
-            "cloud.account.login": self.cloud_account_login,
-            "cloud.account.logout": self.cloud_account_logout,
-            "provider.cloud.status": self.cloud_account_status,
-            "provider.cloud.login": self.cloud_account_login,
-            "provider.cloud.logout": self.cloud_account_logout,
-        }
-        handler = routes.get(method)
-        if handler is None:
-            raise BridgeError("method_not_found", f"Unknown Bridge method: {method}")
-        try:
-            if method == "turn.start":
-                return await handler(value, attachment_roots=attachment_roots)
-            return await handler(value)
-        except BridgeError:
-            raise
-        except SessionError as exc:
-            code = "session_not_found" if exc.code == "not_found" else "invalid_state"
-            raise BridgeError(code, self._sanitize(str(exc))) from None
-        except HarnessError as exc:
-            code = exc.code if exc.code in {"busy", "invalid_state", "invalid_argument"} else "internal_error"
-            raise BridgeError(code, self._sanitize(str(exc))) from None
-        except (KeyError, TypeError, ValueError) as exc:
-            raise BridgeError("invalid_argument", self._sanitize(str(exc))) from None
-        except Exception:
-            raise BridgeError("internal_error", "Aeloon Core could not complete the request") from None
+    ) -> OperationSnapshot:
+        value = await self.turn_start(
+            {"session_id": session_id, "input": input.to_dict()},
+            attachment_roots=attachment_roots,
+        )
+        return OperationSnapshot(
+            operation_id=str(value["operation_id"]),
+            turn_id=str(value["turn_id"]),
+            queue_position=int(value["queue_position"]),
+        )
 
-    async def handshake(self, params: Mapping[str, Any]) -> dict[str, Any]:
-        versions = params.get("protocol_versions", [PROTOCOL_VERSION])
-        if versions and PROTOCOL_VERSION not in versions:
-            raise BridgeError("protocol_incompatible", "Aeloon Core requires Bridge protocol v2")
-        roots = params.get("attachment_roots") or []
-        if not isinstance(roots, list) or any(not isinstance(root, str) for root in roots):
-            raise BridgeError("invalid_argument", "attachment_roots must be a list of paths")
-        return {
-            "protocol": PROTOCOL_NAME,
-            "protocol_version": PROTOCOL_VERSION,
-            "core_version": __version__,
-            "server_instance_id": self.server_instance_id,
-            "capabilities": list(CAPABILITIES),
-            "methods": list(METHODS),
-            "events": list(EVENTS),
-            "attachment_roots": [str(Path(root).expanduser().resolve(strict=False)) for root in roots],
-            "config_path": str(self.config_path),
-            "data_dir": str(self.data_dir),
-            "limits": {
-                "prompt_chars": PROMPT_LIMIT,
-                "attachments": ATTACHMENT_LIMIT,
-                "image_bytes": IMAGE_LIMIT,
-                "file_bytes": FILE_LIMIT,
-                "request_bytes": 1024 * 1024,
-                "retained_events": EVENT_LIMIT,
-            },
-        }
+    async def cancel_turn(self, operation_id: str) -> None:
+        await self.turn_cancel({"operation_id": operation_id})
 
-    async def health(self, _params: Mapping[str, Any]) -> dict[str, Any]:
-        active = sum(1 for runtime in self._runtimes.values() if runtime.active is not None)
-        return {
-            "status": "stopping" if self.shutdown_requested.is_set() else "running",
-            "pid": __import__("os").getpid(),
-            "started_at": self.started_at,
-            "active_operations": active,
-            "current_seq": self._seq,
-        }
+    async def steer_turn(self, operation_id: str, text: str) -> None:
+        await self.turn_steer({"operation_id": operation_id, "text": text})
 
-    async def shutdown(self, _params: Mapping[str, Any]) -> dict[str, Any]:
-        if not self.shutdown_requested.is_set():
-            await self._emit(
-                "system.shutdown",
-                None,
-                None,
-                {"intentional": True, "reason": "requested"},
-            )
-        self.shutdown_requested.set()
-        asyncio.get_running_loop().call_later(0.05, self.shutdown_signal.set)
-        return {"status": "stopping"}
-
-    async def events_subscribe(self, params: Mapping[str, Any]) -> dict[str, Any]:
-        session_ids = params.get("session_ids") or []
-        after_seq = int(params.get("after_seq") or 0)
-        if not isinstance(session_ids, list) or any(not isinstance(item, str) for item in session_ids):
-            raise BridgeError("invalid_argument", "session_ids must be a list")
-        first_seq = self._events[0]["seq"] if self._events else self._seq + 1
-        replay_complete = after_seq >= first_seq - 1
-        replay = [
-            event for event in self._events
-            if event["seq"] > after_seq and (event["session_id"] in session_ids or event["session_id"] is None)
-        ] if replay_complete else []
-        return {
-            "server_instance_id": self.server_instance_id,
-            "current_seq": self._seq,
-            "replay_complete": replay_complete,
-            "events": replay,
-            "cursor": {"server_instance_id": self.server_instance_id, "seq": self._seq},
-        }
+    async def follow_up_turn(self, operation_id: str, text: str) -> None:
+        await self.turn_follow_up({"operation_id": operation_id, "text": text})
 
     async def session_create(self, params: Mapping[str, Any]) -> dict[str, Any]:
         workspace = self._required_string(params, "workspace")
@@ -322,7 +228,7 @@ class CoreService:
         if model_id:
             try:
                 context_window = (await self._model(model_id)).context_window
-            except BridgeError:
+            except RuntimeFailure:
                 # A saved session remains readable when its provider or model is no
                 # longer connected. Token totals are still useful without a limit.
                 pass
@@ -343,7 +249,7 @@ class CoreService:
         session = await self._session(params)
         runtime = self._runtimes.get(session.id)
         if runtime and any(op.status in {"queued", "active"} for op in runtime.operations.values()):
-            raise BridgeError("busy", "Cannot delete a session with active operations")
+            raise RuntimeFailure("busy", "Cannot delete a session with active operations")
         await self.repository.delete(session.id)
         self._runtimes.pop(session.id, None)
         attachments = self.attachment_dir / session.id
@@ -377,7 +283,7 @@ class CoreService:
         if "active_tools" in params:
             tools = params["active_tools"]
             if not isinstance(tools, list) or any(item not in ALL_TOOL_NAMES for item in tools):
-                raise BridgeError("invalid_argument", "active_tools contains an unknown tool")
+                raise RuntimeFailure("invalid_argument", "active_tools contains an unknown tool")
             patch["active_tools"] = list(dict.fromkeys(tools))
         if "steering_mode" in params:
             patch["steering_mode"] = self._queue_mode(params["steering_mode"])
@@ -411,8 +317,8 @@ class CoreService:
         session = await self._session(params)
         target_id = self._required_string(params, "target_id")
 
-        async def execute(harness: AgentHarness) -> Any:
-            result = await harness.navigate_tree(
+        async def execute(agent: SessionAgent) -> Any:
+            result = await agent.navigate_tree(
                 target_id,
                 summarize=bool(params.get("summarize", False)),
                 custom_instructions=(str(params["custom_instructions"]) if params.get("custom_instructions") else None),
@@ -427,8 +333,8 @@ class CoreService:
     async def session_compact(self, params: Mapping[str, Any]) -> dict[str, Any]:
         session = await self._session(params)
 
-        async def execute(harness: AgentHarness) -> Any:
-            result = await harness.compact(
+        async def execute(agent: SessionAgent) -> Any:
+            result = await agent.compact(
                 str(params["custom_instructions"]) if params.get("custom_instructions") else None
             )
             payload = {
@@ -487,22 +393,22 @@ class CoreService:
         operation = self._operation(params)
         if operation.status == "queued" and operation.task is not None:
             operation.task.cancel()
-        elif operation.status == "active" and operation.harness is not None:
-            await operation.harness.abort()
+        elif operation.status == "active" and operation.agent is not None:
+            await operation.agent.abort()
         else:
-            raise BridgeError("invalid_state", "Operation is no longer cancellable")
+            raise RuntimeFailure("invalid_state", "Operation is no longer cancellable")
         return {"operation_id": operation.id, "cancelled": True}
 
     async def turn_steer(self, params: Mapping[str, Any]) -> dict[str, Any]:
         operation = self._active_operation(params)
         text = self._required_string(params, "text")
-        await operation.harness.steer(text)  # type: ignore[union-attr]
+        await operation.agent.steer(text)  # type: ignore[union-attr]
         return {"operation_id": operation.id, "accepted": True}
 
     async def turn_follow_up(self, params: Mapping[str, Any]) -> dict[str, Any]:
         operation = self._active_operation(params)
         text = self._required_string(params, "text")
-        await operation.harness.follow_up(text)  # type: ignore[union-attr]
+        await operation.agent.follow_up(text)  # type: ignore[union-attr]
         return {"operation_id": operation.id, "accepted": True}
 
     async def catalog_get(self, params: Mapping[str, Any]) -> dict[str, Any]:
@@ -586,11 +492,11 @@ class CoreService:
     async def settings_update(self, params: Mapping[str, Any]) -> dict[str, Any]:
         revision = params.get("revision")
         if not isinstance(revision, int):
-            raise BridgeError("invalid_argument", "revision must be an integer")
+            raise RuntimeFailure("invalid_argument", "revision must be an integer")
         patch = params.get("patch") or {}
         actions = params.get("secret_actions") or []
         if not isinstance(patch, Mapping) or not isinstance(actions, list):
-            raise BridgeError("invalid_argument", "patch and secret_actions are invalid")
+            raise RuntimeFailure("invalid_argument", "patch and secret_actions are invalid")
         models = await self._models()
         valid_model_ids = [
             model.id
@@ -608,21 +514,21 @@ class CoreService:
             valid_model_ids.append(self.config.agent.model)
         async with self._settings_lock:
             if revision != self._revision:
-                raise BridgeError("revision_conflict", "Core settings changed; refresh and try again")
+                raise RuntimeFailure("revision_conflict", "Core settings changed; refresh and try again")
             raw = load_config(self.config_path).model_dump(mode="json")
             self._apply_settings_patch(raw, patch, valid_model_ids=valid_model_ids)
             for action in actions:
                 if not isinstance(action, Mapping) or action.get("path") != "deepseek.api_key":
-                    raise BridgeError("invalid_argument", "Unsupported secret action")
+                    raise RuntimeFailure("invalid_argument", "Unsupported secret action")
                 if action.get("action") == "set":
                     value = str(action.get("value") or "")
                     if not value:
-                        raise BridgeError("invalid_argument", "Secret set requires a value")
+                        raise RuntimeFailure("invalid_argument", "Secret set requires a value")
                     raw["deepseek"]["api_key"] = value
                 elif action.get("action") == "clear":
                     raw["deepseek"]["api_key"] = "no-key"
                 else:
-                    raise BridgeError("invalid_argument", "Secret action must be set or clear")
+                    raise RuntimeFailure("invalid_argument", "Secret action must be set or clear")
             persisted_config = Config.model_validate(raw).normalized()
             await asyncio.to_thread(save_config, persisted_config, self.config_path)
             next_config = load_config(self.config_path)
@@ -630,18 +536,10 @@ class CoreService:
                 next_config = next_config.model_copy(
                     update={"data_dir": self._data_dir_override}
                 ).normalized()
-            cloud_changed = next_config.cloud != self.config.cloud
-            previous_cloud_base_url = self.config.cloud.base_url.rstrip("/")
+            account_changed = next_config.cloud != self.config.cloud
             self.config = next_config
-            if self._owns_cloud_account and cloud_changed:
-                previous_cloud = self.cloud_account
-                if next_config.cloud.base_url.rstrip("/") != previous_cloud_base_url:
-                    previous_cloud.logout()
-                self.cloud_account = CloudAccountService(
-                    next_config.cloud,
-                    data_dir=self.data_dir,
-                )
-                await previous_cloud.close()
+            if account_changed:
+                await self.account.configure(next_config.cloud)
             self._revision += 1
         await self._emit("settings.updated", None, None, {"revision": self._revision})
         return await self.settings_get({})
@@ -657,19 +555,18 @@ class CoreService:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        if self._owns_cloud_account:
-            await self.cloud_account.close()
+        await self.account.close()
 
-    async def cloud_account_status(self, _params: Mapping[str, Any]) -> dict[str, Any]:
-        return self.cloud_account.status()
+    async def account_status(self, _params: Mapping[str, Any]) -> dict[str, Any]:
+        return self.account.status()
 
-    async def cloud_account_login(self, params: Mapping[str, Any]) -> dict[str, Any]:
+    async def account_login(self, params: Mapping[str, Any]) -> dict[str, Any]:
         username = self._required_string(params, "username")
         password = self._required_string(params, "password")
         try:
-            result = await self.cloud_account.login(username=username, password=password)
-        except CloudError as exc:
-            raise BridgeError("authentication_failed", self._sanitize(str(exc))) from None
+            result = await self.account.login(username=username, password=password)
+        except Exception as exc:
+            raise RuntimeFailure("authentication_failed", self._sanitize(str(exc))) from None
         await self._emit("cloud.account.updated", None, None, result)
         await self._emit(
             "provider.updated",
@@ -679,8 +576,8 @@ class CoreService:
         )
         return result
 
-    async def cloud_account_logout(self, _params: Mapping[str, Any]) -> dict[str, Any]:
-        result = self.cloud_account.logout()
+    async def account_logout(self, _params: Mapping[str, Any]) -> dict[str, Any]:
+        result = self.account.logout()
         await self._emit("cloud.account.updated", None, None, result)
         await self._emit(
             "provider.updated",
@@ -696,7 +593,7 @@ class CoreService:
     async def provider_local_add(self, params: Mapping[str, Any]) -> dict[str, Any]:
         provider_id = validate_provider_id(self._required_string(params, "provider_id"))
         if provider_id in {DEEPSEEK_PROVIDER_ID, "aeloon-cloud"}:
-            raise BridgeError("invalid_argument", f"Provider id is reserved: {provider_id}")
+            raise RuntimeFailure("invalid_argument", f"Provider id is reserved: {provider_id}")
         base_url = self._http_base_url(self._required_string(params, "base_url"))
         name = str(params.get("name") or provider_id).strip() or provider_id
         api_key = str(params.get("api_key") or "no-key")
@@ -711,17 +608,17 @@ class CoreService:
                 extra_headers=extra_headers,
             )
         if not isinstance(raw_models, list) or not raw_models:
-            raise BridgeError("invalid_argument", "models must be a non-empty list")
+            raise RuntimeFailure("invalid_argument", "models must be a non-empty list")
         models: list[LocalModelConfig] = []
         model_ids: set[str] = set()
         for raw_model in raw_models:
             value = {"id": raw_model} if isinstance(raw_model, str) else raw_model
             if not isinstance(value, Mapping):
-                raise BridgeError("invalid_argument", "each model must be a string or object")
+                raise RuntimeFailure("invalid_argument", "each model must be a string or object")
             parsed_model = LocalModelConfig.model_validate(dict(value))
             canonical = qualify_model_id(provider_id, parsed_model.id)
             if canonical in model_ids:
-                raise BridgeError("invalid_argument", f"Duplicate model: {canonical}")
+                raise RuntimeFailure("invalid_argument", f"Duplicate model: {canonical}")
             model_ids.add(canonical)
             models.append(parsed_model.model_copy(update={"id": split_model_id(canonical)[1]}))
         provider = LocalProviderConfig(
@@ -735,9 +632,9 @@ class CoreService:
         revision = params.get("revision")
         async with self._settings_lock:
             if revision is not None and revision != self._revision:
-                raise BridgeError("revision_conflict", "Core settings changed; refresh and try again")
+                raise RuntimeFailure("revision_conflict", "Core settings changed; refresh and try again")
             if provider_id in self.config.local_providers:
-                raise BridgeError("invalid_argument", f"Provider already exists: {provider_id}")
+                raise RuntimeFailure("invalid_argument", f"Provider already exists: {provider_id}")
             raw = load_config(self.config_path).model_dump(mode="json")
             raw["local_providers"][provider_id] = provider.model_dump(mode="json")
             await asyncio.to_thread(
@@ -756,9 +653,9 @@ class CoreService:
         revision = params.get("revision")
         async with self._settings_lock:
             if revision is not None and revision != self._revision:
-                raise BridgeError("revision_conflict", "Core settings changed; refresh and try again")
+                raise RuntimeFailure("revision_conflict", "Core settings changed; refresh and try again")
             if provider_id not in self.config.local_providers:
-                raise BridgeError("invalid_argument", f"Unknown local provider: {provider_id}")
+                raise RuntimeFailure("invalid_argument", f"Unknown local provider: {provider_id}")
             raw = load_config(self.config_path).model_dump(mode="json")
             del raw["local_providers"][provider_id]
             fallback = self.config.agent.model
@@ -790,15 +687,17 @@ class CoreService:
                 await self._emit("operation.started", session, operation, {"kind": "turn"})
                 await self._emit_queue(session, runtime)
                 config_snapshot = self.config
-                harness = await self._new_harness(config_snapshot, session)
-                operation.harness = harness
-                harness.subscribe(lambda event: self._harness_event(session, operation, event))
+                agent = await self._new_agent(config_snapshot, session)
+                operation.agent = agent
+                await agent.prepare()
+                operation.model = agent.model
+                agent.subscribe(lambda event: self._run_event(session, operation, event))
                 pending = self._pending_next_turn(await session.get_entries())
                 for _, item in pending:
-                    await harness.next_turn(str(item.get("text") or ""))
+                    await agent.next_turn(str(item.get("text") or ""))
                 if pending:
                     await session.append_next_turn_consumed([entry_id for entry_id, _ in pending])
-                result = await self._invoke_input(harness, operation.input)
+                result = await self._invoke_input(agent, operation.input, run_id=operation.id)
                 operation.usage = result.usage.to_dict()
                 status = "cancelled" if result.stop_reason == "aborted" else "failed" if result.stop_reason == "error" else "completed"
                 operation.status = status
@@ -807,22 +706,24 @@ class CoreService:
                     run_id=operation.id,
                     status=status,
                     duration_ms=duration,
-                    error=self._sanitize(result.error_message or "") or None,
+                    error=self._sanitize(result.final_message.error_message or "") or None,
                 )
                 terminal_written = True
                 name = f"operation.{status}"
                 payload = {"kind": "turn", "duration_ms": duration}
                 if status == "failed":
-                    payload["error"] = self._sanitize(result.error_message or "Operation failed")
+                    payload["error"] = self._sanitize(
+                        result.final_message.error_message or "Operation failed"
+                    )
                 await self._emit(name, session, operation, payload)
                 if status == "completed" and await self._should_auto_rename(session, operation):
                     try:
                         title = await rename_session(
                             session=session,
-                            provider=harness.provider,
-                            model=harness.model,
+                            provider=agent.provider,  # type: ignore[arg-type]
+                            model=agent.model,  # type: ignore[arg-type]
                             user_prompt=str(operation.input.get("text") or ""),
-                            assistant_text=result.text,
+                            assistant_text=result.final_message.text,
                             stream_options=StreamOptions(
                                 timeout_ms=config_snapshot.agent.timeout_ms,
                                 max_retries=(
@@ -857,9 +758,10 @@ class CoreService:
                 await session.append_run_end(run_id=operation.id, status="failed", error=safe)
                 await self._emit("operation.failed", session, operation, {"kind": "turn", "error": safe})
         finally:
-            if operation.harness is not None:
-                await operation.harness.close()
-            operation.harness = None
+            if operation.agent is not None:
+                await operation.agent.close()
+            operation.agent = None
+            operation.model = None
             if runtime.active is operation:
                 runtime.active = None
             await self._emit_queue(session, runtime)
@@ -868,7 +770,7 @@ class CoreService:
         self,
         session: Session,
         kind: str,
-        execute: Callable[[AgentHarness], Awaitable[Any]],
+        execute: Callable[[SessionAgent], Awaitable[Any]],
     ) -> dict[str, Any]:
         runtime = self._runtime(session.id)
         operation = Operation(uuid.uuid4().hex, session.id, session.metadata.cwd, kind, {})
@@ -878,10 +780,10 @@ class CoreService:
             operation.status = "active"
             runtime.active = operation
             await self._emit("operation.started", session, operation, {"kind": kind})
-            harness = await self._new_harness(self.config, session)
-            operation.harness = harness
+            agent = await self._new_agent(self.config, session)
+            operation.agent = agent
             try:
-                result = await execute(harness)
+                result = await execute(agent)
                 operation.status = "completed"
                 await self._emit("operation.completed", session, operation, {"kind": kind})
                 return {"operation_id": operation.id, "result": result}
@@ -890,11 +792,11 @@ class CoreService:
                 await self._emit("operation.failed", session, operation, {"kind": kind, "error": self._sanitize(str(exc))})
                 raise
             finally:
-                await harness.close()
-                operation.harness = None
+                await agent.close()
+                operation.agent = None
                 runtime.active = None
 
-    async def _new_harness(self, config: Config, session: Session) -> AgentHarness:
+    async def _new_agent(self, config: Config, session: Session) -> SessionAgent:
         effective = config.model_copy(update={"workspace": Path(session.metadata.cwd)}).normalized()
         overrides = self._session_overrides(await session.get_entries())
         if overrides.get("model_id") or overrides.get("thinking_level"):
@@ -910,39 +812,16 @@ class CoreService:
                     )
                 }
             )
-        if self._harness_factory is not None:
-            value = self._harness_factory(effective, session)
+        catalog = self._provider_registry(effective)
+        if self._agent_factory is not None:
+            value = self._agent_factory(effective, session, catalog)
             return await value if inspect.isawaitable(value) else value
-        registry = self._provider_registry(effective)
-        model = await self._model(effective.agent.model, registry=registry)
-        provider = registry.provider(model)
         active_tools = overrides.get("active_tools")
-        return AgentHarness(
-            provider=provider,
-            model=model,
-            cwd=str(effective.workspace),
+        return SessionAgent(
+            config=effective,
             session=session,
-            active_tool_names=active_tools or DEFAULT_ACTIVE_TOOLS,
-            resource_loader=self._resource_loader(effective),
-            thinking_level=effective.agent.thinking_level,
-            stream_options=StreamOptions(
-                timeout_ms=effective.agent.timeout_ms,
-                max_tokens=effective.agent.max_tokens,
-                temperature=effective.agent.temperature,
-                thinking_level=effective.agent.thinking_level,
-                max_retries=effective.agent.retry.max_retries if effective.agent.retry.enabled else 0,
-                base_delay_ms=effective.agent.retry.base_delay_ms,
-                max_retry_delay_ms=effective.agent.retry.max_retry_delay_ms,
-            ),
-            steering_mode=effective.agent.steering_mode,
-            follow_up_mode=effective.agent.follow_up_mode,
-            compaction=CompactionSettings(
-                enabled=effective.agent.compaction.enabled,
-                reserve_tokens=effective.agent.compaction.reserve_tokens,
-                keep_recent_tokens=effective.agent.compaction.keep_recent_tokens,
-            ),
-            shell_path=effective.tools.shell_path,
-            auto_resize_images=effective.tools.auto_resize_images,
+            catalog=catalog,
+            active_tool_names=tuple(active_tools) if active_tools else None,
         )
 
     async def _should_auto_rename(self, session: Session, operation: Operation) -> bool:
@@ -963,21 +842,19 @@ class CoreService:
         return await self._provider_registry().models()
 
     async def _model(
-        self, model_id: str, *, registry: UnifiedProviderRegistry | None = None
+        self, model_id: str, *, registry: ProviderCatalog | None = None
     ) -> Model:
         try:
             return await (registry or self._provider_registry()).model(model_id)
         except PermissionError as exc:
-            raise BridgeError("authentication_failed", str(exc)) from None
+            raise RuntimeFailure("authentication_failed", str(exc)) from None
         except RuntimeError as exc:
-            raise BridgeError("invalid_state", str(exc)) from None
-        except CloudError as exc:
-            raise BridgeError("authentication_failed", self._sanitize(str(exc))) from None
+            raise RuntimeFailure("invalid_state", str(exc)) from None
         except KeyError:
-            raise BridgeError("invalid_argument", f"Unknown model: {model_id}") from None
+            raise RuntimeFailure("invalid_argument", f"Unknown model: {model_id}") from None
 
-    def _provider_registry(self, config: Config | None = None) -> UnifiedProviderRegistry:
-        return UnifiedProviderRegistry(config or self.config, self.cloud_account)
+    def _provider_registry(self, config: Config | None = None) -> ProviderCatalog:
+        return self._catalog_factory(config or self.config)
 
     async def _provider_result(self, provider_id: str) -> dict[str, Any]:
         providers = await self._provider_registry().providers()
@@ -1001,15 +878,15 @@ class CoreService:
             response.raise_for_status()
             payload = response.json()
         except (httpx.HTTPError, ValueError) as exc:
-            raise BridgeError(
+            raise RuntimeFailure(
                 "invalid_argument",
                 self._sanitize(f"Could not load models from the local API: {exc}"),
             ) from None
         if not isinstance(payload, Mapping):
-            raise BridgeError("invalid_argument", "Local API /models returned an invalid payload")
+            raise RuntimeFailure("invalid_argument", "Local API /models returned an invalid payload")
         raw_models = payload.get("data", payload.get("models"))
         if not isinstance(raw_models, list):
-            raise BridgeError("invalid_argument", "Local API /models returned no model list")
+            raise RuntimeFailure("invalid_argument", "Local API /models returned no model list")
         models: list[dict[str, Any]] = []
         for raw in raw_models:
             if isinstance(raw, str):
@@ -1046,7 +923,7 @@ class CoreService:
             )
             models.append(model)
         if not models:
-            raise BridgeError("invalid_argument", "Local API /models returned no usable models")
+            raise RuntimeFailure("invalid_argument", "Local API /models returned no usable models")
         return models
 
     def _reload_config(self) -> None:
@@ -1061,9 +938,9 @@ class CoreService:
 
         parsed = urlsplit(value)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise BridgeError("invalid_argument", "base_url must be an HTTP(S) URL")
+            raise RuntimeFailure("invalid_argument", "base_url must be an HTTP(S) URL")
         if parsed.username or parsed.password or parsed.query or parsed.fragment:
-            raise BridgeError(
+            raise RuntimeFailure(
                 "invalid_argument",
                 "base_url must not contain credentials, a query, or a fragment",
             )
@@ -1074,10 +951,10 @@ class CoreService:
         if value is None:
             return {}
         if not isinstance(value, Mapping):
-            raise BridgeError("invalid_argument", "extra_headers must be an object")
+            raise RuntimeFailure("invalid_argument", "extra_headers must be an object")
         result = {str(key): str(item) for key, item in value.items()}
         if any(not key.strip() for key in result):
-            raise BridgeError("invalid_argument", "extra_headers contains an empty name")
+            raise RuntimeFailure("invalid_argument", "extra_headers contains an empty name")
         return result
 
     def _resource_loader(self, config: Config) -> ResourceLoader:
@@ -1090,12 +967,26 @@ class CoreService:
             no_context_files=config.resources.no_context_files,
         )
 
-    async def _invoke_input(self, harness: AgentHarness, value: Mapping[str, Any]) -> Any:
+    async def _invoke_input(
+        self,
+        agent: SessionAgent,
+        value: Mapping[str, Any],
+        *,
+        run_id: str,
+    ) -> Any:
         kind = value["kind"]
         if kind == "skill":
-            return await harness.skill(str(value["name"]), value.get("additional_instructions"))
+            return await agent.skill(
+                str(value["name"]),
+                value.get("additional_instructions"),
+                run_id=run_id,
+            )
         if kind == "prompt_template":
-            return await harness.prompt_template(str(value["name"]), tuple(value.get("arguments") or []))
+            return await agent.prompt_template(
+                str(value["name"]),
+                tuple(value.get("arguments") or []),
+                run_id=run_id,
+            )
         text = str(value.get("text") or "")
         images: list[ImageContent] = []
         supplements: list[str] = []
@@ -1114,9 +1005,14 @@ class CoreService:
                     supplements.append(f"[Binary file attached: {attachment['name']}]")
         if supplements:
             text = "\n\n".join([text, *supplements])
-        return await harness.prompt(text, images=tuple(images))
+        return await agent.prompt(text, images=tuple(images), run_id=run_id)
 
-    async def _harness_event(self, session: Session, operation: Operation, event: HarnessEvent) -> None:
+    async def _run_event(
+        self,
+        session: Session,
+        operation: Operation,
+        event: RunEvent,
+    ) -> None:
         data = event.data
         if event.type == "message_update":
             stream = data.get("assistantMessageEvent") or {}
@@ -1150,9 +1046,7 @@ class CoreService:
                     await self._emit(name, session, operation, {"block_id": block["id"], "patch": self._clean_block(block)})
                 usage = message.get("usage") or {}
                 operation.usage = dict(usage) if isinstance(usage, Mapping) else {}
-                context_window = (
-                    operation.harness.model.context_window if operation.harness else None
-                )
+                context_window = operation.model.context_window if operation.model else None
                 await self._emit(
                     "usage.updated",
                     session,
@@ -1196,18 +1090,15 @@ class CoreService:
         session: Session | None,
         operation: Operation | None,
         payload: Mapping[str, Any],
-    ) -> dict[str, Any]:
-        self._seq += 1
-        event = {
-            "seq": self._seq,
-            "time": _now(),
-            "name": name,
-            "workspace": session.metadata.cwd if session else None,
-            "session_id": session.id if session else None,
-            "operation_id": operation.id if operation else None,
-            "payload": self._json_safe(dict(payload)),
-        }
-        self._events.append(event)
+    ) -> RuntimeEvent:
+        event = RuntimeEvent(
+            time=_now(),
+            name=name,
+            workspace=session.metadata.cwd if session else None,
+            session_id=session.id if session else None,
+            operation_id=operation.id if operation else None,
+            payload=self._json_safe(dict(payload)),
+        )
         for listener in tuple(self._listeners):
             try:
                 result = listener(event)
@@ -1233,12 +1124,12 @@ class CoreService:
         for runtime in self._runtimes.values():
             if operation_id in runtime.operations:
                 return runtime.operations[operation_id]
-        raise BridgeError("operation_not_found", f"Operation {operation_id} not found")
+        raise RuntimeFailure("operation_not_found", f"Operation {operation_id} not found")
 
     def _active_operation(self, params: Mapping[str, Any]) -> Operation:
         operation = self._operation(params)
-        if operation.status != "active" or operation.harness is None:
-            raise BridgeError("invalid_state", "steer/follow_up requires the active turn")
+        if operation.status != "active" or operation.agent is None:
+            raise RuntimeFailure("invalid_state", "steer/follow_up requires the active turn")
         return operation
 
     async def _session_metadata(self, session: Session) -> dict[str, Any]:
@@ -1252,7 +1143,7 @@ class CoreService:
 
     def _turn_input(self, raw: Any) -> dict[str, Any]:
         if not isinstance(raw, Mapping):
-            raise BridgeError("invalid_argument", "turn.start.input must be an object")
+            raise RuntimeFailure("invalid_argument", "turn.start.input must be an object")
         kind = raw.get("kind")
         if kind == "prompt":
             return self._prompt_input(raw)
@@ -1261,19 +1152,19 @@ class CoreService:
         if kind == "prompt_template":
             arguments = raw.get("arguments") or []
             if not isinstance(arguments, list) or any(not isinstance(item, str) for item in arguments):
-                raise BridgeError("invalid_argument", "template arguments must be strings")
+                raise RuntimeFailure("invalid_argument", "template arguments must be strings")
             return {"kind": "prompt_template", "name": self._required_string(raw, "name"), "arguments": arguments}
-        raise BridgeError("invalid_argument", "input.kind must be prompt, skill, or prompt_template")
+        raise RuntimeFailure("invalid_argument", "input.kind must be prompt, skill, or prompt_template")
 
     def _prompt_input(self, raw: Any) -> dict[str, Any]:
         if not isinstance(raw, Mapping):
-            raise BridgeError("invalid_argument", "input must be an object")
+            raise RuntimeFailure("invalid_argument", "input must be an object")
         text = str(raw.get("text") or "")
         if not text.strip() or len(text) > PROMPT_LIMIT:
-            raise BridgeError("invalid_argument", f"Prompt must contain 1 to {PROMPT_LIMIT:,} characters")
+            raise RuntimeFailure("invalid_argument", f"Prompt must contain 1 to {PROMPT_LIMIT:,} characters")
         attachments = raw.get("attachments") or []
         if not isinstance(attachments, list) or len(attachments) > ATTACHMENT_LIMIT:
-            raise BridgeError("invalid_attachment", f"At most {ATTACHMENT_LIMIT} attachments are allowed")
+            raise RuntimeFailure("invalid_attachment", f"At most {ATTACHMENT_LIMIT} attachments are allowed")
         return {"kind": "prompt", "text": text, "attachments": attachments}
 
     async def _copy_attachments(
@@ -1288,27 +1179,27 @@ class CoreService:
         result: list[dict[str, Any]] = []
         for raw in attachments:
             if not isinstance(raw, Mapping):
-                raise BridgeError("invalid_attachment", "Attachment must be an object")
+                raise RuntimeFailure("invalid_attachment", "Attachment must be an object")
             kind = str(raw.get("type") or "")
             if kind == "assistant_selection":
                 text = str(raw.get("text") or "")[:PROMPT_LIMIT]
                 result.append({"id": str(raw.get("id") or uuid.uuid4().hex), "type": kind, "name": str(raw.get("name") or "Assistant selection")[:255], "text": text})
                 continue
             if kind not in {"image", "file"}:
-                raise BridgeError("invalid_attachment", f"Unsupported attachment type: {kind}")
+                raise RuntimeFailure("invalid_attachment", f"Unsupported attachment type: {kind}")
             source_raw = raw.get("path")
             if not isinstance(source_raw, str):
-                raise BridgeError("invalid_attachment", "File attachment path is required")
+                raise RuntimeFailure("invalid_attachment", "File attachment path is required")
             try:
                 source = Path(source_raw).expanduser().resolve(strict=True)
             except OSError:
-                raise BridgeError("invalid_attachment", "Attachment source does not exist") from None
+                raise RuntimeFailure("invalid_attachment", "Attachment source does not exist") from None
             if not source.is_file() or not any(source.is_relative_to(root) for root in resolved_roots):
-                raise BridgeError("invalid_attachment", "Attachment is outside the declared roots")
+                raise RuntimeFailure("invalid_attachment", "Attachment is outside the declared roots")
             size = source.stat().st_size
             maximum = IMAGE_LIMIT if kind == "image" else FILE_LIMIT
             if size > maximum:
-                raise BridgeError("invalid_attachment", f"Attachment exceeds the {maximum // (1024 * 1024)} MiB limit")
+                raise RuntimeFailure("invalid_attachment", f"Attachment exceeds the {maximum // (1024 * 1024)} MiB limit")
             name = Path(str(raw.get("name") or source.name)).name[:255]
             target = destination / f"{uuid.uuid4().hex}{source.suffix[:20]}"
             await asyncio.to_thread(shutil.copy2, source, target)
@@ -1452,13 +1343,13 @@ class CoreService:
         allowed = {"default_model_id", "default_thinking_level", "retry", "compaction", "resources", "tools", "deepseek", "cloud"}
         unknown = set(patch) - allowed
         if unknown:
-            raise BridgeError("invalid_argument", f"Unknown settings fields: {', '.join(sorted(unknown))}")
+            raise RuntimeFailure("invalid_argument", f"Unknown settings fields: {', '.join(sorted(unknown))}")
         if "default_model_id" in patch:
             requested_model_id = str(patch["default_model_id"])
             try:
                 model_id = resolve_model_id(requested_model_id, valid_model_ids)
             except KeyError:
-                raise BridgeError(
+                raise RuntimeFailure(
                     "invalid_argument", f"Unknown model: {requested_model_id}"
                 ) from None
             raw["agent"]["model"] = model_id
@@ -1467,12 +1358,12 @@ class CoreService:
         for key in ("retry", "compaction"):
             if key in patch:
                 if not isinstance(patch[key], Mapping):
-                    raise BridgeError("invalid_argument", f"{key} must be an object")
+                    raise RuntimeFailure("invalid_argument", f"{key} must be an object")
                 raw["agent"][key].update(patch[key])
         if "resources" in patch:
             value = patch["resources"]
             if not isinstance(value, Mapping):
-                raise BridgeError("invalid_argument", "resources must be an object")
+                raise RuntimeFailure("invalid_argument", "resources must be an object")
             raw["resources"].update({
                 "roots": value.get("roots", raw["resources"]["roots"]),
                 "no_skills": not bool(value.get("load_skills", not raw["resources"]["no_skills"])),
@@ -1482,7 +1373,7 @@ class CoreService:
         for key in ("tools", "deepseek", "cloud"):
             if key in patch:
                 if not isinstance(patch[key], Mapping):
-                    raise BridgeError("invalid_argument", f"{key} must be an object")
+                    raise RuntimeFailure("invalid_argument", f"{key} must be an object")
                 raw[key].update(patch[key])
 
     def _clean_block(self, block: Mapping[str, Any]) -> dict[str, Any]:
@@ -1527,22 +1418,22 @@ class CoreService:
     def _required_string(params: Mapping[str, Any], key: str) -> str:
         value = params.get(key)
         if not isinstance(value, str) or not value.strip():
-            raise BridgeError("invalid_argument", f"{key} is required")
+            raise RuntimeFailure("invalid_argument", f"{key} is required")
         return value.strip()
 
     @staticmethod
     def _thinking_level(value: Any) -> str:
         level = str(value)
         if level not in {"off", "minimal", "low", "medium", "high", "max"}:
-            raise BridgeError("invalid_argument", "Invalid thinking level")
+            raise RuntimeFailure("invalid_argument", "Invalid thinking level")
         return level
 
     @staticmethod
     def _queue_mode(value: Any) -> str:
         mode = str(value)
         if mode not in {"all", "one-at-a-time"}:
-            raise BridgeError("invalid_argument", "Invalid queue mode")
+            raise RuntimeFailure("invalid_argument", "Invalid queue mode")
         return mode
 
 
-__all__ = ["CoreService"]
+__all__ = ["RuntimeService"]

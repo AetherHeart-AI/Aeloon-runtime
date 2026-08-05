@@ -1,4 +1,4 @@
-"""Core-owned Aeloon Cloud account state and dynamic model catalog."""
+"""Aeloon Cloud account state and dynamic model catalog."""
 
 from __future__ import annotations
 
@@ -13,9 +13,9 @@ from pathlib import Path
 from typing import Any
 
 from aeloon_core.cloud.client import CloudClient, CloudError, CloudTokenBundle
+from aeloon_core.cloud.config import CloudConfig
 from aeloon_core.cloud.vault import TokenVault, default_token_vault
-from aeloon_core.config import CloudConfig
-from aeloon_core.harness.types import Model
+from aeloon_core.core import Model
 
 CLOUD_PROVIDER_ID = "aeloon-cloud"
 CATALOG_TTL_SECONDS = 3_600

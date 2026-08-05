@@ -1,4 +1,4 @@
-"""Configuration for the standalone Python harness."""
+"""Configuration for the Aeloon application runtime."""
 
 from __future__ import annotations
 
@@ -44,18 +44,6 @@ class LocalProviderConfig(BaseModel):
     proxy: str | None = None
     extra_headers: dict[str, str] = Field(default_factory=dict)
     models: list[LocalModelConfig] = Field(min_length=1)
-
-
-class CloudConfig(BaseModel):
-    """Aeloon's optional account-backed model service."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    enabled: bool = True
-    base_url: str = "https://api.aetherheart.com"
-    proxy: str | None = None
-    device_name: str = "Aeloon Core"
-    allow_insecure_http: bool = False
 
 
 class RetryConfig(BaseModel):
@@ -104,6 +92,18 @@ class ToolConfig(BaseModel):
 
     shell_path: str | None = None
     auto_resize_images: bool = True
+
+
+class CloudConfig(BaseModel):
+    """Transport-neutral configuration passed to an injected account gateway."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    base_url: str = "https://api.aetherheart.com"
+    proxy: str | None = None
+    device_name: str = "Aeloon Core"
+    allow_insecure_http: bool = False
 
 
 class Config(BaseModel):

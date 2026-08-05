@@ -26,9 +26,26 @@ uv run aeloon-core config path
 uv run aeloon-core config show
 ```
 
-`stream-json` emits typed harness events followed by a result object. `json` emits only the result
+`stream-json` emits typed run events followed by a result object. `json` emits only the result
 object. Interactive text output uses stderr for status and stdout for the final response, so
 redirected output remains stable.
+
+## Python API
+
+The Python API is intentionally breaking at this boundary. The modules
+`aeloon_core.harness`, `aeloon_core.service`, `aeloon_core.providers`, and
+`aeloon_core.rename_session` have been removed; no compatibility shims are provided.
+
+- Use `aeloon_core.core.RunRequest`, `RunResult`, `RunController`, and `run_agent()` for a
+  single stateless agent run.
+- Use `aeloon_core.runtime.RuntimeService` and the typed runtime DTOs for sessions and
+  application operations.
+- Use `aeloon_core.bootstrap.create_runtime_service()` to compose the standard runtime with
+  cloud account, catalog, and provider capabilities.
+
+`run_agent()` receives the complete initial transcript and does not retain state across calls.
+Injected providers and tools are owned by the caller; runtime owns and closes the instances it
+creates for managed operations.
 
 ## Provider and model configuration
 
@@ -93,3 +110,6 @@ uv run aeloon-core bridge stop
 Older Bridge clients are not protocol-compatible with v2 and must update their method names,
 handshake handling, and DTO parsing together. `status` and `stop` are idempotent when the daemon or
 socket is absent.
+
+This module refactor does not change the Bridge v2 wire protocol or version-3 JSONL session
+format. Existing v2 clients and v3 session files remain compatible.

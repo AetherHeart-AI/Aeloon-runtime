@@ -1,4 +1,4 @@
-"""Public, provider-neutral contracts for the Python agent harness."""
+"""Provider-neutral contracts for stateless agent runs."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from typing import Any, Literal, Protocol, TypeAlias
 ThinkingLevel = Literal["off", "minimal", "low", "medium", "high", "max"]
 QueueMode = Literal["all", "one-at-a-time"]
 StopReason = Literal["stop", "toolUse", "length", "error", "aborted"]
-HarnessEventType = Literal[
+RunEventType = Literal[
     "abort",
     "agent_end",
     "agent_start",
@@ -46,8 +46,8 @@ HarnessEventType = Literal[
 ]
 
 
-class HarnessError(RuntimeError):
-    """Stable public harness failure."""
+class RunError(RuntimeError):
+    """Stable public failure raised while preparing or running an agent."""
 
     def __init__(self, code: str, message: str, *, cause: Exception | None = None) -> None:
         super().__init__(message)
@@ -55,12 +55,8 @@ class HarnessError(RuntimeError):
         self.cause = cause
 
 
-class ProviderError(HarnessError):
+class ProviderError(RunError):
     """Provider or transport failure."""
-
-
-class SessionError(HarnessError):
-    """Session repository or tree failure."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -476,19 +472,18 @@ class Resources:
 
 
 @dataclass(frozen=True, slots=True)
-class HarnessEvent:
-    type: HarnessEventType
+class RunEvent:
+    type: RunEventType
     data: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {**self.data, "type": self.type}
 
 
-EventListener: TypeAlias = Callable[[HarnessEvent], Awaitable[None] | None]
-HookHandler: TypeAlias = Callable[
-    [HarnessEvent], Awaitable[dict[str, Any] | None] | dict[str, Any] | None
+RunEventSink: TypeAlias = Callable[[RunEvent], Awaitable[None] | None]
+RunHook: TypeAlias = Callable[
+    [RunEvent], Awaitable[dict[str, Any] | None] | dict[str, Any] | None
 ]
-
 
 __all__ = [
     "AgentMessage",
@@ -496,11 +491,11 @@ __all__ = [
     "AssistantContent",
     "AssistantMessage",
     "AssistantStreamEvent",
-    "EventListener",
-    "HarnessError",
-    "HarnessEvent",
-    "HarnessEventType",
-    "HookHandler",
+    "RunError",
+    "RunEvent",
+    "RunEventSink",
+    "RunEventType",
+    "RunHook",
     "ImageContent",
     "Model",
     "PromptTemplate",
@@ -509,7 +504,6 @@ __all__ = [
     "ProviderError",
     "QueueMode",
     "Resources",
-    "SessionError",
     "Skill",
     "StopReason",
     "StreamOptions",

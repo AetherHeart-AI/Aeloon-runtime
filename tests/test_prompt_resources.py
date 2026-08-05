@@ -5,7 +5,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from aeloon_core.harness import ResourceLoader, build_system_prompt, create_all_tools
+from aeloon_core.core import build_system_prompt, create_all_tools
+from aeloon_core.runtime import ResourceLoader
 
 
 def test_default_prompt_is_deterministic_and_tracks_active_tools(tmp_path: Path) -> None:

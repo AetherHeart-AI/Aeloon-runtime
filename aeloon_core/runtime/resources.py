@@ -1,4 +1,4 @@
-"""Aeloon-namespaced resource discovery with deterministic precedence."""
+"""Runtime-owned resource discovery with deterministic precedence."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from typing import Any
 
 import yaml
 
-from aeloon_core.harness.types import PromptTemplate, Resources, Skill
+from aeloon_core.core.types import PromptTemplate, Resources, Skill
 
 _CONTEXT_NAMES = ("AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD")
 

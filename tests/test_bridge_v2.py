@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 import aeloon_core.bridge.daemon as bridge_daemon
+from aeloon_core.bridge import BridgeRpcAdapter
 from aeloon_core.bridge.daemon import (
     BridgeDaemon,
     bridge_request,
@@ -20,19 +21,20 @@ from aeloon_core.bridge.daemon import (
 )
 from aeloon_core.bridge.protocol import BridgeError
 from aeloon_core.config import Config, save_config
-from aeloon_core.harness import (
-    AgentHarness,
+from aeloon_core.core import (
     AssistantMessage,
     AssistantStreamEvent,
     ScriptedProvider,
     TextContent,
     Usage,
-    get_deepseek_model,
 )
-from aeloon_core.service import CoreService
+from aeloon_core.runtime import ProviderCatalog, RuntimeService
 
 
-def scripted_service(tmp_path: Path, text: str = "bridge answer") -> CoreService:
+def scripted_service(
+    tmp_path: Path,
+    text: str = "bridge answer",
+) -> tuple[RuntimeService, BridgeRpcAdapter]:
     config_path = tmp_path / "config.json"
     save_config(
         Config(
@@ -43,39 +45,43 @@ def scripted_service(tmp_path: Path, text: str = "bridge answer") -> CoreService
         config_path,
     )
 
-    def factory(config: Config, session: Any) -> AgentHarness:
+    def provider_factory(**_kwargs):
         message = AssistantMessage(
             (TextContent(text),),
             "deepseek",
-            config.agent.model,
+            "deepseek/deepseek-v4-flash",
             usage=Usage(input=2, output=3, total_tokens=5),
         )
-        return AgentHarness(
-            provider=ScriptedProvider([message]),
-            model=get_deepseek_model(config.agent.model),
-            cwd=str(config.workspace),
-            session=session,
-        )
+        return ScriptedProvider([message])
 
-    return CoreService(config_path=config_path, harness_factory=factory)
+    runtime = RuntimeService(
+        config_path=config_path,
+        catalog_factory=lambda config: ProviderCatalog(
+            config,
+            local_provider_factory=provider_factory,
+        ),
+    )
+    return runtime, BridgeRpcAdapter(runtime)
 
 
 @pytest.mark.asyncio
 async def test_stable_turn_projection_and_replay(tmp_path: Path) -> None:
-    service = scripted_service(tmp_path)
-    metadata = await service.session_create({"workspace": str(tmp_path), "title": "Bridge"})
-    started = await service.turn_start(
+    runtime, service = scripted_service(tmp_path)
+    metadata = await service.dispatch(
+        "session.create", {"workspace": str(tmp_path), "title": "Bridge"}
+    )
+    started = await service.dispatch(
+        "turn.start",
         {
             "session_id": metadata["session_id"],
             "input": {"kind": "prompt", "text": "hello"},
         },
-        attachment_roots=(),
     )
-    operation = service._operation({"operation_id": started["operation_id"]})
+    operation = runtime._operation({"operation_id": started["operation_id"]})
     assert operation.task is not None
     await operation.task
 
-    snapshot = await service.session_get({"session_id": metadata["session_id"]})
+    snapshot = await service.dispatch("session.get", {"session_id": metadata["session_id"]})
     turn = snapshot["timeline"][0]
     assert turn["turn_id"] == started["operation_id"]
     assert turn["status"] == "completed"
@@ -92,7 +98,8 @@ async def test_stable_turn_projection_and_replay(tmp_path: Path) -> None:
     assert snapshot["stats"]["cache"]["requestCount"] == 1
     assert snapshot["active_operations"] == []
 
-    replay = await service.events_subscribe(
+    replay = await service.dispatch(
+        "events.subscribe",
         {"session_ids": [metadata["session_id"]], "after_seq": 0}
     )
     assert replay["replay_complete"] is True
@@ -117,32 +124,31 @@ async def test_session_serialization_and_cross_session_concurrency(tmp_path: Pat
         config_path,
     )
 
-    def factory(config: Config, session: Any) -> AgentHarness:
-        return AgentHarness(
-            provider=tracker,
-            model=get_deepseek_model(config.agent.model),
-            cwd=str(config.workspace),
-            session=session,
+    runtime = RuntimeService(
+        config_path=config_path,
+        catalog_factory=lambda config: ProviderCatalog(
+            config,
+            local_provider_factory=lambda **_kwargs: tracker,
         )
-
-    service = CoreService(config_path=config_path, harness_factory=factory)
-    first = await service.session_create({"workspace": str(tmp_path)})
-    second = await service.session_create({"workspace": str(tmp_path)})
+    )
+    service = BridgeRpcAdapter(runtime)
+    first = await service.dispatch("session.create", {"workspace": str(tmp_path)})
+    second = await service.dispatch("session.create", {"workspace": str(tmp_path)})
     operations = [
-        await service.turn_start(
+        await service.dispatch(
+            "turn.start",
             {"session_id": first["session_id"], "input": {"kind": "prompt", "text": text}},
-            attachment_roots=(),
         )
         for text in ("one", "two")
     ]
     operations.append(
-        await service.turn_start(
+        await service.dispatch(
+            "turn.start",
             {"session_id": second["session_id"], "input": {"kind": "prompt", "text": "three"}},
-            attachment_roots=(),
         )
     )
     await asyncio.gather(
-        *(service._operation({"operation_id": item["operation_id"]}).task for item in operations)
+        *(runtime._operation({"operation_id": item["operation_id"]}).task for item in operations)
     )
     assert tracker.max_by_session[first["session_id"]] == 1
     assert tracker.max_global >= 2
@@ -150,8 +156,8 @@ async def test_session_serialization_and_cross_session_concurrency(tmp_path: Pat
 
 @pytest.mark.asyncio
 async def test_attachment_roots_copy_limits_and_cleanup(tmp_path: Path) -> None:
-    service = scripted_service(tmp_path)
-    metadata = await service.session_create({"workspace": str(tmp_path)})
+    runtime, service = scripted_service(tmp_path)
+    metadata = await service.dispatch("session.create", {"workspace": str(tmp_path)})
     allowed = tmp_path / "allowed"
     allowed.mkdir()
     source = allowed / "notes.txt"
@@ -160,7 +166,8 @@ async def test_attachment_roots_copy_limits_and_cleanup(tmp_path: Path) -> None:
     outside.write_text("outside", encoding="utf-8")
 
     with pytest.raises(BridgeError, match="declared roots"):
-        await service.turn_start(
+        await service.dispatch(
+            "turn.start",
             {
                 "session_id": metadata["session_id"],
                 "input": {
@@ -172,7 +179,8 @@ async def test_attachment_roots_copy_limits_and_cleanup(tmp_path: Path) -> None:
             attachment_roots=(allowed,),
         )
 
-    started = await service.turn_start(
+    started = await service.dispatch(
+        "turn.start",
         {
             "session_id": metadata["session_id"],
             "input": {
@@ -183,22 +191,23 @@ async def test_attachment_roots_copy_limits_and_cleanup(tmp_path: Path) -> None:
         },
         attachment_roots=(allowed,),
     )
-    operation = service._operation({"operation_id": started["operation_id"]})
+    operation = runtime._operation({"operation_id": started["operation_id"]})
     managed = Path(operation.input["attachments"][0]["managed_path"])
     assert managed.read_text(encoding="utf-8") == "stable source"
     source.write_text("changed", encoding="utf-8")
     assert managed.read_text(encoding="utf-8") == "stable source"
     assert operation.task is not None
     await operation.task
-    await service.session_delete({"session_id": metadata["session_id"]})
+    await service.dispatch("session.delete", {"session_id": metadata["session_id"]})
     assert not managed.exists()
 
 
 @pytest.mark.asyncio
 async def test_revisioned_settings_never_return_secret(tmp_path: Path) -> None:
-    service = scripted_service(tmp_path)
-    initial = await service.settings_get({})
-    updated = await service.settings_update(
+    _runtime, service = scripted_service(tmp_path)
+    initial = await service.dispatch("settings.get")
+    updated = await service.dispatch(
+        "settings.update",
         {
             "revision": initial["revision"],
             "patch": {"default_model_id": "deepseek-v4-pro"},
@@ -212,16 +221,18 @@ async def test_revisioned_settings_never_return_secret(tmp_path: Path) -> None:
     assert "very-secret" not in json.dumps(updated)
     assert (tmp_path / "config.json").stat().st_mode & 0o777 == 0o600
     with pytest.raises(BridgeError, match="refresh"):
-        await service.settings_update({"revision": initial["revision"], "patch": {}})
+        await service.dispatch(
+            "settings.update", {"revision": initial["revision"], "patch": {}}
+        )
 
 
 @pytest.mark.asyncio
 async def test_unfinished_persisted_run_is_interrupted_after_service_restart(
     tmp_path: Path,
 ) -> None:
-    service = scripted_service(tmp_path)
-    metadata = await service.session_create({"workspace": str(tmp_path)})
-    session = await service.repository.open(metadata["session_id"])
+    runtime, service = scripted_service(tmp_path)
+    metadata = await service.dispatch("session.create", {"workspace": str(tmp_path)})
+    session = await runtime.repository.open(metadata["session_id"])
     await session.append_run_start(
         run_id="crashed-turn",
         input={"kind": "prompt", "text": "unfinished", "attachments": []},
@@ -229,15 +240,17 @@ async def test_unfinished_persisted_run_is_interrupted_after_service_restart(
         thinking_level="off",
     )
 
-    restarted = scripted_service(tmp_path)
-    snapshot = await restarted.session_get({"session_id": metadata["session_id"]})
+    _restarted_runtime, restarted = scripted_service(tmp_path)
+    snapshot = await restarted.dispatch(
+        "session.get", {"session_id": metadata["session_id"]}
+    )
     assert snapshot["timeline"][0]["turn_id"] == "crashed-turn"
     assert snapshot["timeline"][0]["status"] == "interrupted"
 
 
 @pytest.mark.asyncio
 async def test_daemon_socket_permissions_and_multi_client_handshake(tmp_path: Path) -> None:
-    service = scripted_service(tmp_path)
+    _runtime_service, service = scripted_service(tmp_path)
     runtime = Path(tempfile.mkdtemp(prefix="aeloon-bridge-", dir="/tmp"))
     socket_path = runtime / "bridge.sock"
     daemon = BridgeDaemon(service, socket_path)

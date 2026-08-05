@@ -14,9 +14,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from aeloon_core.bootstrap import create_runtime_service
+from aeloon_core.bridge.adapter import BridgeRpcAdapter
 from aeloon_core.bridge.protocol import PROTOCOL_VERSION, BridgeError
 from aeloon_core.config import load_config, resolve_config_path
-from aeloon_core.service import CoreService
 
 MAX_REQUEST_BYTES = 1024 * 1024
 
@@ -97,7 +98,7 @@ class BridgeConnection:
             params = request.get("params") or {}
             if not isinstance(method, str) or not isinstance(params, dict):
                 raise BridgeError("invalid_argument", "Invalid method or params")
-            result = await self.daemon.service.dispatch(
+            result = await self.daemon.adapter.dispatch(
                 method,
                 params,
                 attachment_roots=self.attachment_roots,
@@ -128,12 +129,12 @@ class BridgeConnection:
 
 
 class BridgeDaemon:
-    def __init__(self, service: CoreService, socket_path: Path) -> None:
-        self.service = service
+    def __init__(self, adapter: BridgeRpcAdapter, socket_path: Path) -> None:
+        self.adapter = adapter
         self.socket_path = socket_path.expanduser().resolve(strict=False)
         self.connections: set[BridgeConnection] = set()
         self.server: asyncio.AbstractServer | None = None
-        self._remove_listener = service.add_event_listener(self._broadcast)
+        self._remove_listener = adapter.add_event_listener(self._broadcast)
 
     async def run(self) -> None:
         if len(os.fsencode(self.socket_path)) >= 104:
@@ -161,7 +162,7 @@ class BridgeDaemon:
             with contextlib.suppress(NotImplementedError):
                 loop.add_signal_handler(name, self._signal_shutdown)
         try:
-            await self.service.shutdown_signal.wait()
+            await self.adapter.shutdown_signal.wait()
         finally:
             self.server.close()
             for connection in tuple(self.connections):
@@ -171,7 +172,7 @@ class BridgeDaemon:
                 return_exceptions=True,
             )
             await self.server.wait_closed()
-            await self.service.close()
+            await self.adapter.close()
             self._remove_listener()
             with contextlib.suppress(FileNotFoundError):
                 self.socket_path.unlink()
@@ -179,8 +180,8 @@ class BridgeDaemon:
                 self._metadata_path().unlink()
 
     def _signal_shutdown(self) -> None:
-        self.service.shutdown_requested.set()
-        self.service.shutdown_signal.set()
+        self.adapter.shutdown_requested.set()
+        self.adapter.shutdown_signal.set()
 
     async def _accept(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         connection = BridgeConnection(self, reader, writer)
@@ -203,9 +204,9 @@ class BridgeDaemon:
                 {
                     "pid": os.getpid(),
                     "socket_path": str(self.socket_path),
-                    "config_path": str(self.service.config_path),
-                    "data_dir": str(self.service.data_dir),
-                    "server_instance_id": self.service.server_instance_id,
+                    "config_path": str(self.adapter.config_path),
+                    "data_dir": str(self.adapter.data_dir),
+                    "server_instance_id": self.adapter.server_instance_id,
                     "protocol_version": PROTOCOL_VERSION,
                 },
                 separators=(",", ":"),
@@ -226,12 +227,12 @@ async def run_daemon(
     if data_dir is not None:
         config = config.model_copy(update={"data_dir": Path(data_dir)}).normalized()
     resolved_socket = Path(socket_path) if socket_path is not None else default_socket_path(config.data_dir)
-    service = CoreService(
+    runtime = create_runtime_service(
         config_path=config_path,
         data_dir=data_dir,
         max_concurrent_operations=max_concurrent_operations,
     )
-    await BridgeDaemon(service, resolved_socket).run()
+    await BridgeDaemon(BridgeRpcAdapter(runtime), resolved_socket).run()
 
 
 async def bridge_request(

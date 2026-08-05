@@ -1,4 +1,4 @@
-"""Provider implementations for the Python harness."""
+"""Provider implementations for stateless agent runs."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from typing import Any
 
 import httpx
 
-from aeloon_core.harness.types import (
+from aeloon_core.core.types import (
     AgentMessage,
     AssistantMessage,
     AssistantStreamEvent,

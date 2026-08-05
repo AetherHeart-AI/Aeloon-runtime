@@ -6,17 +6,18 @@ from pathlib import Path
 
 import pytest
 
-from aeloon_core.harness import (
+from aeloon_core.config import Config
+from aeloon_core.core import (
     DEEPSEEK_V4_FLASH,
-    AgentHarness,
     AssistantMessage,
-    JsonlSessionRepository,
     ScriptedProvider,
     TextContent,
     ToolResultMessage,
     Usage,
     UserMessage,
 )
+from aeloon_core.runtime import JsonlSessionRepository
+from aeloon_core.runtime.agent import SessionAgent
 
 
 def _assistant(text: str) -> AssistantMessage:
@@ -203,14 +204,24 @@ async def test_tree_navigation_can_summarize_and_label_abandoned_branch(tmp_path
     await session.append_message(UserMessage("branch work"))
     await session.append_message(_assistant("branch result"))
     provider = ScriptedProvider([_assistant("branch checkpoint")])
-    harness = AgentHarness(
-        provider=provider,
-        model=DEEPSEEK_V4_FLASH,
-        cwd=str(tmp_path),
+    class StaticCatalog:
+        async def model(self, _model_id):
+            return DEEPSEEK_V4_FLASH
+
+        def provider(self, _model):
+            return provider
+
+    agent = SessionAgent(
+        config=Config(
+            workspace=tmp_path,
+            data_dir=tmp_path,
+            agent={"model": DEEPSEEK_V4_FLASH.id},
+        ).normalized(),
         session=session,
+        catalog=StaticCatalog(),  # type: ignore[arg-type]
     )
 
-    result = await harness.navigate_tree(target, summarize=True, label="abandoned")
+    result = await agent.navigate_tree(target, summarize=True, label="abandoned")
 
     assert result["cancelled"] is False
     summary_id = result["summaryEntryId"]

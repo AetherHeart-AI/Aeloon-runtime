@@ -1,4 +1,4 @@
-"""System-prompt construction for the Aeloon harness."""
+"""Pure system-prompt construction for agent runs."""
 
 # Prompt prose uses full lines to keep string snapshots stable.
 # ruff: noqa: E501
@@ -8,7 +8,7 @@ from __future__ import annotations
 from pathlib import Path
 from xml.sax.saxutils import escape
 
-from aeloon_core.harness.types import AgentTool, Resources, Skill
+from aeloon_core.core.types import AgentTool, Resources, Skill
 
 
 def format_skills_for_system_prompt(skills: tuple[Skill, ...]) -> str:

@@ -1,4 +1,4 @@
-"""Append-only JSONL session tree."""
+"""Runtime-owned append-only JSONL session tree."""
 
 from __future__ import annotations
 
@@ -11,15 +11,19 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from aeloon_core.harness.context_stats import cache_statistics, context_statistics
-from aeloon_core.harness.types import (
+from aeloon_core.core.context_stats import cache_statistics, context_statistics
+from aeloon_core.core.types import (
     AgentMessage,
-    SessionError,
+    RunError,
     Usage,
     UserMessage,
     message_from_dict,
     message_to_dict,
 )
+
+
+class SessionError(RunError):
+    """Stable runtime failure raised for invalid or missing session state."""
 
 COMPACTION_SUMMARY_PREFIX = (
     "The conversation history before this point was compacted into the following "
@@ -399,7 +403,7 @@ class Session:
 
 
 class JsonlSessionRepository:
-    """Create, open, list, fork, and delete harness sessions."""
+    """Create, open, list, fork, and delete runtime sessions."""
 
     def __init__(self, data_dir: Path | str) -> None:
         self.directory = Path(data_dir).expanduser().resolve(strict=False) / "harness-sessions"
@@ -579,5 +583,6 @@ __all__ = [
     "JsonlSessionRepository",
     "Session",
     "SessionContext",
+    "SessionError",
     "SessionMetadata",
 ]

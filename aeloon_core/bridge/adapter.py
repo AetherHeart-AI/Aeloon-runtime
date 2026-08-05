@@ -1,0 +1,367 @@
+"""Bridge v2 RPC adapter over the provider-neutral runtime service."""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+import os
+import uuid
+from collections import deque
+from collections.abc import Awaitable, Callable, Mapping
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+from aeloon_core.bridge.protocol import (
+    CAPABILITIES,
+    EVENTS,
+    METHODS,
+    PROTOCOL_NAME,
+    PROTOCOL_VERSION,
+    BridgeError,
+)
+from aeloon_core.core import RunError
+from aeloon_core.runtime.service import (
+    ATTACHMENT_LIMIT,
+    FILE_LIMIT,
+    IMAGE_LIMIT,
+    PROMPT_LIMIT,
+    RuntimeService,
+)
+from aeloon_core.runtime.session import SessionError
+from aeloon_core.runtime.types import RuntimeEvent, RuntimeFailure, TurnInput
+from aeloon_core.version import __version__
+
+EVENT_LIMIT = 5_000
+BridgeEventListener = Callable[[dict[str, Any]], Awaitable[None] | None]
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+class BridgeRpcAdapter:
+    """Own wire dispatch, public errors, event sequencing, and replay."""
+
+    def __init__(self, runtime: RuntimeService) -> None:
+        self.runtime = runtime
+        self.server_instance_id = uuid.uuid4().hex
+        self.started_at = _now()
+        self.shutdown_requested = asyncio.Event()
+        self.shutdown_signal = asyncio.Event()
+        self._events: deque[dict[str, Any]] = deque(maxlen=EVENT_LIMIT)
+        self._seq = 0
+        self._listeners: set[BridgeEventListener] = set()
+        self._remove_runtime_listener = runtime.add_event_listener(self._runtime_event)
+
+    @property
+    def config_path(self) -> Path:
+        return self.runtime.config_path
+
+    @property
+    def data_dir(self) -> Path:
+        return self.runtime.data_dir
+
+    def add_event_listener(self, listener: BridgeEventListener) -> Callable[[], None]:
+        self._listeners.add(listener)
+
+        def remove() -> None:
+            self._listeners.discard(listener)
+
+        return remove
+
+    async def dispatch(
+        self,
+        method: str,
+        params: Mapping[str, Any] | None = None,
+        *,
+        attachment_roots: tuple[Path, ...] = (),
+    ) -> Any:
+        value = dict(params or {})
+        routes: dict[str, Callable[..., Awaitable[Any]]] = {
+            "system.handshake": self.handshake,
+            "system.health": self.health,
+            "system.shutdown": self.shutdown,
+            "events.subscribe": self.events_subscribe,
+            "session.create": self._session_create,
+            "session.list": self._session_list,
+            "session.get": self._session_get,
+            "session.delete": self.runtime.session_delete,
+            "session.rename": self.runtime.session_rename,
+            "session.configure": self.runtime.session_configure,
+            "session.tree": self.runtime.session_tree,
+            "session.navigate": self.runtime.session_navigate,
+            "session.compact": self.runtime.session_compact,
+            "session.next_turn": self.runtime.session_next_turn,
+            "turn.start": self._turn_start,
+            "turn.cancel": self._turn_cancel,
+            "turn.steer": self._turn_steer,
+            "turn.follow_up": self._turn_follow_up,
+            "catalog.get": self.runtime.catalog_get,
+            "provider.list": self.runtime.provider_list,
+            "provider.local.add": self.runtime.provider_local_add,
+            "provider.local.remove": self.runtime.provider_local_remove,
+            "settings.get": self.runtime.settings_get,
+            "settings.update": self.runtime.settings_update,
+            "cloud.account.status": self.runtime.account_status,
+            "cloud.account.login": self.runtime.account_login,
+            "cloud.account.logout": self.runtime.account_logout,
+            "provider.cloud.status": self.runtime.account_status,
+            "provider.cloud.login": self.runtime.account_login,
+            "provider.cloud.logout": self.runtime.account_logout,
+        }
+        handler = routes.get(method)
+        if handler is None:
+            raise BridgeError("method_not_found", f"Unknown Bridge method: {method}")
+        try:
+            if method == "turn.start":
+                return await handler(value, attachment_roots=attachment_roots)
+            return await handler(value)
+        except BridgeError:
+            raise
+        except SessionError as exc:
+            code = "session_not_found" if exc.code == "not_found" else "invalid_state"
+            raise BridgeError(code, self._sanitize(str(exc))) from None
+        except RuntimeFailure as exc:
+            allowed = {
+                "busy",
+                "invalid_state",
+                "invalid_argument",
+                "invalid_attachment",
+                "revision_conflict",
+                "operation_not_found",
+                "authentication_failed",
+            }
+            code = exc.code if exc.code in allowed else "internal_error"
+            raise BridgeError(code, str(exc)) from None
+        except RunError as exc:
+            allowed = {"busy", "invalid_state", "invalid_argument"}
+            code = exc.code if exc.code in allowed else "internal_error"
+            raise BridgeError(code, self._sanitize(str(exc))) from None
+        except (KeyError, TypeError, ValueError) as exc:
+            raise BridgeError("invalid_argument", self._sanitize(str(exc))) from None
+        except Exception:
+            raise BridgeError(
+                "internal_error",
+                "Aeloon Core could not complete the request",
+            ) from None
+
+    async def handshake(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        versions = params.get("protocol_versions", [PROTOCOL_VERSION])
+        if versions and PROTOCOL_VERSION not in versions:
+            raise BridgeError("protocol_incompatible", "Aeloon Core requires Bridge protocol v2")
+        roots = params.get("attachment_roots") or []
+        if not isinstance(roots, list) or any(not isinstance(root, str) for root in roots):
+            raise BridgeError("invalid_argument", "attachment_roots must be a list of paths")
+        return {
+            "protocol": PROTOCOL_NAME,
+            "protocol_version": PROTOCOL_VERSION,
+            "core_version": __version__,
+            "server_instance_id": self.server_instance_id,
+            "capabilities": list(CAPABILITIES),
+            "methods": list(METHODS),
+            "events": list(EVENTS),
+            "attachment_roots": [
+                str(Path(root).expanduser().resolve(strict=False)) for root in roots
+            ],
+            "config_path": str(self.config_path),
+            "data_dir": str(self.data_dir),
+            "limits": {
+                "prompt_chars": PROMPT_LIMIT,
+                "attachments": ATTACHMENT_LIMIT,
+                "image_bytes": IMAGE_LIMIT,
+                "file_bytes": FILE_LIMIT,
+                "request_bytes": 1024 * 1024,
+                "retained_events": EVENT_LIMIT,
+            },
+        }
+
+    async def _session_create(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        workspace = self._required_string(params, "workspace")
+        raw_title = params.get("title")
+        title = str(raw_title).strip() if raw_title is not None else None
+        return (await self.runtime.create_session(workspace=workspace, title=title)).to_dict()
+
+    async def _session_list(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        workspace = str(params["workspace"]) if params.get("workspace") else None
+        sessions = await self.runtime.list_sessions(workspace=workspace)
+        return {"sessions": [item.to_dict() for item in sessions]}
+
+    async def _session_get(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        session_id = self._required_string(params, "session_id")
+        return (await self.runtime.get_session(session_id)).to_dict()
+
+    async def _turn_start(
+        self,
+        params: Mapping[str, Any],
+        *,
+        attachment_roots: tuple[Path, ...] = (),
+    ) -> dict[str, Any]:
+        session_id = self._required_string(params, "session_id")
+        turn_input = self._turn_input(params.get("input"))
+        return (
+            await self.runtime.start_turn(
+                session_id=session_id,
+                input=turn_input,
+                attachment_roots=attachment_roots,
+            )
+        ).to_dict()
+
+    async def _turn_cancel(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        operation_id = self._required_string(params, "operation_id")
+        await self.runtime.cancel_turn(operation_id)
+        return {"operation_id": operation_id, "cancelled": True}
+
+    async def _turn_steer(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        operation_id = self._required_string(params, "operation_id")
+        await self.runtime.steer_turn(operation_id, self._required_string(params, "text"))
+        return {"operation_id": operation_id, "accepted": True}
+
+    async def _turn_follow_up(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        operation_id = self._required_string(params, "operation_id")
+        await self.runtime.follow_up_turn(
+            operation_id,
+            self._required_string(params, "text"),
+        )
+        return {"operation_id": operation_id, "accepted": True}
+
+    async def health(self, _params: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "status": "stopping" if self.shutdown_requested.is_set() else "running",
+            "pid": os.getpid(),
+            "started_at": self.started_at,
+            "active_operations": self.runtime.active_operation_count,
+            "current_seq": self._seq,
+        }
+
+    async def shutdown(self, _params: Mapping[str, Any]) -> dict[str, Any]:
+        if not self.shutdown_requested.is_set():
+            await self._publish(
+                RuntimeEvent(
+                    name="system.shutdown",
+                    time=_now(),
+                    workspace=None,
+                    session_id=None,
+                    operation_id=None,
+                    payload={"intentional": True, "reason": "requested"},
+                )
+            )
+        self.shutdown_requested.set()
+        asyncio.get_running_loop().call_later(0.05, self.shutdown_signal.set)
+        return {"status": "stopping"}
+
+    async def events_subscribe(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        session_ids = params.get("session_ids") or []
+        after_seq = int(params.get("after_seq") or 0)
+        invalid_session_ids = not isinstance(session_ids, list) or any(
+            not isinstance(item, str) for item in session_ids
+        )
+        if invalid_session_ids:
+            raise BridgeError("invalid_argument", "session_ids must be a list")
+        first_seq = self._events[0]["seq"] if self._events else self._seq + 1
+        replay_complete = after_seq >= first_seq - 1
+        replay = (
+            [
+                event
+                for event in self._events
+                if event["seq"] > after_seq
+                and (event["session_id"] in session_ids or event["session_id"] is None)
+            ]
+            if replay_complete
+            else []
+        )
+        return {
+            "server_instance_id": self.server_instance_id,
+            "current_seq": self._seq,
+            "replay_complete": replay_complete,
+            "events": replay,
+            "cursor": {"server_instance_id": self.server_instance_id, "seq": self._seq},
+        }
+
+    async def close(self) -> None:
+        self._remove_runtime_listener()
+        await self.runtime.close()
+
+    async def _runtime_event(self, event: RuntimeEvent) -> None:
+        await self._publish(event)
+
+    async def _publish(self, event: RuntimeEvent) -> None:
+        self._seq += 1
+        public = {"seq": self._seq, **event.to_dict()}
+        self._events.append(public)
+        for listener in tuple(self._listeners):
+            try:
+                result = listener(public)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                continue
+
+    def _sanitize(self, message: str) -> str:
+        value = message.replace(str(Path.home()), "~")
+        secrets = [
+            self.runtime.config.deepseek.api_key,
+            *(provider.api_key for provider in self.runtime.config.local_providers.values()),
+        ]
+        for secret in secrets:
+            if secret and secret != "no-key":
+                value = value.replace(secret, "***")
+        return value
+
+    def _turn_input(self, raw: Any) -> TurnInput:
+        if not isinstance(raw, Mapping):
+            raise BridgeError("invalid_argument", "turn.start.input must be an object")
+        kind = str(raw.get("kind") or "prompt")
+        if kind == "prompt":
+            text = self._required_string(raw, "text")
+            if len(text) > PROMPT_LIMIT:
+                raise BridgeError(
+                    "invalid_argument",
+                    f"Prompt must contain 1 to {PROMPT_LIMIT:,} characters",
+                )
+            attachments = raw.get("attachments") or []
+            if not isinstance(attachments, list):
+                raise BridgeError("invalid_attachment", "attachments must be a list")
+            return TurnInput(
+                kind="prompt",
+                text=text,
+                attachments=tuple(
+                    dict(item) if isinstance(item, Mapping) else {"invalid": item}
+                    for item in attachments
+                ),
+            )
+        if kind == "skill":
+            return TurnInput(
+                kind="skill",
+                name=self._required_string(raw, "name"),
+                additional_instructions=(
+                    str(raw["additional_instructions"])
+                    if raw.get("additional_instructions")
+                    else None
+                ),
+            )
+        if kind == "prompt_template":
+            arguments = raw.get("arguments") or []
+            if not isinstance(arguments, list) or any(
+                not isinstance(item, str) for item in arguments
+            ):
+                raise BridgeError("invalid_argument", "template arguments must be strings")
+            return TurnInput(
+                kind="prompt_template",
+                name=self._required_string(raw, "name"),
+                arguments=tuple(arguments),
+            )
+        raise BridgeError(
+            "invalid_argument",
+            "input.kind must be prompt, skill, or prompt_template",
+        )
+
+    @staticmethod
+    def _required_string(params: Mapping[str, Any], key: str) -> str:
+        value = params.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise BridgeError("invalid_argument", f"{key} is required")
+        return value.strip()
+
+
+__all__ = ["BridgeRpcAdapter"]

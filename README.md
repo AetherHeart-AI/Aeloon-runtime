@@ -1,8 +1,8 @@
 # Aeloon Core
 
-Aeloon Core is a stateful coding harness implemented in Python. It provides a CLI and Python API
-for tool-driven coding tasks, resumable sessions, configurable model providers, retries, and
-automatic context compaction.
+Aeloon Core combines a stateless Python agent-run engine with a stateful application runtime. It
+provides a CLI and Python API for tool-driven coding tasks, resumable sessions, configurable model
+providers, retries, and automatic context compaction.
 
 ## Requirements
 
@@ -106,36 +106,46 @@ same-named global resources and are reloaded at every turn boundary.
 ## Python API
 
 ```python
-from aeloon_core.harness import (
-    AgentHarness,
+from aeloon_core.core import (
     DeepSeekProvider,
-    JsonlSessionRepository,
-    ResourceLoader,
+    RunRequest,
+    UserMessage,
+    create_all_tools,
     get_deepseek_model,
+    run_agent,
 )
 
 workspace = "/path/to/repository"
-repository = JsonlSessionRepository("~/.aeloon-core")
-session = await repository.create(cwd=workspace)
 provider = DeepSeekProvider(api_key="...")
-harness = AgentHarness(
-    provider=provider,
-    model=get_deepseek_model("deepseek/deepseek-v4-flash"),
-    cwd=workspace,
-    session=session,
-    resource_loader=ResourceLoader(cwd=workspace),
-)
+tools = tuple(create_all_tools(workspace).values())
 
 try:
-    response = await harness.prompt("Implement the requested change")
-    print(response.text)
+    result = await run_agent(RunRequest(
+        run_id="example-run",
+        messages=(),
+        input=(UserMessage("Implement the requested change"),),
+        system_prompt="You are a coding agent.",
+        tools=tools,
+        active_tool_names=("read", "bash", "edit", "write"),
+        provider=provider,
+        model=get_deepseek_model("deepseek/deepseek-v4-flash"),
+    ))
+    print(result.final_message.text)
 finally:
-    await harness.close()
+    await provider.close()
 ```
 
-The public harness package also exports provider-neutral message types, tools, models, stream
-options, typed events, resources, sessions, and a deterministic provider for tests and offline
-integrations.
+`run_agent()` retains no state after it returns. Stateful applications should use the runtime API:
+
+```python
+from aeloon_core.bootstrap import create_runtime_service
+
+runtime = create_runtime_service()
+session = await runtime.create_session(workspace="/path/to/repository")
+```
+
+Runtime owns sessions, context construction, persistence, provider selection, and operation
+scheduling. Bridge clients access the same runtime through the stable Bridge v2 protocol.
 
 ## Security
 

@@ -3,24 +3,25 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import AsyncIterator
-from pathlib import Path
 
 import pytest
 
-from aeloon_core.harness import (
+from aeloon_core.core import (
     DEEPSEEK_V4_FLASH,
-    AgentHarness,
     AgentTool,
     AssistantMessage,
     AssistantStreamEvent,
-    HarnessError,
-    JsonlSessionRepository,
-    ResourceLoader,
+    RunController,
+    RunError,
+    RunRequest,
     ScriptedProvider,
+    StreamOptions,
     TextContent,
     ToolCall,
     ToolResult,
     ToolResultMessage,
+    UserMessage,
+    run_agent,
 )
 
 
@@ -28,7 +29,7 @@ def _answer(text: str, *, stop: str = "stop", calls: tuple[ToolCall, ...] = ()):
     return AssistantMessage(
         (TextContent(text), *calls),
         provider="deepseek",
-        model="deepseek-v4-flash",
+        model="deepseek/deepseek-v4-flash",
         stop_reason=stop,
     )
 
@@ -43,8 +44,31 @@ def _tool(name: str, execute) -> AgentTool:
     )
 
 
+def _request(
+    provider,
+    *,
+    text: str = "go",
+    tools: tuple[AgentTool, ...] = (),
+    active: tuple[str, ...] | None = None,
+    messages=(),
+    options: StreamOptions | None = None,
+    run_id: str = "run",
+) -> RunRequest:
+    return RunRequest(
+        run_id=run_id,
+        provider=provider,
+        model=DEEPSEEK_V4_FLASH,
+        messages=tuple(messages),
+        input=(UserMessage(text),),
+        system_prompt="SYSTEM",
+        tools=tools,
+        active_tool_names=active,
+        stream_options=options or StreamOptions(),
+    )
+
+
 @pytest.mark.asyncio
-async def test_loop_executes_tools_and_preserves_pi_event_lifecycle(tmp_path: Path) -> None:
+async def test_loop_executes_tools_and_emits_run_lifecycle() -> None:
     async def execute(_call_id, _params, _update):
         return ToolResult.text("tool output")
 
@@ -54,33 +78,26 @@ async def test_loop_executes_tools_and_preserves_pi_event_lifecycle(tmp_path: Pa
             _answer("done"),
         ]
     )
-    harness = AgentHarness(
-        provider=provider,
-        model=DEEPSEEK_V4_FLASH,
-        cwd=str(tmp_path),
-        tools=(_tool("demo", execute),),
-        active_tool_names=("demo",),
-    )
     events: list[str] = []
-    harness.subscribe(lambda event: events.append(event.type))
+    result = await run_agent(
+        _request(provider, tools=(_tool("demo", execute),), active=("demo",)),
+        emit=lambda event: events.append(event.type),
+    )
 
-    result = await harness.prompt("start")
-
-    assert result.text == "done"
+    assert result.final_message.text == "done"
     assert len(provider.requests) == 2
     injected = provider.requests[1][1].messages[-1]
     assert isinstance(injected, ToolResultMessage)
     assert injected.content[0].text == "tool output"
-    assert events[0:3] == ["before_agent_start", "agent_start", "turn_start"]
     assert events.count("turn_start") == 2
     assert events.count("turn_end") == 2
     assert events.index("tool_execution_start") < events.index("tool_execution_end")
-    assert events[-2:] == ["settled", "queue_update"] or events[-1] == "settled"
+    assert events[-1] == "settled"
     assert "agent_end" in events
 
 
 @pytest.mark.asyncio
-async def test_tool_failures_are_returned_to_model_and_do_not_end_loop(tmp_path: Path) -> None:
+async def test_tool_failures_are_returned_to_model_and_do_not_end_loop() -> None:
     async def fail(_call_id, _params, _update):
         raise RuntimeError("boom")
 
@@ -90,25 +107,19 @@ async def test_tool_failures_are_returned_to_model_and_do_not_end_loop(tmp_path:
             _answer("recovered"),
         ]
     )
-    harness = AgentHarness(
-        provider=provider,
-        model=DEEPSEEK_V4_FLASH,
-        cwd=str(tmp_path),
-        tools=(_tool("fail", fail),),
-        active_tool_names=("fail",),
+    result = await run_agent(
+        _request(provider, tools=(_tool("fail", fail),), active=("fail",))
     )
 
-    result = await harness.prompt("go")
-
     returned = provider.requests[1][1].messages[-1]
-    assert result.text == "recovered"
+    assert result.final_message.text == "recovered"
     assert isinstance(returned, ToolResultMessage)
     assert returned.is_error is True
     assert "RuntimeError: boom" in returned.content[0].text
 
 
 @pytest.mark.asyncio
-async def test_tools_run_in_parallel_but_results_keep_call_order(tmp_path: Path) -> None:
+async def test_tools_run_in_parallel_but_results_keep_call_order() -> None:
     async def slow(_call_id, _params, _update):
         await asyncio.sleep(0.1)
         return ToolResult.text("slow")
@@ -127,16 +138,14 @@ async def test_tools_run_in_parallel_but_results_keep_call_order(tmp_path: Path)
             _answer("done"),
         ]
     )
-    harness = AgentHarness(
-        provider=provider,
-        model=DEEPSEEK_V4_FLASH,
-        cwd=str(tmp_path),
-        tools=(_tool("slow", slow), _tool("fast", fast)),
-        active_tool_names=("slow", "fast"),
-    )
-
     started = time.monotonic()
-    await harness.prompt("go")
+    await run_agent(
+        _request(
+            provider,
+            tools=(_tool("slow", slow), _tool("fast", fast)),
+            active=("slow", "fast"),
+        )
+    )
     elapsed = time.monotonic() - started
 
     assert elapsed < 0.18
@@ -149,7 +158,7 @@ async def test_tools_run_in_parallel_but_results_keep_call_order(tmp_path: Path)
 
 
 @pytest.mark.asyncio
-async def test_length_stop_skips_entire_tool_batch(tmp_path: Path) -> None:
+async def test_length_stop_skips_entire_tool_batch() -> None:
     calls = 0
 
     async def execute(_call_id, _params, _update):
@@ -167,15 +176,7 @@ async def test_length_stop_skips_entire_tool_batch(tmp_path: Path) -> None:
             _answer("retried"),
         ]
     )
-    harness = AgentHarness(
-        provider=provider,
-        model=DEEPSEEK_V4_FLASH,
-        cwd=str(tmp_path),
-        tools=(_tool("demo", execute),),
-        active_tool_names=("demo",),
-    )
-
-    await harness.prompt("go")
+    await run_agent(_request(provider, tools=(_tool("demo", execute),), active=("demo",)))
 
     assert calls == 0
     results = [
@@ -189,7 +190,7 @@ async def test_length_stop_skips_entire_tool_batch(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_steer_is_injected_after_current_tool_batch(tmp_path: Path) -> None:
+async def test_steer_is_injected_after_current_tool_batch() -> None:
     entered = asyncio.Event()
     release = asyncio.Event()
 
@@ -204,16 +205,15 @@ async def test_steer_is_injected_after_current_tool_batch(tmp_path: Path) -> Non
             _answer("done"),
         ]
     )
-    harness = AgentHarness(
-        provider=provider,
-        model=DEEPSEEK_V4_FLASH,
-        cwd=str(tmp_path),
-        tools=(_tool("wait", execute),),
-        active_tool_names=("wait",),
+    controller = RunController()
+    task = asyncio.create_task(
+        run_agent(
+            _request(provider, tools=(_tool("wait", execute),), active=("wait",)),
+            controller=controller,
+        )
     )
-    task = asyncio.create_task(harness.prompt("go"))
     await entered.wait()
-    await harness.steer("change direction")
+    await controller.steer("change direction")
     release.set()
     await task
 
@@ -242,96 +242,58 @@ class GateProvider:
 
 
 @pytest.mark.asyncio
-async def test_follow_up_busy_next_turn_abort_and_idle(tmp_path: Path) -> None:
+async def test_follow_up_cancel_and_controller_lifecycle() -> None:
     provider = GateProvider()
-    harness = AgentHarness(provider=provider, model=DEEPSEEK_V4_FLASH, cwd=str(tmp_path))
-    task = asyncio.create_task(harness.prompt("initial"))
+    controller = RunController()
+    task = asyncio.create_task(run_agent(_request(provider), controller=controller))
     await asyncio.sleep(0)
-    with pytest.raises(HarnessError) as busy:
-        await harness.prompt("too soon")
-    assert busy.value.code == "busy"
-    await harness.follow_up("after completion")
+    await controller.follow_up("after completion")
     provider.gate.set()
     result = await task
-    assert result.text == "second"
+    assert result.final_message.text == "second"
     assert provider.requests[1].messages[-1].content == "after completion"
-    assert harness.is_idle
-
-    await harness.next_turn("queued")
-    provider.gate.set()
-    await harness.prompt("explicit")
-    assert [message.content for message in provider.requests[2].messages[-2:]] == [
-        "queued",
-        "explicit",
-    ]
+    with pytest.raises(RunError) as inactive:
+        await controller.steer("too late")
+    assert inactive.value.code == "invalid_state"
 
     blocked = GateProvider()
-    aborting = AgentHarness(provider=blocked, model=DEEPSEEK_V4_FLASH, cwd=str(tmp_path))
-    prompt_task = asyncio.create_task(aborting.prompt("wait"))
+    aborting = RunController()
+    prompt_task = asyncio.create_task(
+        run_agent(_request(blocked, run_id="abort"), controller=aborting)
+    )
     await asyncio.sleep(0)
-    abort_task = asyncio.create_task(aborting.abort())
+    abort_task = asyncio.create_task(aborting.cancel())
     aborted = await prompt_task
     await abort_task
     assert aborted.stop_reason == "aborted"
-    assert aborting.is_idle
 
 
 @pytest.mark.asyncio
-async def test_provider_retry_phase_emits_events(tmp_path: Path) -> None:
+async def test_provider_retry_emits_events() -> None:
     class RetryingProvider:
         def stream(self, model, _context, options):
             async def events():
                 yield AssistantStreamEvent("start")
                 callback = options.metadata["on_retry"]
-                await callback({"stage": "start", "attempt": 1, "delayMs": 0, "error": "retry"})
-                assert harness.phase == "retry"
-                await callback({"stage": "end", "attempt": 1, "delayMs": 0, "error": None})
-                message = _answer("done")
-                yield AssistantStreamEvent("done", message=message)
+                await callback({"stage": "start", "attempt": 1, "delayMs": 0})
+                await callback({"stage": "end", "attempt": 1, "delayMs": 0})
+                yield AssistantStreamEvent("done", message=_answer("done"))
 
             return events()
 
-    harness = AgentHarness(provider=RetryingProvider(), model=DEEPSEEK_V4_FLASH, cwd=str(tmp_path))
     events: list[str] = []
-    harness.subscribe(lambda event: events.append(event.type))
+    result = await run_agent(
+        _request(RetryingProvider()),
+        emit=lambda event: events.append(event.type),
+    )
 
-    result = await harness.prompt("go")
-
-    assert result.text == "done"
+    assert result.final_message.text == "done"
     assert "auto_retry_start" in events
     assert "auto_retry_end" in events
-    assert harness.phase == "idle"
 
 
 @pytest.mark.asyncio
-async def test_resources_and_active_tools_refresh_at_turn_boundary(tmp_path: Path) -> None:
-    instructions = tmp_path / "AGENTS.md"
-    instructions.write_text("FIRST RULE", encoding="utf-8")
-    provider = ScriptedProvider([_answer("one"), _answer("two")])
-    harness = AgentHarness(
-        provider=provider,
-        model=DEEPSEEK_V4_FLASH,
-        cwd=str(tmp_path),
-        resource_loader=ResourceLoader(cwd=tmp_path, agent_dir=tmp_path / "global"),
-    )
-    events: list[str] = []
-    harness.subscribe(lambda event: events.append(event.type))
-
-    await harness.prompt("first")
-    instructions.write_text("SECOND RULE", encoding="utf-8")
-    await harness.set_active_tools(("read", "grep"))
-    await harness.prompt("second")
-
-    assert "FIRST RULE" in provider.requests[0][1].system_prompt
-    assert "SECOND RULE" in provider.requests[1][1].system_prompt
-    assert "- grep: Search file contents for patterns" in provider.requests[1][1].system_prompt
-    assert "- bash:" not in provider.requests[1][1].system_prompt
-    assert "resources_update" in events
-    assert "tools_update" in events
-
-
-@pytest.mark.asyncio
-async def test_provider_and_tool_hooks_can_patch_or_block(tmp_path: Path) -> None:
+async def test_provider_and_tool_hooks_can_patch_or_block() -> None:
     executed = 0
 
     async def execute(_call_id, _params, _update):
@@ -345,33 +307,24 @@ async def test_provider_and_tool_hooks_can_patch_or_block(tmp_path: Path) -> Non
             _answer("done"),
         ]
     )
-    harness = AgentHarness(
-        provider=provider,
-        model=DEEPSEEK_V4_FLASH,
-        cwd=str(tmp_path),
-        tools=(_tool("demo", execute),),
-        active_tool_names=("demo",),
-    )
-    harness.on(
-        "before_provider_payload",
-        lambda event: (
-            {
-                "payload": {
-                    **event.data["payload"],
-                    "systemPrompt": "PATCHED SYSTEM",
-                }
-            }
-            if len(provider.requests) == 0
-            else None
+    hooks = {
+        "before_provider_payload": (
+            lambda event: (
+                {"payload": {**event.data["payload"], "systemPrompt": "PATCHED SYSTEM"}}
+                if len(provider.requests) == 0
+                else None
+            ),
         ),
-    )
-    harness.on("tool_call", lambda _event: {"block": True, "reason": "blocked"})
-    harness.on(
-        "tool_result",
-        lambda _event: {"content": [{"type": "text", "text": "patched result"}]},
-    )
+        "tool_call": (lambda _event: {"block": True, "reason": "blocked"},),
+        "tool_result": (
+            lambda _event: {"content": [{"type": "text", "text": "patched result"}]},
+        ),
+    }
 
-    await harness.prompt("go")
+    await run_agent(
+        _request(provider, tools=(_tool("demo", execute),), active=("demo",)),
+        hooks=hooks,
+    )
 
     assert provider.requests[0][1].system_prompt == "PATCHED SYSTEM"
     assert executed == 0
@@ -382,21 +335,16 @@ async def test_provider_and_tool_hooks_can_patch_or_block(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_new_session_does_not_override_configured_thinking_or_empty_tools(
-    tmp_path: Path,
-) -> None:
-    session = await JsonlSessionRepository(tmp_path).create(cwd=tmp_path)
-    provider = ScriptedProvider([_answer("done")])
-    harness = AgentHarness(
-        provider=provider,
-        model=DEEPSEEK_V4_FLASH,
-        cwd=str(tmp_path),
-        session=session,
-        thinking_level="high",
-        active_tool_names=(),
+async def test_repeated_and_concurrent_runs_do_not_share_state() -> None:
+    first_provider = ScriptedProvider([_answer("one")])
+    second_provider = ScriptedProvider([_answer("two")])
+
+    first, second = await asyncio.gather(
+        run_agent(_request(first_provider, text="first", run_id="first")),
+        run_agent(_request(second_provider, text="second", run_id="second")),
     )
 
-    await harness.prompt("go")
-
-    assert provider.requests[0][2].thinking_level == "high"
-    assert provider.requests[0][1].tools == ()
+    assert [message.content for message in first_provider.requests[0][1].messages] == ["first"]
+    assert [message.content for message in second_provider.requests[0][1].messages] == ["second"]
+    assert first.final_message.text == "one"
+    assert second.final_message.text == "two"

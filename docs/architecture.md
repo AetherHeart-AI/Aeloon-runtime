@@ -1,105 +1,61 @@
 # Architecture
 
-Aeloon Core separates user-facing commands and transport concerns from the harness runtime,
-provider integrations, and durable session state.
+Aeloon is one Python distribution with four modules and a small composition root:
 
 ```mermaid
 flowchart LR
-    CLI["CLI"] --> Service["CoreService"]
-    Client["Bridge client"] --> Bridge["Bridge v2 daemon"]
-    Bridge --> Service
-    Service --> Harness["AgentHarness"]
-    Service --> Config["Config and account vault"]
-    Service --> Sessions["JSONL session repository"]
-    Harness --> Provider["Provider runtime"]
-    Harness --> Tools["Tool runtime"]
-    Harness --> Resources["Resource loader"]
-    Harness --> Sessions
+    CLI["CLI"] --> Runtime["runtime"]
+    Client["Bridge client"] --> Bridge["bridge"]
+    Bridge --> Runtime
+    Runtime --> Core["core"]
+    Cloud["cloud"] --> Core
+    Bootstrap["bootstrap"] --> Runtime
+    Bootstrap --> Cloud
 ```
 
-## Application boundary
+`core` never imports `runtime`, `bridge`, or `cloud`. `runtime` never imports `bridge` or `cloud`;
+remote providers and account operations are injected by `bootstrap`.
 
-`CoreService` is the boundary between CLI or Bridge clients and the private harness, session, and
-configuration layers. It owns provider discovery, model selection, session lookup, operation
-serialization, and the DTOs exposed to external clients.
+## Core: one stateless run
 
-The CLI uses the same service operations as other clients. Bridge transport code handles daemon
-lifecycle, socket communication, validation, and event replay without exposing internal Python
-types.
+`aeloon_core.core.run_agent()` receives a complete `RunRequest` and returns a `RunResult`. It owns
+only invocation-local state: the provider/tool loop, retries, streaming events, hooks, temporary
+messages, steering/follow-up queues, and cancellation. A `RunController` is bound for one call and
+becomes inactive when that call settles.
 
-## Providers and models
+Core detects context thresholds and provider overflow errors. It asks an injected
+`ContextCompactor` for a replacement message sequence without accessing a Session or repository.
+Stateless summary generation and token estimation also live in core.
 
-The provider registry merges account-backed cloud models and user-added OpenAI-compatible local
-endpoints into one catalog. Every model has a stable `provider/model` identifier. Provider-local
-names are resolved in catalog order, while full identifiers provide explicit disambiguation.
+## Runtime: sessions and context
 
-Core owns cloud account refresh state and the local credential vault. Public account and provider
-DTOs are redacted before they cross the service boundary.
+`RuntimeService` is the application boundary. It owns the append-only JSONL v3 Session tree,
+context restoration, resources, persisted next-turn input, branch navigation, provider catalog,
+settings, per-session serialization, cross-session concurrency, and operation lifecycle.
 
-## Harness lifecycle
+For a turn, runtime builds a `RunRequest`, injects a Session-backed context compactor, and persists
+each completed core message immediately. Provider and tool resources are closed by runtime after
+the operation. Runtime emits typed `RuntimeEvent` values and does not know RPC methods or
+`BridgeError`.
 
-`AgentHarness` uses the phases `idle`, `turn`, `compaction`, `branch_summary`, and `retry`. A normal
-prompt is rejected while another phase is active.
+## Bridge: channels and wire contracts
 
-During a turn:
+`BridgeRpcAdapter` maps Bridge v2 JSON-RPC methods and errors to typed runtime calls. It owns public
+event sequence numbers, the 5,000-event replay buffer, server instance identity, handshake data,
+wire DTO serialization, and attachment-root validation. `BridgeDaemon` only owns Unix socket,
+NDJSON connection, lifecycle, and broadcast behavior.
 
-1. resources are reloaded and the effective prompt is assembled;
-2. the provider streams an assistant response;
-3. complete tool calls are dispatched and their results are returned to the provider;
-4. a response without tool calls ends the turn naturally;
-5. completed messages and run boundaries are persisted.
+Bridge v2 method names, events, schema, error codes, and replay behavior remain stable.
 
-`steer()` adds input after the current tool batch, `follow_up()` continues after natural
-completion, and `next_turn()` queues input for the next explicit prompt. Queue modes can process
-one item at a time or all pending items together.
+## Cloud: optional remote capabilities
 
-## Tool runtime
-
-The default tools are `read`, `bash`, `edit`, and `write`; `grep`, `find`, and `ls` can be enabled
-as additional tools. Calls execute concurrently by default. Mutations to the same file are
-serialized, and results are returned in call order.
-
-A length-limited response that still contains tool calls is not executed because its arguments
-may be incomplete. Tool errors are returned to the provider so the turn can recover or finish with
-a useful diagnostic.
-
-## Resources and prompts
-
-`ResourceLoader` combines global resources from `~/.aeloon-core`, workspace resources from
-`<workspace>/.aeloon-core`, and recognized project instruction files. Workspace resources override
-same-named global resources.
-
-The effective prompt is assembled in deterministic order from the base prompt, appended system
-content, project instructions, skills, and the current working directory. Resources are reloaded
-at every turn boundary.
+Cloud owns account login, token refresh and vault storage, model discovery, the HTTP client, and
+the cloud Provider implementation. It depends only on provider-neutral core contracts. The
+composition root adapts these capabilities into runtime's account and remote-provider ports.
 
 ## Sessions and compaction
 
-Sessions are version-3 append-only JSONL trees with an immutable header. Entries record messages,
-model and tool changes, compactions, branch summaries, labels, navigation, and Bridge run
-boundaries. Each completed message is flushed and fsynced immediately.
-
-Tree navigation can return to an earlier entry and optionally summarize the abandoned branch.
-Automatic semantic compaction keeps a recent turn-safe tail and summarizes older context. The
-summary preserves goals, decisions, progress, paths, errors, and file-operation history, and can
-merge an earlier summary.
-
-Session snapshots expose lifetime token and cost totals alongside effective-branch context
-statistics. Context statistics report window occupancy, estimated token share for system, user,
-assistant, and tool-result messages, plus cache token and request hit rates. Provider-reported
-usage is preferred for the current context total; messages after the last response use the same
-estimator as automatic compaction.
-
-## Bridge v2
-
-Bridge v2 uses JSON-RPC 2.0 over NDJSON on a Unix domain socket. The runtime directory is mode
-`0700`; socket and daemon metadata are mode `0600`. Startup is concurrency-safe, and conflicting
-configuration never terminates an existing daemon.
-
-The daemon serializes operations within each session and limits cross-session concurrency. It
-retains 5,000 ordered public events for cursor replay. Client disconnects do not cancel active
-work; clients reconcile through `session.get` after an instance change or replay gap.
-
-Attachments are validated against roots declared during the handshake and copied into
-Core-managed per-session storage before an operation is queued. The protocol schema is stored in
-[`aeloon_core/bridge/bridge-protocol-v2.json`](../aeloon_core/bridge/bridge-protocol-v2.json).
+Sessions remain append-only version-3 JSONL trees with immutable headers. Messages are flushed and
+fsynced as soon as core completes them. Runtime selects the compaction cut point and persists the
+summary; core supplies the stateless summarization call and coordinates overflow retry within the
+active run.

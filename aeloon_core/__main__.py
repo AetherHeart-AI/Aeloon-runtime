@@ -1,4 +1,4 @@
-"""Command-line interface for the pure-Python Aeloon harness."""
+"""Command-line interface for the Aeloon runtime."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.table import Table
 
+from aeloon_core.bootstrap import cloud_provider_source
 from aeloon_core.bridge.daemon import (
     bridge_request,
     daemon_status,
@@ -33,23 +34,20 @@ from aeloon_core.config import (
     resolve_config_path,
     save_config,
 )
-from aeloon_core.harness import (
-    AgentHarness,
-    CompactionSettings,
+from aeloon_core.core import (
     DeepSeekProvider,
-    HarnessError,
-    HarnessEvent,
-    JsonlSessionRepository,
-    ResourceLoader,
-    SessionError,
-    StreamOptions,
+    RunError,
+    RunEvent,
     message_to_dict,
 )
-from aeloon_core.providers import (
-    UnifiedProviderRegistry,
+from aeloon_core.runtime import (
+    JsonlSessionRepository,
+    ProviderCatalog,
+    SessionError,
     qualify_model_id,
     resolve_model_id,
 )
+from aeloon_core.runtime.agent import SessionAgent
 from aeloon_core.version import __version__
 
 CONFIG_PATHS: dict[str, tuple[str, ...]] = {
@@ -428,7 +426,7 @@ class RunRenderer:
         self._tool_args: dict[str, dict[str, Any]] = {}
         self._status_visible = False
 
-    async def __call__(self, event: HarnessEvent) -> None:
+    async def __call__(self, event: RunEvent) -> None:
         if self.verbose >= 2 and self.output == "text" and event.type in {
             "agent_start",
             "agent_end",
@@ -500,7 +498,7 @@ class RunRenderer:
         print("\r\x1b[2K", end="", file=sys.stderr, flush=True)
         self._status_visible = False
 
-    def _render_tool_end(self, event: HarnessEvent) -> None:
+    def _render_tool_end(self, event: RunEvent) -> None:
         name = str(event.data.get("toolName") or "unknown")
         call_id = str(event.data.get("toolCallId") or "")
         raw_result = event.data.get("result")
@@ -691,7 +689,7 @@ def _format_duration(seconds: float) -> str:
 
 async def run_command(args: argparse.Namespace) -> int:
     if args.session and args.no_session:
-        raise HarnessError("invalid_argument", "--session and --no-session cannot be combined")
+        raise RunError("invalid_argument", "--session and --no-session cannot be combined")
     prompt = _read_prompt(args)
     config = _with_run_overrides(load_config(args.config), args)
     session_dir = args.session_dir or config.data_dir
@@ -713,9 +711,9 @@ async def run_command(args: argparse.Namespace) -> int:
                 update={"agent": config.agent.model_copy(update={"model": restored_id})}
             )
     cloud_account = CloudAccountService(config.cloud, data_dir=config.data_dir)
-    registry = UnifiedProviderRegistry(
+    registry = ProviderCatalog(
         config,
-        cloud_account,
+        remote_sources=(cloud_provider_source(cloud_account),),
         local_provider_factory=DeepSeekProvider,
     )
     try:
@@ -724,7 +722,7 @@ async def run_command(args: argparse.Namespace) -> int:
         else:
             available = _available_cli_models(config, await registry.models())
             if not available:
-                raise HarnessError(
+                raise RunError(
                     "model_not_configured",
                     "No connected model is available",
                 )
@@ -735,64 +733,35 @@ async def run_command(args: argparse.Namespace) -> int:
             registry.config = config
     except PermissionError as exc:
         await cloud_account.close()
-        raise HarnessError("auth", str(exc)) from None
-    except HarnessError:
+        raise RunError("auth", str(exc)) from None
+    except RunError:
         await cloud_account.close()
         raise
     except (KeyError, RuntimeError, CloudError) as exc:
         await cloud_account.close()
-        raise HarnessError("model_not_found", str(exc)) from None
+        raise RunError("model_not_found", str(exc)) from None
     if session is None and not args.no_session:
         assert repository is not None
         session = await repository.create(cwd=config.workspace)
 
-    provider = registry.provider(model)
-    resources = ResourceLoader(
-        cwd=config.workspace,
-        agent_dir=Path("~/.aeloon-core"),
-        additional_roots=tuple(config.resources.roots),
-        no_skills=config.resources.no_skills,
-        no_prompt_templates=config.resources.no_prompt_templates,
-        no_context_files=config.resources.no_context_files,
-    )
-    harness = AgentHarness(
-        provider=provider,
-        model=model,
-        cwd=str(config.workspace),
+    agent = SessionAgent(
+        config=config,
         session=session,
-        resource_loader=resources,
-        thinking_level=config.agent.thinking_level,
-        stream_options=StreamOptions(
-            timeout_ms=config.agent.timeout_ms,
-            max_tokens=config.agent.max_tokens,
-            temperature=config.agent.temperature,
-            thinking_level=config.agent.thinking_level,
-            max_retries=config.agent.retry.max_retries if config.agent.retry.enabled else 0,
-            base_delay_ms=config.agent.retry.base_delay_ms,
-            max_retry_delay_ms=config.agent.retry.max_retry_delay_ms,
-        ),
-        steering_mode=config.agent.steering_mode,
-        follow_up_mode=config.agent.follow_up_mode,
-        compaction=CompactionSettings(
-            enabled=config.agent.compaction.enabled,
-            reserve_tokens=config.agent.compaction.reserve_tokens,
-            keep_recent_tokens=config.agent.compaction.keep_recent_tokens,
-        ),
-        shell_path=config.tools.shell_path,
-        auto_resize_images=config.tools.auto_resize_images,
+        catalog=registry,
     )
     renderer = RunRenderer(
         args.output,
         verbose=args.verbose,
         quiet=bool(getattr(args, "quiet", False)),
     )
-    harness.subscribe(renderer)
+    agent.subscribe(renderer)
     started = time.monotonic()
     try:
-        message = await harness.prompt(prompt)
+        run_result = await agent.prompt(prompt, run_id=f"cli-{time.time_ns()}")
+        message = run_result.final_message
     finally:
         renderer._clear_status()
-        await harness.close()
+        await agent.close()
         await cloud_account.close()
     result = {
         "type": "result",
@@ -947,7 +916,7 @@ async def models_command(args: argparse.Namespace) -> int:
     if args.data_dir is not None:
         config = config.model_copy(update={"data_dir": args.data_dir}).normalized()
     account = CloudAccountService(config.cloud, data_dir=config.data_dir)
-    registry = UnifiedProviderRegistry(config, account)
+    registry = ProviderCatalog(config, remote_sources=(cloud_provider_source(account),))
     try:
         models = _available_cli_models(config, await registry.models())
     finally:
@@ -1032,7 +1001,7 @@ async def model_use_command(args: argparse.Namespace) -> int:
     try:
         candidate = resolve_model_id(requested, available)
     except KeyError:
-        raise HarnessError(
+        raise RunError(
             "model_not_found",
             f"Model is not available: {requested}",
         ) from None
@@ -1082,7 +1051,7 @@ async def doctor_command(args: argparse.Namespace) -> int:
         )
 
     account = CloudAccountService(config.cloud, data_dir=config.data_dir)
-    registry = UnifiedProviderRegistry(config, account)
+    registry = ProviderCatalog(config, remote_sources=(cloud_provider_source(account),))
     try:
         if not config.agent.model.strip():
             available = _available_cli_models(config, await registry.models())
@@ -1564,7 +1533,7 @@ def _with_run_overrides(config: Config, args: argparse.Namespace) -> Config:
 
 def _read_prompt(args: argparse.Namespace) -> str:
     if args.prompt and (args.prompt_file or args.stdin):
-        raise HarnessError("invalid_argument", "Use exactly one prompt source")
+        raise RunError("invalid_argument", "Use exactly one prompt source")
     if args.prompt_file:
         value = args.prompt_file.read_text(encoding="utf-8")
     elif args.stdin:
@@ -1572,7 +1541,7 @@ def _read_prompt(args: argparse.Namespace) -> str:
     else:
         value = " ".join(args.prompt)
     if not value.strip():
-        raise HarnessError("invalid_argument", "Prompt must not be empty")
+        raise RunError("invalid_argument", "Prompt must not be empty")
     return value
 
 
@@ -1688,7 +1657,7 @@ def main(argv: list[str] | None = None) -> int:
     json_errors = _json_errors_for(raw)
     try:
         return asyncio.run(async_main(raw))
-    except (BridgeError, HarnessError, SessionError) as exc:
+    except (BridgeError, RunError, SessionError) as exc:
         _print_cli_error(exc.code, str(exc), as_json=json_errors)
         return 2
     except (OSError, ValueError, json.JSONDecodeError) as exc:

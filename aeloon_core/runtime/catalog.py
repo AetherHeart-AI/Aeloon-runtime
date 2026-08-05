@@ -1,24 +1,32 @@
-"""Unified application-level registry for local and Aeloon Cloud providers."""
+"""Provider-neutral runtime catalog and model-id resolution."""
 
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Iterable
-from dataclasses import replace
+from collections.abc import Awaitable, Callable, Iterable
+from dataclasses import dataclass, replace
 from typing import Any
 
-from aeloon_core.cloud import CloudAccountService, CloudError, CloudProvider
-from aeloon_core.cloud.account import CLOUD_PROVIDER_ID
 from aeloon_core.config import Config, LocalModelConfig, LocalProviderConfig
-from aeloon_core.harness import DEEPSEEK_MODELS, DeepSeekProvider, Model, Provider
+from aeloon_core.core import DEEPSEEK_MODELS, DeepSeekProvider, Model, Provider
 
 DEEPSEEK_PROVIDER_ID = "deepseek"
 _PROVIDER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
-def qualify_model_id(provider_id: str, model_id: str) -> str:
-    """Return the canonical ``provider/model`` identifier."""
+@dataclass(frozen=True, slots=True)
+class RemoteProviderSource:
+    """Injected remote provider capability; runtime knows no cloud implementation."""
 
+    id: str
+    name: str
+    kind: str
+    status: Callable[[], dict[str, Any]]
+    models: Callable[[], Awaitable[dict[str, Model]]]
+    create_provider: Callable[[], Provider]
+
+
+def qualify_model_id(provider_id: str, model_id: str) -> str:
     provider = validate_provider_id(provider_id)
     model = model_id.strip().lstrip("/")
     if not model:
@@ -28,8 +36,6 @@ def qualify_model_id(provider_id: str, model_id: str) -> str:
 
 
 def split_model_id(model_id: str) -> tuple[str, str]:
-    """Split a canonical model id once so model keys may themselves contain slashes."""
-
     value = model_id.strip()
     provider, separator, model = value.partition("/")
     if not separator or not model:
@@ -48,8 +54,6 @@ def validate_provider_id(provider_id: str) -> str:
 
 
 def normalize_model_id(model_id: str) -> str:
-    """Upgrade legacy built-in DeepSeek ids while rejecting other bare ids."""
-
     value = model_id.strip()
     if "/" in value:
         provider, model = split_model_id(value)
@@ -61,8 +65,6 @@ def normalize_model_id(model_id: str) -> str:
 
 
 def resolve_model_id(model_id: str, available_model_ids: Iterable[str]) -> str:
-    """Resolve a canonical id or the first matching provider-local model id."""
-
     requested = model_id.strip()
     if not requested:
         raise KeyError("model id is required")
@@ -79,74 +81,70 @@ def resolve_model_id(model_id: str, available_model_ids: Iterable[str]) -> str:
     raise KeyError(f"Unknown model: {requested}")
 
 
-class UnifiedProviderRegistry:
-    """Resolve every provider and model through one qualified namespace."""
+class ProviderCatalog:
+    """Resolve local and injected remote providers through one namespace."""
 
     def __init__(
         self,
         config: Config,
-        cloud_account: CloudAccountService,
         *,
+        remote_sources: Iterable[RemoteProviderSource] = (),
         local_provider_factory: Callable[..., Provider] = DeepSeekProvider,
-        cloud_provider_factory: Callable[..., Provider] = CloudProvider,
     ) -> None:
         self.config = config
-        self.cloud_account = cloud_account
+        self._remotes = {source.id: source for source in remote_sources}
         self._local_provider_factory = local_provider_factory
-        self._cloud_provider_factory = cloud_provider_factory
 
     async def models(self) -> dict[str, Model]:
         models = self._local_models()
-        status = self.cloud_account.status()
-        if status["enabled"] and status["authenticated"]:
+        for source in self._remotes.values():
+            status = source.status()
+            if not status.get("enabled") or not status.get("authenticated"):
+                continue
             try:
-                models.update(await self.cloud_account.models())
-            except CloudError:
-                # A transient cloud failure must not hide configured local APIs.
-                pass
+                models.update(await source.models())
+            except Exception:
+                # A transient remote failure must not hide configured local APIs.
+                continue
         return models
 
     async def model(self, model_id: str) -> Model:
         requested = model_id.strip()
         local_models = self._local_models()
-        local = local_models.get(requested)
-        if local is not None:
-            return local
-
+        if requested in local_models:
+            return local_models[requested]
         provider_id, separator, _ = requested.partition("/")
-        local_provider_ids = self._local_providers()
-        if separator and provider_id in local_provider_ids:
+        if separator and provider_id in self._local_providers():
             raise KeyError(f"Unknown model: {requested}")
-        if separator and provider_id == CLOUD_PROVIDER_ID:
-            status = self.cloud_account.status()
-            if not status["enabled"]:
-                raise RuntimeError("Aeloon Cloud is disabled in Core settings")
-            if not status["authenticated"]:
-                raise PermissionError("Sign in to Aeloon Cloud first")
-            cloud_model = (await self.cloud_account.models()).get(requested)
-            if cloud_model is None:
+        if separator and provider_id in self._remotes:
+            source = self._remotes[provider_id]
+            status = source.status()
+            if not status.get("enabled"):
+                raise RuntimeError(f"{source.name} is disabled in settings")
+            if not status.get("authenticated"):
+                raise PermissionError(f"Sign in to {source.name} first")
+            model = (await source.models()).get(requested)
+            if model is None:
                 raise KeyError(f"Unknown model: {requested}")
-            return cloud_model
-
+            return model
         models = await self.models()
-        connected_model_ids = [
+        connected = [
             candidate.id
             for candidate in models.values()
             if candidate.provider != DEEPSEEK_PROVIDER_ID
             or self.config.deepseek.api_key != "no-key"
         ]
         try:
-            canonical = resolve_model_id(requested, connected_model_ids)
+            canonical = resolve_model_id(requested, connected)
         except KeyError:
-            # Keep legacy short DeepSeek ids useful when no connected provider
-            # exposes the requested name; the provider then reports the missing key.
             canonical = resolve_model_id(requested, models)
         return models[canonical]
 
     def provider(self, model: Model) -> Provider:
         provider_id, _ = split_model_id(model.id)
-        if provider_id == CLOUD_PROVIDER_ID:
-            return self._cloud_provider_factory(self.cloud_account)
+        remote = self._remotes.get(provider_id)
+        if remote is not None:
+            return remote.create_provider()
         provider = self._local_provider(provider_id)
         return self._local_provider_factory(
             api_key=provider.api_key,
@@ -163,7 +161,7 @@ class UnifiedProviderRegistry:
         by_provider: dict[str, list[str]] = {}
         for model in models.values():
             by_provider.setdefault(model.provider, []).append(model.id)
-        result = []
+        result: list[dict[str, Any]] = []
         for provider_id, provider in self._local_providers().items():
             result.append(
                 {
@@ -178,19 +176,20 @@ class UnifiedProviderRegistry:
                     "model_ids": by_provider.get(provider_id, []),
                 }
             )
-        cloud_status = self.cloud_account.status()
-        result.append(
-            {
-                "id": CLOUD_PROVIDER_ID,
-                "name": "Aeloon Cloud",
-                "kind": "cloud",
-                "base_url": cloud_status["base_url"],
-                "authenticated": cloud_status["authenticated"],
-                "credential_configured": cloud_status["authenticated"],
-                "model_ids": by_provider.get(CLOUD_PROVIDER_ID, []),
-                "user": cloud_status["user"],
-            }
-        )
+        for source in self._remotes.values():
+            status = source.status()
+            result.append(
+                {
+                    "id": source.id,
+                    "name": source.name,
+                    "kind": source.kind,
+                    "base_url": status.get("base_url"),
+                    "authenticated": bool(status.get("authenticated")),
+                    "credential_configured": bool(status.get("authenticated")),
+                    "model_ids": by_provider.get(source.id, []),
+                    "user": status.get("user"),
+                }
+            )
         return result
 
     def _local_models(self) -> dict[str, Model]:
@@ -254,11 +253,16 @@ class UnifiedProviderRegistry:
         )
 
 
+CatalogFactory = Callable[[Config], ProviderCatalog]
+
 __all__ = [
+    "CatalogFactory",
     "DEEPSEEK_PROVIDER_ID",
-    "UnifiedProviderRegistry",
+    "ProviderCatalog",
+    "RemoteProviderSource",
     "normalize_model_id",
     "qualify_model_id",
+    "resolve_model_id",
     "split_model_id",
     "validate_provider_id",
 ]

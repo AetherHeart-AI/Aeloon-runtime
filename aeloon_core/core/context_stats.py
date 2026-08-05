@@ -1,4 +1,4 @@
-"""Context token estimation and presentation-ready statistics."""
+"""Pure context token estimation and presentation-ready statistics."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import json
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from aeloon_core.harness.types import (
+from aeloon_core.core.types import (
     AgentMessage,
     AssistantMessage,
     TextContent,

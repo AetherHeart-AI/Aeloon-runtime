@@ -1,10 +1,10 @@
-"""Conversation state and session persistence."""
+"""Runtime conversation state and session persistence."""
 
 from __future__ import annotations
 
-from aeloon_core.harness.events import HarnessEventDispatcher
-from aeloon_core.harness.session import Session, SessionContext
-from aeloon_core.harness.types import AgentMessage, message_to_dict
+from aeloon_core.core.events import RunEventDispatcher
+from aeloon_core.core.types import AgentMessage, message_to_dict
+from aeloon_core.runtime.session import Session, SessionContext
 
 
 class ConversationTranscript:
@@ -13,7 +13,7 @@ class ConversationTranscript:
     def __init__(
         self,
         session: Session | None,
-        events: HarnessEventDispatcher,
+        events: RunEventDispatcher,
     ) -> None:
         self._session = session
         self._events = events

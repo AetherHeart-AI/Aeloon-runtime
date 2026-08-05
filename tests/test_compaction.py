@@ -5,12 +5,11 @@ from pathlib import Path
 
 import pytest
 
-from aeloon_core.harness import (
+from aeloon_core.config import Config
+from aeloon_core.core import (
     DEEPSEEK_V4_FLASH,
-    AgentHarness,
     AssistantMessage,
-    CompactionSettings,
-    JsonlSessionRepository,
+    ContextPolicy,
     ScriptedProvider,
     TextContent,
     ToolCall,
@@ -18,7 +17,10 @@ from aeloon_core.harness import (
     UserMessage,
     estimate_context_tokens,
 )
-from aeloon_core.harness.compaction import prepare_compaction, should_compact
+from aeloon_core.core.compaction import should_compact
+from aeloon_core.runtime import JsonlSessionRepository
+from aeloon_core.runtime.agent import SessionAgent
+from aeloon_core.runtime.compaction import CompactionSettings, prepare_compaction
 
 
 def _assistant(text: str, tokens: int = 0) -> AssistantMessage:
@@ -28,6 +30,38 @@ def _assistant(text: str, tokens: int = 0) -> AssistantMessage:
         model="deepseek-v4-flash",
         usage=Usage(input=tokens, output=1, total_tokens=tokens + 1 if tokens else 0),
     )
+
+
+def _session_agent(
+    tmp_path: Path,
+    session,
+    provider,
+    *,
+    model=DEEPSEEK_V4_FLASH,
+    settings: CompactionSettings | None = None,
+) -> SessionAgent:
+    selected = settings or CompactionSettings()
+    config = Config(
+        workspace=tmp_path,
+        data_dir=tmp_path,
+        agent={
+            "model": model.id,
+            "compaction": {
+                "enabled": selected.enabled,
+                "reserve_tokens": selected.reserve_tokens,
+                "keep_recent_tokens": selected.keep_recent_tokens,
+            },
+        },
+    ).normalized()
+
+    class StaticCatalog:
+        async def model(self, _model_id):
+            return model
+
+        def provider(self, _model):
+            return provider
+
+    return SessionAgent(config=config, session=session, catalog=StaticCatalog())  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio
@@ -46,14 +80,8 @@ async def test_turn_safe_compaction_and_previous_summary_merge(tmp_path: Path) -
     assert len(preparation.messages_to_summarize) % 2 == 0
 
     provider = ScriptedProvider([_assistant("structured checkpoint", tokens=12)])
-    harness = AgentHarness(
-        provider=provider,
-        model=DEEPSEEK_V4_FLASH,
-        cwd=str(tmp_path),
-        session=session,
-        compaction=settings,
-    )
-    result = await harness.compact()
+    agent = _session_agent(tmp_path, session, provider, settings=settings)
+    result = await agent.compact()
     assert result.summary.startswith("structured checkpoint")
     assert (await session.find_entries("compaction"))[-1]["fromHook"] is False
 
@@ -77,39 +105,34 @@ def test_token_estimation_prefers_last_valid_assistant_usage_plus_tail() -> None
         UserMessage("y" * 40),
     ]
     assert estimate_context_tokens(messages) == 1_001 + 10
-    assert should_compact(90, 100, CompactionSettings(reserve_tokens=16))
+    assert should_compact(90, 100, ContextPolicy(reserve_tokens=16))
     assert not should_compact(
         90,
         100,
-        CompactionSettings(enabled=False, reserve_tokens=16),
+        ContextPolicy(enabled=False, reserve_tokens=16),
     )
 
 
 @pytest.mark.asyncio
-async def test_compaction_hook_can_supply_summary_without_model_call(tmp_path: Path) -> None:
+async def test_explicit_compaction_uses_runtime_compactor_port(tmp_path: Path) -> None:
     session = await JsonlSessionRepository(tmp_path).create(cwd=tmp_path)
     for index in range(3):
         await session.append_message(UserMessage(f"user {index} " + "x" * 50))
         await session.append_message(_assistant(f"assistant {index}"))
-    provider = ScriptedProvider([])
-    harness = AgentHarness(
-        provider=provider,
-        model=DEEPSEEK_V4_FLASH,
-        cwd=str(tmp_path),
-        session=session,
-        compaction=CompactionSettings(keep_recent_tokens=5),
-    )
-    harness.on(
-        "session_before_compact",
-        lambda _event: {"compaction": {"summary": "from hook", "tokensBefore": 42}},
+    provider = ScriptedProvider([_assistant("from runtime compactor")])
+    agent = _session_agent(
+        tmp_path,
+        session,
+        provider,
+        settings=CompactionSettings(keep_recent_tokens=5),
     )
 
-    result = await harness.compact("focus")
+    result = await agent.compact("focus")
 
-    assert result.summary == "from hook"
-    assert provider.requests == []
+    assert result.summary == "from runtime compactor"
+    assert len(provider.requests) == 1
     entry = (await session.find_entries("compaction"))[-1]
-    assert entry["fromHook"] is True
+    assert entry["fromHook"] is False
 
 
 @pytest.mark.asyncio
@@ -128,19 +151,18 @@ async def test_context_overflow_compacts_once_then_retries(tmp_path: Path) -> No
     provider = ScriptedProvider(
         [overflow, _assistant("overflow checkpoint", tokens=20), _assistant("recovered")]
     )
-    harness = AgentHarness(
-        provider=provider,
-        model=DEEPSEEK_V4_FLASH,
-        cwd=str(tmp_path),
-        session=session,
-        compaction=CompactionSettings(keep_recent_tokens=10),
+    agent = _session_agent(
+        tmp_path,
+        session,
+        provider,
+        settings=CompactionSettings(keep_recent_tokens=10),
     )
     events: list[tuple[str, dict]] = []
-    harness.subscribe(lambda event: events.append((event.type, event.data)))
+    agent.subscribe(lambda event: events.append((event.type, event.data)))
 
-    result = await harness.prompt("continue")
+    result = await agent.prompt("continue", run_id="overflow")
 
-    assert result.text == "recovered"
+    assert result.final_message.text == "recovered"
     assert len(provider.requests) == 3
     assert len(await session.find_entries("compaction")) == 1
     assert any(kind == "compaction_start" and data["reason"] == "overflow" for kind, data in events)
@@ -156,19 +178,19 @@ async def test_threshold_compaction_runs_automatically_after_turn(tmp_path: Path
     provider = ScriptedProvider(
         [_assistant("main answer", tokens=90), _assistant("automatic checkpoint", tokens=5)]
     )
-    harness = AgentHarness(
-        provider=provider,
+    agent = _session_agent(
+        tmp_path,
+        session,
+        provider,
         model=replace(DEEPSEEK_V4_FLASH, context_window=100),
-        cwd=str(tmp_path),
-        session=session,
-        compaction=CompactionSettings(reserve_tokens=10, keep_recent_tokens=10),
+        settings=CompactionSettings(reserve_tokens=10, keep_recent_tokens=10),
     )
     events: list[tuple[str, dict]] = []
-    harness.subscribe(lambda event: events.append((event.type, event.data)))
+    agent.subscribe(lambda event: events.append((event.type, event.data)))
 
-    result = await harness.prompt("new prompt")
+    result = await agent.prompt("new prompt", run_id="threshold")
 
-    assert result.text == "main answer"
+    assert result.final_message.text == "main answer"
     assert len(await session.find_entries("compaction")) == 1
     assert any(
         kind == "compaction_start" and data["reason"] == "threshold" for kind, data in events
@@ -192,15 +214,14 @@ async def test_compaction_records_files_read_and_modified(tmp_path: Path) -> Non
     )
     await session.append_message(UserMessage("recent"))
     await session.append_message(_assistant("recent answer"))
-    harness = AgentHarness(
-        provider=ScriptedProvider([_assistant("checkpoint")]),
-        model=DEEPSEEK_V4_FLASH,
-        cwd=str(tmp_path),
-        session=session,
-        compaction=CompactionSettings(keep_recent_tokens=1),
+    agent = _session_agent(
+        tmp_path,
+        session,
+        ScriptedProvider([_assistant("checkpoint")]),
+        settings=CompactionSettings(keep_recent_tokens=1),
     )
 
-    result = await harness.compact()
+    result = await agent.compact()
 
     assert result.details == {
         "readFiles": ["src/a.py"],

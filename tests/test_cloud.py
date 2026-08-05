@@ -8,6 +8,8 @@ from typing import Any
 import httpx
 import pytest
 
+from aeloon_core.bootstrap import cloud_provider_source
+from aeloon_core.bridge import BridgeRpcAdapter
 from aeloon_core.cloud import (
     CloudAccountService,
     CloudProvider,
@@ -15,9 +17,9 @@ from aeloon_core.cloud import (
     InMemoryTokenVault,
 )
 from aeloon_core.config import CloudConfig, Config, save_config
-from aeloon_core.harness import Model, ProviderContext, StreamOptions, UserMessage
-from aeloon_core.harness.providers import collect_assistant
-from aeloon_core.service import CoreService
+from aeloon_core.core import Model, ProviderContext, StreamOptions, UserMessage
+from aeloon_core.core.providers import collect_assistant
+from aeloon_core.runtime import ProviderCatalog, RuntimeService
 
 
 class FakeCloudClient:
@@ -106,7 +108,15 @@ async def test_bridge_exposes_account_without_credentials_and_adds_cloud_models(
     cloud, _, _ = account(tmp_path)
     config_path = tmp_path / "config.json"
     save_config(Config(workspace=tmp_path, data_dir=tmp_path / "data"), config_path)
-    service = CoreService(config_path=config_path, cloud_account_service=cloud)
+    runtime = RuntimeService(
+        config_path=config_path,
+        account_gateway=cloud,  # type: ignore[arg-type]
+        catalog_factory=lambda config: ProviderCatalog(
+            config,
+            remote_sources=(cloud_provider_source(cloud),),
+        ),
+    )
+    service = BridgeRpcAdapter(runtime)
 
     logged_in = await service.dispatch(
         "cloud.account.login", {"username": "alice", "password": "secret"}
@@ -114,22 +124,23 @@ async def test_bridge_exposes_account_without_credentials_and_adds_cloud_models(
     assert logged_in["authenticated"] is True
     assert "secret" not in json.dumps(logged_in)
     assert "access-1" not in json.dumps(logged_in)
-    catalog = await service.catalog_get({})
+    catalog = await service.dispatch("catalog.get")
     cloud_model = next(item for item in catalog["models"] if item["provider_id"] == "aeloon-cloud")
     assert cloud_model["id"] == "aeloon-cloud/reasoner"
     assert cloud_model["supports_image"] is True
 
-    session = await service.session_create({"workspace": str(tmp_path)})
-    configured = await service.session_configure(
+    session = await service.dispatch("session.create", {"workspace": str(tmp_path)})
+    configured = await service.dispatch(
+        "session.configure",
         {"session_id": session["session_id"], "model_id": cloud_model["id"]}
     )
     assert configured["model_id"] == "aeloon-cloud/reasoner"
-    replay = await service.events_subscribe({"session_ids": [], "after_seq": 0})
+    replay = await service.dispatch("events.subscribe", {"session_ids": [], "after_seq": 0})
     assert any(event["name"] == "cloud.account.updated" for event in replay["events"])
 
     logged_out = await service.dispatch("cloud.account.logout")
     assert logged_out["authenticated"] is False
-    logged_out_catalog = await service.catalog_get({})
+    logged_out_catalog = await service.dispatch("catalog.get")
     assert all(item["provider_id"] != "aeloon-cloud" for item in logged_out_catalog["models"])
 
 

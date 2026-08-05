@@ -6,7 +6,7 @@ import json
 import httpx
 import pytest
 
-from aeloon_core.harness import (
+from aeloon_core.core import (
     DEEPSEEK_V4_FLASH,
     DeepSeekProvider,
     ProviderContext,
@@ -16,7 +16,7 @@ from aeloon_core.harness import (
     ToolCall,
     UserMessage,
 )
-from aeloon_core.harness.providers import collect_assistant
+from aeloon_core.core.providers import collect_assistant
 
 
 def _sse(*chunks: dict[str, object]) -> bytes:

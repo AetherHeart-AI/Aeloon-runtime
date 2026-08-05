@@ -7,17 +7,18 @@ from typing import Any
 import httpx
 import pytest
 
+from aeloon_core.bootstrap import create_runtime_service
+from aeloon_core.bridge import BridgeRpcAdapter
 from aeloon_core.config import Config, LocalModelConfig, LocalProviderConfig, save_config
-from aeloon_core.harness import DeepSeekProvider, ProviderContext, StreamOptions, UserMessage
-from aeloon_core.harness.providers import collect_assistant
-from aeloon_core.providers import (
-    UnifiedProviderRegistry,
+from aeloon_core.core import DeepSeekProvider, ProviderContext, StreamOptions, UserMessage
+from aeloon_core.core.providers import collect_assistant
+from aeloon_core.runtime import (
+    ProviderCatalog,
     normalize_model_id,
     qualify_model_id,
     resolve_model_id,
     split_model_id,
 )
-from aeloon_core.service import CoreService
 
 
 class OfflineCloudAccount:
@@ -69,10 +70,7 @@ async def test_registry_resolves_unqualified_model_to_first_provider() -> None:
             ),
         }
     ).normalized()
-    registry = UnifiedProviderRegistry(
-        config,
-        OfflineCloudAccount(),  # type: ignore[arg-type]
-    )
+    registry = ProviderCatalog(config)
 
     assert (await registry.model("coder")).id == "studio/coder"
     assert (
@@ -106,9 +104,8 @@ async def test_local_provider_routes_qualified_model_to_unprefixed_api_model() -
             )
         }
     ).normalized()
-    registry = UnifiedProviderRegistry(
+    registry = ProviderCatalog(
         config,
-        OfflineCloudAccount(),  # type: ignore[arg-type]
         local_provider_factory=lambda **kwargs: DeepSeekProvider(client=client, **kwargs),
     )
 
@@ -133,7 +130,8 @@ async def test_bridge_adds_and_removes_local_provider_without_exposing_secret(
 ) -> None:
     config_path = tmp_path / "config.json"
     save_config(Config(workspace=tmp_path, data_dir=tmp_path / "data"), config_path)
-    service = CoreService(config_path=config_path)
+    runtime = create_runtime_service(config_path=config_path)
+    service = BridgeRpcAdapter(runtime)
 
     added = await service.dispatch(
         "provider.local.add",
@@ -185,14 +183,15 @@ async def test_bridge_discovers_models_when_local_provider_omits_model_list(
 ) -> None:
     config_path = tmp_path / "config.json"
     save_config(Config(workspace=tmp_path, data_dir=tmp_path / "data"), config_path)
-    service = CoreService(config_path=config_path)
+    runtime = create_runtime_service(config_path=config_path)
+    service = BridgeRpcAdapter(runtime)
     calls: list[dict[str, Any]] = []
 
     async def discover(base_url: str, **kwargs: Any) -> list[dict[str, Any]]:
         calls.append({"base_url": base_url, **kwargs})
         return [{"id": "discovered", "name": "Discovered Model", "context_window": 64_000}]
 
-    service._discover_local_models = discover  # type: ignore[method-assign]
+    runtime._discover_local_models = discover  # type: ignore[method-assign]
     added = await service.dispatch(
         "provider.local.add",
         {

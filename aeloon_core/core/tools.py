@@ -1,4 +1,4 @@
-"""Local coding tools implemented in Python."""
+"""Stateless local coding tool definitions implemented in Python."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from typing import Any
 
 from PIL import Image
 
-from aeloon_core.harness.types import (
+from aeloon_core.core.types import (
     AgentTool,
     ImageContent,
     TextContent,

@@ -1,18 +1,19 @@
-"""Public API for Aeloon's pure-Python agent harness."""
+"""Public stateless agent-run API."""
 
-from aeloon_core.harness.compaction import (
-    CompactionResult,
-    CompactionSettings,
+from aeloon_core.core.compaction import (
+    ContextCompactor,
+    ContextPolicy,
+    ContextUpdate,
 )
-from aeloon_core.harness.context_stats import (
+from aeloon_core.core.context_stats import (
     cache_statistics,
     context_statistics,
     estimate_context_tokens,
     estimate_tokens,
 )
-from aeloon_core.harness.core import AgentHarness, AgentHarnessPhase
-from aeloon_core.harness.prompt import build_system_prompt, format_skills_for_system_prompt
-from aeloon_core.harness.providers import (
+from aeloon_core.core.control import RunController
+from aeloon_core.core.prompt import build_system_prompt, format_skills_for_system_prompt
+from aeloon_core.core.providers import (
     DEEPSEEK_MODELS,
     DEEPSEEK_V4_FLASH,
     DEEPSEEK_V4_PRO,
@@ -20,26 +21,13 @@ from aeloon_core.harness.providers import (
     ScriptedProvider,
     get_deepseek_model,
 )
-from aeloon_core.harness.resources import ResourceLoader
-from aeloon_core.harness.session import (
-    JsonlSessionRepository,
-    Session,
-    SessionContext,
-    SessionMetadata,
-)
-from aeloon_core.harness.tools import (
-    ALL_TOOL_NAMES,
-    DEFAULT_ACTIVE_TOOLS,
-    create_all_tools,
-)
-from aeloon_core.harness.types import (
+from aeloon_core.core.runner import RunHooks, RunRequest, RunResult, run_agent
+from aeloon_core.core.tools import ALL_TOOL_NAMES, DEFAULT_ACTIVE_TOOLS, create_all_tools
+from aeloon_core.core.types import (
     AgentMessage,
     AgentTool,
     AssistantMessage,
     AssistantStreamEvent,
-    HarnessError,
-    HarnessEvent,
-    HarnessEventType,
     ImageContent,
     Model,
     PromptTemplate,
@@ -47,7 +35,11 @@ from aeloon_core.harness.types import (
     ProviderContext,
     ProviderError,
     Resources,
-    SessionError,
+    RunError,
+    RunEvent,
+    RunEventSink,
+    RunEventType,
+    RunHook,
     Skill,
     StreamOptions,
     TextContent,
@@ -68,32 +60,31 @@ __all__ = [
     "DEEPSEEK_MODELS",
     "DEEPSEEK_V4_FLASH",
     "DEEPSEEK_V4_PRO",
-    "AgentHarness",
-    "AgentHarnessPhase",
     "AgentMessage",
     "AgentTool",
     "AssistantMessage",
     "AssistantStreamEvent",
-    "CompactionResult",
-    "CompactionSettings",
+    "ContextCompactor",
+    "ContextPolicy",
+    "ContextUpdate",
     "DeepSeekProvider",
-    "HarnessError",
-    "HarnessEvent",
-    "HarnessEventType",
     "ImageContent",
-    "JsonlSessionRepository",
     "Model",
     "PromptTemplate",
     "Provider",
     "ProviderContext",
     "ProviderError",
-    "ResourceLoader",
     "Resources",
+    "RunController",
+    "RunError",
+    "RunEvent",
+    "RunEventSink",
+    "RunEventType",
+    "RunHook",
+    "RunHooks",
+    "RunRequest",
+    "RunResult",
     "ScriptedProvider",
-    "Session",
-    "SessionContext",
-    "SessionError",
-    "SessionMetadata",
     "Skill",
     "StreamOptions",
     "TextContent",
@@ -114,4 +105,5 @@ __all__ = [
     "get_deepseek_model",
     "message_from_dict",
     "message_to_dict",
+    "run_agent",
 ]

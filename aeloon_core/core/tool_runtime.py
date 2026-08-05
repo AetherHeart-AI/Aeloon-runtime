@@ -1,4 +1,4 @@
-"""Tool registration, validation, execution, and cancellation."""
+"""Tool registration, validation, execution, and cancellation for one run."""
 
 from __future__ import annotations
 
@@ -9,10 +9,10 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 
-from aeloon_core.harness.events import HarnessEventDispatcher
-from aeloon_core.harness.types import (
+from aeloon_core.core.events import RunEventDispatcher
+from aeloon_core.core.types import (
     AgentTool,
-    HarnessError,
+    RunError,
     TextContent,
     ToolCall,
     ToolResult,
@@ -38,7 +38,7 @@ class ToolRuntime:
         self,
         tools: Iterable[AgentTool],
         active_names: Sequence[str],
-        events: HarnessEventDispatcher,
+        events: RunEventDispatcher,
     ) -> None:
         self._events = events
         self._tools = self._unique_tools(tuple(tools))
@@ -251,7 +251,7 @@ class ToolRuntime:
         result: dict[str, AgentTool] = {}
         for tool in tools:
             if tool.name in result:
-                raise HarnessError("invalid_argument", f"Duplicate tool name: {tool.name}")
+                raise RunError("invalid_argument", f"Duplicate tool name: {tool.name}")
             result[tool.name] = tool
         return result
 
@@ -264,7 +264,7 @@ class ToolRuntime:
         result = tuple(dict.fromkeys(names))
         unknown = [name for name in result if name not in available]
         if unknown:
-            raise HarnessError(
+            raise RunError(
                 "invalid_argument",
                 f"Unknown active tools: {', '.join(unknown)}",
             )

@@ -1,4 +1,4 @@
-"""Provider request preparation and stream lifecycle."""
+"""Provider request preparation and stream lifecycle for one run."""
 
 from __future__ import annotations
 
@@ -8,16 +8,16 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import replace
 from typing import Any
 
-from aeloon_core.harness.events import HarnessEventDispatcher
-from aeloon_core.harness.types import (
+from aeloon_core.core.events import RunEventDispatcher
+from aeloon_core.core.types import (
     AgentMessage,
     AgentTool,
     AssistantMessage,
     AssistantStreamEvent,
-    HarnessError,
     Model,
     Provider,
     ProviderContext,
+    RunError,
     StreamOptions,
     message_from_dict,
     message_to_dict,
@@ -29,7 +29,7 @@ RetryCallback = Callable[[dict[str, Any]], Awaitable[None]]
 class ProviderRuntime:
     """Build provider requests and own the active streaming task."""
 
-    def __init__(self, provider: Provider, events: HarnessEventDispatcher) -> None:
+    def __init__(self, provider: Provider, events: RunEventDispatcher) -> None:
         self._provider = provider
         self._events = events
         self._task: asyncio.Task[AssistantMessage] | None = None
@@ -41,7 +41,7 @@ class ProviderRuntime:
     @provider.setter
     def provider(self, provider: Provider) -> None:
         if self._task is not None:
-            raise HarnessError("busy", "Cannot replace the provider while it is streaming")
+            raise RunError("busy", "Cannot replace the provider while it is streaming")
         self._provider = provider
 
     def cancel(self) -> None:
@@ -204,7 +204,7 @@ class ProviderRuntime:
             elif event.type in {"done", "error"}:
                 final = event.message
         if final is None:
-            raise HarnessError("provider", "Provider stream ended without a final message")
+            raise RunError("provider", "Provider stream ended without a final message")
         if not started:
             await self._events.emit("message_start", {"message": message_to_dict(final)})
         return final

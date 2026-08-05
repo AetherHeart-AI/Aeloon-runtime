@@ -1,19 +1,19 @@
-"""Model-generated session titles that never enter the conversation transcript."""
+"""Runtime-generated session titles that never enter the transcript."""
 
 from __future__ import annotations
 
 import re
 from dataclasses import replace
 
-from aeloon_core.harness.providers import collect_assistant
-from aeloon_core.harness.session import Session
-from aeloon_core.harness.types import (
+from aeloon_core.core.providers import collect_assistant
+from aeloon_core.core.types import (
     Model,
     Provider,
     ProviderContext,
     StreamOptions,
     UserMessage,
 )
+from aeloon_core.runtime.session import Session
 
 GENERIC_SESSION_TITLES = frozenset(
     {
@@ -65,7 +65,7 @@ async def rename_session(
 ) -> str | None:
     """Generate and persist the first semantic title for ``session``.
 
-    The provider call is deliberately made outside ``AgentHarness.prompt`` so the
+    The provider call is deliberately made outside the main agent run so the
     naming request and response never become part of the user's context window.
     """
 

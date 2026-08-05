@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
-from aeloon_core.harness import DEFAULT_ACTIVE_TOOLS, ImageContent, create_all_tools
+from aeloon_core.core import DEFAULT_ACTIVE_TOOLS, ImageContent, create_all_tools
 
 
 @pytest.mark.asyncio

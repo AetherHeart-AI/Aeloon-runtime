@@ -5,10 +5,9 @@ from typing import Any
 
 import pytest
 
-from aeloon_core.harness.events import HarnessEventDispatcher
-from aeloon_core.harness.input_queue import TurnInputQueues
-from aeloon_core.harness.tool_runtime import ToolRuntime
-from aeloon_core.harness.types import AgentTool, HarnessError, ToolCall, ToolResult
+from aeloon_core.core import AgentTool, RunController, RunError, ToolCall, ToolResult
+from aeloon_core.core.events import RunEventDispatcher
+from aeloon_core.core.tool_runtime import ToolRuntime
 
 
 def _tool(name: str) -> AgentTool:
@@ -26,7 +25,7 @@ def _tool(name: str) -> AgentTool:
 
 @pytest.mark.asyncio
 async def test_event_dispatcher_isolates_listeners_and_merges_hooks() -> None:
-    events = HarnessEventDispatcher()
+    events = RunEventDispatcher()
     observed: list[str] = []
 
     def broken_listener(_event: Any) -> None:
@@ -46,36 +45,38 @@ async def test_event_dispatcher_isolates_listeners_and_merges_hooks() -> None:
 
 
 @pytest.mark.asyncio
-async def test_turn_input_queues_own_queue_modes_and_snapshots() -> None:
-    events = HarnessEventDispatcher()
+async def test_run_controller_owns_ephemeral_queue_modes_and_snapshots() -> None:
+    events = RunEventDispatcher()
     updates: list[dict[str, Any]] = []
     events.subscribe(
         lambda event: updates.append(event.data) if event.type == "queue_update" else None
     )
-    queues = TurnInputQueues(
-        events,
+    controller = RunController(
         steering_mode="one-at-a-time",
         follow_up_mode="all",
     )
+    await controller._bind(events, lambda: None)
 
-    await queues.enqueue("steer", "first")
-    await queues.enqueue("steer", "second")
-    await queues.enqueue("follow_up", "third")
-    await queues.enqueue("follow_up", "fourth")
-    await queues.enqueue("next_turn", "later")
+    await controller.steer("first")
+    await controller.steer("second")
+    await controller.follow_up("third")
+    await controller.follow_up("fourth")
 
-    assert [message.content for message in await queues.drain_steering()] == ["first"]
-    assert [message.content for message in await queues.drain_follow_up()] == ["third", "fourth"]
-    assert [message.content for message in queues.take_next_turn()] == ["later"]
-    assert queues.snapshot()["steer"][0]["content"] == "second"
+    assert [message.content for message in await controller._drain_steering()] == ["first"]
+    assert [message.content for message in await controller._drain_follow_up()] == [
+        "third",
+        "fourth",
+    ]
+    assert controller.snapshot()["steer"][0]["content"] == "second"
     assert updates
+    controller._release()
 
 
 def test_tool_runtime_rejects_invalid_reconfiguration_atomically() -> None:
-    events = HarnessEventDispatcher()
+    events = RunEventDispatcher()
     runtime = ToolRuntime((_tool("read"),), ("read",), events)
 
-    with pytest.raises(HarnessError) as invalid:
+    with pytest.raises(RunError) as invalid:
         runtime.configure((_tool("write"),), ("missing",))
 
     assert invalid.value.code == "invalid_argument"
@@ -100,7 +101,7 @@ async def test_tool_runtime_can_cancel_a_sequential_tool() -> None:
         execute=execute,
         execution_mode="sequential",
     )
-    runtime = ToolRuntime((tool,), ("wait",), HarnessEventDispatcher())
+    runtime = ToolRuntime((tool,), ("wait",), RunEventDispatcher())
     execution = asyncio.create_task(
         runtime.execute_calls((ToolCall("call", "wait", {}),), is_aborted=lambda: True)
     )

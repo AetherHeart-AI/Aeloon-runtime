@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 import aeloon_core.__main__ as cli
-from aeloon_core.harness import AssistantMessage, ScriptedProvider, TextContent, Usage
+from aeloon_core.core import AssistantMessage, ScriptedProvider, TextContent, Usage
 
 
 def _provider(text: str = "done") -> ScriptedProvider:
@@ -70,7 +70,7 @@ async def test_run_output_modes_are_stable_and_network_free(
 async def test_text_renderer_is_quiet_by_default(capsys) -> None:
     renderer = cli.RunRenderer("text")
     await renderer(
-        cli.HarnessEvent(
+        cli.RunEvent(
             "tool_execution_start",
             {
                 "toolCallId": "call-1",
@@ -80,7 +80,7 @@ async def test_text_renderer_is_quiet_by_default(capsys) -> None:
         )
     )
     await renderer(
-        cli.HarnessEvent(
+        cli.RunEvent(
             "tool_execution_end",
             {
                 "toolCallId": "call-1",
@@ -105,14 +105,14 @@ async def test_text_renderer_uses_one_status_line_in_a_terminal(monkeypatch, cap
     monkeypatch.setattr(cli, "_is_interactive_stderr", lambda: True)
     renderer = cli.RunRenderer("text")
 
-    await renderer(cli.HarnessEvent("agent_start"))
+    await renderer(cli.RunEvent("agent_start"))
     await renderer(
-        cli.HarnessEvent(
+        cli.RunEvent(
             "tool_execution_start",
             {"toolCallId": "call-1", "toolName": "read", "args": {"path": "private.txt"}},
         )
     )
-    await renderer(cli.HarnessEvent("agent_end"))
+    await renderer(cli.RunEvent("agent_end"))
 
     rendered = capsys.readouterr().err
     assert "Working…" in rendered
@@ -125,7 +125,7 @@ async def test_text_renderer_uses_one_status_line_in_a_terminal(monkeypatch, cap
 async def test_text_renderer_summarizes_tool_command_and_result(capsys) -> None:
     renderer = cli.RunRenderer("text", verbose=True)
     await renderer(
-        cli.HarnessEvent(
+        cli.RunEvent(
             "tool_execution_start",
             {
                 "toolCallId": "call-1",
@@ -135,7 +135,7 @@ async def test_text_renderer_summarizes_tool_command_and_result(capsys) -> None:
         )
     )
     await renderer(
-        cli.HarnessEvent(
+        cli.RunEvent(
             "tool_execution_end",
             {
                 "toolCallId": "call-1",
@@ -161,7 +161,7 @@ async def test_text_renderer_summarizes_tool_command_and_result(capsys) -> None:
 async def test_text_renderer_reports_read_size_without_echoing_content(capsys) -> None:
     renderer = cli.RunRenderer("text", verbose=True)
     await renderer(
-        cli.HarnessEvent(
+        cli.RunEvent(
             "tool_execution_start",
             {
                 "toolCallId": "call-read",
@@ -171,7 +171,7 @@ async def test_text_renderer_reports_read_size_without_echoing_content(capsys) -
         )
     )
     await renderer(
-        cli.HarnessEvent(
+        cli.RunEvent(
             "tool_execution_end",
             {
                 "toolCallId": "call-read",
@@ -194,7 +194,7 @@ async def test_text_renderer_reports_read_size_without_echoing_content(capsys) -
 async def test_text_renderer_marks_nonzero_bash_exit_as_failed(capsys) -> None:
     renderer = cli.RunRenderer("text", verbose=True)
     await renderer(
-        cli.HarnessEvent(
+        cli.RunEvent(
             "tool_execution_start",
             {
                 "toolCallId": "call-failed",
@@ -204,7 +204,7 @@ async def test_text_renderer_marks_nonzero_bash_exit_as_failed(capsys) -> None:
         )
     )
     await renderer(
-        cli.HarnessEvent(
+        cli.RunEvent(
             "tool_execution_end",
             {
                 "toolCallId": "call-failed",
@@ -227,7 +227,7 @@ async def test_text_renderer_marks_nonzero_bash_exit_as_failed(capsys) -> None:
 async def test_text_renderer_summarizes_mutation_arguments_and_shows_errors(capsys) -> None:
     renderer = cli.RunRenderer("text", verbose=True)
     await renderer(
-        cli.HarnessEvent(
+        cli.RunEvent(
             "tool_execution_start",
             {
                 "toolCallId": "call-2",
@@ -237,7 +237,7 @@ async def test_text_renderer_summarizes_mutation_arguments_and_shows_errors(caps
         )
     )
     await renderer(
-        cli.HarnessEvent(
+        cli.RunEvent(
             "tool_execution_end",
             {
                 "toolCallId": "call-2",

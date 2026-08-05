@@ -9,9 +9,9 @@ import httpx
 
 from aeloon_core.cloud.account import CLOUD_PROVIDER_ID, CloudAccountService
 from aeloon_core.cloud.client import CloudError
-from aeloon_core.harness.providers import DeepSeekProvider
-from aeloon_core.harness.types import (
+from aeloon_core.core import (
     AssistantStreamEvent,
+    DeepSeekProvider,
     Model,
     ProviderContext,
     ProviderError,
