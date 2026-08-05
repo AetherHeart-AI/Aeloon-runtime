@@ -125,6 +125,7 @@ class SessionAgent:
         self.controller: RunController | None = None
         self._observers: list[RunObserver] = []
         self._resources = None
+        self._resource_loader_instance: ResourceLoader | None = None
         self._pending_next_turn: list[UserMessage] = []
 
     def subscribe(self, observer: RunObserver) -> Callable[[], None]:
@@ -141,7 +142,8 @@ class SessionAgent:
             return
         self.model = await self.catalog.model(self.config.agent.model)
         self.provider = self.catalog.provider(self.model)
-        self._resources = await asyncio.to_thread(self._resource_loader().reload)
+        self._resource_loader_instance = self._resource_loader()
+        self._resources = await asyncio.to_thread(self._resource_loader_instance.reload)
 
     async def prompt(
         self,
@@ -229,20 +231,22 @@ class SessionAgent:
         name: str,
         additional_instructions: str | None,
         *,
+        images: Sequence[ImageContent] = (),
         run_id: str,
     ) -> RunResult:
         await self.prepare()
-        assert self._resources is not None
-        skill = next((item for item in self._resources.skills if item.name == name), None)
-        if skill is None:
-            raise ValueError(f"Unknown skill: {name}")
+        assert self._resources is not None and self._resource_loader_instance is not None
+        try:
+            skill = await asyncio.to_thread(self._resource_loader_instance.load_skill, name)
+        except KeyError:
+            raise ValueError(f"Unknown skill: {name}") from None
         prompt = (
             f'<skill name="{skill.name}" location="{skill.file_path}">\n'
             f"{skill.content}\n</skill>"
         )
         if additional_instructions:
             prompt += f"\n\n{additional_instructions}"
-        return await self.prompt(prompt, run_id=run_id)
+        return await self.prompt(prompt, images=images, run_id=run_id)
 
     async def prompt_template(
         self,
@@ -403,6 +407,11 @@ class SessionAgent:
             cwd=Path(self.config.workspace),
             agent_dir=self.config.data_dir,
             additional_roots=tuple(self.config.resources.roots),
+            enabled_skills=(
+                tuple(self.config.resources.enabled_skills)
+                if self.config.resources.enabled_skills is not None
+                else None
+            ),
             no_skills=self.config.resources.no_skills,
             no_prompt_templates=self.config.resources.no_prompt_templates,
             no_context_files=self.config.resources.no_context_files,

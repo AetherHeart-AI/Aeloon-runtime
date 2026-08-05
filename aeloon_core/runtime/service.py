@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import inspect
+import re
 import shutil
 import time
 import uuid
@@ -34,6 +35,7 @@ from aeloon_core.core import (
     StreamOptions,
 )
 from aeloon_core.runtime.agent import SessionAgent, SessionAgentFactory
+from aeloon_core.runtime.builtin_skills import provision_builtin_skills
 from aeloon_core.runtime.catalog import (
     DEEPSEEK_PROVIDER_ID,
     CatalogFactory,
@@ -63,6 +65,7 @@ ATTACHMENT_LIMIT = 8
 IMAGE_LIMIT = 10 * 1024 * 1024
 FILE_LIMIT = 25 * 1024 * 1024
 TOOL_OUTPUT_LIMIT = 20_000
+_SKILL_COMMAND = re.compile(r"^/([A-Za-z0-9][A-Za-z0-9._:-]*)(?:\s+([\s\S]*))?$")
 RuntimeFailure = RuntimeFailure
 
 
@@ -113,6 +116,7 @@ class RuntimeService:
             config = config.model_copy(update={"data_dir": self._data_dir_override}).normalized()
         self.config = config
         self.data_dir = config.data_dir
+        provision_builtin_skills(self.data_dir)
         self.repository = JsonlSessionRepository(self.data_dir)
         self.attachment_dir = self.data_dir / "session-attachments"
         self.attachment_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -171,6 +175,7 @@ class RuntimeService:
             operation_id=str(value["operation_id"]),
             turn_id=str(value["turn_id"]),
             queue_position=int(value["queue_position"]),
+            skill_id=str(value["skill_id"]) if value.get("skill_id") else None,
         )
 
     async def cancel_turn(self, operation_id: str) -> None:
@@ -361,6 +366,7 @@ class RuntimeService:
     ) -> dict[str, Any]:
         session = await self._session(params)
         input_value = self._turn_input(params.get("input"))
+        input_value = await self._resolve_skill_command(session, input_value)
         if input_value["kind"] == "prompt":
             input_value["attachments"] = await self._copy_attachments(
                 session.id,
@@ -384,10 +390,20 @@ class RuntimeService:
         )
         runtime.operations[operation.id] = operation
         queued = sum(1 for item in runtime.operations.values() if item.status == "queued")
-        await self._emit("operation.queued", session, operation, {"kind": "turn", "queue_position": queued})
+        queued_payload: dict[str, Any] = {"kind": "turn", "queue_position": queued}
+        if input_value.get("skill_id"):
+            queued_payload["skill_id"] = input_value["skill_id"]
+        await self._emit("operation.queued", session, operation, queued_payload)
         await self._emit_queue(session, runtime)
         operation.task = asyncio.create_task(self._execute_turn(session, runtime, operation))
-        return {"operation_id": operation.id, "turn_id": operation.id, "queue_position": queued}
+        result = {
+            "operation_id": operation.id,
+            "turn_id": operation.id,
+            "queue_position": queued,
+        }
+        if input_value.get("skill_id"):
+            result["skill_id"] = input_value["skill_id"]
+        return result
 
     async def turn_cancel(self, params: Mapping[str, Any]) -> dict[str, Any]:
         operation = self._operation(params)
@@ -412,12 +428,18 @@ class RuntimeService:
         return {"operation_id": operation.id, "accepted": True}
 
     async def catalog_get(self, params: Mapping[str, Any]) -> dict[str, Any]:
-        workspace = self.config.workspace
+        workspace = (
+            Path(str(params["workspace"])).expanduser().resolve(strict=False)
+            if params.get("workspace")
+            else self.config.workspace
+        )
         if params.get("session_id"):
             session = await self.repository.open(str(params["session_id"]))
             workspace = Path(session.metadata.cwd)
         loader = self._resource_loader(self.config.model_copy(update={"workspace": workspace}).normalized())
         resources = await asyncio.to_thread(loader.reload)
+        enabled_skill_ids = {skill.name for skill in resources.skills}
+        selected_skill_ids = self._selected_skill_ids(loader)
         models = await self._models()
         return {
             "providers": await self._provider_registry().providers(),
@@ -439,8 +461,23 @@ class RuntimeService:
                 for name in ALL_TOOL_NAMES
             ],
             "skills": [
-                {"id": skill.name, "name": skill.name, "description": skill.description}
-                for skill in resources.skills
+                {
+                    "id": skill.name,
+                    "name": skill.name,
+                    "description": skill.description,
+                    "command": f"/{skill.name}",
+                    "source": skill.source,
+                    "location": skill.file_path,
+                    "selected": skill.name in selected_skill_ids,
+                    "enabled": skill.name in enabled_skill_ids,
+                    "explicit_invocation_enabled": skill.name in enabled_skill_ids,
+                    "model_invocation_enabled": (
+                        skill.name in enabled_skill_ids
+                        and not skill.disable_model_invocation
+                    ),
+                    "content_loading": "on_demand",
+                }
+                for skill in loader.available_skills
             ],
             "prompt_templates": [
                 {"id": item.name, "name": item.name, "description": item.description or ""}
@@ -448,8 +485,17 @@ class RuntimeService:
             ],
         }
 
-    async def settings_get(self, _params: Mapping[str, Any]) -> dict[str, Any]:
+    async def settings_get(self, params: Mapping[str, Any]) -> dict[str, Any]:
         config = self.config
+        workspace = (
+            Path(str(params["workspace"])).expanduser().resolve(strict=False)
+            if params.get("workspace")
+            else config.workspace
+        )
+        loader = self._resource_loader(
+            config.model_copy(update={"workspace": workspace}).normalized()
+        )
+        await asyncio.to_thread(loader.reload)
         return {
             "revision": self._revision,
             "config_path": str(self.config_path),
@@ -460,6 +506,7 @@ class RuntimeService:
             "resources": {
                 "roots": [str(root) for root in config.resources.roots],
                 "load_skills": not config.resources.no_skills,
+                "enabled_skill_ids": sorted(self._selected_skill_ids(loader)),
                 "load_prompt_templates": not config.resources.no_prompt_templates,
                 "load_context_files": not config.resources.no_context_files,
             },
@@ -530,6 +577,27 @@ class RuntimeService:
                 else:
                     raise RuntimeFailure("invalid_argument", "Secret action must be set or clear")
             persisted_config = Config.model_validate(raw).normalized()
+            resource_patch = patch.get("resources")
+            if isinstance(resource_patch, Mapping) and "enabled_skill_ids" in resource_patch:
+                validation_config = persisted_config
+                if params.get("workspace"):
+                    validation_config = persisted_config.model_copy(
+                        update={
+                            "workspace": Path(str(params["workspace"]))
+                            .expanduser()
+                            .resolve(strict=False)
+                        }
+                    ).normalized()
+                loader = self._resource_loader(validation_config)
+                await asyncio.to_thread(loader.reload)
+                known_skill_ids = {skill.name for skill in loader.available_skills}
+                requested_skill_ids = set(persisted_config.resources.enabled_skills or ())
+                unknown_skill_ids = requested_skill_ids - known_skill_ids
+                if unknown_skill_ids:
+                    raise RuntimeFailure(
+                        "invalid_argument",
+                        "Unknown skill ids: " + ", ".join(sorted(unknown_skill_ids)),
+                    )
             await asyncio.to_thread(save_config, persisted_config, self.config_path)
             next_config = load_config(self.config_path)
             if self._data_dir_override is not None:
@@ -542,7 +610,9 @@ class RuntimeService:
                 await self.account.configure(next_config.cloud)
             self._revision += 1
         await self._emit("settings.updated", None, None, {"revision": self._revision})
-        return await self.settings_get({})
+        return await self.settings_get(
+            {"workspace": params["workspace"]} if params.get("workspace") else {}
+        )
 
     async def close(self) -> None:
         tasks = [
@@ -962,10 +1032,54 @@ class RuntimeService:
             cwd=config.workspace,
             agent_dir=self.data_dir,
             additional_roots=tuple(config.resources.roots),
+            enabled_skills=(
+                tuple(config.resources.enabled_skills)
+                if config.resources.enabled_skills is not None
+                else None
+            ),
             no_skills=config.resources.no_skills,
             no_prompt_templates=config.resources.no_prompt_templates,
             no_context_files=config.resources.no_context_files,
         )
+
+    @staticmethod
+    def _selected_skill_ids(loader: ResourceLoader) -> set[str]:
+        available = {skill.name for skill in loader.available_skills}
+        if loader.enabled_skills is None:
+            return available
+        return available.intersection(loader.enabled_skills)
+
+    async def _resolve_skill_command(
+        self,
+        session: Session,
+        value: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Resolve `/skill instructions` in runtime while preserving the public prompt."""
+
+        if value.get("kind") != "prompt":
+            return value
+        match = _SKILL_COMMAND.fullmatch(str(value.get("text") or ""))
+        if match is None:
+            return value
+        name = match.group(1)
+        effective = self.config.model_copy(
+            update={"workspace": Path(session.metadata.cwd)}
+        ).normalized()
+        loader = self._resource_loader(effective)
+        resources = await asyncio.to_thread(loader.reload)
+        skill = next((item for item in loader.available_skills if item.name == name), None)
+        if skill is None:
+            return value
+        if not any(item.name == name for item in resources.skills):
+            raise RuntimeFailure(
+                "invalid_argument",
+                f"Skill '{name}' is available but disabled in Core settings",
+            )
+        return {
+            **value,
+            "skill_id": name,
+            "_skill_instructions": (match.group(2) or "").strip() or None,
+        }
 
     async def _invoke_input(
         self,
@@ -1003,6 +1117,18 @@ class RuntimeService:
                     supplements.append(f"[File: {attachment['name']}]\n{content}")
                 except UnicodeError:
                     supplements.append(f"[Binary file attached: {attachment['name']}]")
+        if value.get("skill_id"):
+            instructions = str(value.get("_skill_instructions") or "")
+            if supplements:
+                instructions = "\n\n".join(
+                    item for item in (instructions, *supplements) if item
+                )
+            return await agent.skill(
+                str(value["skill_id"]),
+                instructions or None,
+                images=tuple(images),
+                run_id=run_id,
+            )
         if supplements:
             text = "\n\n".join([text, *supplements])
         return await agent.prompt(text, images=tuple(images), run_id=run_id)
@@ -1215,7 +1341,7 @@ class RuntimeService:
         return result
 
     def _public_input(self, value: Mapping[str, Any]) -> dict[str, Any]:
-        result = dict(value)
+        result = {key: item for key, item in value.items() if not key.startswith("_")}
         result["attachments"] = [
             {key: item[key] for key in ("id", "type", "name", "mime_type", "size_bytes", "text") if key in item}
             for item in value.get("attachments") or []
@@ -1364,8 +1490,25 @@ class RuntimeService:
             value = patch["resources"]
             if not isinstance(value, Mapping):
                 raise RuntimeFailure("invalid_argument", "resources must be an object")
+            enabled_skill_ids = value.get(
+                "enabled_skill_ids",
+                raw["resources"].get("enabled_skills"),
+            )
+            if enabled_skill_ids is not None and (
+                not isinstance(enabled_skill_ids, list)
+                or any(not isinstance(item, str) or not item.strip() for item in enabled_skill_ids)
+            ):
+                raise RuntimeFailure(
+                    "invalid_argument",
+                    "resources.enabled_skill_ids must be a list of skill ids or null",
+                )
             raw["resources"].update({
                 "roots": value.get("roots", raw["resources"]["roots"]),
+                "enabled_skills": (
+                    None
+                    if enabled_skill_ids is None
+                    else list(dict.fromkeys(item.strip() for item in enabled_skill_ids))
+                ),
                 "no_skills": not bool(value.get("load_skills", not raw["resources"]["no_skills"])),
                 "no_prompt_templates": not bool(value.get("load_prompt_templates", not raw["resources"]["no_prompt_templates"])),
                 "no_context_files": not bool(value.get("load_context_files", not raw["resources"]["no_context_files"])),

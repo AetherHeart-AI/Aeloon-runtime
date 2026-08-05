@@ -447,6 +447,7 @@ class Skill:
     content: str
     file_path: str
     disable_model_invocation: bool = False
+    source: str = "unknown"
 
 
 @dataclass(frozen=True, slots=True)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,7 @@ class ResourceLoader:
         cwd: Path | str,
         agent_dir: Path | str | None = None,
         additional_roots: tuple[Path | str, ...] = (),
+        enabled_skills: tuple[str, ...] | None = None,
         no_skills: bool = False,
         no_prompt_templates: bool = False,
         no_context_files: bool = False,
@@ -30,14 +32,24 @@ class ResourceLoader:
         self.additional_roots = tuple(
             Path(path).expanduser().resolve(strict=False) for path in additional_roots
         )
+        self.enabled_skills = (
+            None if enabled_skills is None else frozenset(enabled_skills)
+        )
         self.no_skills = no_skills
         self.no_prompt_templates = no_prompt_templates
         self.no_context_files = no_context_files
         self._resources = Resources()
+        self._available_skills: tuple[Skill, ...] = ()
 
     @property
     def resources(self) -> Resources:
         return self._resources
+
+    @property
+    def available_skills(self) -> tuple[Skill, ...]:
+        """All discovered skill descriptors, including disabled skills."""
+
+        return self._available_skills
 
     def reload(self) -> Resources:
         project_dir = self.cwd / ".aeloon-core"
@@ -45,7 +57,16 @@ class ResourceLoader:
         append_source = _first_file(
             project_dir / "APPEND_SYSTEM.md", self.agent_dir / "APPEND_SYSTEM.md"
         )
-        skills = () if self.no_skills else self._load_skills(project_dir)
+        self._available_skills = self._load_skills(project_dir)
+        skills = (
+            ()
+            if self.no_skills
+            else tuple(
+                skill
+                for skill in self._available_skills
+                if self.enabled_skills is None or skill.name in self.enabled_skills
+            )
+        )
         prompts = () if self.no_prompt_templates else self._load_prompts(project_dir)
         context = () if self.no_context_files else self._load_context_files()
         self._resources = Resources(
@@ -58,6 +79,22 @@ class ResourceLoader:
             ),
         )
         return self._resources
+
+    def load_skill(self, name: str) -> Skill:
+        """Load one enabled skill body after metadata-only discovery."""
+
+        skill = next((item for item in self._resources.skills if item.name == name), None)
+        if skill is None:
+            raise KeyError(name)
+        try:
+            raw = Path(skill.file_path).read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise ValueError(f"Could not read skill: {name}") from exc
+        metadata, content = _frontmatter(raw)
+        loaded_name = str(metadata.get("name") or Path(skill.file_path).parent.name).strip()
+        if loaded_name != skill.name:
+            raise ValueError(f"Skill metadata changed while loading: {name}")
+        return replace(skill, content=content.strip())
 
     def _load_context_files(self) -> tuple[tuple[str, str], ...]:
         files: list[Path] = []
@@ -87,11 +124,15 @@ class ResourceLoader:
         return tuple(result)
 
     def _load_skills(self, project_dir: Path) -> tuple[Skill, ...]:
-        roots = (self.agent_dir / "skills", project_dir / "skills", *self.additional_roots)
+        roots = (
+            (self.agent_dir / "skills", "user"),
+            (project_dir / "skills", "workspace"),
+            *((root, "additional") for root in self.additional_roots),
+        )
         selected: dict[str, Skill] = {}
-        for root in roots:
+        for root, source in roots:
             for path in _resource_files(root, "SKILL.md"):
-                skill = _parse_skill(path)
+                skill = _parse_skill(path, source=source)
                 if skill is not None:
                     selected[skill.name] = skill
         return tuple(selected[name] for name in sorted(selected))
@@ -147,12 +188,12 @@ def _frontmatter(text: str) -> tuple[dict[str, Any], str]:
     return (dict(raw) if isinstance(raw, dict) else {}), text[end + 5 :]
 
 
-def _parse_skill(path: Path) -> Skill | None:
-    try:
-        raw = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError):
+def _parse_skill(path: Path, *, source: str) -> Skill | None:
+    """Read only frontmatter during discovery; the body is loaded on invocation."""
+
+    metadata = _frontmatter_metadata(path)
+    if metadata is None:
         return None
-    metadata, content = _frontmatter(raw)
     name = str(metadata.get("name") or path.parent.name).strip()
     description = str(metadata.get("description") or "").strip()
     if not name or not description:
@@ -160,10 +201,39 @@ def _parse_skill(path: Path) -> Skill | None:
     return Skill(
         name=name,
         description=description,
-        content=content.strip(),
+        content="",
         file_path=str(path.resolve(strict=False)),
         disable_model_invocation=bool(metadata.get("disable-model-invocation", False)),
+        source=source,
     )
+
+
+def _frontmatter_metadata(path: Path) -> dict[str, Any] | None:
+    """Parse bounded YAML frontmatter without reading the skill instructions."""
+
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            first = handle.readline().removeprefix("\ufeff").rstrip("\r\n")
+            if first != "---":
+                return {}
+            lines: list[str] = []
+            size = 0
+            for line in handle:
+                if line.rstrip("\r\n") == "---":
+                    break
+                size += len(line)
+                if size > 64 * 1024:
+                    return None
+                lines.append(line)
+            else:
+                return {}
+    except (OSError, UnicodeError):
+        return None
+    try:
+        raw = yaml.safe_load("".join(lines)) or {}
+    except yaml.YAMLError:
+        return {}
+    return dict(raw) if isinstance(raw, dict) else {}
 
 
 def _parse_prompt(path: Path) -> PromptTemplate:

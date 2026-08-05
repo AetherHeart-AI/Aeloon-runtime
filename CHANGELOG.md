@@ -18,3 +18,7 @@ release is cut, those entries should move to a versioned section with an ISO dat
   development.
 - Moved compatibility guidance and internal architecture details into dedicated documents.
 - Reworded public project descriptions and core module documentation to focus on Aeloon behavior.
+- Added runtime-owned skill selection, `/skill` prompt resolution, metadata-rich Bridge catalog
+  entries, and on-demand loading of full skill instructions.
+- Bundled office, presentation, document-writing, and reporting skills and provisioned missing
+  presets into the Core data directory without overwriting user-owned skills.

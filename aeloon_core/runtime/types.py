@@ -84,13 +84,17 @@ class OperationSnapshot:
     operation_id: str
     turn_id: str
     queue_position: int
+    skill_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        value = {
             "operation_id": self.operation_id,
             "turn_id": self.turn_id,
             "queue_position": self.queue_position,
         }
+        if self.skill_id is not None:
+            value["skill_id"] = self.skill_id
+        return value
 
 
 @dataclass(frozen=True, slots=True)

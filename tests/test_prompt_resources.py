@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from aeloon_core.core import build_system_prompt, create_all_tools
 from aeloon_core.runtime import ResourceLoader
 
@@ -102,3 +104,42 @@ def test_prompt_templates_use_project_override(tmp_path: Path) -> None:
 
     assert len(resources.prompt_templates) == 1
     assert resources.prompt_templates[0].format(("a", "b")) == "local a a b"
+
+
+def test_skills_are_discovered_as_metadata_then_loaded_on_demand(tmp_path: Path) -> None:
+    skill_file = tmp_path / "global" / "skills" / "review" / "SKILL.md"
+    skill_file.parent.mkdir(parents=True)
+    skill_file.write_text(
+        "---\nname: review\ndescription: Review changes\n---\nFULL INSTRUCTIONS\n",
+        encoding="utf-8",
+    )
+    loader = ResourceLoader(cwd=tmp_path, agent_dir=tmp_path / "global")
+
+    resources = loader.reload()
+
+    assert resources.skills[0].content == ""
+    assert loader.available_skills[0].source == "user"
+    assert loader.load_skill("review").content == "FULL INSTRUCTIONS"
+
+
+def test_skill_selection_filters_runtime_resources_but_not_catalog(tmp_path: Path) -> None:
+    skill_root = tmp_path / "global" / "skills"
+    for name in ("one", "two"):
+        path = skill_root / name / "SKILL.md"
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            f"---\nname: {name}\ndescription: Skill {name}\n---\n{name} body\n",
+            encoding="utf-8",
+        )
+    loader = ResourceLoader(
+        cwd=tmp_path,
+        agent_dir=tmp_path / "global",
+        enabled_skills=("two",),
+    )
+
+    resources = loader.reload()
+
+    assert [skill.name for skill in loader.available_skills] == ["one", "two"]
+    assert [skill.name for skill in resources.skills] == ["two"]
+    with pytest.raises(KeyError):
+        loader.load_skill("one")

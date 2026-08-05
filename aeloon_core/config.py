@@ -82,6 +82,9 @@ class ResourceConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     roots: list[Path] = Field(default_factory=list)
+    # None preserves the historical behaviour: every discovered skill is enabled.
+    # Once the UI saves a selection, the explicit list becomes the source of truth.
+    enabled_skills: list[str] | None = None
     no_skills: bool = False
     no_prompt_templates: bool = False
     no_context_files: bool = False
@@ -129,12 +132,25 @@ class Config(BaseModel):
             )
             for root in self.resources.roots
         ]
+        enabled_skills = (
+            None
+            if self.resources.enabled_skills is None
+            else list(
+                dict.fromkeys(
+                    name
+                    for item in self.resources.enabled_skills
+                    if (name := item.strip())
+                )
+            )
+        )
         return self.model_copy(
             update={
                 "workspace": workspace,
                 "data_dir": self.data_dir.expanduser().resolve(strict=False),
                 "agent": self.agent.model_copy(update={"model": model_id}),
-                "resources": self.resources.model_copy(update={"roots": roots}),
+                "resources": self.resources.model_copy(
+                    update={"roots": roots, "enabled_skills": enabled_skills}
+                ),
             }
         )
 

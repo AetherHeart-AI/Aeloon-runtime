@@ -27,8 +27,10 @@ from aeloon_core.core import (
     ScriptedProvider,
     TextContent,
     Usage,
+    UserMessage,
 )
 from aeloon_core.runtime import ProviderCatalog, RuntimeService
+from aeloon_core.runtime.builtin_skills import BUILTIN_SKILL_IDS
 
 
 def scripted_service(
@@ -224,6 +226,149 @@ async def test_revisioned_settings_never_return_secret(tmp_path: Path) -> None:
         await service.dispatch(
             "settings.update", {"revision": initial["revision"], "patch": {}}
         )
+
+
+@pytest.mark.asyncio
+async def test_skill_catalog_selection_and_runtime_slash_invocation(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    for name, description, body, model_disabled in (
+        ("review", "Review changes", "FULL REVIEW INSTRUCTIONS", False),
+        ("private", "Explicit only", "PRIVATE INSTRUCTIONS", True),
+    ):
+        skill_file = data_dir / "skills" / name / "SKILL.md"
+        skill_file.parent.mkdir(parents=True)
+        skill_file.write_text(
+            "---\n"
+            f"name: {name}\n"
+            f"description: {description}\n"
+            f"disable-model-invocation: {str(model_disabled).lower()}\n"
+            "---\n"
+            f"{body}\n",
+            encoding="utf-8",
+        )
+    alternate_workspace = tmp_path / "alternate"
+    project_skill = alternate_workspace / ".aeloon-core" / "skills" / "project" / "SKILL.md"
+    project_skill.parent.mkdir(parents=True)
+    project_skill.write_text(
+        "---\nname: project\ndescription: Workspace skill\n---\nPROJECT INSTRUCTIONS\n",
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "config.json"
+    save_config(
+        Config(
+            workspace=tmp_path,
+            data_dir=data_dir,
+            agent={"model": "deepseek/deepseek-v4-flash"},
+        ),
+        config_path,
+    )
+    provider = ScriptedProvider(
+        [
+            AssistantMessage(
+                (TextContent("reviewed"),),
+                "deepseek",
+                "deepseek/deepseek-v4-flash",
+            )
+        ]
+    )
+    runtime = RuntimeService(
+        config_path=config_path,
+        catalog_factory=lambda config: ProviderCatalog(
+            config,
+            local_provider_factory=lambda **_kwargs: provider,
+        ),
+    )
+    service = BridgeRpcAdapter(runtime)
+
+    initial_settings = await service.dispatch("settings.get")
+    assert initial_settings["resources"]["enabled_skill_ids"] == sorted(
+        (*BUILTIN_SKILL_IDS, "private", "review")
+    )
+    workspace_settings = await service.dispatch(
+        "settings.get", {"workspace": str(alternate_workspace)}
+    )
+    assert workspace_settings["resources"]["enabled_skill_ids"] == sorted(
+        (*BUILTIN_SKILL_IDS, "private", "project", "review")
+    )
+    workspace_catalog = await service.dispatch(
+        "catalog.get", {"workspace": str(alternate_workspace)}
+    )
+    assert next(
+        item for item in workspace_catalog["skills"] if item["id"] == "project"
+    )["source"] == "workspace"
+    initial_catalog = await service.dispatch("catalog.get")
+    review = next(item for item in initial_catalog["skills"] if item["id"] == "review")
+    private = next(item for item in initial_catalog["skills"] if item["id"] == "private")
+    assert review == {
+        "id": "review",
+        "name": "review",
+        "description": "Review changes",
+        "command": "/review",
+        "source": "user",
+        "location": str(data_dir / "skills" / "review" / "SKILL.md"),
+        "selected": True,
+        "enabled": True,
+        "explicit_invocation_enabled": True,
+        "model_invocation_enabled": True,
+        "content_loading": "on_demand",
+    }
+    assert private["model_invocation_enabled"] is False
+
+    with pytest.raises(BridgeError, match="Unknown skill ids: missing"):
+        await service.dispatch(
+            "settings.update",
+            {
+                "revision": initial_settings["revision"],
+                "patch": {"resources": {"enabled_skill_ids": ["missing"]}},
+            },
+        )
+    updated = await service.dispatch(
+        "settings.update",
+        {
+            "revision": initial_settings["revision"],
+            "patch": {"resources": {"enabled_skill_ids": ["review"]}},
+        },
+    )
+    assert updated["resources"]["enabled_skill_ids"] == ["review"]
+    catalog = await service.dispatch("catalog.get")
+    private = next(item for item in catalog["skills"] if item["id"] == "private")
+    assert private["selected"] is False
+    assert private["enabled"] is False
+
+    session = await service.dispatch(
+        "session.create", {"workspace": str(tmp_path), "title": "Skill review"}
+    )
+    with pytest.raises(BridgeError, match="available but disabled"):
+        await service.dispatch(
+            "turn.start",
+            {
+                "session_id": session["session_id"],
+                "input": {"kind": "prompt", "text": "/private do this"},
+            },
+        )
+    started = await service.dispatch(
+        "turn.start",
+        {
+            "session_id": session["session_id"],
+            "input": {"kind": "prompt", "text": "/review check this patch"},
+        },
+    )
+    assert started["skill_id"] == "review"
+    operation = runtime._operation({"operation_id": started["operation_id"]})
+    assert operation.task is not None
+    await operation.task
+
+    context = provider.requests[0][1]
+    assert "FULL REVIEW INSTRUCTIONS" not in context.system_prompt
+    assert "PRIVATE INSTRUCTIONS" not in context.system_prompt
+    assert len(context.messages) == 1
+    skill_prompt = context.messages[0]
+    assert isinstance(skill_prompt, UserMessage)
+    assert isinstance(skill_prompt.content, str)
+    assert "FULL REVIEW INSTRUCTIONS" in skill_prompt.content
+    assert skill_prompt.content.endswith("check this patch")
+    snapshot = await service.dispatch("session.get", {"session_id": session["session_id"]})
+    assert snapshot["timeline"][0]["input"]["skill_id"] == "review"
 
 
 @pytest.mark.asyncio

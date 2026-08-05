@@ -103,6 +103,22 @@ Global resources live in `~/.aeloon-core`; workspace resources live in
 and the working directory are appended in a deterministic order. Workspace resources override
 same-named global resources and are reloaded at every turn boundary.
 
+Core bundles the `office`, `ppt`, `document-writing`, and `reports` presets. On the first runtime
+startup after installation, any missing presets are copied from the package resources into
+`<data_dir>/skills` (normally `~/.aeloon-core/skills`). Existing same-named files and directories
+are preserved, so local customizations are not overwritten.
+
+Skill discovery is progressive: Core reads only each `SKILL.md` frontmatter for the catalog and
+system-prompt index. The full instructions are read only when the model chooses an enabled skill or
+when a prompt starts with an explicit command such as `/review inspect this patch`. Bridge clients
+select enabled skills through `settings.update.resources.enabled_skill_ids`; they continue to send
+the user's text as a normal prompt, and runtime resolves the slash command.
+
+`catalog.get.skills` includes each skill's command, source, location, selection and invocation
+status, plus `content_loading: "on_demand"`. `settings.get.resources.enabled_skill_ids` is the
+persisted selection. On existing configurations, all discovered skills remain selected until a
+client saves an explicit list.
+
 ## Python API
 
 ```python
