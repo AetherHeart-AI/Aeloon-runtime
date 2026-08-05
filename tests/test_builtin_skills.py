@@ -40,3 +40,7 @@ def test_runtime_bootstrap_copies_and_discovers_builtin_skills(tmp_path: Path) -
     assert all(skill.content == "" for skill in resources.skills)
     loaded = loader.load_skill("ppt")
     assert "定义演示策略" in loaded.content
+    assert all(
+        "present_files" in loader.load_skill(skill_id).content
+        for skill_id in BUILTIN_SKILL_IDS
+    )
