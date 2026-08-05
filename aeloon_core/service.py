@@ -515,6 +515,7 @@ class CoreService:
                     "description": f"{model.context_window:,} token context",
                     "provider_id": model.provider,
                     "thinking_levels": ["off", "minimal", "low", "medium", "high", "max"],
+                    "supports_image": "image" in model.input,
                     "context_window": model.context_window,
                     "max_tokens": model.max_tokens,
                 }

@@ -45,6 +45,7 @@ class FakeCloudClient:
                     "context_window": 200_000,
                     "max_tokens": 40_000,
                     "supports_reasoning": True,
+                    "supports_image": True,
                 }
             ]
         }
@@ -116,6 +117,7 @@ async def test_bridge_exposes_account_without_credentials_and_adds_cloud_models(
     catalog = await service.catalog_get({})
     cloud_model = next(item for item in catalog["models"] if item["provider_id"] == "aeloon-cloud")
     assert cloud_model["id"] == "aeloon-cloud/reasoner"
+    assert cloud_model["supports_image"] is True
 
     session = await service.session_create({"workspace": str(tmp_path)})
     configured = await service.session_configure(

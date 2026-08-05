@@ -157,6 +157,9 @@ async def test_bridge_adds_and_removes_local_provider_without_exposing_secret(
         "studio/coder",
         "studio/vision",
     }
+    catalog_models = {model["id"]: model for model in catalog["models"]}
+    assert catalog_models["studio/coder"]["supports_image"] is False
+    assert catalog_models["studio/vision"]["supports_image"] is True
     assert {provider["id"] for provider in listed["providers"]} >= {
         "deepseek",
         "studio",
