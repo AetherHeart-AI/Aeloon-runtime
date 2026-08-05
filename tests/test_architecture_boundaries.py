@@ -74,6 +74,15 @@ def test_runtime_has_no_wire_dispatch_or_bridge_errors() -> None:
     )
 
 
+def test_artifact_delivery_is_runtime_owned() -> None:
+    assert (PACKAGE / "runtime" / "artifacts.py").is_file()
+    core_source = "\n".join(
+        path.read_text(encoding="utf-8") for path in (PACKAGE / "core").rglob("*.py")
+    )
+    assert "present_files" not in core_source
+    assert "artifact_delivery" not in core_source
+
+
 def test_shared_config_does_not_load_cloud_implementation() -> None:
     config = (PACKAGE / "config.py").read_text(encoding="utf-8")
     assert "aeloon_core.cloud" not in config

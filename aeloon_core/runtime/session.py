@@ -207,6 +207,22 @@ class Session:
             payload["error"] = error
         return await self._append_entry("run_end", **payload)
 
+    async def append_artifact_delivery(
+        self,
+        *,
+        run_id: str,
+        tool_call_id: str,
+        artifacts: list[dict[str, Any]],
+    ) -> str:
+        """Persist display-only deliverables without adding model context."""
+
+        return await self._append_entry(
+            "artifact_delivery",
+            runId=run_id,
+            toolCallId=tool_call_id,
+            artifacts=artifacts,
+        )
+
     async def append_session_config(self, config: dict[str, Any]) -> str:
         """Persist Bridge session overrides without adding model context."""
 

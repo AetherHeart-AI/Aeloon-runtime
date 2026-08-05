@@ -35,6 +35,11 @@ from aeloon_core.core import (
     StreamOptions,
 )
 from aeloon_core.runtime.agent import SessionAgent, SessionAgentFactory
+from aeloon_core.runtime.artifacts import (
+    PRESENT_FILES_TOOL_NAME,
+    artifacts_from_tool_result,
+    with_present_files,
+)
 from aeloon_core.runtime.builtin_skills import provision_builtin_skills
 from aeloon_core.runtime.catalog import (
     DEEPSEEK_PROVIDER_ID,
@@ -243,7 +248,11 @@ class RuntimeService:
                 "leaf_id": await session.get_leaf_id(),
                 "model_id": model_id,
                 "thinking_level": overrides.get("thinking_level", self.config.agent.thinking_level),
-                "active_tools": overrides.get("active_tools", list(DEFAULT_ACTIVE_TOOLS)),
+                "active_tools": list(
+                    with_present_files(
+                        overrides.get("active_tools", list(DEFAULT_ACTIVE_TOOLS))
+                    )
+                ),
             },
             "stats": await session.stats(context_window=context_window),
             "timeline": self._project_timeline(branch, active_ids={item["operation_id"] for item in active}),
@@ -287,9 +296,14 @@ class RuntimeService:
             patch["thinking_level"] = level
         if "active_tools" in params:
             tools = params["active_tools"]
-            if not isinstance(tools, list) or any(item not in ALL_TOOL_NAMES for item in tools):
+            known_tools = {*ALL_TOOL_NAMES, PRESENT_FILES_TOOL_NAME}
+            if not isinstance(tools, list) or any(item not in known_tools for item in tools):
                 raise RuntimeFailure("invalid_argument", "active_tools contains an unknown tool")
-            patch["active_tools"] = list(dict.fromkeys(tools))
+            patch["active_tools"] = [
+                item
+                for item in dict.fromkeys(tools)
+                if item != PRESENT_FILES_TOOL_NAME
+            ]
         if "steering_mode" in params:
             patch["steering_mode"] = self._queue_mode(params["steering_mode"])
         if "follow_up_mode" in params:
@@ -457,8 +471,16 @@ class RuntimeService:
                 for model in models.values()
             ],
             "tools": [
-                {"id": name, "name": name, "description": "Core-managed local tool"}
-                for name in ALL_TOOL_NAMES
+                {
+                    "id": name,
+                    "name": name,
+                    "description": (
+                        "Runtime-managed final deliverable tool"
+                        if name == PRESENT_FILES_TOOL_NAME
+                        else "Core-managed local tool"
+                    ),
+                }
+                for name in (*sorted(ALL_TOOL_NAMES), PRESENT_FILES_TOOL_NAME)
             ],
             "skills": [
                 {
@@ -891,7 +913,11 @@ class RuntimeService:
             config=effective,
             session=session,
             catalog=catalog,
-            active_tool_names=tuple(active_tools) if active_tools else None,
+            active_tool_names=(
+                tuple(active_tools)
+                if active_tools is not None
+                else None
+            ),
         )
 
     async def _should_auto_rename(self, session: Session, operation: Operation) -> bool:
@@ -1197,9 +1223,24 @@ class RuntimeService:
             raw = data.get("partialResult") if event.type.endswith("update") else data.get("result")
             result = self._tool_text(raw)
             patch = {"result": result, "status": "running" if event.type.endswith("update") else "failed" if data.get("isError") else "completed"}
+            artifacts = (
+                artifacts_from_tool_result(raw)
+                if event.type == "tool_execution_end"
+                and data.get("toolName") == PRESENT_FILES_TOOL_NAME
+                and not data.get("isError")
+                else []
+            )
+            if artifacts:
+                patch["artifacts"] = artifacts
             for block in operation.blocks:
                 if block["id"] == block_id:
                     block.update(patch)
+            if artifacts:
+                await session.append_artifact_delivery(
+                    run_id=operation.id,
+                    tool_call_id=block_id,
+                    artifacts=artifacts,
+                )
             await self._emit("tool.updated" if event.type.endswith("update") else "tool.completed", session, operation, {"block_id": block_id, "patch": patch})
         elif event.type == "queue_update":
             await self._emit("queue.updated", session, operation, {key: len(value) if isinstance(value, list) else value for key, value in data.items() if key.lower().endswith("count") or isinstance(value, list)})
@@ -1397,6 +1438,16 @@ class RuntimeService:
                     for block in current["blocks"]:
                         if block["id"] == tool_id:
                             block.update({"status": "failed" if message.get("isError") else "completed", "result": self._content_text(message.get("content"))})
+            elif kind == "artifact_delivery" and current is not None:
+                if str(entry.get("runId") or "") != current["turn_id"]:
+                    continue
+                tool_id = str(entry.get("toolCallId") or "")
+                artifacts = entry.get("artifacts")
+                if not isinstance(artifacts, list):
+                    continue
+                for block in current["blocks"]:
+                    if block["id"] == tool_id:
+                        block["artifacts"] = artifacts
             elif kind == "run_end" and current is not None and entry.get("runId") == current["turn_id"]:
                 current.update({
                     "status": str(entry.get("status") or "completed"),

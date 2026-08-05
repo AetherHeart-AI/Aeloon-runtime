@@ -119,6 +119,11 @@ status, plus `content_loading: "on_demand"`. `settings.get.resources.enabled_ski
 persisted selection. On existing configurations, all discovered skills remain selected until a
 client saves an explicit list.
 
+Runtime also injects the intrinsic `present_files` delivery tool. Skills use it after verifying
+final office, PDF, image, Markdown, or HTML files. Runtime validates the paths, persists their
+display metadata outside model context, and exposes them to Bridge clients as structured
+artifacts; stateless core tools and message types remain format-agnostic.
+
 ## Python API
 
 ```python

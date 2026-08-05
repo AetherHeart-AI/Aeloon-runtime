@@ -1,5 +1,9 @@
 """Public session and application runtime API."""
 
+from aeloon_core.runtime.artifacts import (
+    PRESENT_FILES_TOOL_NAME,
+    create_present_files_tool,
+)
 from aeloon_core.runtime.catalog import (
     ProviderCatalog,
     RemoteProviderSource,
@@ -30,6 +34,7 @@ from aeloon_core.runtime.types import (
 __all__ = [
     "JsonlSessionRepository",
     "OperationSnapshot",
+    "PRESENT_FILES_TOOL_NAME",
     "ProviderCatalog",
     "RemoteProviderSource",
     "ResourceLoader",
@@ -43,6 +48,7 @@ __all__ = [
     "SessionMetadata",
     "SessionSnapshot",
     "TurnInput",
+    "create_present_files_tool",
     "normalize_model_id",
     "qualify_model_id",
     "resolve_model_id",

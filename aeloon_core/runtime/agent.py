@@ -12,6 +12,7 @@ from aeloon_core.config import Config
 from aeloon_core.core import (
     DEFAULT_ACTIVE_TOOLS,
     AgentMessage,
+    AgentTool,
     ImageContent,
     Model,
     Provider,
@@ -29,6 +30,10 @@ from aeloon_core.core import (
     run_agent,
 )
 from aeloon_core.core.compaction import ContextPolicy, ContextUpdate
+from aeloon_core.runtime.artifacts import (
+    create_present_files_tool,
+    with_present_files,
+)
 from aeloon_core.runtime.catalog import ProviderCatalog
 from aeloon_core.runtime.compaction import (
     CompactionResult,
@@ -156,6 +161,10 @@ class SessionAgent:
         assert self.provider is not None and self.model is not None and self._resources is not None
         context = await self.session.build_context() if self.session is not None else None
         content = text if not images else (TextContent(text), *tuple(images))
+        tools = self._all_tools()
+        active_tool_names = self._active_tool_names(
+            context.active_tool_names if context is not None else None
+        )
         request = RunRequest(
             run_id=run_id,
             provider=self.provider,
@@ -164,28 +173,11 @@ class SessionAgent:
             input=(*self._pending_next_turn, UserMessage(content)),
             system_prompt=build_system_prompt(
                 cwd=str(self.config.workspace),
-                tools=tuple(
-                    create_all_tools(
-                        self.config.workspace,
-                        shell_path=self.config.tools.shell_path,
-                        auto_resize_images=self.config.tools.auto_resize_images,
-                    )[name]
-                    for name in self._active_tool_names(
-                        context.active_tool_names if context is not None else None
-                    )
-                ),
+                tools=tuple(tools[name] for name in active_tool_names),
                 resources=self._resources,
             ),
-            tools=tuple(
-                create_all_tools(
-                    self.config.workspace,
-                    shell_path=self.config.tools.shell_path,
-                    auto_resize_images=self.config.tools.auto_resize_images,
-                ).values()
-            ),
-            active_tool_names=self._active_tool_names(
-                context.active_tool_names if context is not None else None
-            ),
+            tools=tuple(tools.values()),
+            active_tool_names=active_tool_names,
             stream_options=self._stream_options(),
             context_policy=ContextPolicy(
                 enabled=self.config.agent.compaction.enabled,
@@ -385,10 +377,22 @@ class SessionAgent:
 
     def _active_tool_names(self, restored: tuple[str, ...] | None) -> tuple[str, ...]:
         if self._configured_active_tools is not None:
-            return self._configured_active_tools
-        if restored is not None:
-            return restored
-        return DEFAULT_ACTIVE_TOOLS
+            selected = self._configured_active_tools
+        elif restored is not None:
+            selected = restored
+        else:
+            selected = DEFAULT_ACTIVE_TOOLS
+        return with_present_files(selected)
+
+    def _all_tools(self) -> dict[str, AgentTool]:
+        tools = create_all_tools(
+            self.config.workspace,
+            shell_path=self.config.tools.shell_path,
+            auto_resize_images=self.config.tools.auto_resize_images,
+        )
+        delivery = create_present_files_tool(self.config.workspace)
+        tools[delivery.name] = delivery
+        return tools
 
     def _stream_options(self) -> StreamOptions:
         retry = self.config.agent.retry

@@ -38,6 +38,11 @@ each completed core message immediately. Provider and tool resources are closed 
 the operation. Runtime emits typed `RuntimeEvent` values and does not know RPC methods or
 `BridgeError`.
 
+Runtime-owned workflow tools may be composed into a `RunRequest` through core's generic
+`AgentTool` contract. The intrinsic `present_files` tool follows this path: runtime validates final
+deliverables, records `artifact_delivery` entries outside model context, and projects optional
+artifact metadata into operation blocks. Core has no office-format or presentation dependency.
+
 ## Bridge: channels and wire contracts
 
 `BridgeRpcAdapter` maps Bridge v2 JSON-RPC methods and errors to typed runtime calls. It owns public

@@ -31,7 +31,7 @@ CAPABILITIES = (
     "daemon", "sessions", "turn-queue", "ordered-events", "event-replay",
     "session-snapshots", "attachments", "revisioned-settings", "dynamic-catalog",
     "cloud-account", "unified-providers", "runtime-skills", "skill-slash-commands",
-    "progressive-skill-loading",
+    "progressive-skill-loading", "structured-artifacts",
 )
 
 RPC_CODES = {
