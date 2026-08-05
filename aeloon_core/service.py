@@ -59,6 +59,7 @@ from aeloon_core.providers import (
     split_model_id,
     validate_provider_id,
 )
+from aeloon_core.rename_session import is_generic_session_title, rename_session
 from aeloon_core.version import __version__
 
 PROMPT_LIMIT = 100_000
@@ -354,6 +355,12 @@ class CoreService:
         session = await self._session(params)
         title = str(params.get("title") or "").strip()
         await session.set_name(title or None)
+        await self._emit(
+            "session.renamed",
+            session,
+            None,
+            {"title": title or None, "source": "manual"},
+        )
         return {"session_id": session.id, "title": title or None}
 
     async def session_configure(self, params: Mapping[str, Any]) -> dict[str, Any]:
@@ -808,6 +815,36 @@ class CoreService:
                 if status == "failed":
                     payload["error"] = self._sanitize(result.error_message or "Operation failed")
                 await self._emit(name, session, operation, payload)
+                if status == "completed" and await self._should_auto_rename(session, operation):
+                    try:
+                        title = await rename_session(
+                            session=session,
+                            provider=harness.provider,
+                            model=harness.model,
+                            user_prompt=str(operation.input.get("text") or ""),
+                            assistant_text=result.text,
+                            stream_options=StreamOptions(
+                                timeout_ms=config_snapshot.agent.timeout_ms,
+                                max_retries=(
+                                    config_snapshot.agent.retry.max_retries
+                                    if config_snapshot.agent.retry.enabled
+                                    else 0
+                                ),
+                                base_delay_ms=config_snapshot.agent.retry.base_delay_ms,
+                                max_retry_delay_ms=config_snapshot.agent.retry.max_retry_delay_ms,
+                            ),
+                        )
+                        if title:
+                            await self._emit(
+                                "session.renamed",
+                                session,
+                                operation,
+                                {"title": title, "source": "automatic"},
+                            )
+                    except Exception:
+                        # Naming is best-effort metadata and must never change a
+                        # successfully completed user operation into a failure.
+                        pass
         except asyncio.CancelledError:
             operation.status = "cancelled"
             if not terminal_written:
@@ -907,6 +944,20 @@ class CoreService:
             shell_path=effective.tools.shell_path,
             auto_resize_images=effective.tools.auto_resize_images,
         )
+
+    async def _should_auto_rename(self, session: Session, operation: Operation) -> bool:
+        if operation.input.get("kind") != "prompt":
+            return False
+        entries = await session.get_entries()
+        run_ids = [
+            str(entry.get("runId") or "")
+            for entry in entries
+            if entry.get("type") == "run_start"
+        ]
+        if run_ids != [operation.id]:
+            return False
+        title = await session.get_name() or session.metadata.metadata.get("title")
+        return is_generic_session_title(str(title or ""))
 
     async def _models(self) -> dict[str, Model]:
         return await self._provider_registry().models()

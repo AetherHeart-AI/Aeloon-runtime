@@ -27,7 +27,7 @@
       "operation.cancelled", "content.started", "content.delta", "content.updated",
       "content.completed", "tool.started", "tool.updated", "tool.completed",
       "usage.updated", "queue.updated", "retry.started", "retry.completed",
-      "resources.updated", "session.compacted", "session.navigated", "settings.updated",
+      "resources.updated", "session.compacted", "session.navigated", "session.renamed", "settings.updated",
       "cloud.account.updated", "provider.updated", "log.entry", "system.shutdown"
     ]
   },
