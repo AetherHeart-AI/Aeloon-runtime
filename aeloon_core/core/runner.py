@@ -16,20 +16,20 @@ from aeloon_core.core.compaction import (
 from aeloon_core.core.context_stats import estimate_context_tokens
 from aeloon_core.core.control import RunController
 from aeloon_core.core.events import RunEventDispatcher
-from aeloon_core.core.provider_runtime import ProviderRuntime
+from aeloon_core.core.inference_runtime import InferenceRuntime
 from aeloon_core.core.tool_runtime import ToolRuntime
 from aeloon_core.core.types import (
     AgentMessage,
-    AgentTool,
     AssistantMessage,
+    InferencePort,
     Model,
-    Provider,
     QueueMode,
     RunError,
     RunEventSink,
     RunHook,
     StopReason,
     StreamOptions,
+    Tool,
     ToolResultMessage,
     Usage,
     UserMessage,
@@ -43,12 +43,12 @@ class RunRequest:
     """Every dependency and input required for exactly one agent run."""
 
     run_id: str
-    provider: Provider
+    inference: InferencePort
     model: Model
     messages: tuple[AgentMessage, ...]
     input: tuple[UserMessage, ...]
     system_prompt: str
-    tools: tuple[AgentTool, ...] = ()
+    tools: tuple[Tool, ...] = ()
     active_tool_names: tuple[str, ...] | None = None
     stream_options: StreamOptions = field(default_factory=StreamOptions)
     context_policy: ContextPolicy = field(default_factory=ContextPolicy)
@@ -116,7 +116,7 @@ class _RunEngine:
         if active_names is None:
             active_names = tuple(tool.name for tool in request.tools)
         self.tools = ToolRuntime(request.tools, active_names, events)
-        self.provider = ProviderRuntime(request.provider, events)
+        self.inference = InferenceRuntime(request.inference, events)
 
     async def run(self) -> RunResult:
         await self.controller._bind(self.events, self._cancel)
@@ -136,13 +136,10 @@ class _RunEngine:
                 ]
             system_prompt = str(hook.get("systemPrompt") or self.request.system_prompt)
             final = await self._run_loop(initial, system_prompt)
-            if (
-                self.compactor is not None
-                and should_compact(
-                    estimate_context_tokens(self.messages),
-                    self.request.model.context_window,
-                    self.request.context_policy,
-                )
+            if self.compactor is not None and should_compact(
+                estimate_context_tokens(self.messages),
+                self.request.model.context_window,
+                self.request.context_policy,
             ):
                 try:
                     await self._compact("threshold")
@@ -263,14 +260,14 @@ class _RunEngine:
         return final
 
     async def _stream_response(self, system_prompt: str) -> AssistantMessage:
-        return await self.provider.request(
+        return await self.inference.request(
             model=self.request.model,
             messages=self.messages,
             system_prompt=system_prompt,
             tools=self.tools.active_tools,
             session_id=self.request.context_id or self.request.run_id,
             stream_options=self.request.stream_options,
-            on_retry=self._provider_retry,
+            on_retry=self._inference_retry,
         )
 
     async def _append(self, message: AgentMessage, *, message_started: bool = False) -> None:
@@ -291,7 +288,7 @@ class _RunEngine:
         self.messages = list(update.messages)
         self.context_update = update
         await self.events.emit(
-            "session_compact",
+            "context_compacted",
             {
                 "compactionEntryId": update.details.get("compactionEntryId"),
                 "summary": update.summary,
@@ -303,7 +300,7 @@ class _RunEngine:
             {"reason": reason, "aborted": False, "willRetry": reason == "overflow"},
         )
 
-    async def _provider_retry(self, data: dict[str, Any]) -> None:
+    async def _inference_retry(self, data: dict[str, Any]) -> None:
         event_type = "auto_retry_start" if data.get("stage") == "start" else "auto_retry_end"
         await self.events.emit(event_type, data)  # type: ignore[arg-type]
 
@@ -314,7 +311,7 @@ class _RunEngine:
         )
 
     def _cancel(self) -> None:
-        self.provider.cancel()
+        self.inference.cancel()
         self.tools.cancel()
 
 

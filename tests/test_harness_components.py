@@ -5,22 +5,33 @@ from typing import Any
 
 import pytest
 
-from aeloon_core.core import AgentTool, RunController, RunError, ToolCall, ToolResult
+from aeloon_core.core import RunController, ToolCall, ToolResult
 from aeloon_core.core.events import RunEventDispatcher
 from aeloon_core.core.tool_runtime import ToolRuntime
+from aeloon_core.tool import BaseTool
 
 
-def _tool(name: str) -> AgentTool:
-    async def execute(_call_id: str, _params: dict[str, Any], _update: Any) -> ToolResult:
-        return ToolResult.text(name)
+class FunctionTool(BaseTool):
+    def __init__(self, name: str, execute=None, *, execution_mode="parallel") -> None:
+        self.name = name
+        self.label = name
+        self.description = name
+        self.parameters = {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        }
+        self._execute = execute
+        self.execution_mode = execution_mode
 
-    return AgentTool(
-        name=name,
-        label=name,
-        description=name,
-        parameters={"type": "object", "properties": {}, "additionalProperties": False},
-        execute=execute,
-    )
+    async def execute(self, call_id, arguments, on_update):
+        if self._execute is not None:
+            return await self._execute(call_id, arguments, on_update)
+        return ToolResult.text(self.name)
+
+
+def _tool(name: str) -> FunctionTool:
+    return FunctionTool(name)
 
 
 @pytest.mark.asyncio
@@ -72,14 +83,11 @@ async def test_run_controller_owns_ephemeral_queue_modes_and_snapshots() -> None
     controller._release()
 
 
-def test_tool_runtime_rejects_invalid_reconfiguration_atomically() -> None:
+def test_tool_runtime_has_no_dynamic_reconfiguration_api() -> None:
     events = RunEventDispatcher()
     runtime = ToolRuntime((_tool("read"),), ("read",), events)
 
-    with pytest.raises(RunError) as invalid:
-        runtime.configure((_tool("write"),), ("missing",))
-
-    assert invalid.value.code == "invalid_argument"
+    assert not hasattr(runtime, "configure")
     assert runtime.tool_names == ("read",)
     assert runtime.active_names == ("read",)
 
@@ -93,14 +101,7 @@ async def test_tool_runtime_can_cancel_a_sequential_tool() -> None:
         await asyncio.Event().wait()
         return ToolResult.text("unreachable")
 
-    tool = AgentTool(
-        name="wait",
-        label="wait",
-        description="wait",
-        parameters={"type": "object", "properties": {}, "additionalProperties": False},
-        execute=execute,
-        execution_mode="sequential",
-    )
+    tool = FunctionTool("wait", execute, execution_mode="sequential")
     runtime = ToolRuntime((tool,), ("wait",), RunEventDispatcher())
     execution = asyncio.create_task(
         runtime.execute_calls((ToolCall("call", "wait", {}),), is_aborted=lambda: True)

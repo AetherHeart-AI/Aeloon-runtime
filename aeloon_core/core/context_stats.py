@@ -68,12 +68,8 @@ def context_statistics(
 
     used_tokens = estimate_context_tokens(messages)
     window_tokens = max(1, int(context_window)) if context_window is not None else None
-    remaining_tokens = (
-        max(0, window_tokens - used_tokens) if window_tokens is not None else None
-    )
-    usage_percent = (
-        _percent(used_tokens, window_tokens) if window_tokens is not None else None
-    )
+    remaining_tokens = max(0, window_tokens - used_tokens) if window_tokens is not None else None
+    usage_percent = _percent(used_tokens, window_tokens) if window_tokens is not None else None
 
     message_counts = {message_type: 0 for message_type in MESSAGE_TYPES}
     estimated_tokens = {message_type: 0 for message_type in MESSAGE_TYPES}
@@ -84,7 +80,7 @@ def context_statistics(
 
     attributed_tokens = sum(estimated_tokens.values())
     if attributed_tokens <= used_tokens:
-        # Provider totals also include the system prompt, tool schemas, and request
+        # Inference totals also include the system prompt, tool schemas, and request
         # framing. Attribute that otherwise invisible portion to the system bucket.
         estimated_tokens["system"] += used_tokens - attributed_tokens
     elif attributed_tokens:
@@ -156,9 +152,7 @@ def _scale_tokens(values: Mapping[str, int], total: int) -> dict[str, int]:
     source_total = sum(values.values())
     if source_total <= 0 or total <= 0:
         return {key: 0 for key in values}
-    divided = {
-        key: divmod(value * total, source_total) for key, value in values.items()
-    }
+    divided = {key: divmod(value * total, source_total) for key, value in values.items()}
     scaled = {key: quotient for key, (quotient, _) in divided.items()}
     remaining = total - sum(scaled.values())
     order = sorted(values, key=lambda key: divided[key][1], reverse=True)

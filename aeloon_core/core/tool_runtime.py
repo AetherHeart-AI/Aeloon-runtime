@@ -4,16 +4,15 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
 from typing import Any
 
 from jsonschema import Draft202012Validator
 
 from aeloon_core.core.events import RunEventDispatcher
 from aeloon_core.core.types import (
-    AgentTool,
     RunError,
     TextContent,
+    Tool,
     ToolCall,
     ToolResult,
     ToolResultMessage,
@@ -23,20 +22,12 @@ from aeloon_core.core.types import (
 )
 
 
-@dataclass(frozen=True, slots=True)
-class ToolConfigurationChange:
-    """The registry state before a tool configuration update."""
-
-    previous_tool_names: tuple[str, ...]
-    previous_active_names: tuple[str, ...]
-
-
 class ToolRuntime:
     """Own the tool registry and all in-flight tool tasks."""
 
     def __init__(
         self,
-        tools: Iterable[AgentTool],
+        tools: Iterable[Tool],
         active_names: Sequence[str],
         events: RunEventDispatcher,
     ) -> None:
@@ -46,7 +37,7 @@ class ToolRuntime:
         self._tasks: set[asyncio.Task[Any]] = set()
 
     @property
-    def tools(self) -> tuple[AgentTool, ...]:
+    def tools(self) -> tuple[Tool, ...]:
         return tuple(self._tools.values())
 
     @property
@@ -54,35 +45,12 @@ class ToolRuntime:
         return tuple(self._tools)
 
     @property
-    def active_tools(self) -> tuple[AgentTool, ...]:
+    def active_tools(self) -> tuple[Tool, ...]:
         return tuple(self._tools[name] for name in self._active_names)
 
     @property
     def active_names(self) -> tuple[str, ...]:
         return self._active_names
-
-    def configure(
-        self,
-        tools: Iterable[AgentTool],
-        active_names: Sequence[str] | None = None,
-    ) -> ToolConfigurationChange:
-        change = self._configuration_change()
-        configured = self._unique_tools(tuple(tools))
-        selected = tuple(configured) if active_names is None else active_names
-        validated = self._validate_active_names(selected, configured)
-        self._tools = configured
-        self._active_names = validated
-        return change
-
-    def activate(self, names: Sequence[str]) -> ToolConfigurationChange:
-        change = self._configuration_change()
-        self._active_names = self._validate_active_names(names)
-        return change
-
-    def restore_active(self, names: Sequence[str]) -> None:
-        """Restore persisted names while ignoring tools unavailable in this process."""
-
-        self._active_names = tuple(name for name in names if name in self._tools)
 
     def cancel(self) -> None:
         for task in tuple(self._tasks):
@@ -160,8 +128,7 @@ class ToolRuntime:
             result = ToolResult.text(f"Tool {call.name} not found", is_error=True)
         else:
             try:
-                if tool.prepare_arguments is not None:
-                    args = tool.prepare_arguments(args)
+                args = tool.prepare_arguments(args)
                 Draft202012Validator(tool.parameters).validate(args)
                 hook = await self._events.hook(
                     "tool_call",
@@ -231,8 +198,7 @@ class ToolRuntime:
         if isinstance(raw_content, str):
             raw_content = (TextContent(raw_content),)
         content = tuple(
-            content_from_dict(part) if isinstance(part, Mapping) else part
-            for part in raw_content
+            content_from_dict(part) if isinstance(part, Mapping) else part for part in raw_content
         )
         raw_usage = hook.get("usage", result.usage)
         return ToolResult(
@@ -243,12 +209,9 @@ class ToolRuntime:
             usage=Usage.from_dict(raw_usage) if isinstance(raw_usage, Mapping) else raw_usage,
         )
 
-    def _configuration_change(self) -> ToolConfigurationChange:
-        return ToolConfigurationChange(self.tool_names, self._active_names)
-
     @staticmethod
-    def _unique_tools(tools: Sequence[AgentTool]) -> dict[str, AgentTool]:
-        result: dict[str, AgentTool] = {}
+    def _unique_tools(tools: Sequence[Tool]) -> dict[str, Tool]:
+        result: dict[str, Tool] = {}
         for tool in tools:
             if tool.name in result:
                 raise RunError("invalid_argument", f"Duplicate tool name: {tool.name}")
@@ -258,7 +221,7 @@ class ToolRuntime:
     def _validate_active_names(
         self,
         names: Sequence[str],
-        tools: Mapping[str, AgentTool] | None = None,
+        tools: Mapping[str, Tool] | None = None,
     ) -> tuple[str, ...]:
         available = self._tools if tools is None else tools
         result = tuple(dict.fromkeys(names))
@@ -281,4 +244,4 @@ def tool_result_to_dict(result: ToolResult) -> dict[str, Any]:
     }
 
 
-__all__ = ["ToolConfigurationChange", "ToolRuntime", "tool_result_to_dict"]
+__all__ = ["ToolRuntime", "tool_result_to_dict"]

@@ -1,9 +1,8 @@
-"""Provider request preparation and stream lifecycle for one run."""
+"""Inference request preparation and stream lifecycle for one run."""
 
 from __future__ import annotations
 
 import asyncio
-import inspect
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import replace
 from typing import Any
@@ -11,14 +10,14 @@ from typing import Any
 from aeloon_core.core.events import RunEventDispatcher
 from aeloon_core.core.types import (
     AgentMessage,
-    AgentTool,
     AssistantMessage,
     AssistantStreamEvent,
+    InferenceContext,
+    InferenceError,
+    InferencePort,
     Model,
-    Provider,
-    ProviderContext,
-    RunError,
     StreamOptions,
+    Tool,
     message_from_dict,
     message_to_dict,
 )
@@ -26,35 +25,17 @@ from aeloon_core.core.types import (
 RetryCallback = Callable[[dict[str, Any]], Awaitable[None]]
 
 
-class ProviderRuntime:
-    """Build provider requests and own the active streaming task."""
+class InferenceRuntime:
+    """Build requests and own the active inference task for one run."""
 
-    def __init__(self, provider: Provider, events: RunEventDispatcher) -> None:
-        self._provider = provider
+    def __init__(self, inference: InferencePort, events: RunEventDispatcher) -> None:
+        self._inference = inference
         self._events = events
         self._task: asyncio.Task[AssistantMessage] | None = None
-
-    @property
-    def provider(self) -> Provider:
-        return self._provider
-
-    @provider.setter
-    def provider(self, provider: Provider) -> None:
-        if self._task is not None:
-            raise RunError("busy", "Cannot replace the provider while it is streaming")
-        self._provider = provider
 
     def cancel(self) -> None:
         if self._task is not None and not self._task.done():
             self._task.cancel()
-
-    async def close(self) -> None:
-        close = getattr(self._provider, "close", None)
-        if close is None:
-            return
-        result = close()
-        if inspect.isawaitable(result):
-            await result
 
     async def request(
         self,
@@ -62,7 +43,7 @@ class ProviderRuntime:
         model: Model,
         messages: Sequence[AgentMessage],
         system_prompt: str,
-        tools: Sequence[AgentTool],
+        tools: Sequence[Tool],
         session_id: str,
         stream_options: StreamOptions,
         on_retry: RetryCallback,
@@ -74,14 +55,16 @@ class ProviderRuntime:
             stream_options=stream_options,
             on_retry=on_retry,
         )
-        context = ProviderContext(
+        context = InferenceContext(
             system_prompt=system_prompt,
             messages=tuple(context_messages),
             tools=tuple(tool.definition() for tool in tools),
             session_id=session_id,
         )
-        context = await self._patch_payload(model, context)
-        self._task = asyncio.create_task(self._collect(model, context, options))
+        context = await self._patch_context(model, context)
+        self._task = asyncio.create_task(
+            collect_assistant(self._inference, model, context, options, events=self._events)
+        )
         try:
             return await self._task
         except asyncio.CancelledError:
@@ -103,10 +86,7 @@ class ProviderRuntime:
         finally:
             self._task = None
 
-    async def _context_messages(
-        self,
-        messages: Sequence[AgentMessage],
-    ) -> list[AgentMessage]:
+    async def _context_messages(self, messages: Sequence[AgentMessage]) -> list[AgentMessage]:
         hook = await self._events.hook(
             "context",
             {"messages": [message_to_dict(message) for message in messages]},
@@ -127,7 +107,7 @@ class ProviderRuntime:
         on_retry: RetryCallback,
     ) -> StreamOptions:
         hook = await self._events.hook(
-            "before_provider_request",
+            "before_inference_request",
             {
                 "model": model_to_dict(model),
                 "sessionId": session_id,
@@ -141,23 +121,23 @@ class ProviderRuntime:
             options = _with_retry_callback(options, on_retry)
         return options
 
-    async def _patch_payload(
+    async def _patch_context(
         self,
         model: Model,
-        context: ProviderContext,
-    ) -> ProviderContext:
+        context: InferenceContext,
+    ) -> InferenceContext:
         hook = await self._events.hook(
-            "before_provider_payload",
+            "before_inference_context",
             {
                 "model": model_to_dict(model),
-                "payload": {
+                "context": {
                     "systemPrompt": context.system_prompt,
                     "messages": [message_to_dict(message) for message in context.messages],
                     "tools": list(context.tools),
                 },
             },
         )
-        patch = hook.get("payload")
+        patch = hook.get("context")
         if not isinstance(patch, Mapping):
             return context
         raw_messages = patch.get("messages")
@@ -170,25 +150,31 @@ class ProviderRuntime:
         raw_tools = patch.get("tools", context.tools)
         if not isinstance(raw_tools, Sequence) or isinstance(raw_tools, str | bytes):
             raw_tools = context.tools
-        return ProviderContext(
+        return InferenceContext(
             system_prompt=str(patch.get("systemPrompt", context.system_prompt)),
             messages=tuple(messages),
             tools=tuple(dict(item) for item in raw_tools if isinstance(item, Mapping)),
             session_id=context.session_id,
         )
 
-    async def _collect(
-        self,
-        model: Model,
-        context: ProviderContext,
-        options: StreamOptions,
-    ) -> AssistantMessage:
-        final: AssistantMessage | None = None
-        started = False
-        async for event in self._provider.stream(model, context, options):
-            if event.type == "start":
-                started = True
-                await self._events.emit(
+
+async def collect_assistant(
+    inference: InferencePort,
+    model: Model,
+    context: InferenceContext,
+    options: StreamOptions,
+    *,
+    events: RunEventDispatcher | None = None,
+) -> AssistantMessage:
+    """Collect a vendor-neutral stream into its final assistant message."""
+
+    final: AssistantMessage | None = None
+    started = False
+    async for event in inference.stream(model, context, options):
+        if event.type == "start":
+            started = True
+            if events is not None:
+                await events.emit(
                     "message_start",
                     {
                         "message": message_to_dict(
@@ -196,18 +182,19 @@ class ProviderRuntime:
                         )
                     },
                 )
-            elif event.type in {"text_delta", "thinking_delta", "toolcall_delta"}:
-                await self._events.emit(
+        elif event.type in {"text_delta", "thinking_delta", "toolcall_delta"}:
+            if events is not None:
+                await events.emit(
                     "message_update",
                     {"assistantMessageEvent": stream_event_to_dict(event)},
                 )
-            elif event.type in {"done", "error"}:
-                final = event.message
-        if final is None:
-            raise RunError("provider", "Provider stream ended without a final message")
-        if not started:
-            await self._events.emit("message_start", {"message": message_to_dict(final)})
-        return final
+        elif event.type in {"done", "error"}:
+            final = event.message
+    if final is None:
+        raise InferenceError("invalid_response", "Inference stream ended without a final message")
+    if events is not None and not started:
+        await events.emit("message_start", {"message": message_to_dict(final)})
+    return final
 
 
 def model_to_dict(model: Model) -> dict[str, Any]:
@@ -215,9 +202,8 @@ def model_to_dict(model: Model) -> dict[str, Any]:
         "id": model.id,
         "name": model.name,
         "provider": model.provider,
-        "api": model.api,
-        "baseUrl": model.base_url,
         "reasoning": model.reasoning,
+        "input": list(model.input),
         "contextWindow": model.context_window,
         "maxTokens": model.max_tokens,
     }
@@ -263,11 +249,8 @@ def stream_event_to_dict(event: AssistantStreamEvent) -> dict[str, Any]:
     }
 
 
-def _with_retry_callback(
-    options: StreamOptions,
-    on_retry: RetryCallback,
-) -> StreamOptions:
+def _with_retry_callback(options: StreamOptions, on_retry: RetryCallback) -> StreamOptions:
     return replace(options, metadata={**options.metadata, "on_retry": on_retry})
 
 
-__all__ = ["ProviderRuntime", "model_to_dict"]
+__all__ = ["InferenceRuntime", "collect_assistant", "model_to_dict"]

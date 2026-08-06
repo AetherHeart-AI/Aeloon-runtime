@@ -7,22 +7,40 @@ from collections.abc import AsyncIterator
 import pytest
 
 from aeloon_core.core import (
-    DEEPSEEK_V4_FLASH,
-    AgentTool,
     AssistantMessage,
     AssistantStreamEvent,
     RunController,
     RunError,
     RunRequest,
-    ScriptedProvider,
     StreamOptions,
     TextContent,
+    Tool,
     ToolCall,
     ToolResult,
     ToolResultMessage,
     UserMessage,
     run_agent,
 )
+from aeloon_core.runtime.providers import DEEPSEEK_V4_FLASH
+from aeloon_core.runtime.providers.testing import ScriptedProvider
+from aeloon_core.tool import BaseTool
+
+
+class FunctionTool(BaseTool):
+    def __init__(self, name, execute, *, execution_mode="parallel"):
+        self.name = name
+        self.label = name
+        self.description = name
+        self.parameters = {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        }
+        self._execute = execute
+        self.execution_mode = execution_mode
+
+    async def execute(self, call_id, arguments, on_update):
+        return await self._execute(call_id, arguments, on_update)
 
 
 def _answer(text: str, *, stop: str = "stop", calls: tuple[ToolCall, ...] = ()):
@@ -34,21 +52,15 @@ def _answer(text: str, *, stop: str = "stop", calls: tuple[ToolCall, ...] = ()):
     )
 
 
-def _tool(name: str, execute) -> AgentTool:
-    return AgentTool(
-        name=name,
-        label=name,
-        description=name,
-        parameters={"type": "object", "properties": {}, "additionalProperties": False},
-        execute=execute,
-    )
+def _tool(name: str, execute) -> Tool:
+    return FunctionTool(name, execute)
 
 
 def _request(
     provider,
     *,
     text: str = "go",
-    tools: tuple[AgentTool, ...] = (),
+    tools: tuple[Tool, ...] = (),
     active: tuple[str, ...] | None = None,
     messages=(),
     options: StreamOptions | None = None,
@@ -56,7 +68,7 @@ def _request(
 ) -> RunRequest:
     return RunRequest(
         run_id=run_id,
-        provider=provider,
+        inference=provider,
         model=DEEPSEEK_V4_FLASH,
         messages=tuple(messages),
         input=(UserMessage(text),),
@@ -107,9 +119,7 @@ async def test_tool_failures_are_returned_to_model_and_do_not_end_loop() -> None
             _answer("recovered"),
         ]
     )
-    result = await run_agent(
-        _request(provider, tools=(_tool("fail", fail),), active=("fail",))
-    )
+    result = await run_agent(_request(provider, tools=(_tool("fail", fail),), active=("fail",)))
 
     returned = provider.requests[1][1].messages[-1]
     assert result.final_message.text == "recovered"
@@ -308,17 +318,20 @@ async def test_provider_and_tool_hooks_can_patch_or_block() -> None:
         ]
     )
     hooks = {
-        "before_provider_payload": (
+        "before_inference_context": (
             lambda event: (
-                {"payload": {**event.data["payload"], "systemPrompt": "PATCHED SYSTEM"}}
+                {
+                    "context": {
+                        **event.data["context"],
+                        "systemPrompt": "PATCHED SYSTEM",
+                    }
+                }
                 if len(provider.requests) == 0
                 else None
             ),
         ),
         "tool_call": (lambda _event: {"block": True, "reason": "blocked"},),
-        "tool_result": (
-            lambda _event: {"content": [{"type": "text", "text": "patched result"}]},
-        ),
+        "tool_result": (lambda _event: {"content": [{"type": "text", "text": "patched result"}]},),
     }
 
     await run_agent(

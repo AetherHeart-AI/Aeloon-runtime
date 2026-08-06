@@ -1,4 +1,4 @@
-"""Provider-neutral contracts for stateless agent runs."""
+"""Vendor-neutral contracts for one stateless inference run."""
 
 from __future__ import annotations
 
@@ -17,30 +17,22 @@ RunEventType = Literal[
     "auto_retry_end",
     "auto_retry_start",
     "before_agent_start",
-    "before_provider_payload",
-    "before_provider_request",
+    "before_inference_context",
+    "before_inference_request",
     "compaction_end",
     "compaction_start",
     "context",
     "message_end",
     "message_start",
     "message_update",
-    "model_update",
     "queue_update",
-    "resources_update",
-    "save_point",
-    "session_before_compact",
-    "session_before_tree",
-    "session_compact",
-    "session_tree",
+    "context_compacted",
     "settled",
-    "thinking_level_update",
     "tool_call",
     "tool_execution_end",
     "tool_execution_start",
     "tool_execution_update",
     "tool_result",
-    "tools_update",
     "turn_end",
     "turn_start",
 ]
@@ -55,8 +47,8 @@ class RunError(RuntimeError):
         self.cause = cause
 
 
-class ProviderError(RunError):
-    """Provider or transport failure."""
+class InferenceError(RunError):
+    """Inference or transport failure."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,7 +182,6 @@ class AssistantMessage:
     stop_reason: StopReason = "stop"
     error_message: str | None = None
     timestamp: int = field(default_factory=now_ms)
-    api: str = "openai-completions"
     role: Literal["assistant"] = "assistant"
 
     @property
@@ -239,7 +230,6 @@ def message_to_dict(message: AgentMessage) -> dict[str, Any]:
         value: dict[str, Any] = {
             "role": "assistant",
             "content": [content_to_dict(part) for part in message.content],
-            "api": message.api,
             "provider": message.provider,
             "model": message.model,
             "usage": message.usage.to_dict(),
@@ -303,7 +293,6 @@ def message_from_dict(value: Mapping[str, Any]) -> AgentMessage:
             content=tuple(
                 content_from_dict(part) for part in raw_content or [] if isinstance(part, Mapping)
             ),
-            api=str(value.get("api") or "openai-completions"),
             provider=str(value.get("provider") or "unknown"),
             model=str(value.get("model") or "unknown"),
             usage=Usage.from_dict(
@@ -335,15 +324,11 @@ class Model:
     id: str
     name: str
     provider: str
-    base_url: str
-    api: str = "openai-completions"
     reasoning: bool = False
     input: tuple[str, ...] = ("text",)
     context_window: int = 128_000
     max_tokens: int = 32_768
     cost: dict[str, float] = field(default_factory=dict)
-    compat: dict[str, Any] = field(default_factory=dict)
-    thinking_level_map: dict[str, str | None] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -360,7 +345,7 @@ class StreamOptions:
 
 
 @dataclass(frozen=True, slots=True)
-class ProviderContext:
+class InferenceContext:
     system_prompt: str
     messages: tuple[AgentMessage, ...]
     tools: tuple[dict[str, Any], ...]
@@ -385,19 +370,16 @@ class AssistantStreamEvent:
     message: AssistantMessage | None = None
 
 
-class Provider(Protocol):
+class InferencePort(Protocol):
     def stream(
         self,
         model: Model,
-        context: ProviderContext,
+        context: InferenceContext,
         options: StreamOptions,
     ) -> AsyncIterator[AssistantStreamEvent]: ...
 
 
 ToolUpdateCallback: TypeAlias = Callable[["ToolResult"], Awaitable[None] | None]
-ToolExecutor: TypeAlias = Callable[
-    [str, dict[str, Any], ToolUpdateCallback | None], Awaitable["ToolResult"]
-]
 
 
 @dataclass(frozen=True, slots=True)
@@ -420,56 +402,27 @@ class ToolResult:
         return cls((TextContent(value),), details, is_error, terminate)
 
 
-@dataclass(frozen=True, slots=True)
-class AgentTool:
+class Tool(Protocol):
+    """Executable tool contract consumed by the stateless run engine."""
+
     name: str
     label: str
     description: str
     parameters: dict[str, Any]
-    execute: ToolExecutor
-    prompt_snippet: str = ""
-    prompt_guidelines: tuple[str, ...] = ()
-    execution_mode: Literal["parallel", "sequential"] = "parallel"
-    prepare_arguments: Callable[[dict[str, Any]], dict[str, Any]] | None = None
+    prompt_snippet: str
+    prompt_guidelines: tuple[str, ...]
+    execution_mode: Literal["parallel", "sequential"]
 
-    def definition(self) -> dict[str, Any]:
-        return {
-            "name": self.name,
-            "description": self.description,
-            "input_schema": self.parameters,
-        }
+    def definition(self) -> dict[str, Any]: ...
 
+    def prepare_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]: ...
 
-@dataclass(frozen=True, slots=True)
-class Skill:
-    name: str
-    description: str
-    content: str
-    file_path: str
-    disable_model_invocation: bool = False
-    source: str = "unknown"
-
-
-@dataclass(frozen=True, slots=True)
-class PromptTemplate:
-    name: str
-    content: str
-    description: str | None = None
-
-    def format(self, args: Sequence[str] = ()) -> str:
-        rendered = self.content
-        for index, argument in enumerate(args, 1):
-            rendered = rendered.replace(f"${index}", argument)
-        return rendered.replace("$@", " ".join(args))
-
-
-@dataclass(frozen=True, slots=True)
-class Resources:
-    skills: tuple[Skill, ...] = ()
-    prompt_templates: tuple[PromptTemplate, ...] = ()
-    context_files: tuple[tuple[str, str], ...] = ()
-    system_prompt: str | None = None
-    append_system_prompt: tuple[str, ...] = ()
+    async def execute(
+        self,
+        call_id: str,
+        arguments: dict[str, Any],
+        on_update: ToolUpdateCallback | None,
+    ) -> ToolResult: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -482,13 +435,10 @@ class RunEvent:
 
 
 RunEventSink: TypeAlias = Callable[[RunEvent], Awaitable[None] | None]
-RunHook: TypeAlias = Callable[
-    [RunEvent], Awaitable[dict[str, Any] | None] | dict[str, Any] | None
-]
+RunHook: TypeAlias = Callable[[RunEvent], Awaitable[dict[str, Any] | None] | dict[str, Any] | None]
 
 __all__ = [
     "AgentMessage",
-    "AgentTool",
     "AssistantContent",
     "AssistantMessage",
     "AssistantStreamEvent",
@@ -499,18 +449,16 @@ __all__ = [
     "RunHook",
     "ImageContent",
     "Model",
-    "PromptTemplate",
-    "Provider",
-    "ProviderContext",
-    "ProviderError",
+    "InferenceContext",
+    "InferenceError",
+    "InferencePort",
     "QueueMode",
-    "Resources",
-    "Skill",
     "StopReason",
     "StreamOptions",
     "TextContent",
     "ThinkingContent",
     "ThinkingLevel",
+    "Tool",
     "ToolCall",
     "ToolResult",
     "ToolResultMessage",

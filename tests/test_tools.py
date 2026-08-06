@@ -9,7 +9,14 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
-from aeloon_core.core import DEFAULT_ACTIVE_TOOLS, ImageContent, create_all_tools
+from aeloon_core.core import ImageContent
+from aeloon_core.tool import BuiltinToolSet
+
+DEFAULT_ACTIVE_TOOLS = BuiltinToolSet.default_active_names
+
+
+def create_all_tools(cwd: Path):
+    return BuiltinToolSet(cwd).by_name
 
 
 @pytest.mark.asyncio
