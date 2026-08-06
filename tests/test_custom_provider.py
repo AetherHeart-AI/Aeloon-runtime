@@ -11,6 +11,48 @@ from aeloon_core.runtime.providers import CustomProvider
 
 
 @pytest.mark.asyncio
+async def test_custom_discovery_reads_llamacpp_meta_allow_image_without_probe() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.method == "GET"
+        return httpx.Response(
+            200,
+            json={
+                "models": [
+                    {
+                        "model": "vision.gguf",
+                        "capabilities": ["completion", "multimodal"],
+                    }
+                ],
+                "object": "list",
+                "data": [
+                    {"id": "vision.gguf", "meta": {"allow_image": True}},
+                    {"id": "text.gguf", "meta": {"allow_image": False}},
+                ],
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = CustomProvider(
+        provider_id="studio",
+        name="Studio",
+        endpoint="https://studio.example/v1",
+        client=client,
+    )
+
+    models = await provider.discover_models()
+    await provider.close()
+    await client.aclose()
+
+    by_id = {model.id: model for model in models}
+    assert by_id["studio/vision.gguf"].input == ("text", "image")
+    assert by_id["studio/text.gguf"].input == ("text",)
+    assert [request.method for request in requests] == ["GET"]
+
+
+@pytest.mark.asyncio
 async def test_custom_discovery_reads_common_metadata_and_probes_only_unknown_models() -> None:
     requests: list[httpx.Request] = []
 

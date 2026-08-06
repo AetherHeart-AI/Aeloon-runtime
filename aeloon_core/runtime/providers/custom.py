@@ -199,23 +199,25 @@ def _models_from_payload(payload: Any, provider_id: str) -> list[_DiscoveredMode
 
 
 def _image_capability(value: Mapping[str, Any]) -> bool | None:
-    direct = _first_bool(
-        value,
-        "supports_image",
-        "supportsImage",
-        "supports_vision",
-        "supportsVision",
-        "vision",
-        "multimodal",
-    )
-    if direct is not None:
-        return direct
-
     sources = [value]
-    architecture = value.get("architecture")
-    if isinstance(architecture, Mapping):
-        sources.append(architecture)
+    for key in ("architecture", "meta"):
+        source = value.get(key)
+        if isinstance(source, Mapping):
+            sources.append(source)
     for source in sources:
+        direct = _first_bool(
+            source,
+            "supports_image",
+            "supportsImage",
+            "supports_vision",
+            "supportsVision",
+            "allow_image",
+            "allowImage",
+            "vision",
+            "multimodal",
+        )
+        if direct is not None:
+            return direct
         for key in (
             "input_modalities",
             "inputModalities",
