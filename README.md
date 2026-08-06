@@ -17,16 +17,17 @@ Install the project and connect a local endpoint:
 ```bash
 uv sync
 
-uv run aeloon local add studio \
-  --base-url http://127.0.0.1:8000/v1 \
-  --model qwen3-coder \
-  --no-api-key
+uv run aeloon provider add studio \
+  --driver openai-compatible \
+  --endpoint http://127.0.0.1:8000/v1 \
+  --model qwen3-coder
 
 uv run aeloon "Inspect this repository and explain its entry points"
 ```
 
-Omit `--no-api-key` when the endpoint requires a key. The CLI reads the key from a hidden prompt
-and stores it in the mode-`0600` config file.
+Pass `--api-key` when the endpoint requires one. The key is stored in the mode-`0600` config file.
+For Ollama, use `aeloon provider add ollama --driver ollama`; its default endpoint is
+`http://127.0.0.1:11434/v1`.
 
 To use Aeloon Cloud instead:
 
@@ -64,7 +65,7 @@ uv run aeloon -vv "also show lifecycle events"
 Useful management commands:
 
 ```bash
-uv run aeloon local list
+uv run aeloon provider list
 uv run aeloon models
 uv run aeloon models use studio/qwen3-coder
 uv run aeloon history
@@ -103,12 +104,12 @@ Global resources live in `~/.aeloon-core`; workspace resources live in
 and the working directory are appended in a deterministic order. Workspace resources override
 same-named global resources and are reloaded at every turn boundary.
 
-Core bundles the `office`, `ppt`, `document-writing`, and `reports` presets. On the first runtime
-startup after installation, any missing presets are copied from the package resources into
+Runtime bundles the `office`, `ppt`, `document-writing`, and `reports` presets. On first startup
+after installation, any missing presets are copied from the package resources into
 `<data_dir>/skills` (normally `~/.aeloon-core/skills`). Existing same-named files and directories
 are preserved, so local customizations are not overwritten.
 
-Skill discovery is progressive: Core reads only each `SKILL.md` frontmatter for the catalog and
+Skill discovery is progressive: Runtime reads only each `SKILL.md` frontmatter for the catalog and
 system-prompt index. The full instructions are read only when the model chooses an enabled skill or
 when a prompt starts with an explicit command such as `/review inspect this patch`. Bridge clients
 select enabled skills through `settings.update.resources.enabled_skill_ids`; they continue to send
@@ -127,18 +128,13 @@ artifacts; stateless core tools and message types remain format-agnostic.
 ## Python API
 
 ```python
-from aeloon_core.core import (
-    DeepSeekProvider,
-    RunRequest,
-    UserMessage,
-    create_all_tools,
-    get_deepseek_model,
-    run_agent,
-)
+from aeloon_core.core import RunRequest, UserMessage, run_agent
+from aeloon_core.runtime.providers import DeepSeekProvider, get_deepseek_model
+from aeloon_core.tool import BuiltinToolSet
 
 workspace = "/path/to/repository"
 provider = DeepSeekProvider(api_key="...")
-tools = tuple(create_all_tools(workspace).values())
+tools = BuiltinToolSet(workspace)
 
 try:
     result = await run_agent(RunRequest(
@@ -146,9 +142,9 @@ try:
         messages=(),
         input=(UserMessage("Implement the requested change"),),
         system_prompt="You are a coding agent.",
-        tools=tools,
+        tools=tools.tools,
         active_tool_names=("read", "bash", "edit", "write"),
-        provider=provider,
+        inference=provider,
         model=get_deepseek_model("deepseek/deepseek-v4-flash"),
     ))
     print(result.final_message.text)
@@ -166,7 +162,7 @@ session = await runtime.create_session(workspace="/path/to/repository")
 ```
 
 Runtime owns sessions, context construction, persistence, provider selection, and operation
-scheduling. Bridge clients access the same runtime through the stable Bridge v2 protocol.
+scheduling. Bridge clients access the same runtime through Bridge v3.
 
 ## Security
 

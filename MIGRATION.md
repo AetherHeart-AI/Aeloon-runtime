@@ -1,115 +1,79 @@
-# Migration Guide
+# Migrating to 0.4
 
-This guide collects compatibility details that are useful when upgrading existing scripts,
-configuration, sessions, or Bridge clients. New installations can follow the
-[README](README.md) directly.
+Version 0.4 intentionally removes the old Provider configuration, Python imports, CLI aliases,
+and Bridge v2 contract. JSONL Session schema v3 is unchanged and existing sessions remain
+readable.
 
-## CLI commands
+## Configuration
 
-The `aeloon` command is the primary interface. Existing automation can continue to use the
-low-level `aeloon-core` command surface:
+Move all Provider settings into the `providers` mapping:
 
-```bash
-# Explicit saved, resumed, or ephemeral runs
-uv run aeloon-core run "task"
-uv run aeloon-core run "continue" --session <id>
-uv run aeloon-core run "one shot" --no-session
+```yaml
+providers:
+  deepseek:
+    driver: deepseek
+    name: DeepSeek
+    enabled: true
+    endpoint: https://api.deepseek.com
+    api_key: null
+    proxy: null
+    headers: {}
 
-# Machine-readable output
-uv run aeloon-core run "task" --output json
-uv run aeloon-core run "task" --output stream-json
-
-# Session and configuration inspection
-uv run aeloon-core session list
-uv run aeloon-core session show <id>
-uv run aeloon-core config path
-uv run aeloon-core config show
+  aeloon-cloud:
+    driver: cloud
+    name: Aeloon Cloud
+    enabled: true
+    endpoint: https://api.aetherheart.com
+    proxy: null
+    device_name: Aeloon Core
+    allow_insecure_http: false
 ```
 
-`stream-json` emits typed run events followed by a result object. `json` emits only the result
-object. Interactive text output uses stderr for status and stdout for the final response, so
-redirected output remains stable.
+The IDs `deepseek` and `aeloon-cloud` are reserved. They may be edited or disabled, but cannot be
+removed or assigned another driver. API keys are nullable; the old `"no-key"` sentinel is not
+accepted.
+
+Files containing any old top-level `deepseek`, `local_providers`, or `cloud` key are rejected with
+`ConfigMigrationError`. Aeloon does not automatically convert or accept both formats. Rewrite the
+file before starting 0.4.
 
 ## Python API
 
-The Python API is intentionally breaking at this boundary. The modules
-`aeloon_core.harness`, `aeloon_core.service`, `aeloon_core.providers`, and
-`aeloon_core.rename_session` have been removed; no compatibility shims are provided.
+- `Provider`, `ProviderContext`, `ProviderError`, and `ProviderRuntime` become `InferencePort`,
+  `InferenceContext`, `InferenceError`, and `InferenceRuntime`.
+- `RunRequest.provider` becomes `RunRequest.inference`.
+- `AgentTool` becomes the `Tool` protocol.
+- Concrete Providers are imported from `aeloon_core.runtime.providers`.
+- Built-in tools and `BuiltinToolSet` are imported from `aeloon_core.tool`.
+- Skill, `LoadedSkill`, `PromptTemplate`, and prompt construction are imported from
+  `aeloon_core.runtime`.
+- `PresentFilesTool` replaces the old factory and is normally composed by Runtime.
 
-- Use `aeloon_core.core.RunRequest`, `RunResult`, `RunController`, and `run_agent()` for a
-  single stateless agent run.
-- Use `aeloon_core.runtime.RuntimeService` and the typed runtime DTOs for sessions and
-  application operations.
-- Use `aeloon_core.bootstrap.create_runtime_service()` to compose the standard runtime with
-  cloud account, catalog, and provider capabilities.
+There are no old-name re-exports.
 
-`run_agent()` receives the complete initial transcript and does not retain state across calls.
-Injected providers and tools are owned by the caller; runtime owns and closes the instances it
-creates for managed operations.
+## CLI
 
-## Provider and model configuration
-
-Fresh installations do not pin a default model or import provider keys from the process
-environment. After a local endpoint is added or a cloud account is connected, Aeloon selects the
-first available model. Pin a model with:
+Use only the unified Provider commands:
 
 ```bash
-uv run aeloon models use PROVIDER/MODEL
+aeloon provider list
+aeloon provider add ollama --driver ollama
+aeloon provider add studio --driver openai-compatible --endpoint https://api.example/v1
+aeloon provider remove studio
 ```
 
-Provider-local names are resolved in catalog order; use the full `provider/model` ID to
-disambiguate overlapping names. Existing explicitly configured DeepSeek providers and sessions
-remain supported, but the provider appears in the CLI catalog only when its credential is stored.
+`--model` may be repeated. If it is omitted, the selected driver discovers `/models` and stores a
+normalized model list. Cloud account operations remain separate as `aeloon login/logout/whoami`
+or the low-level `aeloon cloud ...` commands. The old `local`, `provider local`, Provider login,
+and cloud Provider aliases are removed.
 
-The following compatibility commands remain available:
+## Bridge
 
-```bash
-uv run aeloon config show
-uv run aeloon config set model studio/qwen3-coder
-uv run aeloon provider list
+Bridge v3 replaces `provider.local.add/remove` with `provider.add/remove`, removes
+`provider.cloud.*`, and keeps `cloud.account.*`. `settings.get` exposes a unified `providers`
+mapping without API keys. Provider DTOs contain `id`, `name`, `driver`, `kind`, `endpoint`,
+`enabled`, `authenticated`, `credential_configured`, and `model_ids`.
 
-uv run aeloon-core provider login <username>
-uv run aeloon-core provider list
-uv run aeloon-core cloud login <username>
-uv run aeloon-core cloud status
-uv run aeloon-core cloud logout
-```
-
-`provider add` remains an alias for `local add`. Cloud credentials are stored in the account
-vault, and local API keys are stored in the mode-`0600` config. Neither login flow accepts secrets
-as command-line arguments.
-
-## Session storage
-
-New sessions are stored under `<data-dir>/harness-sessions/`. The older `sessions/` directory is
-not read or modified automatically, so copy or convert historical data explicitly if it must be
-retained.
-
-Current sessions use append-only version-3 JSONL records. Each completed message is persisted and
-fsynced immediately. Restarting restores the last saved entry rather than reconstructing a
-cumulative turn snapshot.
-
-## Bridge clients
-
-Bridge v2 uses JSON-RPC 2.0 over NDJSON on a Unix domain socket. Clients should consume the stable
-session, operation, catalog, and revisioned settings DTOs instead of internal Python objects or raw
-provider payloads.
-
-Administration commands are:
-
-```bash
-uv run aeloon system bridge status
-uv run aeloon system bridge stop
-
-uv run aeloon-core bridge ensure --output json
-uv run aeloon-core bridge status --output json
-uv run aeloon-core bridge schema
-uv run aeloon-core bridge stop
-```
-
-Older Bridge clients are not protocol-compatible with v2 and must update their method names,
-handshake handling, and DTO parsing together. `status` and `stop` are idempotent when the daemon or
-socket is absent.
-
-This module refactor does not change the Bridge v2 wire protocol or version-3 JSONL session
-format. Existing v2 clients and v3 session files remain compatible.
+Clients must offer protocol version 3 during `system.handshake`. A client offering only v2
+receives `protocol_incompatible`. The v3 schema is available through `aeloon bridge schema` and
+at `aeloon_core/bridge/bridge-protocol-v3.json`.

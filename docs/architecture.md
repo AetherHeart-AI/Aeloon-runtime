@@ -1,66 +1,71 @@
 # Architecture
 
-Aeloon is one Python distribution with four modules and a small composition root:
+Aeloon is one Python distribution with inward-only dependencies:
 
 ```mermaid
 flowchart LR
-    CLI["CLI"] --> Runtime["runtime"]
-    Client["Bridge client"] --> Bridge["bridge"]
-    Bridge --> Runtime
-    Runtime --> Core["core"]
-    Cloud["cloud"] --> Core
+    Client["Bridge client"] --> Bridge["bridge v3"]
+    Bridge --> Runtime["runtime"]
+    Runtime --> Core["stateless core"]
+    Runtime --> Tool["tool"]
+    Tool --> Core
     Bootstrap["bootstrap"] --> Runtime
-    Bootstrap --> Cloud
+    Bootstrap --> Cloud["cloud account"]
 ```
 
-`core` never imports `runtime`, `bridge`, or `cloud`. `runtime` never imports `bridge` or `cloud`;
-remote providers and account operations are injected by `bootstrap`.
+The fixed dependency directions are `bridge → runtime → core`, `runtime → tool/core`, and
+`tool → core`. Bootstrap is the composition root. Core never imports Runtime, Cloud, Bridge,
+`httpx`, Pillow, or a concrete vendor implementation.
 
-## Core: one stateless run
+## Core: one stateless inference run
 
-`aeloon_core.core.run_agent()` receives a complete `RunRequest` and returns a `RunResult`. It owns
-only invocation-local state: the provider/tool loop, retries, streaming events, hooks, temporary
-messages, steering/follow-up queues, and cancellation. A `RunController` is bound for one call and
-becomes inactive when that call settles.
+`aeloon_core.core.run_agent()` receives a complete `RunRequest` and returns a `RunResult`.
+`RunRequest.inference` is an `InferencePort`; tools implement the neutral `Tool` protocol. Core
+owns only invocation-local engine, controller, queues, cancellation tasks, messages, and tool-loop
+state. Nothing is retained after the await completes.
 
-Core detects context thresholds and provider overflow errors. It asks an injected
-`ContextCompactor` for a replacement message sequence without accessing a Session or repository.
-Stateless summary generation and token estimation also live in core.
+Core contains model identity and general capability metadata, streaming inference contracts,
+events, token estimation, and the `ContextCompactor` port. It coordinates threshold and overflow
+compaction but has no Session selection, summarization prompt, transport, authentication, model
+discovery, or vendor compatibility logic.
 
-## Runtime: sessions and context
+## Tool: object-oriented built-ins
 
-`RuntimeService` is the application boundary. It owns the append-only JSONL v3 Session tree,
-context restoration, resources, persisted next-turn input, branch navigation, provider catalog,
-settings, per-session serialization, cross-session concurrency, and operation lifecycle.
+`aeloon_core.tool` contains `BaseTool`, `ToolContext`, filesystem tools, `BashTool`, search tools,
+and `BuiltinToolSet`. A ToolSet shares one context-scoped mutation-lock map; there is no process
+global write registry. Writes and edits replace their target atomically.
 
-For a turn, runtime builds a `RunRequest`, injects a Session-backed context compactor, and persists
-each completed core message immediately. Provider and tool resources are closed by runtime after
-the operation. Runtime emits typed `RuntimeEvent` values and does not know RPC methods or
-`BridgeError`.
+Runtime's `RuntimeToolSet` explicitly adds `PresentFilesTool`. This composition is intentionally
+small and does not introduce a plugin registry.
 
-Runtime-owned workflow tools may be composed into a `RunRequest` through core's generic
-`AgentTool` contract. The intrinsic `present_files` tool follows this path: runtime validates final
-deliverables, records `artifact_delivery` entries outside model context, and projects optional
-artifact metadata into operation blocks. Core has no office-format or presentation dependency.
+## Runtime: state and capabilities
 
-## Bridge: channels and wire contracts
+Runtime owns Sessions, Skills, prompt templates, prompt construction, artifacts, compaction
+selection and persistence, Provider configuration, and all resource lifecycles. `SessionAgent`
+uses one operation-scoped `ProviderManager`, so the main run, compaction, branch summary, and
+automatic title reuse one inference instance. Closing the agent closes the whole manager.
 
-`BridgeRpcAdapter` maps Bridge v2 JSON-RPC methods and errors to typed runtime calls. It owns public
-event sequence numbers, the 5,000-event replay buffer, server instance identity, handshake data,
-wire DTO serialization, and attachment-root validation. `BridgeDaemon` only owns Unix socket,
-NDJSON connection, lifecycle, and broadcast behavior.
+`ProviderManager` constructs Providers lazily from a fixed driver factory mapping. It resolves
+qualified and unqualified model IDs, isolates transient model-discovery failures by Provider, and
+closes every instantiated Provider idempotently. Catalog and settings operations use short-lived
+managers and always close them in `finally` blocks.
 
-Bridge v2 method names, events, schema, error codes, and replay behavior remain stable.
+Bootstrap also gives each Manager a lazy Cloud account gateway bound to the same configuration
+snapshot. Updating settings can therefore replace the service-level account client without
+mutating an operation that is already running.
 
-## Cloud: optional remote capabilities
+Concrete implementations live in `aeloon_core.runtime.providers`: a shared
+`OpenAICompatibleProvider`, DeepSeek, Ollama, Aeloon Cloud, and the testing-only
+`ScriptedProvider`.
 
-Cloud owns account login, token refresh and vault storage, model discovery, the HTTP client, and
-the cloud Provider implementation. It depends only on provider-neutral core contracts. The
-composition root adapts these capabilities into runtime's account and remote-provider ports.
+## Bridge and Cloud
 
-## Sessions and compaction
+Bridge v3 is a transport adapter over Runtime. It owns JSON-RPC dispatch, handshake negotiation,
+wire errors, event sequencing/replay, and JSON DTOs. It does not import Core.
 
-Sessions remain append-only version-3 JSONL trees with immutable headers. Messages are flushed and
-fsynced as soon as core completes them. Runtime selects the compaction cut point and persists the
-summary; core supplies the stateless summarization call and coordinates overflow retry within the
-active run.
+Cloud owns login, refresh tokens, the vault, and raw model-catalog access. It does not create Core
+models or inference implementations. Bootstrap adapts `CloudAccountService` to `AccountGateway`
+and injects it into Runtime's Provider manager factory.
+
+Sessions remain append-only JSONL schema v3. Existing Session v3 files remain readable even
+though newly serialized models no longer carry transport fields.

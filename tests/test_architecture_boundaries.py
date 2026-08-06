@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import ast
+from dataclasses import fields
 from pathlib import Path
+
+from aeloon_core.core import Model
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / "aeloon_core"
@@ -41,11 +44,37 @@ def test_package_imports_have_no_removed_runtime_edges() -> None:
     assert not {name for name in imports if name.startswith(forbidden)}
 
 
-def test_four_module_dependencies_point_inward() -> None:
+def test_architecture_dependencies_point_inward() -> None:
     forbidden_by_module = {
-        "core": ("aeloon_core.runtime", "aeloon_core.bridge", "aeloon_core.cloud"),
+        "core": (
+            "aeloon_core.bootstrap",
+            "aeloon_core.bridge",
+            "aeloon_core.cloud",
+            "aeloon_core.config",
+            "aeloon_core.runtime",
+            "aeloon_core.tool",
+        ),
+        "tool": (
+            "aeloon_core.bootstrap",
+            "aeloon_core.bridge",
+            "aeloon_core.cloud",
+            "aeloon_core.config",
+            "aeloon_core.runtime",
+        ),
         "runtime": ("aeloon_core.bridge", "aeloon_core.cloud"),
-        "cloud": ("aeloon_core.runtime", "aeloon_core.bridge", "aeloon_core.config"),
+        "bridge": (
+            "aeloon_core.bootstrap",
+            "aeloon_core.cloud",
+            "aeloon_core.core",
+            "aeloon_core.tool",
+        ),
+        "cloud": (
+            "aeloon_core.bridge",
+            "aeloon_core.config",
+            "aeloon_core.core",
+            "aeloon_core.runtime",
+            "aeloon_core.tool",
+        ),
     }
     for module, forbidden in forbidden_by_module.items():
         imports: set[str] = set()
@@ -57,10 +86,57 @@ def test_four_module_dependencies_point_inward() -> None:
                 elif isinstance(node, ast.Import):
                     imports.update(alias.name for alias in node.names)
         assert not {
-            name
-            for name in imports
-            if any(name.startswith(prefix) for prefix in forbidden)
+            name for name in imports if any(name.startswith(prefix) for prefix in forbidden)
         }, module
+
+
+def test_core_contains_only_vendor_neutral_stateless_contracts() -> None:
+    source = "\n".join(
+        path.read_text(encoding="utf-8") for path in (PACKAGE / "core").rglob("*.py")
+    ).lower()
+    for forbidden in ("httpx", "from pil", "pillow", "deepseek", "ollama", "aeloon cloud"):
+        assert forbidden not in source
+
+    removed = ("providers.py", "provider_runtime.py", "tools.py", "prompt.py", "summary.py")
+    assert all(not (PACKAGE / "core" / name).exists() for name in removed)
+    assert [field.name for field in fields(Model)] == [
+        "id",
+        "name",
+        "provider",
+        "reasoning",
+        "input",
+        "context_window",
+        "max_tokens",
+        "cost",
+    ]
+
+
+def test_bridge_adapter_depends_on_runtime_not_core() -> None:
+    adapter = (PACKAGE / "bridge" / "adapter.py").read_text(encoding="utf-8")
+    assert "aeloon_core.runtime" in adapter
+    assert "aeloon_core.core" not in adapter
+    assert "aeloon_core.cloud" not in adapter
+
+
+def test_runtime_components_and_object_oriented_tool_layer_exist() -> None:
+    for name in ("coordinator.py", "input.py", "projection.py", "tooling.py"):
+        assert (PACKAGE / "runtime" / name).is_file()
+    tool_source = "\n".join(
+        path.read_text(encoding="utf-8") for path in (PACKAGE / "tool").rglob("*.py")
+    )
+    for class_name in (
+        "BaseTool",
+        "ToolContext",
+        "ReadTool",
+        "WriteTool",
+        "EditTool",
+        "BashTool",
+        "GrepTool",
+        "FindTool",
+        "ListTool",
+        "BuiltinToolSet",
+    ):
+        assert f"class {class_name}" in tool_source
 
 
 def test_runtime_has_no_wire_dispatch_or_bridge_errors() -> None:
@@ -68,8 +144,7 @@ def test_runtime_has_no_wire_dispatch_or_bridge_errors() -> None:
     tree = ast.parse(service)
     assert "BridgeError" not in service
     assert not any(
-        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name == "dispatch"
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "dispatch"
         for node in ast.walk(tree)
     )
 
