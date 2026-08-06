@@ -5,11 +5,15 @@ release is cut, those entries should move to a versioned section with an ISO dat
 
 ## Unreleased
 
+## 0.0.3 - 2026-08-07
+
 ### Changed
 
 - Unified URL-configured model endpoints under the `custom` Provider driver. Provider setup now
   discovers the usable API base and model list automatically, then best-effort probes undeclared
   image-input capability without failing setup when a capability probe is rejected or times out.
+- Custom Provider discovery now reads declared image capability from nested metadata such as
+  `meta.allow_image`, avoiding an image probe when the endpoint already reports the capability.
 
 ## 0.4.0 - 2026-08-06
 
