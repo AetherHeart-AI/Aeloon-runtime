@@ -26,6 +26,9 @@ dev = [
   "ruff>=0.15",
   "tqdm>=4.66",
 ]
+package = [
+  "pyinstaller>=6.21,<7",
+]
 
 [project.scripts]
 aeloon = "aeloon_core.__main__:main"
