@@ -212,6 +212,13 @@ GitHub Actions also builds and verifies the binary on every pull request and pus
 run uploads a 30-day workflow artifact. Pushing a tag such as `v0.4.0` additionally creates or
 updates the matching GitHub Release with the archive and its SHA-256 checksum.
 
+### Ubuntu ARM64 binary
+
+The same PyInstaller command builds a native single-file executable on an ARM64 Ubuntu host.
+GitHub Actions builds it on an `ubuntu-24.04-arm` runner, verifies the ELF architecture and daemon
+lifecycle, and uploads `aeloon-ubuntu-arm64.tar.gz` plus its SHA-256 checksum. Tag builds also add
+these files to the matching GitHub Release.
+
 ## Documentation
 
 - [Architecture](docs/architecture.md)
