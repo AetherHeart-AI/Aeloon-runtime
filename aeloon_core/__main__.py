@@ -191,14 +191,8 @@ def _add_account_arguments(command: argparse.ArgumentParser, *, login: bool = Fa
 
 def _add_provider_arguments(command: argparse.ArgumentParser) -> None:
     command.add_argument("provider_id", help="Short name used in provider/model ids.")
-    command.add_argument(
-        "--driver",
-        required=True,
-        choices=("ollama", "openai-compatible"),
-        help="Provider implementation to use.",
-    )
     command.add_argument("--name", help="Human-readable provider name.")
-    command.add_argument("--endpoint", help="OpenAI-compatible API endpoint.")
+    command.add_argument("--endpoint", required=True, help="Custom API base URL.")
     command.add_argument("--api-key", help="Optional API key.")
     command.add_argument("--proxy", help="Optional HTTP proxy.")
     command.add_argument(
@@ -207,12 +201,6 @@ def _add_provider_arguments(command: argparse.ArgumentParser) -> None:
         dest="headers",
         metavar="NAME=VALUE",
         help="Additional HTTP header; repeat for multiple headers.",
-    )
-    command.add_argument(
-        "--model",
-        action="append",
-        dest="models",
-        help="Model id; repeat for multiple models, or omit to discover GET /models.",
     )
 
 
@@ -267,7 +255,7 @@ def build_parser() -> argparse.ArgumentParser:
             "examples:\n"
             '  aeloon "fix the failing tests"\n'
             '  aeloon resume "continue with the implementation"\n'
-            "  aeloon provider add ollama --driver ollama\n"
+            "  aeloon provider add studio --endpoint http://127.0.0.1:8000\n"
             "  aeloon login\n"
             "  aeloon doctor\n\n"
             "task options: -C PATH, -m MODEL, --json, -v, --ephemeral\n"
@@ -1458,20 +1446,16 @@ async def provider_command(args: argparse.Namespace) -> int:
         params = {
             "provider_id": args.provider_id,
             "name": args.name or args.provider_id,
-            "driver": args.driver,
+            "endpoint": args.endpoint,
         }
-        if args.endpoint:
-            params["endpoint"] = args.endpoint
         if args.api_key:
             params["api_key"] = args.api_key
         if args.proxy:
             params["proxy"] = args.proxy
         if args.headers:
             params["headers"] = _parse_headers(args.headers)
-        if args.models:
-            params["models"] = args.models
         method = "provider.add"
-        timeout = 60.0
+        timeout = None
     else:
         params = {"provider_id": args.provider_id}
         method = "provider.remove"

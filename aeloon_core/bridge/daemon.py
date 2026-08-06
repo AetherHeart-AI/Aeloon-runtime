@@ -243,7 +243,7 @@ async def bridge_request(
     method: str,
     params: dict[str, Any] | None = None,
     *,
-    timeout: float = 3.0,
+    timeout: float | None = 3.0,
 ) -> dict[str, Any]:
     reader, writer = await asyncio.wait_for(
         asyncio.open_unix_connection(str(Path(socket_path))),

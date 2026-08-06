@@ -5,6 +5,12 @@ release is cut, those entries should move to a versioned section with an ISO dat
 
 ## Unreleased
 
+### Changed
+
+- Unified URL-configured model endpoints under the `custom` Provider driver. Provider setup now
+  discovers the usable API base and model list automatically, then best-effort probes undeclared
+  image-input capability without failing setup when a capability probe is rejected or times out.
+
 ## 0.4.0 - 2026-08-06
 
 ### Changed

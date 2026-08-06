@@ -37,7 +37,7 @@ def _use_scripted_openai_provider(
 
     def create_manager(config, *, account=None, driver_factories=None):
         factories = dict(driver_factories or {})
-        factories["openai-compatible"] = lambda provider_id, *_args: (
+        factories["custom"] = lambda provider_id, *_args: (
             providers[provider_id] if providers is not None else provider
         )
         return RuntimeProviderManager(
@@ -1006,12 +1006,12 @@ async def test_provider_add_uses_unified_bridge_v3(
         request.update(path=path, method=method, params=params, timeout=timeout)
         return {
             "provider": {
-                "id": "ollama",
-                "name": "Ollama",
-                "driver": "openai-compatible",
+                "id": "studio",
+                "name": "Studio",
+                "driver": "custom",
                 "kind": "local",
-                "endpoint": "http://127.0.0.1:11434/v1",
-                "model_ids": ["ollama/qwen3-coder"],
+                "endpoint": "http://127.0.0.1:8000/v1",
+                "model_ids": ["studio/qwen3-coder"],
             },
             "revision": 2,
         }
@@ -1023,17 +1023,13 @@ async def test_provider_add_uses_unified_bridge_v3(
             [
                 "provider",
                 "add",
-                "ollama",
-                "--driver",
-                "openai-compatible",
+                "studio",
                 "--name",
-                "Ollama",
+                "Studio",
                 "--endpoint",
-                "http://127.0.0.1:11434/v1",
+                "http://127.0.0.1:8000",
                 "--api-key",
                 "private-local-key",
-                "--model",
-                "qwen3-coder",
                 "--socket",
                 str(socket_path),
             ]
@@ -1045,18 +1041,16 @@ async def test_provider_add_uses_unified_bridge_v3(
         "path": socket_path,
         "method": "provider.add",
         "params": {
-            "provider_id": "ollama",
-            "name": "Ollama",
-            "driver": "openai-compatible",
-            "endpoint": "http://127.0.0.1:11434/v1",
+            "provider_id": "studio",
+            "name": "Studio",
+            "endpoint": "http://127.0.0.1:8000",
             "api_key": "private-local-key",
-            "models": ["qwen3-coder"],
         },
-        "timeout": 60.0,
+        "timeout": None,
     }
     output = capsys.readouterr().out
     assert "private-local-key" not in output
-    assert "aeloon models use ollama/qwen3-coder" in output
+    assert "aeloon models use studio/qwen3-coder" in output
 
 
 @pytest.mark.asyncio
