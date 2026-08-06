@@ -1,5 +1,5 @@
 # ruff: noqa: E501
-"""Unix-domain-socket JSON-RPC 2.0 daemon for Bridge v2."""
+"""Unix-domain-socket JSON-RPC 2.0 daemon for Bridge v3."""
 
 from __future__ import annotations
 
@@ -14,10 +14,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from aeloon_core.bootstrap import create_runtime_service
 from aeloon_core.bridge.adapter import BridgeRpcAdapter
 from aeloon_core.bridge.protocol import PROTOCOL_VERSION, BridgeError
 from aeloon_core.config import load_config, resolve_config_path
+from aeloon_core.runtime.service import RuntimeService
+from aeloon_core.version import __version__
 
 MAX_REQUEST_BYTES = 1024 * 1024
 
@@ -30,7 +31,7 @@ def runtime_directory(data_dir: Path | str) -> Path:
 
 
 def default_socket_path(data_dir: Path | str) -> Path:
-    return runtime_directory(data_dir) / "bridge-v2.sock"
+    return runtime_directory(data_dir) / "bridge-v3.sock"
 
 
 class BridgeConnection:
@@ -56,13 +57,19 @@ class BridgeConnection:
                     line = await self.reader.readuntil(b"\n")
                 except asyncio.IncompleteReadError as exc:
                     if exc.partial:
-                        await self._error(None, BridgeError("invalid_argument", "Incomplete NDJSON request"))
+                        await self._error(
+                            None, BridgeError("invalid_argument", "Incomplete NDJSON request")
+                        )
                     break
                 except asyncio.LimitOverrunError:
-                    await self._error(None, BridgeError("invalid_argument", "Bridge request exceeds 1 MiB"))
+                    await self._error(
+                        None, BridgeError("invalid_argument", "Bridge request exceeds 1 MiB")
+                    )
                     break
                 if len(line) > MAX_REQUEST_BYTES:
-                    await self._error(None, BridgeError("invalid_argument", "Bridge request exceeds 1 MiB"))
+                    await self._error(
+                        None, BridgeError("invalid_argument", "Bridge request exceeds 1 MiB")
+                    )
                     break
                 task = asyncio.create_task(self._handle(line))
                 self._tasks.add(task)
@@ -148,7 +155,10 @@ class BridgeDaemon:
             self.socket_path.parent.chmod(0o700)
         if self.socket_path.exists():
             if await _socket_alive(self.socket_path):
-                raise BridgeError("daemon_config_conflict", f"Bridge daemon is already running at {self.socket_path}")
+                raise BridgeError(
+                    "daemon_config_conflict",
+                    f"Bridge daemon is already running at {self.socket_path}",
+                )
             self.socket_path.unlink()
         self.server = await asyncio.start_unix_server(
             self._accept,
@@ -195,7 +205,7 @@ class BridgeDaemon:
         )
 
     def _metadata_path(self) -> Path:
-        return self.socket_path.parent / "bridge-v2.json"
+        return self.socket_path.parent / "bridge-v3.json"
 
     def _write_metadata(self) -> None:
         path = self._metadata_path()
@@ -210,27 +220,20 @@ class BridgeDaemon:
                     "protocol_version": PROTOCOL_VERSION,
                 },
                 separators=(",", ":"),
-            ) + "\n",
+            )
+            + "\n",
             encoding="utf-8",
         )
         path.chmod(0o600)
 
 
 async def run_daemon(
+    runtime: RuntimeService,
     *,
-    config_path: Path | str | None = None,
-    data_dir: Path | str | None = None,
     socket_path: Path | str | None = None,
-    max_concurrent_operations: int = 4,
 ) -> None:
-    config = load_config(config_path)
-    if data_dir is not None:
-        config = config.model_copy(update={"data_dir": Path(data_dir)}).normalized()
-    resolved_socket = Path(socket_path) if socket_path is not None else default_socket_path(config.data_dir)
-    runtime = create_runtime_service(
-        config_path=config_path,
-        data_dir=data_dir,
-        max_concurrent_operations=max_concurrent_operations,
+    resolved_socket = (
+        Path(socket_path) if socket_path is not None else default_socket_path(runtime.data_dir)
     )
     await BridgeDaemon(BridgeRpcAdapter(runtime), resolved_socket).run()
 
@@ -254,7 +257,10 @@ async def bridge_request(
         response = json.loads(raw)
         if response.get("error"):
             error = response["error"]
-            raise BridgeError(str((error.get("data") or {}).get("code") or "internal_error"), str(error.get("message") or "Bridge request failed"))
+            raise BridgeError(
+                str((error.get("data") or {}).get("code") or "internal_error"),
+                str(error.get("message") or "Bridge request failed"),
+            )
         return dict(response.get("result") or {})
     finally:
         writer.close()
@@ -275,13 +281,17 @@ async def ensure_daemon(
         config = config.model_copy(update={"data_dir": Path(data_dir)}).normalized()
     resolved_config = resolve_config_path(config_path).resolve(strict=False)
     resolved_data = config.data_dir.resolve(strict=False)
-    resolved_socket = (Path(socket_path) if socket_path is not None else default_socket_path(resolved_data)).expanduser().resolve(strict=False)
+    resolved_socket = (
+        (Path(socket_path) if socket_path is not None else default_socket_path(resolved_data))
+        .expanduser()
+        .resolve(strict=False)
+    )
     runtime = runtime_directory(resolved_data)
-    lock_path = runtime / "bridge-v2.lock"
+    lock_path = runtime / "bridge-v3.lock"
     lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        metadata_path = runtime / "bridge-v2.json"
+        metadata_path = runtime / "bridge-v3.json"
         if metadata_path.is_file():
             try:
                 recorded = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -390,7 +400,11 @@ async def _existing(socket_path: Path) -> dict[str, Any] | None:
         handshake = await bridge_request(
             socket_path,
             "system.handshake",
-            {"protocol_versions": [PROTOCOL_VERSION], "client": {"name": "aeloon-core-cli", "version": "0.3.0"}, "attachment_roots": []},
+            {
+                "protocol_versions": [PROTOCOL_VERSION],
+                "client": {"name": "aeloon-core-cli", "version": __version__},
+                "attachment_roots": [],
+            },
             timeout=0.5,
         )
         health = await bridge_request(socket_path, "system.health", timeout=0.5)
@@ -428,6 +442,12 @@ def _remove_stale_socket(path: Path) -> None:
 
 
 __all__ = [
-    "BridgeDaemon", "bridge_request", "daemon_status", "default_socket_path",
-    "ensure_daemon", "run_daemon", "runtime_directory", "stop_daemon",
+    "BridgeDaemon",
+    "bridge_request",
+    "daemon_status",
+    "default_socket_path",
+    "ensure_daemon",
+    "run_daemon",
+    "runtime_directory",
+    "stop_daemon",
 ]

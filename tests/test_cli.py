@@ -6,10 +6,12 @@ from pathlib import Path
 import pytest
 
 import aeloon_core.__main__ as cli
-from aeloon_core.core import AssistantMessage, ScriptedProvider, TextContent, Usage
+from aeloon_core.core import AssistantMessage, Model, TextContent, Usage
+from aeloon_core.runtime.providers import ProviderManager as RuntimeProviderManager
+from aeloon_core.runtime.providers.testing import ScriptedProvider
 
 
-def _provider(text: str = "done") -> ScriptedProvider:
+def _provider(text: str = "done", *, models=()) -> ScriptedProvider:
     return ScriptedProvider(
         [
             AssistantMessage(
@@ -18,8 +20,33 @@ def _provider(text: str = "done") -> ScriptedProvider:
                 model="deepseek-v4-flash",
                 usage=Usage(input=3, output=1, total_tokens=4),
             )
-        ]
+        ],
+        models=models,
     )
+
+
+def _providers(configured=None, **updates):
+    return {**cli.Config().providers, **(configured or {}), **updates}
+
+
+def _use_scripted_openai_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    provider: ScriptedProvider | dict[str, ScriptedProvider],
+) -> None:
+    providers = provider if isinstance(provider, dict) else None
+
+    def create_manager(config, *, account=None, driver_factories=None):
+        factories = dict(driver_factories or {})
+        factories["openai-compatible"] = lambda provider_id, *_args: (
+            providers[provider_id] if providers is not None else provider
+        )
+        return RuntimeProviderManager(
+            config,
+            account=account,
+            driver_factories=factories,
+        )
+
+    monkeypatch.setattr(cli, "ProviderManager", create_manager)
 
 
 @pytest.mark.asyncio
@@ -333,18 +360,18 @@ async def test_session_dir_does_not_change_cloud_account_data_dir(
         cli.Config(
             workspace=tmp_path,
             data_dir=configured_data_dir,
-            deepseek={"api_key": "configured-key"},
+            providers=_providers(deepseek={"driver": "deepseek", "api_key": "configured-key"}),
         ),
         config_path,
     )
     account_data_dirs: list[Path] = []
-    account_type = cli.CloudAccountService
+    account_type = cli.CloudAccountGateway
 
     def cloud_account(config, *, data_dir):
         account_data_dirs.append(data_dir)
         return account_type(config, data_dir=data_dir)
 
-    monkeypatch.setattr(cli, "CloudAccountService", cloud_account)
+    monkeypatch.setattr(cli, "CloudAccountGateway", cloud_account)
     monkeypatch.setattr(cli, "DeepSeekProvider", lambda **_kwargs: _provider("isolated"))
 
     assert (
@@ -397,9 +424,9 @@ def test_config_path_init_show_and_set(tmp_path: Path, monkeypatch, capsys) -> N
     shown = json.loads(capsys.readouterr().out)
     assert shown["agent"]["retry"]["max_retries"] == 5
     assert shown["agent"]["model"] == ""
-    assert shown["deepseek"]["api_key"] == "no-key"
+    assert shown["providers"]["deepseek"]["api_key"] is None
     persisted = json.loads(path.read_text(encoding="utf-8"))
-    assert persisted["deepseek"]["api_key"] == "no-key"
+    assert persisted["providers"]["deepseek"]["api_key"] is None
 
 
 def test_fresh_config_ignores_deepseek_environment_and_has_no_default_model(
@@ -409,7 +436,7 @@ def test_fresh_config_ignores_deepseek_environment_and_has_no_default_model(
 
     config = cli.load_config(tmp_path / "missing.json")
 
-    assert config.deepseek.api_key == "no-key"
+    assert config.providers["deepseek"].api_key is None
     assert config.agent.model == ""
 
 
@@ -429,7 +456,7 @@ def test_run_without_any_connected_model_explains_setup(tmp_path: Path, capsys) 
     )
     error = capsys.readouterr().err
     assert "No connected model is available" in error
-    assert "aeloon local add" in error
+    assert "aeloon provider add" in error
     assert "first available model automatically" in error
 
 
@@ -443,6 +470,17 @@ def test_top_level_help_focuses_on_user_tasks() -> None:
     assert "bridge    " not in help_text
     assert "session   " not in help_text
     assert "==SUPPRESS==" not in help_text
+
+
+def test_removed_local_and_provider_login_commands_are_absent() -> None:
+    parser = cli.build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["local", "add", "studio"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["provider", "local", "add", "studio"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["provider", "login"])
 
 
 def test_default_task_command_and_explicit_separator_are_normalized() -> None:
@@ -599,25 +637,16 @@ async def test_history_is_human_readable_and_supports_json(
     )
     capsys.readouterr()
 
-    assert (
-        await cli.async_main(
-            ["history", "-C", str(tmp_path), "--data-dir", str(data_dir)]
-        )
-        == 0
-    )
+    assert await cli.async_main(["history", "-C", str(tmp_path), "--data-dir", str(data_dir)]) == 0
     human = capsys.readouterr().out
     assert "UPDATED\tWORKSPACE\tSUMMARY\tSESSION" in human
     assert "remember this task" in human
 
-    await cli.async_main(
-        ["history", "-C", str(tmp_path), "--data-dir", str(data_dir), "--json"]
-    )
+    await cli.async_main(["history", "-C", str(tmp_path), "--data-dir", str(data_dir), "--json"])
     payload = json.loads(capsys.readouterr().out)
     assert payload[0]["summary"] == "remember this task"
 
-    await cli.async_main(
-        ["history", payload[0]["id"][:8], "--data-dir", str(data_dir)]
-    )
+    await cli.async_main(["history", payload[0]["id"][:8], "--data-dir", str(data_dir)])
     detail = capsys.readouterr().out
     assert "remember this task" in detail
     assert f"Session: {payload[0]['id']}" in detail
@@ -638,7 +667,7 @@ async def test_models_and_doctor_offer_human_and_machine_views(tmp_path: Path, c
     assert diagnosis["ok"] is False
     model = next(item for item in diagnosis["checks"] if item["name"] == "model")
     assert model["status"] == "error"
-    assert "aeloon local add" in model["fix"]
+    assert "aeloon provider add" in model["fix"]
 
 
 @pytest.mark.asyncio
@@ -650,18 +679,27 @@ async def test_first_listed_model_is_automatic_default(
         cli.Config(
             workspace=tmp_path,
             data_dir=tmp_path / "data",
-            local_providers={
-                "studio": {
-                    "name": "Studio",
-                    "base_url": "http://127.0.0.1:8000/v1",
-                    "models": [{"id": "first"}, {"id": "second"}],
+            providers=_providers(
+                {
+                    "studio": {
+                        "driver": "openai-compatible",
+                        "name": "Studio",
+                        "endpoint": "http://127.0.0.1:8000/v1",
+                        "models": [{"id": "first"}, {"id": "second"}],
+                    }
                 }
-            },
+            ),
         ),
         config_path,
     )
-    provider = _provider("automatic")
-    monkeypatch.setattr(cli, "DeepSeekProvider", lambda **_kwargs: provider)
+    provider = _provider(
+        "automatic",
+        models=(
+            Model("studio/first", "first", "studio"),
+            Model("studio/second", "second", "studio"),
+        ),
+    )
+    _use_scripted_openai_provider(monkeypatch, provider)
 
     assert (
         await cli.async_main(
@@ -697,23 +735,37 @@ async def test_explicit_short_model_uses_first_matching_provider(
         cli.Config(
             workspace=tmp_path,
             data_dir=tmp_path / "data",
-            local_providers={
-                "studio": {
-                    "name": "Studio",
-                    "base_url": "http://127.0.0.1:8000/v1",
-                    "models": [{"id": "deepseek-v4-flash"}],
-                },
-                "backup": {
-                    "name": "Backup",
-                    "base_url": "http://127.0.0.1:9000/v1",
-                    "models": [{"id": "deepseek-v4-flash"}],
-                },
-            },
+            providers=_providers(
+                {
+                    "studio": {
+                        "driver": "openai-compatible",
+                        "name": "Studio",
+                        "endpoint": "http://127.0.0.1:8000/v1",
+                        "models": [{"id": "shared-model"}],
+                    },
+                    "backup": {
+                        "driver": "openai-compatible",
+                        "name": "Backup",
+                        "endpoint": "http://127.0.0.1:9000/v1",
+                        "models": [{"id": "shared-model"}],
+                    },
+                }
+            ),
         ),
         config_path,
     )
-    provider = _provider("matched")
-    monkeypatch.setattr(cli, "DeepSeekProvider", lambda **_kwargs: provider)
+    provider = _provider(
+        "matched",
+        models=(Model("studio/shared-model", "shared-model", "studio"),),
+    )
+    backup = ScriptedProvider(
+        (),
+        models=(Model("backup/shared-model", "shared-model", "backup"),),
+    )
+    _use_scripted_openai_provider(
+        monkeypatch,
+        {"studio": provider, "backup": backup},
+    )
 
     assert (
         await cli.async_main(
@@ -722,7 +774,7 @@ async def test_explicit_short_model_uses_first_matching_provider(
                 "--config",
                 str(config_path),
                 "--model",
-                "deepseek-v4-flash",
+                "shared-model",
                 "--ephemeral",
                 "--json",
             ]
@@ -732,7 +784,7 @@ async def test_explicit_short_model_uses_first_matching_provider(
 
     result = json.loads(capsys.readouterr().out)
     assert result["final_content"] == "matched"
-    assert provider.requests[0][0].id == "studio/deepseek-v4-flash"
+    assert provider.requests[0][0].id == "studio/shared-model"
 
 
 @pytest.mark.asyncio
@@ -763,8 +815,8 @@ async def test_setup_configures_deepseek_without_exposing_key(
     output = capsys.readouterr().out
     saved = json.loads(config_path.read_text(encoding="utf-8"))
     assert "setup-secret" not in output
-    assert saved["deepseek"]["api_key"] == "setup-secret"
-    assert saved["deepseek"]["api_key"] != "ignored-environment-secret"
+    assert saved["providers"]["deepseek"]["api_key"] == "setup-secret"
+    assert saved["providers"]["deepseek"]["api_key"] != "ignored-environment-secret"
     assert saved["agent"]["model"] == "deepseek/deepseek-v4-pro"
 
 
@@ -833,7 +885,7 @@ def test_completion_command_emits_shell_script(capsys) -> None:
     assert cli.main(["completion", "zsh"]) == 0
     rendered = capsys.readouterr().out
     assert rendered.startswith("#compdef aeloon aeloon-core")
-    assert "resume history local login" in rendered
+    assert "resume history login logout" in rendered
 
 
 @pytest.mark.asyncio
@@ -939,7 +991,7 @@ async def test_cloud_status_and_logout_use_bridge(
 
 
 @pytest.mark.asyncio
-async def test_local_add_reads_api_key_privately_and_uses_unified_bridge(
+async def test_provider_add_uses_unified_bridge_v3(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -956,8 +1008,9 @@ async def test_local_add_reads_api_key_privately_and_uses_unified_bridge(
             "provider": {
                 "id": "ollama",
                 "name": "Ollama",
+                "driver": "openai-compatible",
                 "kind": "local",
-                "base_url": "http://127.0.0.1:11434/v1",
+                "endpoint": "http://127.0.0.1:11434/v1",
                 "model_ids": ["ollama/qwen3-coder"],
             },
             "revision": 2,
@@ -965,18 +1018,20 @@ async def test_local_add_reads_api_key_privately_and_uses_unified_bridge(
 
     monkeypatch.setattr(cli, "ensure_daemon", fake_ensure_daemon)
     monkeypatch.setattr(cli, "bridge_request", fake_bridge_request)
-    monkeypatch.setattr(cli.getpass, "getpass", lambda _prompt: "private-local-key")
-
     assert (
         await cli.async_main(
             [
-                "local",
+                "provider",
                 "add",
                 "ollama",
+                "--driver",
+                "openai-compatible",
                 "--name",
                 "Ollama",
-                "--base-url",
+                "--endpoint",
                 "http://127.0.0.1:11434/v1",
+                "--api-key",
+                "private-local-key",
                 "--model",
                 "qwen3-coder",
                 "--socket",
@@ -988,15 +1043,16 @@ async def test_local_add_reads_api_key_privately_and_uses_unified_bridge(
 
     assert request == {
         "path": socket_path,
-        "method": "provider.local.add",
+        "method": "provider.add",
         "params": {
             "provider_id": "ollama",
             "name": "Ollama",
-            "base_url": "http://127.0.0.1:11434/v1",
+            "driver": "openai-compatible",
+            "endpoint": "http://127.0.0.1:11434/v1",
             "api_key": "private-local-key",
             "models": ["qwen3-coder"],
         },
-        "timeout": 3.0,
+        "timeout": 60.0,
     }
     output = capsys.readouterr().out
     assert "private-local-key" not in output
@@ -1028,9 +1084,7 @@ async def test_provider_login_uses_cloud_rpc_compatible_with_existing_daemon(
     monkeypatch.setattr(cli.getpass, "getpass", lambda _prompt: "secret")
 
     assert (
-        await cli.async_main(
-            ["login", "alice", "--socket", str(socket_path), "--output", "json"]
-        )
+        await cli.async_main(["login", "alice", "--socket", str(socket_path), "--output", "json"])
         == 0
     )
 
@@ -1065,9 +1119,7 @@ async def test_models_use_sets_default_through_bridge(tmp_path: Path, monkeypatc
     monkeypatch.setattr(cli, "bridge_request", fake_bridge_request)
 
     assert (
-        await cli.async_main(
-            ["models", "use", "coder", "--socket", str(socket_path), "--json"]
-        )
+        await cli.async_main(["models", "use", "coder", "--socket", str(socket_path), "--json"])
         == 0
     )
     assert requests[-1] == (

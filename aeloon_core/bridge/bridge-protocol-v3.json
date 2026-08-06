@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://aeloon.dev/schemas/bridge-protocol-v2.json",
-  "title": "Aeloon Core Bridge Protocol v2",
+  "$id": "https://aeloon.dev/schemas/bridge-protocol-v3.json",
+  "title": "Aeloon Core Bridge Protocol v3",
   "description": "JSON-RPC 2.0 over UTF-8 NDJSON on a local Unix domain socket.",
   "oneOf": [
     { "$ref": "#/$defs/request" },
@@ -10,7 +10,7 @@
   ],
   "x-aeloon-protocol": {
     "name": "aeloon-core-bridge",
-    "version": 2,
+    "version": 3,
     "transport": "json-rpc-2.0-over-ndjson-unix",
     "methods": [
       "system.handshake", "system.health", "system.shutdown", "events.subscribe",
@@ -18,16 +18,15 @@
       "session.rename", "session.configure", "session.tree", "session.navigate",
       "session.compact", "session.next_turn", "turn.start", "turn.cancel",
       "turn.steer", "turn.follow_up", "catalog.get", "provider.list",
-      "provider.local.add", "provider.local.remove", "settings.get", "settings.update",
-      "cloud.account.status", "cloud.account.login", "cloud.account.logout",
-      "provider.cloud.status", "provider.cloud.login", "provider.cloud.logout"
+      "provider.add", "provider.remove", "settings.get", "settings.update",
+      "cloud.account.status", "cloud.account.login", "cloud.account.logout"
     ],
     "events": [
       "operation.queued", "operation.started", "operation.completed", "operation.failed",
       "operation.cancelled", "content.started", "content.delta", "content.updated",
       "content.completed", "tool.started", "tool.updated", "tool.completed",
       "usage.updated", "queue.updated", "retry.started", "retry.completed",
-      "resources.updated", "session.compacted", "session.navigated", "session.renamed", "settings.updated",
+      "session.compacted", "session.navigated", "session.renamed", "settings.updated",
       "cloud.account.updated", "provider.updated", "log.entry", "system.shutdown"
     ]
   },

@@ -1,4 +1,4 @@
-"""Bridge v2 RPC adapter over the provider-neutral runtime service."""
+"""Bridge v3 RPC adapter over the runtime service."""
 
 from __future__ import annotations
 
@@ -20,7 +20,6 @@ from aeloon_core.bridge.protocol import (
     PROTOCOL_VERSION,
     BridgeError,
 )
-from aeloon_core.core import RunError
 from aeloon_core.runtime.service import (
     ATTACHMENT_LIMIT,
     FILE_LIMIT,
@@ -99,16 +98,13 @@ class BridgeRpcAdapter:
             "turn.follow_up": self._turn_follow_up,
             "catalog.get": self.runtime.catalog_get,
             "provider.list": self.runtime.provider_list,
-            "provider.local.add": self.runtime.provider_local_add,
-            "provider.local.remove": self.runtime.provider_local_remove,
+            "provider.add": self.runtime.provider_add,
+            "provider.remove": self.runtime.provider_remove,
             "settings.get": self.runtime.settings_get,
             "settings.update": self.runtime.settings_update,
             "cloud.account.status": self.runtime.account_status,
             "cloud.account.login": self.runtime.account_login,
             "cloud.account.logout": self.runtime.account_logout,
-            "provider.cloud.status": self.runtime.account_status,
-            "provider.cloud.login": self.runtime.account_login,
-            "provider.cloud.logout": self.runtime.account_logout,
         }
         handler = routes.get(method)
         if handler is None:
@@ -134,10 +130,6 @@ class BridgeRpcAdapter:
             }
             code = exc.code if exc.code in allowed else "internal_error"
             raise BridgeError(code, str(exc)) from None
-        except RunError as exc:
-            allowed = {"busy", "invalid_state", "invalid_argument"}
-            code = exc.code if exc.code in allowed else "internal_error"
-            raise BridgeError(code, self._sanitize(str(exc))) from None
         except (KeyError, TypeError, ValueError) as exc:
             raise BridgeError("invalid_argument", self._sanitize(str(exc))) from None
         except Exception:
@@ -149,7 +141,7 @@ class BridgeRpcAdapter:
     async def handshake(self, params: Mapping[str, Any]) -> dict[str, Any]:
         versions = params.get("protocol_versions", [PROTOCOL_VERSION])
         if versions and PROTOCOL_VERSION not in versions:
-            raise BridgeError("protocol_incompatible", "Aeloon Core requires Bridge protocol v2")
+            raise BridgeError("protocol_incompatible", "Aeloon Core requires Bridge protocol v3")
         roots = params.get("attachment_roots") or []
         if not isinstance(roots, list) or any(not isinstance(root, str) for root in roots):
             raise BridgeError("invalid_argument", "attachment_roots must be a list of paths")
@@ -299,12 +291,16 @@ class BridgeRpcAdapter:
 
     def _sanitize(self, message: str) -> str:
         value = message.replace(str(Path.home()), "~")
-        secrets = [
-            self.runtime.config.deepseek.api_key,
-            *(provider.api_key for provider in self.runtime.config.local_providers.values()),
-        ]
+        secrets: list[str] = []
+        for provider in self.runtime.config.providers.values():
+            api_key = getattr(provider, "api_key", None)
+            if api_key:
+                secrets.append(api_key)
+            for name, header_value in getattr(provider, "headers", {}).items():
+                if name.lower() in {"authorization", "api-key", "x-api-key"}:
+                    secrets.append(header_value)
         for secret in secrets:
-            if secret and secret != "no-key":
+            if secret:
                 value = value.replace(secret, "***")
         return value
 

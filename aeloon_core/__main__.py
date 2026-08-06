@@ -8,6 +8,7 @@ import getpass
 import json
 import sys
 import time
+from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -16,7 +17,7 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.table import Table
 
-from aeloon_core.bootstrap import cloud_provider_source
+from aeloon_core.bootstrap import CloudAccountGateway, create_runtime_service
 from aeloon_core.bridge.daemon import (
     bridge_request,
     daemon_status,
@@ -26,36 +27,39 @@ from aeloon_core.bridge.daemon import (
     stop_daemon,
 )
 from aeloon_core.bridge.protocol import BridgeError, load_schema
-from aeloon_core.cloud import CloudAccountService, CloudError
 from aeloon_core.config import (
+    CloudProviderConfig,
     Config,
+    DeepSeekProviderConfig,
     load_config,
     public_config,
     resolve_config_path,
     save_config,
 )
 from aeloon_core.core import (
-    DeepSeekProvider,
     RunError,
     RunEvent,
     message_to_dict,
 )
 from aeloon_core.runtime import (
     JsonlSessionRepository,
-    ProviderCatalog,
     SessionError,
+)
+from aeloon_core.runtime.agent import SessionAgent
+from aeloon_core.runtime.providers import (
+    DeepSeekProvider,
+    ProviderManager,
     qualify_model_id,
     resolve_model_id,
 )
-from aeloon_core.runtime.agent import SessionAgent
 from aeloon_core.version import __version__
 
 CONFIG_PATHS: dict[str, tuple[str, ...]] = {
     "workspace": ("workspace",),
     "data-dir": ("data_dir",),
-    "api-key": ("deepseek", "api_key"),
-    "base-url": ("deepseek", "base_url"),
-    "proxy": ("deepseek", "proxy"),
+    "api-key": ("providers", "deepseek", "api_key"),
+    "endpoint": ("providers", "deepseek", "endpoint"),
+    "proxy": ("providers", "deepseek", "proxy"),
     "model": ("agent", "model"),
     "thinking": ("agent", "thinking_level"),
     "max-tokens": ("agent", "max_tokens"),
@@ -88,7 +92,6 @@ _KNOWN_COMMANDS = {
     "logout",
     "whoami",
     "models",
-    "local",
     "setup",
     "doctor",
     "completion",
@@ -186,20 +189,30 @@ def _add_account_arguments(command: argparse.ArgumentParser, *, login: bool = Fa
     )
 
 
-def _add_local_api_arguments(command: argparse.ArgumentParser) -> None:
+def _add_provider_arguments(command: argparse.ArgumentParser) -> None:
     command.add_argument("provider_id", help="Short name used in provider/model ids.")
+    command.add_argument(
+        "--driver",
+        required=True,
+        choices=("ollama", "openai-compatible"),
+        help="Provider implementation to use.",
+    )
     command.add_argument("--name", help="Human-readable provider name.")
-    command.add_argument("--base-url", required=True, help="OpenAI-compatible API base URL.")
+    command.add_argument("--endpoint", help="OpenAI-compatible API endpoint.")
+    command.add_argument("--api-key", help="Optional API key.")
+    command.add_argument("--proxy", help="Optional HTTP proxy.")
+    command.add_argument(
+        "--header",
+        action="append",
+        dest="headers",
+        metavar="NAME=VALUE",
+        help="Additional HTTP header; repeat for multiple headers.",
+    )
     command.add_argument(
         "--model",
         action="append",
         dest="models",
         help="Model id; repeat for multiple models, or omit to discover GET /models.",
-    )
-    command.add_argument(
-        "--no-api-key",
-        action="store_true",
-        help="Do not prompt for an API key.",
     )
 
 
@@ -235,7 +248,7 @@ def _add_bridge_commands(parent: argparse.ArgumentParser) -> None:
             command.add_argument("--max-concurrent-operations", type=int, default=4)
         if name in {"ensure", "status", "stop"}:
             command.add_argument("--output", choices=("text", "json"), default="text")
-    commands.add_parser("schema", help="Print the Bridge v2 JSON schema.")
+    commands.add_parser("schema", help="Print the Bridge v3 JSON schema.")
 
 
 def _hide_suppressed_subcommands(commands: Any) -> None:
@@ -252,9 +265,9 @@ def build_parser() -> argparse.ArgumentParser:
         description="A coding agent for the current workspace.",
         epilog=(
             "examples:\n"
-            "  aeloon \"fix the failing tests\"\n"
-            "  aeloon resume \"continue with the implementation\"\n"
-            "  aeloon local add ollama --base-url http://127.0.0.1:11434/v1 --no-api-key\n"
+            '  aeloon "fix the failing tests"\n'
+            '  aeloon resume "continue with the implementation"\n'
+            "  aeloon provider add ollama --driver ollama\n"
             "  aeloon login\n"
             "  aeloon doctor\n\n"
             "task options: -C PATH, -m MODEL, --json, -v, --ephemeral\n"
@@ -303,17 +316,6 @@ def build_parser() -> argparse.ArgumentParser:
     model_use.add_argument("--data-dir", type=Path, help=argparse.SUPPRESS)
     model_use.add_argument("--socket", type=Path, help=argparse.SUPPRESS)
     model_use.add_argument("--json", action="store_true", help="Print JSON output.")
-
-    local = commands.add_parser("local", help="Manage local OpenAI-compatible APIs.")
-    local_commands = local.add_subparsers(dest="local_command", required=True, metavar="COMMAND")
-    local_add = local_commands.add_parser("add", help="Add a local API connection.")
-    _add_local_api_arguments(local_add)
-    local_list = local_commands.add_parser("list", help="List local API connections.")
-    local_remove = local_commands.add_parser("remove", help="Remove a local API connection.")
-    local_remove.add_argument("provider_id")
-    for command in (local_add, local_list, local_remove):
-        _add_provider_runtime_arguments(command)
-        command.set_defaults(local_only=True)
 
     setup = commands.add_parser("setup", help=argparse.SUPPRESS)
     setup.add_argument("--provider", choices=("cloud", "deepseek"))
@@ -371,30 +373,30 @@ def build_parser() -> argparse.ArgumentParser:
     cloud_login = cloud_commands.add_parser("login", help="Sign in to Aeloon Cloud.")
     cloud_login.add_argument("username", nargs="?", help="Account username or email.")
     for command_name in ("login", "status", "logout"):
-        command = cloud_login if command_name == "login" else cloud_commands.add_parser(
-            command_name,
-            help={
-                "status": "Show the current Aeloon Cloud account.",
-                "logout": "Sign out of Aeloon Cloud.",
-            }[command_name],
+        command = (
+            cloud_login
+            if command_name == "login"
+            else cloud_commands.add_parser(
+                command_name,
+                help={
+                    "status": "Show the current Aeloon Cloud account.",
+                    "logout": "Sign out of Aeloon Cloud.",
+                }[command_name],
+            )
         )
         command.add_argument("--config", type=Path)
         command.add_argument("--data-dir", type=Path)
         command.add_argument("--socket", type=Path)
         command.add_argument("--output", choices=("text", "json"), default="text")
 
-    provider = commands.add_parser("provider", help=argparse.SUPPRESS)
+    provider = commands.add_parser("provider", help="Manage inference Providers.")
     provider_commands = provider.add_subparsers(dest="provider_command", required=True)
-    provider_login = provider_commands.add_parser("login", help="Sign in to Aeloon Cloud.")
-    provider_login.add_argument("username", nargs="?", help="Account username or email.")
-    provider_add = provider_commands.add_parser("add", help="Add a local API provider.")
-    _add_local_api_arguments(provider_add)
-    provider_remove = provider_commands.add_parser("remove", help="Remove a local API provider.")
+    provider_add = provider_commands.add_parser("add", help="Add an inference Provider.")
+    _add_provider_arguments(provider_add)
+    provider_remove = provider_commands.add_parser("remove", help="Remove an inference Provider.")
     provider_remove.add_argument("provider_id")
-    for command_name in ("login", "status", "logout", "list", "add", "remove"):
-        if command_name == "login":
-            command = provider_login
-        elif command_name == "add":
+    for command_name in ("list", "add", "remove"):
+        if command_name == "add":
             command = provider_add
         elif command_name == "remove":
             command = provider_remove
@@ -402,8 +404,6 @@ def build_parser() -> argparse.ArgumentParser:
             command = provider_commands.add_parser(
                 command_name,
                 help={
-                    "status": "Show the current Aeloon Cloud account.",
-                    "logout": "Sign out of Aeloon Cloud.",
                     "list": "List configured API providers.",
                 }[command_name],
             )
@@ -427,14 +427,19 @@ class RunRenderer:
         self._status_visible = False
 
     async def __call__(self, event: RunEvent) -> None:
-        if self.verbose >= 2 and self.output == "text" and event.type in {
-            "agent_start",
-            "agent_end",
-            "auto_retry_start",
-            "auto_retry_end",
-            "compaction_start",
-            "compaction_end",
-        }:
+        if (
+            self.verbose >= 2
+            and self.output == "text"
+            and event.type
+            in {
+                "agent_start",
+                "agent_end",
+                "auto_retry_start",
+                "auto_retry_end",
+                "compaction_start",
+                "compaction_end",
+            }
+        ):
             print(f"[debug] {event.type}", file=sys.stderr)
         if event.type == "agent_start":
             self._render_status("Working…")
@@ -481,12 +486,7 @@ class RunRenderer:
         print(f"[{action}] {summary}", file=sys.stderr)
 
     def _render_status(self, value: str) -> None:
-        if (
-            self.output != "text"
-            or self.quiet
-            or self.verbose
-            or not _is_interactive_stderr()
-        ):
+        if self.output != "text" or self.quiet or self.verbose or not _is_interactive_stderr():
             return
         summary = _one_line_summary(value, max_chars=100)
         print(f"\r\x1b[2K{summary}", end="", file=sys.stderr, flush=True)
@@ -710,17 +710,16 @@ async def run_command(args: argparse.Namespace) -> int:
             config = config.model_copy(
                 update={"agent": config.agent.model_copy(update={"model": restored_id})}
             )
-    cloud_account = CloudAccountService(config.cloud, data_dir=config.data_dir)
-    registry = ProviderCatalog(
-        config,
-        remote_sources=(cloud_provider_source(cloud_account),),
-        local_provider_factory=DeepSeekProvider,
+    cloud_account = CloudAccountGateway(
+        _cloud_provider_config(config),
+        data_dir=config.data_dir,
     )
+    manager = _provider_manager(config, cloud_account)
     try:
         if config.agent.model.strip():
-            model = await registry.model(config.agent.model)
+            model = await manager.model(config.agent.model)
         else:
-            available = _available_cli_models(config, await registry.models())
+            available = _available_cli_models(config, await manager.models())
             if not available:
                 raise RunError(
                     "model_not_configured",
@@ -730,14 +729,16 @@ async def run_command(args: argparse.Namespace) -> int:
             config = config.model_copy(
                 update={"agent": config.agent.model_copy(update={"model": model.id})}
             )
-            registry.config = config
     except PermissionError as exc:
+        await manager.close()
         await cloud_account.close()
         raise RunError("auth", str(exc)) from None
     except RunError:
+        await manager.close()
         await cloud_account.close()
         raise
-    except (KeyError, RuntimeError, CloudError) as exc:
+    except (KeyError, RuntimeError) as exc:
+        await manager.close()
         await cloud_account.close()
         raise RunError("model_not_found", str(exc)) from None
     if session is None and not args.no_session:
@@ -747,7 +748,7 @@ async def run_command(args: argparse.Namespace) -> int:
     agent = SessionAgent(
         config=config,
         session=session,
-        catalog=registry,
+        provider_manager=manager,
     )
     renderer = RunRenderer(
         args.output,
@@ -828,9 +829,7 @@ async def history_command(args: argparse.Namespace) -> int:
             print(title)
             print(f"Session: {session.id}")
             print(f"Workspace: {session.metadata.cwd}")
-            print(
-                f"Messages: {stats['messageCount']} · Tokens: {stats['totalTokens']}"
-            )
+            print(f"Messages: {stats['messageCount']} · Tokens: {stats['totalTokens']}")
         return 0
 
     workspace = None if args.all else (args.workspace or config.workspace)
@@ -915,18 +914,17 @@ async def models_command(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     if args.data_dir is not None:
         config = config.model_copy(update={"data_dir": args.data_dir}).normalized()
-    account = CloudAccountService(config.cloud, data_dir=config.data_dir)
-    registry = ProviderCatalog(config, remote_sources=(cloud_provider_source(account),))
+    account = CloudAccountGateway(_cloud_provider_config(config), data_dir=config.data_dir)
+    manager = _provider_manager(config, account)
     try:
-        models = _available_cli_models(config, await registry.models())
+        models = _available_cli_models(config, await manager.models())
     finally:
+        await manager.close()
         await account.close()
     effective_id = models[0].id if models else ""
     if config.agent.model:
         try:
-            effective_id = resolve_model_id(
-                config.agent.model, (model.id for model in models)
-            )
+            effective_id = resolve_model_id(config.agent.model, (model.id for model in models))
         except KeyError:
             effective_id = config.agent.model
     payload = [
@@ -944,7 +942,7 @@ async def models_command(args: argparse.Namespace) -> int:
         print(_json(payload))
         return 0
     if not payload:
-        print("No models are connected. Run `aeloon local add ...` or `aeloon login`.")
+        print("No models are connected. Run `aeloon provider add ...` or `aeloon login`.")
         return 0
     _print_table(
         ("", "MODEL", "PROVIDER", "CONTEXT"),
@@ -960,18 +958,41 @@ async def models_command(args: argparse.Namespace) -> int:
     )
     if payload[0]["automatic"]:
         print(
-            "* automatically used when no default is set; "
-            "pin one with `aeloon models use MODEL`."
+            "* automatically used when no default is set; pin one with `aeloon models use MODEL`."
         )
     return 0
 
 
 def _available_cli_models(config: Config, models: dict[str, Any]) -> list[Any]:
+    deepseek = config.providers["deepseek"]
+    assert isinstance(deepseek, DeepSeekProviderConfig)
     return [
-        model
-        for model in models.values()
-        if model.provider != "deepseek" or config.deepseek.api_key != "no-key"
+        model for model in models.values() if model.provider != "deepseek" or bool(deepseek.api_key)
     ]
+
+
+def _cloud_provider_config(config: Config) -> CloudProviderConfig:
+    provider = config.providers["aeloon-cloud"]
+    assert isinstance(provider, CloudProviderConfig)
+    return provider
+
+
+def _provider_manager(config: Config, account: Any) -> ProviderManager:
+    def create_deepseek(_provider_id: str, configured: Any, _account: Any):
+        return DeepSeekProvider(
+            name=configured.name,
+            endpoint=configured.endpoint,
+            api_key=configured.api_key,
+            proxy=configured.proxy,
+            headers=configured.headers,
+            enabled=configured.enabled,
+        )
+
+    return ProviderManager(
+        config,
+        account=account,
+        driver_factories={"deepseek": create_deepseek},
+    )
 
 
 async def model_use_command(args: argparse.Namespace) -> int:
@@ -994,7 +1015,7 @@ async def model_use_command(args: argparse.Namespace) -> int:
         and item.get("id")
         and not (
             item.get("provider_id") == "deepseek"
-            and config.deepseek.api_key == "no-key"
+            and not getattr(config.providers["deepseek"], "api_key", None)
         )
     ]
     requested = args.model_id.strip()
@@ -1038,7 +1059,7 @@ async def doctor_command(args: argparse.Namespace) -> int:
             "config",
             "warning",
             "Using built-in defaults",
-            "Connect a local API with `aeloon local add ...` or run `aeloon login`.",
+            "Connect an API with `aeloon provider add ...` or run `aeloon login`.",
         )
     if config.workspace.is_dir():
         add("workspace", "ok", str(config.workspace))
@@ -1050,11 +1071,11 @@ async def doctor_command(args: argparse.Namespace) -> int:
             "Run Aeloon in a project directory or pass `-C PATH`.",
         )
 
-    account = CloudAccountService(config.cloud, data_dir=config.data_dir)
-    registry = ProviderCatalog(config, remote_sources=(cloud_provider_source(account),))
+    account = CloudAccountGateway(_cloud_provider_config(config), data_dir=config.data_dir)
+    manager = _provider_manager(config, account)
     try:
         if not config.agent.model.strip():
-            available = _available_cli_models(config, await registry.models())
+            available = _available_cli_models(config, await manager.models())
             if available:
                 add(
                     "model",
@@ -1068,26 +1089,28 @@ async def doctor_command(args: argparse.Namespace) -> int:
                     "model",
                     "error",
                     "No connected model is available",
-                    "Connect with `aeloon local add ...` or `aeloon login`.",
+                    "Connect with `aeloon provider add ...` or `aeloon login`.",
                 )
         else:
             try:
-                model = await registry.model(config.agent.model)
-            except (KeyError, RuntimeError, PermissionError, CloudError) as exc:
+                model = await manager.model(config.agent.model)
+            except (KeyError, RuntimeError, PermissionError) as exc:
                 add("model", "error", str(exc), "Run `aeloon models` to choose another model.")
             else:
                 add("model", "ok", f"{model.id} ({model.name})")
-                if model.provider == "deepseek" and config.deepseek.api_key == "no-key":
+                if model.provider == "deepseek" and not getattr(
+                    config.providers["deepseek"], "api_key", None
+                ):
                     add(
                         "credential",
                         "error",
                         "DeepSeek API key is not configured",
-                        "Add a local API with `aeloon local add ...` or log in with "
-                        "`aeloon login`.",
+                        "Add an API with `aeloon provider add ...` or log in with `aeloon login`.",
                     )
                 else:
                     add("credential", "ok", "Credentials are configured")
     finally:
+        await manager.close()
         await account.close()
 
     socket_path = default_socket_path(config.data_dir)
@@ -1136,8 +1159,10 @@ async def setup_command(args: argparse.Namespace) -> int:
             raise ValueError("Choose `--provider cloud` or `--provider deepseek`")
 
     if provider == "deepseek":
-        api_key = config.deepseek.api_key
-        if not api_key or api_key == "no-key":
+        deepseek = config.providers["deepseek"]
+        assert isinstance(deepseek, DeepSeekProviderConfig)
+        api_key = deepseek.api_key
+        if not api_key:
             try:
                 api_key = getpass.getpass("DeepSeek API key: ")
             except EOFError:
@@ -1155,18 +1180,19 @@ async def setup_command(args: argparse.Namespace) -> int:
             "deepseek/deepseek-v4-flash",
             "deepseek/deepseek-v4-pro",
         }:
-            raise ValueError(
-                "DeepSeek setup model must be deepseek-v4-flash or deepseek-v4-pro"
-            )
+            raise ValueError("DeepSeek setup model must be deepseek-v4-flash or deepseek-v4-pro")
         config = config.model_copy(
             update={
-                "deepseek": config.deepseek.model_copy(update={"api_key": api_key}),
+                "providers": {
+                    **config.providers,
+                    "deepseek": deepseek.model_copy(update={"api_key": api_key}),
+                },
                 "agent": config.agent.model_copy(update={"model": model_id}),
             }
         ).normalized()
         save_config(config, path)
         print(f"Configured {model_id} in {path}.")
-        print("Try: aeloon \"inspect this repository\"")
+        print('Try: aeloon "inspect this repository"')
         return 0
 
     # Persist the workspace before the daemon reads the configuration, then use
@@ -1203,7 +1229,7 @@ async def setup_command(args: argparse.Namespace) -> int:
         },
     )
     print(f"Selected {selected}.")
-    print("Try: aeloon \"inspect this repository\"")
+    print('Try: aeloon "inspect this repository"')
     return 0
 
 
@@ -1222,19 +1248,18 @@ def _print_table(headers: tuple[str, ...], rows: list[tuple[str, ...]]) -> None:
 
 
 def completion_command(args: argparse.Namespace) -> int:
-    commands = "resume history local login logout whoami models setup doctor config provider system"
+    commands = "resume history login logout whoami models setup doctor config provider system"
     scripts = {
         "bash": (
             "_aeloon_complete() {\n"
-            "  local current\n"
-            "  current=\"${COMP_WORDS[COMP_CWORD]}\"\n"
-            f"  COMPREPLY=($(compgen -W \"{commands}\" -- \"$current\"))\n"
+            "  provider current\n"
+            '  current="${COMP_WORDS[COMP_CWORD]}"\n'
+            f'  COMPREPLY=($(compgen -W "{commands}" -- "$current"))\n'
             "}\n"
             "complete -F _aeloon_complete aeloon aeloon-core"
         ),
         "zsh": (
-            "#compdef aeloon aeloon-core\n"
-            f"_arguments '1:command:({commands})' '*::argument:->args'"
+            f"#compdef aeloon aeloon-core\n_arguments '1:command:({commands})' '*::argument:->args'"
         ),
         "fish": "\n".join(
             f"complete -c aeloon -f -n '__fish_use_subcommand' -a {command}"
@@ -1323,11 +1348,14 @@ async def bridge_command(args: argparse.Namespace) -> int:
         config = config.model_copy(update={"data_dir": args.data_dir}).normalized()
     socket_path = args.socket or default_socket_path(config.data_dir)
     if args.bridge_command == "serve":
-        await run_daemon(
+        runtime = create_runtime_service(
             config_path=args.config,
             data_dir=args.data_dir,
-            socket_path=socket_path,
             max_concurrent_operations=args.max_concurrent_operations,
+        )
+        await run_daemon(
+            runtime,
+            socket_path=socket_path,
         )
         return 0
     if args.bridge_command == "ensure":
@@ -1424,57 +1452,53 @@ async def provider_command(args: argparse.Namespace) -> int:
     command = args.provider_command
     params: dict[str, Any] = {}
     timeout = 3.0
-    if command == "login":
-        username = (args.username or _read_cloud_username()).strip()
-        if not username:
-            raise ValueError("Aeloon Cloud username is required")
-        params = {"username": username, "password": _read_cloud_password()}
-        method = "cloud.account.login"
-        timeout = 60.0
-    elif command in {"status", "logout"}:
-        method = f"cloud.account.{command}"
-    elif command == "list":
+    if command == "list":
         method = "provider.list"
     elif command == "add":
-        api_key = "no-key" if args.no_api_key else _read_local_api_key()
         params = {
             "provider_id": args.provider_id,
             "name": args.name or args.provider_id,
-            "base_url": args.base_url,
-            "api_key": api_key,
+            "driver": args.driver,
         }
+        if args.endpoint:
+            params["endpoint"] = args.endpoint
+        if args.api_key:
+            params["api_key"] = args.api_key
+        if args.proxy:
+            params["proxy"] = args.proxy
+        if args.headers:
+            params["headers"] = _parse_headers(args.headers)
         if args.models:
             params["models"] = args.models
-        method = "provider.local.add"
+        method = "provider.add"
+        timeout = 60.0
     else:
         params = {"provider_id": args.provider_id}
-        method = "provider.local.remove"
+        method = "provider.remove"
 
-    required_methods = () if method.startswith("cloud.account.") else (method,)
     daemon = await ensure_daemon(
         config_path=args.config,
         data_dir=args.data_dir,
         socket_path=socket_path,
-        required_methods=required_methods,
+        required_methods=(method,),
     )
-    result = await bridge_request(
-        Path(str(daemon["socket_path"])), method, params, timeout=timeout
-    )
+    result = await bridge_request(Path(str(daemon["socket_path"])), method, params, timeout=timeout)
     _print_provider_result(
         command,
         result,
         output=args.output,
-        local_only=bool(getattr(args, "local_only", False)),
     )
     return 0
 
 
-def _read_local_api_key() -> str:
-    try:
-        value = getpass.getpass("Local API key (leave empty for none): ")
-    except EOFError:
-        raise ValueError("Local API key must be entered from a terminal") from None
-    return value or "no-key"
+def _parse_headers(values: list[str]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for value in values:
+        name, separator, header_value = value.partition("=")
+        if not separator or not name.strip():
+            raise ValueError("--header must use NAME=VALUE")
+        result[name.strip()] = header_value
+    return result
 
 
 def _print_provider_result(
@@ -1482,24 +1506,14 @@ def _print_provider_result(
     result: dict[str, Any],
     *,
     output: str,
-    local_only: bool = False,
 ) -> None:
     if output == "json":
         print(_json(result))
         return
-    if command in {"login", "status", "logout"}:
-        _print_cloud_result(command, result, output="text")
-        return
     if command == "list":
         providers = result.get("providers") or []
-        if local_only:
-            providers = [
-                provider
-                for provider in providers
-                if provider.get("kind") == "local" and provider.get("id") != "deepseek"
-            ]
         if not providers:
-            print("No local APIs configured." if local_only else "No providers configured.")
+            print("No providers configured.")
             return
         for provider in providers:
             status = "signed in" if provider.get("authenticated") else provider.get("kind")
@@ -1507,12 +1521,12 @@ def _print_provider_result(
         return
     if command == "add":
         provider = result["provider"]
-        print(f"Added local provider {provider['id']} ({provider['base_url']}).")
-        if local_only and provider.get("model_ids"):
+        print(f"Added provider {provider['id']} [{provider['driver']}] ({provider['endpoint']}).")
+        if provider.get("model_ids"):
             print("The first model in `aeloon models` is used automatically.")
             print(f"Optional pin: aeloon models use {provider['model_ids'][0]}")
         return
-    print(f"Removed local provider {result['provider_id']}.")
+    print(f"Removed provider {result['provider_id']}.")
 
 
 def _with_run_overrides(config: Config, args: argparse.Namespace) -> Config:
@@ -1570,7 +1584,12 @@ def _parse_value(value: str) -> Any:
 
 
 def _json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=lambda item: asdict(item) if is_dataclass(item) else str(item),
+    )
 
 
 async def async_main(argv: list[str] | None = None) -> int:
@@ -1592,9 +1611,6 @@ async def async_main(argv: list[str] | None = None) -> int:
         return await cloud_command(args)
     if args.command == "models":
         return await models_command(args)
-    if args.command == "local":
-        args.provider_command = args.local_command
-        return await provider_command(args)
     if args.command == "setup":
         return await setup_command(args)
     if args.command == "doctor":
@@ -1640,9 +1656,9 @@ def _print_cli_error(code: str, message: str, *, as_json: bool) -> None:
         return
     print(f"Error: {message}", file=sys.stderr)
     suggestions = {
-        "auth": "Run `aeloon local add ...` or `aeloon login` to configure a model source.",
+        "auth": "Run `aeloon provider add ...` or `aeloon login` to configure a model source.",
         "model_not_configured": (
-            "Add a local API with `aeloon local add ...` or sign in with `aeloon login`, "
+            "Add an API with `aeloon provider add ...` or sign in with `aeloon login`, "
             "then Aeloon will use the first available model automatically."
         ),
         "model_not_found": "Run `aeloon models` to see available models.",

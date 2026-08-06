@@ -24,13 +24,50 @@ from aeloon_core.config import Config, save_config
 from aeloon_core.core import (
     AssistantMessage,
     AssistantStreamEvent,
-    ScriptedProvider,
     TextContent,
     Usage,
     UserMessage,
 )
-from aeloon_core.runtime import ProviderCatalog, RuntimeService
+from aeloon_core.runtime import RuntimeService
 from aeloon_core.runtime.builtin_skills import BUILTIN_SKILL_IDS
+from aeloon_core.runtime.providers import (
+    DEEPSEEK_MODELS,
+    BaseProvider,
+    ProviderManager,
+)
+from aeloon_core.runtime.providers.testing import ScriptedProvider
+
+
+class ManagedInference(BaseProvider):
+    def __init__(self, inference):
+        super().__init__(
+            provider_id="deepseek",
+            name="Injected",
+            endpoint="scripted://local",
+        )
+        self.inference = inference
+
+    async def models(self):
+        return dict(DEEPSEEK_MODELS)
+
+    def stream(self, model, context, options):
+        return self.inference.stream(model, context, options)
+
+    async def close(self):
+        close = getattr(self.inference, "close", None)
+        if close is not None:
+            await close()
+
+
+def manager_factory(inference_factory):
+    return lambda config: ProviderManager(
+        config,
+        driver_factories={
+            "deepseek": lambda _provider_id, _configured, _account: ManagedInference(
+                inference_factory()
+            )
+        },
+    )
 
 
 def scripted_service(
@@ -58,12 +95,29 @@ def scripted_service(
 
     runtime = RuntimeService(
         config_path=config_path,
-        catalog_factory=lambda config: ProviderCatalog(
-            config,
-            local_provider_factory=provider_factory,
-        ),
+        provider_manager_factory=manager_factory(provider_factory),
     )
     return runtime, BridgeRpcAdapter(runtime)
+
+
+@pytest.mark.asyncio
+async def test_bridge_v3_rejects_v2_handshake_and_removed_provider_methods(
+    tmp_path: Path,
+) -> None:
+    _runtime, service = scripted_service(tmp_path)
+
+    with pytest.raises(BridgeError) as incompatible:
+        await service.dispatch(
+            "system.handshake",
+            {"protocol_versions": [2]},
+        )
+    assert incompatible.value.code == "protocol_incompatible"
+
+    for method in ("provider.local.add", "provider.local.remove", "provider.cloud.login"):
+        with pytest.raises(BridgeError) as removed:
+            await service.dispatch(method)
+        assert removed.value.code == "method_not_found"
+    await service.close()
 
 
 @pytest.mark.asyncio
@@ -101,8 +155,7 @@ async def test_stable_turn_projection_and_replay(tmp_path: Path) -> None:
     assert snapshot["active_operations"] == []
 
     replay = await service.dispatch(
-        "events.subscribe",
-        {"session_ids": [metadata["session_id"]], "after_seq": 0}
+        "events.subscribe", {"session_ids": [metadata["session_id"]], "after_seq": 0}
     )
     assert replay["replay_complete"] is True
     assert replay["events"][0]["name"] == "operation.queued"
@@ -128,10 +181,7 @@ async def test_session_serialization_and_cross_session_concurrency(tmp_path: Pat
 
     runtime = RuntimeService(
         config_path=config_path,
-        catalog_factory=lambda config: ProviderCatalog(
-            config,
-            local_provider_factory=lambda **_kwargs: tracker,
-        )
+        provider_manager_factory=manager_factory(lambda: tracker),
     )
     service = BridgeRpcAdapter(runtime)
     first = await service.dispatch("session.create", {"workspace": str(tmp_path)})
@@ -214,18 +264,20 @@ async def test_revisioned_settings_never_return_secret(tmp_path: Path) -> None:
             "revision": initial["revision"],
             "patch": {"default_model_id": "deepseek-v4-pro"},
             "secret_actions": [
-                {"path": "deepseek.api_key", "action": "set", "value": "very-secret"}
+                {
+                    "path": "providers.deepseek.api_key",
+                    "action": "set",
+                    "value": "very-secret",
+                }
             ],
-        }
+        },
     )
     assert updated["default_model_id"] == "deepseek/deepseek-v4-pro"
-    assert updated["deepseek"]["credential_configured"] is True
+    assert updated["providers"]["deepseek"]["credential_configured"] is True
     assert "very-secret" not in json.dumps(updated)
     assert (tmp_path / "config.json").stat().st_mode & 0o777 == 0o600
     with pytest.raises(BridgeError, match="refresh"):
-        await service.dispatch(
-            "settings.update", {"revision": initial["revision"], "patch": {}}
-        )
+        await service.dispatch("settings.update", {"revision": initial["revision"], "patch": {}})
 
 
 @pytest.mark.asyncio
@@ -273,10 +325,7 @@ async def test_skill_catalog_selection_and_runtime_slash_invocation(tmp_path: Pa
     )
     runtime = RuntimeService(
         config_path=config_path,
-        catalog_factory=lambda config: ProviderCatalog(
-            config,
-            local_provider_factory=lambda **_kwargs: provider,
-        ),
+        provider_manager_factory=manager_factory(lambda: provider),
     )
     service = BridgeRpcAdapter(runtime)
 
@@ -293,9 +342,10 @@ async def test_skill_catalog_selection_and_runtime_slash_invocation(tmp_path: Pa
     workspace_catalog = await service.dispatch(
         "catalog.get", {"workspace": str(alternate_workspace)}
     )
-    assert next(
-        item for item in workspace_catalog["skills"] if item["id"] == "project"
-    )["source"] == "workspace"
+    assert (
+        next(item for item in workspace_catalog["skills"] if item["id"] == "project")["source"]
+        == "workspace"
+    )
     initial_catalog = await service.dispatch("catalog.get")
     review = next(item for item in initial_catalog["skills"] if item["id"] == "review")
     private = next(item for item in initial_catalog["skills"] if item["id"] == "private")
@@ -386,9 +436,7 @@ async def test_unfinished_persisted_run_is_interrupted_after_service_restart(
     )
 
     _restarted_runtime, restarted = scripted_service(tmp_path)
-    snapshot = await restarted.dispatch(
-        "session.get", {"session_id": metadata["session_id"]}
-    )
+    snapshot = await restarted.dispatch("session.get", {"session_id": metadata["session_id"]})
     assert snapshot["timeline"][0]["turn_id"] == "crashed-turn"
     assert snapshot["timeline"][0]["status"] == "interrupted"
 
@@ -411,7 +459,7 @@ async def test_daemon_socket_permissions_and_multi_client_handshake(tmp_path: Pa
         bridge_request(socket_path, "system.handshake"),
     )
     assert first["server_instance_id"] == second["server_instance_id"]
-    assert first["protocol_version"] == 2
+    assert first["protocol_version"] == 3
     reader, writer = await asyncio.open_unix_connection(socket_path)
     writer.write(
         json.dumps(
@@ -481,7 +529,7 @@ async def test_ensure_daemon_upgrades_idle_daemon_missing_required_method(
         [
             {**identity, "methods": ["system.handshake", "system.shutdown"]},
             None,
-            {**identity, "methods": ["system.handshake", "provider.local.add"]},
+            {**identity, "methods": ["system.handshake", "provider.add"]},
         ]
     )
     requests: list[str] = []
@@ -510,7 +558,7 @@ async def test_ensure_daemon_upgrades_idle_daemon_missing_required_method(
         config_path=config_path,
         data_dir=data_dir,
         socket_path=socket_path,
-        required_methods=("provider.local.add",),
+        required_methods=("provider.add",),
     )
 
     assert result["status"] == "started"
@@ -544,7 +592,7 @@ async def test_ensure_daemon_does_not_upgrade_while_operation_is_active(
             config_path=config_path,
             data_dir=data_dir,
             socket_path=socket_path,
-            required_methods=("provider.local.add",),
+            required_methods=("provider.add",),
         )
 
 
