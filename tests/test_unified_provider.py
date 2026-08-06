@@ -10,8 +10,7 @@ import pytest
 from aeloon_core.bridge import BridgeRpcAdapter
 from aeloon_core.config import (
     Config,
-    OllamaProviderConfig,
-    OpenAICompatibleProviderConfig,
+    CustomProviderConfig,
     ProviderModelConfig,
     save_config,
 )
@@ -25,7 +24,7 @@ from aeloon_core.runtime import (
     resolve_model_id,
     split_model_id,
 )
-from aeloon_core.runtime.providers import BaseProvider, OllamaProvider
+from aeloon_core.runtime.providers import BaseProvider, CustomProvider, model_from_config
 
 
 class TrackingProvider(BaseProvider):
@@ -72,8 +71,8 @@ def _provider_config(
     provider_id: str,
     *,
     enabled: bool = True,
-) -> OpenAICompatibleProviderConfig:
-    return OpenAICompatibleProviderConfig(
+) -> CustomProviderConfig:
+    return CustomProviderConfig(
         name=provider_id,
         endpoint=f"https://{provider_id}.example/v1",
         enabled=enabled,
@@ -111,12 +110,12 @@ def test_unqualified_model_id_uses_first_matching_provider() -> None:
 
 @pytest.mark.asyncio
 async def test_manager_resolves_unqualified_model_in_configuration_order() -> None:
-    studio = OpenAICompatibleProviderConfig(
+    studio = CustomProviderConfig(
         name="Studio",
         endpoint="http://127.0.0.1:8000/v1",
         models=[ProviderModelConfig(id="coder")],
     )
-    backup = OpenAICompatibleProviderConfig(
+    backup = CustomProviderConfig(
         name="Backup",
         endpoint="http://127.0.0.1:9000/v1",
         models=[ProviderModelConfig(id="coder")],
@@ -156,7 +155,7 @@ async def test_manager_is_lazy_isolates_failures_and_closes_idempotently() -> No
             broken=_provider_config("broken"),
             studio=_provider_config("studio"),
         ),
-        driver_factories={"openai-compatible": factory},
+        driver_factories={"custom": factory},
     )
     assert calls == []
 
@@ -240,7 +239,7 @@ async def test_manager_rejects_disabled_and_unauthenticated_providers() -> None:
             disabled=_provider_config("disabled", enabled=False),
             locked=_provider_config("locked"),
         ),
-        driver_factories={"openai-compatible": factory},
+        driver_factories={"custom": factory},
     )
     try:
         with pytest.raises(RuntimeError, match="disabled"):
@@ -252,7 +251,7 @@ async def test_manager_rejects_disabled_and_unauthenticated_providers() -> None:
 
 
 @pytest.mark.asyncio
-async def test_ollama_routes_qualified_model_to_unprefixed_api_model() -> None:
+async def test_custom_provider_routes_qualified_model_to_unprefixed_api_model() -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -268,12 +267,17 @@ async def test_ollama_routes_qualified_model_to_unprefixed_api_model() -> None:
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     model_config = ProviderModelConfig(id="llama/3.3")
-    config = OllamaProviderConfig(name="Ollama", models=[model_config])
+    config = CustomProviderConfig(
+        name="Custom",
+        endpoint="http://127.0.0.1:11434/v1",
+        models=[model_config],
+    )
     model = ProviderManager(Config(providers={**Config().providers, "ollama": config}))
     selected = await model.model("ollama/llama/3.3")
-    provider = OllamaProvider(
+    provider = CustomProvider(
         provider_id="ollama",
         name="Ollama",
+        endpoint="http://127.0.0.1:11434/v1",
         models=(selected,),
         client=client,
     )
@@ -297,7 +301,44 @@ async def test_bridge_adds_and_removes_provider_without_exposing_secret(
 ) -> None:
     config_path = tmp_path / "config.json"
     save_config(Config(workspace=tmp_path, data_dir=tmp_path / "data"), config_path)
-    runtime = RuntimeService(config_path=config_path)
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {"id": "coder"},
+                        {"id": "vision", "supportsImage": True},
+                    ]
+                },
+            )
+        assert request.headers["authorization"] == "Bearer local-secret"
+        assert json.loads(request.content)["model"] == "coder"
+        return httpx.Response(400, json={"error": {"message": "images are unsupported"}})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    def factory(config: Config) -> ProviderManager:
+        def custom(provider_id: str, configured: Any, _account: Any):
+            return CustomProvider(
+                provider_id=provider_id,
+                name=configured.name,
+                endpoint=configured.endpoint,
+                models=tuple(
+                    model_from_config(provider_id, model) for model in configured.models
+                ),
+                api_key=configured.api_key,
+                proxy=configured.proxy,
+                headers=configured.headers,
+                client=client,
+            )
+
+        return ProviderManager(config, driver_factories={"custom": custom})
+
+    runtime = RuntimeService(config_path=config_path, provider_manager_factory=factory)
     service = BridgeRpcAdapter(runtime)
 
     added = await service.dispatch(
@@ -308,13 +349,13 @@ async def test_bridge_adds_and_removes_provider_without_exposing_secret(
             "name": "Studio API",
             "endpoint": "http://127.0.0.1:9000/v1/",
             "api_key": "local-secret",
-            "models": ["coder", {"id": "vision", "supports_image": True}],
+            "models": ["ignored-legacy-model"],
         },
     )
     catalog = await service.dispatch("catalog.get")
     settings = await service.dispatch("settings.get")
 
-    assert added["provider"]["driver"] == "openai-compatible"
+    assert added["provider"]["driver"] == "custom"
     assert added["provider"]["model_ids"] == ["studio/coder", "studio/vision"]
     assert "local-secret" not in json.dumps(added)
     catalog_models = {model["id"]: model for model in catalog["models"]}
@@ -324,20 +365,28 @@ async def test_bridge_adds_and_removes_provider_without_exposing_secret(
     assert "local-secret" not in json.dumps(settings)
     persisted = json.loads(config_path.read_text(encoding="utf-8"))
     assert persisted["providers"]["studio"]["api_key"] == "local-secret"
+    assert persisted["providers"]["studio"]["driver"] == "custom"
+    assert [request.url.path for request in requests] == [
+        "/v1/models",
+        "/v1/chat/completions",
+    ]
 
     removed = await service.dispatch("provider.remove", {"provider_id": "studio"})
     assert removed["removed"] is True
     await service.close()
+    await client.aclose()
 
 
 @pytest.mark.asyncio
-async def test_bridge_discovers_models_through_selected_driver(tmp_path: Path) -> None:
+async def test_bridge_discovers_models_and_persists_resolved_v1_endpoint(tmp_path: Path) -> None:
     config_path = tmp_path / "config.json"
     save_config(Config(workspace=tmp_path, data_dir=tmp_path / "data"), config_path)
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
+        if request.url.path == "/models":
+            return httpx.Response(404)
         return httpx.Response(
             200,
             json={
@@ -346,6 +395,7 @@ async def test_bridge_discovers_models_through_selected_driver(tmp_path: Path) -
                         "id": "discovered",
                         "name": "Discovered Model",
                         "context_window": 64_000,
+                        "supports_image": False,
                     }
                 ]
             },
@@ -354,15 +404,18 @@ async def test_bridge_discovers_models_through_selected_driver(tmp_path: Path) -
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
     def factory(config: Config) -> ProviderManager:
-        def ollama(provider_id: str, configured: Any, _account: Any):
-            return OllamaProvider(
+        def custom(provider_id: str, configured: Any, _account: Any):
+            return CustomProvider(
                 provider_id=provider_id,
                 name=configured.name,
                 endpoint=configured.endpoint,
+                models=tuple(
+                    model_from_config(provider_id, model) for model in configured.models
+                ),
                 client=client,
             )
 
-        return ProviderManager(config, driver_factories={"ollama": ollama})
+        return ProviderManager(config, driver_factories={"custom": custom})
 
     runtime = RuntimeService(
         config_path=config_path,
@@ -371,10 +424,11 @@ async def test_bridge_discovers_models_through_selected_driver(tmp_path: Path) -
     service = BridgeRpcAdapter(runtime)
     added = await service.dispatch(
         "provider.add",
-        {"provider_id": "desktop", "driver": "ollama"},
+        {"provider_id": "desktop", "endpoint": "http://127.0.0.1:11434"},
     )
 
     assert added["provider"]["model_ids"] == ["desktop/discovered"]
-    assert requests[0].url.path == "/v1/models"
+    assert added["provider"]["endpoint"] == "http://127.0.0.1:11434/v1"
+    assert [request.url.path for request in requests] == ["/models", "/v1/models"]
     await service.close()
     await client.aclose()

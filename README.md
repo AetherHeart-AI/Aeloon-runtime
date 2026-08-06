@@ -8,7 +8,7 @@ providers, retries, and automatic context compaction.
 
 - Python 3.11 or newer
 - [uv](https://docs.astral.sh/uv/)
-- an OpenAI-compatible local API or an Aeloon Cloud account
+- a Custom OpenAI-compatible API or an Aeloon Cloud account
 
 ## Quick start
 
@@ -18,16 +18,15 @@ Install the project and connect a local endpoint:
 uv sync
 
 uv run aeloon provider add studio \
-  --driver openai-compatible \
-  --endpoint http://127.0.0.1:8000/v1 \
-  --model qwen3-coder
+  --endpoint http://127.0.0.1:8000
 
 uv run aeloon "Inspect this repository and explain its entry points"
 ```
 
 Pass `--api-key` when the endpoint requires one. The key is stored in the mode-`0600` config file.
-For Ollama, use `aeloon provider add ollama --driver ollama`; its default endpoint is
-`http://127.0.0.1:11434/v1`.
+Custom Providers try the supplied URL and its `/v1` form, discover the model catalog, and make one
+small best-effort image request for each model whose image capability is not present in metadata.
+Capability probe failures leave that model available as text-only and do not block setup.
 
 To use Aeloon Cloud instead:
 

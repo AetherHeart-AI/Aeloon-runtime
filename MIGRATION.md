@@ -57,15 +57,17 @@ Use only the unified Provider commands:
 
 ```bash
 aeloon provider list
-aeloon provider add ollama --driver ollama
-aeloon provider add studio --driver openai-compatible --endpoint https://api.example/v1
+aeloon provider add studio --endpoint https://api.example
 aeloon provider remove studio
 ```
 
-`--model` may be repeated. If it is omitted, the selected driver discovers `/models` and stores a
-normalized model list. Cloud account operations remain separate as `aeloon login/logout/whoami`
-or the low-level `aeloon cloud ...` commands. The old `local`, `provider local`, Provider login,
-and cloud Provider aliases are removed.
+Custom Providers use the single `custom` driver internally. Adding one always discovers its models
+from the supplied URL or its `/v1` form and best-effort probes image input when the model metadata
+does not declare that capability. The earlier `ollama` and `openai-compatible` configuration
+drivers are accepted when loading an existing configuration and are written back as `custom` on
+the next save. Cloud account operations remain separate as `aeloon login/logout/whoami` or the
+low-level `aeloon cloud ...` commands. The old `local`, `provider local`, Provider login, and cloud
+Provider aliases are removed.
 
 ## Bridge
 

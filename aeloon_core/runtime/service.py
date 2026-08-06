@@ -18,8 +18,7 @@ from typing import Any
 from aeloon_core.config import (
     CloudProviderConfig,
     Config,
-    OllamaProviderConfig,
-    OpenAICompatibleProviderConfig,
+    CustomProviderConfig,
     ProviderModelConfig,
     load_config,
     redact_sensitive_headers,
@@ -49,10 +48,8 @@ from aeloon_core.runtime.input import TurnInputResolver
 from aeloon_core.runtime.ports import AccountGateway, NullAccountGateway
 from aeloon_core.runtime.projection import RuntimeProjection
 from aeloon_core.runtime.providers import (
-    OLLAMA_ENDPOINT,
     ProviderManager,
     ProviderManagerFactory,
-    qualify_model_id,
     resolve_model_id,
     split_model_id,
     validate_provider_id,
@@ -686,86 +683,47 @@ class RuntimeService:
         provider_id = validate_provider_id(self._required_string(params, "provider_id"))
         if provider_id in {"deepseek", "aeloon-cloud"}:
             raise RuntimeFailure("invalid_argument", f"Provider id is reserved: {provider_id}")
-        driver = self._required_string(params, "driver")
-        if driver not in {"ollama", "openai-compatible"}:
-            raise RuntimeFailure(
-                "invalid_argument",
-                "driver must be ollama or openai-compatible",
-            )
-        raw_endpoint = params.get("endpoint")
-        if driver == "ollama" and not raw_endpoint:
-            endpoint = OLLAMA_ENDPOINT
-        else:
-            endpoint = self._http_endpoint(self._required_string(params, "endpoint"))
+        endpoint = self._http_endpoint(self._required_string(params, "endpoint"))
         name = str(params.get("name") or provider_id).strip() or provider_id
         api_key = str(params["api_key"]) if params.get("api_key") else None
-        if driver == "ollama" and api_key is not None:
-            raise RuntimeFailure(
-                "invalid_argument",
-                "Ollama does not accept api_key; use a sensitive header or "
-                "the openai-compatible driver",
-            )
         proxy = str(params["proxy"]) if params.get("proxy") else None
         headers = self._string_mapping(params.get("headers"))
-        raw_models = params.get("models")
-        if raw_models is not None and not isinstance(raw_models, list):
-            raise RuntimeFailure("invalid_argument", "models must be a list")
-        models: list[ProviderModelConfig] = []
-        model_ids: set[str] = set()
-        for raw_model in raw_models or []:
-            value = {"id": raw_model} if isinstance(raw_model, str) else raw_model
-            if not isinstance(value, Mapping):
-                raise RuntimeFailure("invalid_argument", "each model must be a string or object")
-            parsed_model = ProviderModelConfig.model_validate(dict(value))
-            canonical = qualify_model_id(provider_id, parsed_model.id)
-            if canonical in model_ids:
-                raise RuntimeFailure("invalid_argument", f"Duplicate model: {canonical}")
-            model_ids.add(canonical)
-            models.append(parsed_model.model_copy(update={"id": split_model_id(canonical)[1]}))
-        if driver == "ollama":
-            provider: OllamaProviderConfig | OpenAICompatibleProviderConfig = OllamaProviderConfig(
-                name=name,
-                endpoint=endpoint,
-                proxy=proxy,
-                headers=headers,
-                models=models,
+        provider = CustomProviderConfig(
+            name=name,
+            endpoint=endpoint,
+            api_key=api_key,
+            proxy=proxy,
+            headers=headers,
+        )
+        candidate = self.config.model_copy(
+            update={"providers": {**self.config.providers, provider_id: provider}}
+        ).normalized()
+        manager = self._provider_manager(candidate)
+        try:
+            discovered = await manager.discover_models(provider_id)
+            resolved_endpoint = manager.provider_endpoint(provider_id)
+        except Exception as exc:
+            raise RuntimeFailure(
+                "invalid_argument",
+                self._sanitize(f"Could not discover Provider models: {exc}"),
+            ) from None
+        finally:
+            await manager.close()
+        models = [
+            ProviderModelConfig(
+                id=split_model_id(model.id)[1],
+                name=model.name,
+                reasoning=model.reasoning,
+                supports_image="image" in model.input,
+                context_window=model.context_window,
+                max_tokens=model.max_tokens,
+                cost=model.cost,
             )
-        else:
-            provider = OpenAICompatibleProviderConfig(
-                name=name,
-                endpoint=endpoint,
-                api_key=api_key,
-                proxy=proxy,
-                headers=headers,
-                models=models,
-            )
-        if not models:
-            candidate = self.config.model_copy(
-                update={"providers": {**self.config.providers, provider_id: provider}}
-            ).normalized()
-            manager = self._provider_manager(candidate)
-            try:
-                discovered = await manager.discover_models(provider_id)
-            except Exception as exc:
-                raise RuntimeFailure(
-                    "invalid_argument",
-                    self._sanitize(f"Could not discover Provider models: {exc}"),
-                ) from None
-            finally:
-                await manager.close()
-            models = [
-                ProviderModelConfig(
-                    id=split_model_id(model.id)[1],
-                    name=model.name,
-                    reasoning=model.reasoning,
-                    supports_image="image" in model.input,
-                    context_window=model.context_window,
-                    max_tokens=model.max_tokens,
-                    cost=model.cost,
-                )
-                for model in discovered
-            ]
-            provider = provider.model_copy(update={"models": models})
+            for model in discovered
+        ]
+        provider = provider.model_copy(
+            update={"endpoint": resolved_endpoint, "models": models}
+        )
         revision = params.get("revision")
         async with self._settings_lock:
             if revision is not None and revision != self._revision:

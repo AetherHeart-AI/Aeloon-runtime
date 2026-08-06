@@ -9,9 +9,8 @@ from typing import Any, TypeAlias
 from aeloon_core.config import (
     CloudProviderConfig,
     Config,
+    CustomProviderConfig,
     DeepSeekProviderConfig,
-    OllamaProviderConfig,
-    OpenAICompatibleProviderConfig,
     ProviderConfig,
     ProviderModelConfig,
 )
@@ -19,9 +18,8 @@ from aeloon_core.core import InferencePort, Model
 from aeloon_core.runtime.ports import AccountGateway, NullAccountGateway
 from aeloon_core.runtime.providers.base import BaseProvider
 from aeloon_core.runtime.providers.cloud import CloudProvider
+from aeloon_core.runtime.providers.custom import CustomProvider
 from aeloon_core.runtime.providers.deepseek import DeepSeekProvider
-from aeloon_core.runtime.providers.ollama import OllamaProvider
-from aeloon_core.runtime.providers.openai import OpenAICompatibleProvider
 
 _PROVIDER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
@@ -121,8 +119,7 @@ class ProviderManager:
         self._close_account = close_account
         self._factories: dict[str, DriverFactory] = {
             "deepseek": _create_deepseek,
-            "ollama": _create_ollama,
-            "openai-compatible": _create_openai_compatible,
+            "custom": _create_custom,
             "cloud": _create_cloud,
             **dict(driver_factories or {}),
         }
@@ -217,6 +214,9 @@ class ProviderManager:
         self._require_authenticated(provider)
         return await provider.discover_models()
 
+    def provider_endpoint(self, provider_id: str) -> str:
+        return self._provider(provider_id).endpoint
+
     async def close(self) -> None:
         if self._closed:
             return
@@ -309,7 +309,7 @@ def provider_manager_factory(
 
 def _configured_models(
     provider_id: str,
-    configured: OllamaProviderConfig | OpenAICompatibleProviderConfig,
+    configured: CustomProviderConfig,
 ) -> tuple[Model, ...]:
     return tuple(model_from_config(provider_id, item) for item in configured.models)
 
@@ -331,32 +331,14 @@ def _create_deepseek(
     )
 
 
-def _create_ollama(
+def _create_custom(
     provider_id: str,
     configured: ProviderConfig,
     account: AccountGateway,
 ) -> BaseProvider:
     del account
-    assert isinstance(configured, OllamaProviderConfig)
-    return OllamaProvider(
-        provider_id=provider_id,
-        name=configured.name,
-        endpoint=configured.endpoint,
-        models=_configured_models(provider_id, configured),
-        enabled=configured.enabled,
-        proxy=configured.proxy,
-        headers=configured.headers,
-    )
-
-
-def _create_openai_compatible(
-    provider_id: str,
-    configured: ProviderConfig,
-    account: AccountGateway,
-) -> BaseProvider:
-    del account
-    assert isinstance(configured, OpenAICompatibleProviderConfig)
-    return OpenAICompatibleProvider(
+    assert isinstance(configured, CustomProviderConfig)
+    return CustomProvider(
         provider_id=provider_id,
         name=configured.name,
         endpoint=configured.endpoint,

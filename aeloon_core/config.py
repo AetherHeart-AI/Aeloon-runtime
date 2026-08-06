@@ -46,22 +46,10 @@ class DeepSeekProviderConfig(BaseModel):
         return _normalize_api_key(value)
 
 
-class OllamaProviderConfig(BaseModel):
+class CustomProviderConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    driver: Literal["ollama"] = "ollama"
-    name: str = "Ollama"
-    enabled: bool = True
-    endpoint: str = "http://127.0.0.1:11434/v1"
-    proxy: str | None = None
-    headers: dict[str, str] = Field(default_factory=dict)
-    models: list[ProviderModelConfig] = Field(default_factory=list)
-
-
-class OpenAICompatibleProviderConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    driver: Literal["openai-compatible"] = "openai-compatible"
+    driver: Literal["custom"] = "custom"
     name: str
     enabled: bool = True
     endpoint: str
@@ -90,8 +78,7 @@ class CloudProviderConfig(BaseModel):
 
 ProviderConfig = Annotated[
     DeepSeekProviderConfig
-    | OllamaProviderConfig
-    | OpenAICompatibleProviderConfig
+    | CustomProviderConfig
     | CloudProviderConfig,
     Field(discriminator="driver"),
 ]
@@ -222,6 +209,29 @@ class Config(BaseModel):
                     f"Legacy Provider configuration detected: {names}. Move these values into "
                     "Config.providers using the 0.4 format documented in MIGRATION.md."
                 )
+            providers = value.get("providers")
+            if isinstance(providers, dict):
+                normalized = dict(value)
+                normalized_providers: dict[str, Any] = {}
+                changed = False
+                for provider_id, provider in providers.items():
+                    if not isinstance(provider, dict) or provider.get("driver") not in {
+                        "ollama",
+                        "openai-compatible",
+                    }:
+                        normalized_providers[provider_id] = provider
+                        continue
+                    migrated = dict(provider)
+                    legacy_driver = migrated["driver"]
+                    migrated["driver"] = "custom"
+                    if legacy_driver == "ollama":
+                        migrated.setdefault("name", "Ollama")
+                        migrated.setdefault("endpoint", "http://127.0.0.1:11434/v1")
+                    normalized_providers[provider_id] = migrated
+                    changed = True
+                if changed:
+                    normalized["providers"] = normalized_providers
+                    return normalized
         return value
 
     @model_validator(mode="after")
@@ -374,8 +384,7 @@ __all__ = [
     "CloudProviderConfig",
     "ConfigMigrationError",
     "DeepSeekProviderConfig",
-    "OllamaProviderConfig",
-    "OpenAICompatibleProviderConfig",
+    "CustomProviderConfig",
     "ProviderConfig",
     "ProviderModelConfig",
     "ResourceConfig",

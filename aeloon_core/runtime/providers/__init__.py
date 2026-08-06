@@ -2,6 +2,7 @@
 
 from aeloon_core.runtime.providers.base import BaseProvider
 from aeloon_core.runtime.providers.cloud import CLOUD_PROVIDER_ID, CloudProvider
+from aeloon_core.runtime.providers.custom import CustomProvider
 from aeloon_core.runtime.providers.deepseek import (
     DEEPSEEK_ENDPOINT,
     DEEPSEEK_MODELS,
@@ -24,7 +25,6 @@ from aeloon_core.runtime.providers.manager import (
     split_model_id,
     validate_provider_id,
 )
-from aeloon_core.runtime.providers.ollama import OLLAMA_ENDPOINT, OllamaProvider
 from aeloon_core.runtime.providers.openai import OpenAICompatibleProvider
 
 __all__ = [
@@ -34,13 +34,12 @@ __all__ = [
     "DEEPSEEK_PROVIDER_ID",
     "DEEPSEEK_V4_FLASH",
     "DEEPSEEK_V4_PRO",
-    "OLLAMA_ENDPOINT",
     "BaseProvider",
     "AccountGatewayFactory",
     "CloudProvider",
+    "CustomProvider",
     "DeepSeekProvider",
     "DriverFactory",
-    "OllamaProvider",
     "OpenAICompatibleProvider",
     "ProviderManager",
     "ProviderManagerFactory",

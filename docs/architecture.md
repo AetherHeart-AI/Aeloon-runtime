@@ -54,9 +54,8 @@ Bootstrap also gives each Manager a lazy Cloud account gateway bound to the same
 snapshot. Updating settings can therefore replace the service-level account client without
 mutating an operation that is already running.
 
-Concrete implementations live in `aeloon_core.runtime.providers`: a shared
-`OpenAICompatibleProvider`, DeepSeek, Ollama, Aeloon Cloud, and the testing-only
-`ScriptedProvider`.
+Concrete implementations live in `aeloon_core.runtime.providers`: Custom OpenAI-compatible APIs,
+DeepSeek, Aeloon Cloud, and the testing-only `ScriptedProvider`.
 
 ## Bridge and Cloud
 
