@@ -184,6 +184,34 @@ git diff --check
 The default test suite is offline and uses local fixtures. Optional live tests require credentials
 in an explicit test config and are not part of default CI.
 
+### macOS Apple Silicon binary
+
+Build a single-file `arm64` command-line executable with Python 3.12 and PyInstaller:
+
+```bash
+uv run --isolated --frozen --no-default-groups \
+  --group package --python 3.12 \
+  pyinstaller --clean --noconfirm aeloon.spec
+```
+
+The executable is written to `dist/aeloon`. It includes Python, runtime dependencies, the Bridge
+schema, and bundled skills, so the target Mac does not need Python or `uv`. Install it somewhere on
+your `PATH`:
+
+```bash
+mkdir -p ~/.local/bin
+install -m 755 dist/aeloon ~/.local/bin/aeloon
+aeloon --version
+```
+
+This build targets Apple Silicon Macs and uses an ad-hoc signature. It is intended for local use;
+public distribution requires Developer ID signing and notarization. A PyInstaller binary must be
+built on the oldest macOS version it needs to support.
+
+GitHub Actions also builds and verifies the binary on every pull request and push to `main`. Each
+run uploads a 30-day workflow artifact. Pushing a tag such as `v0.4.0` additionally creates or
+updates the matching GitHub Release with the archive and its SHA-256 checksum.
+
 ## Documentation
 
 - [Architecture](docs/architecture.md)

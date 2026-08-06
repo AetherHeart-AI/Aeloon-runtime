@@ -510,6 +510,71 @@ async def test_daemon_socket_permissions_and_multi_client_handshake(tmp_path: Pa
     runtime.rmdir()
 
 
+def test_daemon_launch_uses_python_module_in_source_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(bridge_daemon.sys, "executable", "/usr/bin/python3")
+    monkeypatch.delattr(bridge_daemon.sys, "frozen", raising=False)
+
+    command, environment = bridge_daemon._daemon_launch(
+        config_path=tmp_path / "config.json",
+        data_dir=tmp_path / "data",
+        socket_path=tmp_path / "bridge.sock",
+        max_concurrent_operations=7,
+    )
+
+    assert command == [
+        "/usr/bin/python3",
+        "-m",
+        "aeloon_core",
+        "bridge",
+        "serve",
+        "--config",
+        str(tmp_path / "config.json"),
+        "--data-dir",
+        str(tmp_path / "data"),
+        "--socket",
+        str(tmp_path / "bridge.sock"),
+        "--max-concurrent-operations",
+        "7",
+    ]
+    assert environment is None
+
+
+def test_daemon_launch_restarts_frozen_executable_independently(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(bridge_daemon.sys, "executable", "/Applications/aeloon")
+    monkeypatch.setattr(bridge_daemon.sys, "frozen", True, raising=False)
+    monkeypatch.setenv("AELOON_TEST_ENVIRONMENT", "preserved")
+
+    command, environment = bridge_daemon._daemon_launch(
+        config_path=tmp_path / "config.json",
+        data_dir=tmp_path / "data",
+        socket_path=tmp_path / "bridge.sock",
+        max_concurrent_operations=3,
+    )
+
+    assert command == [
+        "/Applications/aeloon",
+        "bridge",
+        "serve",
+        "--config",
+        str(tmp_path / "config.json"),
+        "--data-dir",
+        str(tmp_path / "data"),
+        "--socket",
+        str(tmp_path / "bridge.sock"),
+        "--max-concurrent-operations",
+        "3",
+    ]
+    assert environment is not None
+    assert environment["AELOON_TEST_ENVIRONMENT"] == "preserved"
+    assert environment["PYINSTALLER_RESET_ENVIRONMENT"] == "1"
+
+
 @pytest.mark.asyncio
 async def test_ensure_daemon_upgrades_idle_daemon_missing_required_method(
     tmp_path: Path,

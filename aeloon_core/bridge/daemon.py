@@ -268,6 +268,33 @@ async def bridge_request(
             await writer.wait_closed()
 
 
+def _daemon_launch(
+    *,
+    config_path: Path,
+    data_dir: Path,
+    socket_path: Path,
+    max_concurrent_operations: int,
+) -> tuple[list[str], dict[str, str] | None]:
+    arguments = [
+        "bridge",
+        "serve",
+        "--config",
+        str(config_path),
+        "--data-dir",
+        str(data_dir),
+        "--socket",
+        str(socket_path),
+        "--max-concurrent-operations",
+        str(max_concurrent_operations),
+    ]
+    if getattr(sys, "frozen", False):
+        # The onefile daemon outlives this CLI process and needs its own unpack directory.
+        environment = dict(os.environ)
+        environment["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+        return [sys.executable, *arguments], environment
+    return [sys.executable, "-m", "aeloon_core", *arguments], None
+
+
 async def ensure_daemon(
     *,
     config_path: Path | str | None = None,
@@ -334,23 +361,15 @@ async def ensure_daemon(
                 return {"socket_path": str(resolved_socket), **existing, "status": "running"}
         if resolved_socket.exists():
             resolved_socket.unlink()
-        command = [
-            sys.executable,
-            "-m",
-            "aeloon_core",
-            "bridge",
-            "serve",
-            "--config",
-            str(resolved_config),
-            "--data-dir",
-            str(resolved_data),
-            "--socket",
-            str(resolved_socket),
-            "--max-concurrent-operations",
-            str(max_concurrent_operations),
-        ]
+        command, environment = _daemon_launch(
+            config_path=resolved_config,
+            data_dir=resolved_data,
+            socket_path=resolved_socket,
+            max_concurrent_operations=max_concurrent_operations,
+        )
         subprocess.Popen(
             command,
+            env=environment,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
