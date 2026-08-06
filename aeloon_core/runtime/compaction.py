@@ -5,7 +5,9 @@ from __future__ import annotations
 from typing import Any
 
 from aeloon_core.core.context_stats import estimate_context_tokens, estimate_tokens
-from aeloon_core.core.summary import (
+from aeloon_core.core.types import AgentMessage, UserMessage, message_from_dict
+from aeloon_core.runtime.session import Session
+from aeloon_core.runtime.summarization import (
     BRANCH_SUMMARY_PROMPT,
     SUMMARIZATION_PROMPT,
     SUMMARIZATION_SYSTEM_PROMPT,
@@ -13,12 +15,10 @@ from aeloon_core.core.summary import (
     CompactionResult,
     CompactionSettings,
     compact_preparation,
+    file_operations,
     serialize_conversation,
-    should_compact,
     summarize_branch,
 )
-from aeloon_core.core.types import AgentMessage, UserMessage, message_from_dict
-from aeloon_core.runtime.session import Session
 
 
 async def prepare_compaction(
@@ -60,18 +60,14 @@ async def prepare_compaction(
     if first_kept is None:
         return None
     to_summarize = tuple(
-        message
-        for entry in entries[start:cut]
-        if (message := _entry_message(entry)) is not None
+        message for entry in entries[start:cut] if (message := _entry_message(entry)) is not None
     )
     retained = tuple(
-        message
-        for entry in entries[cut:]
-        if (message := _entry_message(entry)) is not None
+        message for entry in entries[cut:] if (message := _entry_message(entry)) is not None
     )
     if not to_summarize:
         return None
-    read_files, modified_files = _file_operations((*to_summarize, *retained))
+    read_files, modified_files = file_operations((*to_summarize, *retained))
     return CompactionPreparation(
         first_kept_entry_id=str(first_kept["id"]),
         messages_to_summarize=to_summarize,
@@ -92,22 +88,6 @@ def _entry_message(entry: dict[str, Any]) -> AgentMessage | None:
     return None
 
 
-def _file_operations(messages: tuple[AgentMessage, ...]) -> tuple[set[str], set[str]]:
-    reads: set[str] = set()
-    modified: set[str] = set()
-    for message in messages:
-        tool_calls = getattr(message, "tool_calls", ())
-        for part in tool_calls:
-            path = part.arguments.get("path")
-            if not isinstance(path, str):
-                continue
-            if part.name in {"read", "grep", "find", "ls"}:
-                reads.add(path)
-            elif part.name in {"edit", "write"}:
-                modified.add(path)
-    return reads, modified
-
-
 __all__ = [
     "BRANCH_SUMMARY_PROMPT",
     "CompactionPreparation",
@@ -120,6 +100,5 @@ __all__ = [
     "estimate_tokens",
     "prepare_compaction",
     "serialize_conversation",
-    "should_compact",
     "summarize_branch",
 ]

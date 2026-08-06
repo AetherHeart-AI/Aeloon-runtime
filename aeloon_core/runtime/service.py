@@ -11,26 +11,26 @@ import shutil
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-import httpx
-
 from aeloon_core.config import (
+    CloudProviderConfig,
     Config,
-    LocalModelConfig,
-    LocalProviderConfig,
+    OllamaProviderConfig,
+    OpenAICompatibleProviderConfig,
+    ProviderModelConfig,
     load_config,
+    redact_sensitive_headers,
     resolve_config_path,
     save_config,
 )
 from aeloon_core.core import (
-    ALL_TOOL_NAMES,
-    DEFAULT_ACTIVE_TOOLS,
     ImageContent,
+    InferenceError,
     Model,
+    RunError,
     RunEvent,
     StreamOptions,
 )
@@ -38,23 +38,32 @@ from aeloon_core.runtime.agent import SessionAgent, SessionAgentFactory
 from aeloon_core.runtime.artifacts import (
     PRESENT_FILES_TOOL_NAME,
     artifacts_from_tool_result,
-    with_present_files,
 )
 from aeloon_core.runtime.builtin_skills import provision_builtin_skills
-from aeloon_core.runtime.catalog import (
-    DEEPSEEK_PROVIDER_ID,
-    CatalogFactory,
-    ProviderCatalog,
-    normalize_model_id,
+from aeloon_core.runtime.coordinator import (
+    Operation,
+    OperationCoordinator,
+    SessionRuntime,
+)
+from aeloon_core.runtime.input import TurnInputResolver
+from aeloon_core.runtime.ports import AccountGateway, NullAccountGateway
+from aeloon_core.runtime.projection import RuntimeProjection
+from aeloon_core.runtime.providers import (
+    OLLAMA_ENDPOINT,
+    ProviderManager,
+    ProviderManagerFactory,
     qualify_model_id,
     resolve_model_id,
     split_model_id,
     validate_provider_id,
 )
-from aeloon_core.runtime.ports import AccountGateway, NullAccountGateway
+from aeloon_core.runtime.providers import (
+    provider_manager_factory as default_provider_manager_factory,
+)
 from aeloon_core.runtime.rename import is_generic_session_title, rename_session
 from aeloon_core.runtime.resources import ResourceLoader
 from aeloon_core.runtime.session import JsonlSessionRepository, Session
+from aeloon_core.runtime.tooling import RuntimeToolSet
 from aeloon_core.runtime.types import (
     OperationSnapshot,
     RuntimeEvent,
@@ -70,35 +79,11 @@ ATTACHMENT_LIMIT = 8
 IMAGE_LIMIT = 10 * 1024 * 1024
 FILE_LIMIT = 25 * 1024 * 1024
 TOOL_OUTPUT_LIMIT = 20_000
-_SKILL_COMMAND = re.compile(r"^/([A-Za-z0-9][A-Za-z0-9._:-]*)(?:\s+([\s\S]*))?$")
 RuntimeFailure = RuntimeFailure
 
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
-
-
-@dataclass(slots=True)
-class Operation:
-    id: str
-    session_id: str
-    workspace: str
-    kind: str
-    input: dict[str, Any]
-    created_at: str = field(default_factory=_now)
-    status: str = "queued"
-    blocks: list[dict[str, Any]] = field(default_factory=list)
-    usage: dict[str, Any] = field(default_factory=dict)
-    task: asyncio.Task[None] | None = None
-    agent: SessionAgent | None = None
-    model: Model | None = None
-
-
-@dataclass(slots=True)
-class SessionRuntime:
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    operations: dict[str, Operation] = field(default_factory=dict)
-    active: Operation | None = None
 
 
 class RuntimeService:
@@ -111,11 +96,13 @@ class RuntimeService:
         data_dir: Path | str | None = None,
         max_concurrent_operations: int = 4,
         agent_factory: SessionAgentFactory | None = None,
-        catalog_factory: CatalogFactory | None = None,
+        provider_manager_factory: ProviderManagerFactory | None = None,
         account_gateway: AccountGateway | None = None,
     ) -> None:
         self.config_path = resolve_config_path(config_path).resolve(strict=False)
-        self._data_dir_override = Path(data_dir).expanduser().resolve(strict=False) if data_dir is not None else None
+        self._data_dir_override = (
+            Path(data_dir).expanduser().resolve(strict=False) if data_dir is not None else None
+        )
         config = load_config(self.config_path)
         if self._data_dir_override is not None:
             config = config.model_copy(update={"data_dir": self._data_dir_override}).normalized()
@@ -128,12 +115,26 @@ class RuntimeService:
         self.started_at = _now()
         self._revision = 1
         self._agent_factory = agent_factory
-        self._catalog_factory = catalog_factory or (lambda value: ProviderCatalog(value))
-        self._semaphore = asyncio.Semaphore(max(1, max_concurrent_operations))
-        self._runtimes: dict[str, SessionRuntime] = {}
         self._listeners: set[RuntimeEventListener] = set()
         self._settings_lock = asyncio.Lock()
         self.account = account_gateway or NullAccountGateway()
+        self._provider_manager_factory = provider_manager_factory or (
+            default_provider_manager_factory(account=self.account)
+        )
+        self.coordinator = OperationCoordinator(
+            max_concurrent_operations=max_concurrent_operations,
+            provider_manager_factory=self._provider_manager_factory,
+        )
+        self._semaphore = self.coordinator.semaphore
+        self._runtimes = self.coordinator.runtimes
+        self.input_resolver = TurnInputResolver(
+            prompt_limit=PROMPT_LIMIT,
+            attachment_limit=ATTACHMENT_LIMIT,
+        )
+        self.projection = RuntimeProjection(
+            lambda: self.config,
+            output_limit=TOOL_OUTPUT_LIMIT,
+        )
 
     def add_event_listener(self, listener: RuntimeEventListener) -> Callable[[], None]:
         self._listeners.add(listener)
@@ -145,7 +146,7 @@ class RuntimeService:
 
     @property
     def active_operation_count(self) -> int:
-        return sum(1 for runtime in self._runtimes.values() if runtime.active is not None)
+        return self.coordinator.active_count
 
     async def create_session(self, *, workspace: str, title: str | None = None) -> SessionInfo:
         value = await self.session_create({"workspace": workspace, "title": title})
@@ -249,13 +250,16 @@ class RuntimeService:
                 "model_id": model_id,
                 "thinking_level": overrides.get("thinking_level", self.config.agent.thinking_level),
                 "active_tools": list(
-                    with_present_files(
-                        overrides.get("active_tools", list(DEFAULT_ACTIVE_TOOLS))
+                    self._tool_set(workspace=Path(session.metadata.cwd)).active_names(
+                        None,
+                        tuple(overrides["active_tools"]) if "active_tools" in overrides else None,
                     )
                 ),
             },
             "stats": await session.stats(context_window=context_window),
-            "timeline": self._project_timeline(branch, active_ids={item["operation_id"] for item in active}),
+            "timeline": self._project_timeline(
+                branch, active_ids={item["operation_id"] for item in active}
+            ),
             "active_operations": active,
         }
 
@@ -296,14 +300,10 @@ class RuntimeService:
             patch["thinking_level"] = level
         if "active_tools" in params:
             tools = params["active_tools"]
-            known_tools = {*ALL_TOOL_NAMES, PRESENT_FILES_TOOL_NAME}
+            known_tools = self._tool_set(workspace=Path(session.metadata.cwd)).all_names
             if not isinstance(tools, list) or any(item not in known_tools for item in tools):
                 raise RuntimeFailure("invalid_argument", "active_tools contains an unknown tool")
-            patch["active_tools"] = [
-                item
-                for item in dict.fromkeys(tools)
-                if item != PRESENT_FILES_TOOL_NAME
-            ]
+            patch["active_tools"] = list(dict.fromkeys(tools))
         if "steering_mode" in params:
             patch["steering_mode"] = self._queue_mode(params["steering_mode"])
         if "follow_up_mode" in params:
@@ -340,7 +340,11 @@ class RuntimeService:
             result = await agent.navigate_tree(
                 target_id,
                 summarize=bool(params.get("summarize", False)),
-                custom_instructions=(str(params["custom_instructions"]) if params.get("custom_instructions") else None),
+                custom_instructions=(
+                    str(params["custom_instructions"])
+                    if params.get("custom_instructions")
+                    else None
+                ),
                 replace_instructions=bool(params.get("replace_instructions", False)),
                 label=(str(params["label"]) if params.get("label") else None),
             )
@@ -450,13 +454,21 @@ class RuntimeService:
         if params.get("session_id"):
             session = await self.repository.open(str(params["session_id"]))
             workspace = Path(session.metadata.cwd)
-        loader = self._resource_loader(self.config.model_copy(update={"workspace": workspace}).normalized())
+        loader = self._resource_loader(
+            self.config.model_copy(update={"workspace": workspace}).normalized()
+        )
         resources = await asyncio.to_thread(loader.reload)
         enabled_skill_ids = {skill.name for skill in resources.skills}
         selected_skill_ids = self._selected_skill_ids(loader)
-        models = await self._models()
+        manager = self._provider_manager()
+        try:
+            models = await manager.models()
+            providers = await manager.providers()
+        finally:
+            await manager.close()
+        tool_set = self._tool_set(workspace=workspace)
         return {
-            "providers": await self._provider_registry().providers(),
+            "providers": providers,
             "models": [
                 {
                     "id": model.id,
@@ -477,10 +489,10 @@ class RuntimeService:
                     "description": (
                         "Runtime-managed final deliverable tool"
                         if name == PRESENT_FILES_TOOL_NAME
-                        else "Core-managed local tool"
+                        else "Runtime-managed local tool"
                     ),
                 }
-                for name in (*sorted(ALL_TOOL_NAMES), PRESENT_FILES_TOOL_NAME)
+                for name in sorted(tool_set.all_names)
             ],
             "skills": [
                 {
@@ -494,8 +506,7 @@ class RuntimeService:
                     "enabled": skill.name in enabled_skill_ids,
                     "explicit_invocation_enabled": skill.name in enabled_skill_ids,
                     "model_invocation_enabled": (
-                        skill.name in enabled_skill_ids
-                        and not skill.disable_model_invocation
+                        skill.name in enabled_skill_ids and not skill.disable_model_invocation
                     ),
                     "content_loading": "on_demand",
                 }
@@ -533,28 +544,9 @@ class RuntimeService:
                 "load_context_files": not config.resources.no_context_files,
             },
             "tools": config.tools.model_dump(mode="json"),
-            "deepseek": {
-                "base_url": config.deepseek.base_url,
-                "proxy": config.deepseek.proxy,
-                "credential_configured": bool(config.deepseek.api_key and config.deepseek.api_key != "no-key"),
-            },
-            "local_providers": {
-                provider_id: {
-                    "name": provider.name,
-                    "base_url": provider.base_url,
-                    "proxy": provider.proxy,
-                    "credential_configured": bool(
-                        provider.api_key and provider.api_key != "no-key"
-                    ),
-                    "models": [model.model_dump(mode="json") for model in provider.models],
-                }
-                for provider_id, provider in config.local_providers.items()
-            },
-            "cloud": {
-                "enabled": config.cloud.enabled,
-                "base_url": config.cloud.base_url,
-                "proxy": config.cloud.proxy,
-                "device_name": config.cloud.device_name,
+            "providers": {
+                provider_id: self._public_provider_config(provider)
+                for provider_id, provider in config.providers.items()
             },
         }
 
@@ -567,35 +559,36 @@ class RuntimeService:
         if not isinstance(patch, Mapping) or not isinstance(actions, list):
             raise RuntimeFailure("invalid_argument", "patch and secret_actions are invalid")
         models = await self._models()
-        valid_model_ids = [
-            model.id
-            for model in models.values()
-            if model.provider != DEEPSEEK_PROVIDER_ID
-            or self.config.deepseek.api_key != "no-key"
-        ]
-        valid_model_ids.extend(
-            model_id for model_id in models if model_id not in valid_model_ids
-        )
-        if (
-            "/" in self.config.agent.model
-            and self.config.agent.model not in valid_model_ids
-        ):
+        valid_model_ids = list(models)
+        if "/" in self.config.agent.model and self.config.agent.model not in valid_model_ids:
             valid_model_ids.append(self.config.agent.model)
         async with self._settings_lock:
             if revision != self._revision:
-                raise RuntimeFailure("revision_conflict", "Core settings changed; refresh and try again")
+                raise RuntimeFailure(
+                    "revision_conflict", "Core settings changed; refresh and try again"
+                )
             raw = load_config(self.config_path).model_dump(mode="json")
             self._apply_settings_patch(raw, patch, valid_model_ids=valid_model_ids)
             for action in actions:
-                if not isinstance(action, Mapping) or action.get("path") != "deepseek.api_key":
+                if not isinstance(action, Mapping):
                     raise RuntimeFailure("invalid_argument", "Unsupported secret action")
+                match = re.fullmatch(
+                    r"providers\.([A-Za-z0-9][A-Za-z0-9._-]*)\.api_key",
+                    str(action.get("path") or ""),
+                )
+                if match is None:
+                    raise RuntimeFailure("invalid_argument", "Unsupported secret action")
+                provider_id = match.group(1)
+                provider = raw["providers"].get(provider_id)
+                if not isinstance(provider, dict) or "api_key" not in provider:
+                    raise RuntimeFailure("invalid_argument", "Provider does not support API keys")
                 if action.get("action") == "set":
                     value = str(action.get("value") or "")
                     if not value:
                         raise RuntimeFailure("invalid_argument", "Secret set requires a value")
-                    raw["deepseek"]["api_key"] = value
+                    provider["api_key"] = value
                 elif action.get("action") == "clear":
-                    raw["deepseek"]["api_key"] = "no-key"
+                    provider["api_key"] = None
                 else:
                     raise RuntimeFailure("invalid_argument", "Secret action must be set or clear")
             persisted_config = Config.model_validate(raw).normalized()
@@ -626,10 +619,13 @@ class RuntimeService:
                 next_config = next_config.model_copy(
                     update={"data_dir": self._data_dir_override}
                 ).normalized()
-            account_changed = next_config.cloud != self.config.cloud
+            next_cloud = next_config.providers["aeloon-cloud"]
+            current_cloud = self.config.providers["aeloon-cloud"]
+            account_changed = next_cloud != current_cloud
             self.config = next_config
             if account_changed:
-                await self.account.configure(next_config.cloud)
+                assert isinstance(next_cloud, CloudProviderConfig)
+                await self.account.configure(next_cloud)
             self._revision += 1
         await self._emit("settings.updated", None, None, {"revision": self._revision})
         return await self.settings_get(
@@ -680,55 +676,106 @@ class RuntimeService:
         return result
 
     async def provider_list(self, _params: Mapping[str, Any]) -> dict[str, Any]:
-        return {"providers": await self._provider_registry().providers()}
+        manager = self._provider_manager()
+        try:
+            return {"providers": await manager.providers()}
+        finally:
+            await manager.close()
 
-    async def provider_local_add(self, params: Mapping[str, Any]) -> dict[str, Any]:
+    async def provider_add(self, params: Mapping[str, Any]) -> dict[str, Any]:
         provider_id = validate_provider_id(self._required_string(params, "provider_id"))
-        if provider_id in {DEEPSEEK_PROVIDER_ID, "aeloon-cloud"}:
+        if provider_id in {"deepseek", "aeloon-cloud"}:
             raise RuntimeFailure("invalid_argument", f"Provider id is reserved: {provider_id}")
-        base_url = self._http_base_url(self._required_string(params, "base_url"))
-        name = str(params.get("name") or provider_id).strip() or provider_id
-        api_key = str(params.get("api_key") or "no-key")
-        proxy = str(params["proxy"]) if params.get("proxy") else None
-        extra_headers = self._string_mapping(params.get("extra_headers"))
-        raw_models = params.get("models")
-        if raw_models is None:
-            raw_models = await self._discover_local_models(
-                base_url,
-                api_key=api_key,
-                proxy=proxy,
-                extra_headers=extra_headers,
+        driver = self._required_string(params, "driver")
+        if driver not in {"ollama", "openai-compatible"}:
+            raise RuntimeFailure(
+                "invalid_argument",
+                "driver must be ollama or openai-compatible",
             )
-        if not isinstance(raw_models, list) or not raw_models:
-            raise RuntimeFailure("invalid_argument", "models must be a non-empty list")
-        models: list[LocalModelConfig] = []
+        raw_endpoint = params.get("endpoint")
+        if driver == "ollama" and not raw_endpoint:
+            endpoint = OLLAMA_ENDPOINT
+        else:
+            endpoint = self._http_endpoint(self._required_string(params, "endpoint"))
+        name = str(params.get("name") or provider_id).strip() or provider_id
+        api_key = str(params["api_key"]) if params.get("api_key") else None
+        if driver == "ollama" and api_key is not None:
+            raise RuntimeFailure(
+                "invalid_argument",
+                "Ollama does not accept api_key; use a sensitive header or "
+                "the openai-compatible driver",
+            )
+        proxy = str(params["proxy"]) if params.get("proxy") else None
+        headers = self._string_mapping(params.get("headers"))
+        raw_models = params.get("models")
+        if raw_models is not None and not isinstance(raw_models, list):
+            raise RuntimeFailure("invalid_argument", "models must be a list")
+        models: list[ProviderModelConfig] = []
         model_ids: set[str] = set()
-        for raw_model in raw_models:
+        for raw_model in raw_models or []:
             value = {"id": raw_model} if isinstance(raw_model, str) else raw_model
             if not isinstance(value, Mapping):
                 raise RuntimeFailure("invalid_argument", "each model must be a string or object")
-            parsed_model = LocalModelConfig.model_validate(dict(value))
+            parsed_model = ProviderModelConfig.model_validate(dict(value))
             canonical = qualify_model_id(provider_id, parsed_model.id)
             if canonical in model_ids:
                 raise RuntimeFailure("invalid_argument", f"Duplicate model: {canonical}")
             model_ids.add(canonical)
             models.append(parsed_model.model_copy(update={"id": split_model_id(canonical)[1]}))
-        provider = LocalProviderConfig(
-            name=name,
-            base_url=base_url,
-            api_key=api_key,
-            proxy=proxy,
-            extra_headers=extra_headers,
-            models=models,
-        )
+        if driver == "ollama":
+            provider: OllamaProviderConfig | OpenAICompatibleProviderConfig = OllamaProviderConfig(
+                name=name,
+                endpoint=endpoint,
+                proxy=proxy,
+                headers=headers,
+                models=models,
+            )
+        else:
+            provider = OpenAICompatibleProviderConfig(
+                name=name,
+                endpoint=endpoint,
+                api_key=api_key,
+                proxy=proxy,
+                headers=headers,
+                models=models,
+            )
+        if not models:
+            candidate = self.config.model_copy(
+                update={"providers": {**self.config.providers, provider_id: provider}}
+            ).normalized()
+            manager = self._provider_manager(candidate)
+            try:
+                discovered = await manager.discover_models(provider_id)
+            except Exception as exc:
+                raise RuntimeFailure(
+                    "invalid_argument",
+                    self._sanitize(f"Could not discover Provider models: {exc}"),
+                ) from None
+            finally:
+                await manager.close()
+            models = [
+                ProviderModelConfig(
+                    id=split_model_id(model.id)[1],
+                    name=model.name,
+                    reasoning=model.reasoning,
+                    supports_image="image" in model.input,
+                    context_window=model.context_window,
+                    max_tokens=model.max_tokens,
+                    cost=model.cost,
+                )
+                for model in discovered
+            ]
+            provider = provider.model_copy(update={"models": models})
         revision = params.get("revision")
         async with self._settings_lock:
             if revision is not None and revision != self._revision:
-                raise RuntimeFailure("revision_conflict", "Core settings changed; refresh and try again")
-            if provider_id in self.config.local_providers:
+                raise RuntimeFailure(
+                    "revision_conflict", "Core settings changed; refresh and try again"
+                )
+            if provider_id in self.config.providers:
                 raise RuntimeFailure("invalid_argument", f"Provider already exists: {provider_id}")
             raw = load_config(self.config_path).model_dump(mode="json")
-            raw["local_providers"][provider_id] = provider.model_dump(mode="json")
+            raw["providers"][provider_id] = provider.model_dump(mode="json")
             await asyncio.to_thread(
                 save_config, Config.model_validate(raw).normalized(), self.config_path
             )
@@ -740,19 +787,23 @@ class RuntimeService:
         await self._emit("settings.updated", None, None, {"revision": self._revision})
         return await self._provider_result(provider_id)
 
-    async def provider_local_remove(self, params: Mapping[str, Any]) -> dict[str, Any]:
+    async def provider_remove(self, params: Mapping[str, Any]) -> dict[str, Any]:
         provider_id = validate_provider_id(self._required_string(params, "provider_id"))
+        if provider_id in {"deepseek", "aeloon-cloud"}:
+            raise RuntimeFailure("invalid_argument", f"Provider id is reserved: {provider_id}")
         revision = params.get("revision")
         async with self._settings_lock:
             if revision is not None and revision != self._revision:
-                raise RuntimeFailure("revision_conflict", "Core settings changed; refresh and try again")
-            if provider_id not in self.config.local_providers:
-                raise RuntimeFailure("invalid_argument", f"Unknown local provider: {provider_id}")
+                raise RuntimeFailure(
+                    "revision_conflict", "Core settings changed; refresh and try again"
+                )
+            if provider_id not in self.config.providers:
+                raise RuntimeFailure("invalid_argument", f"Unknown Provider: {provider_id}")
             raw = load_config(self.config_path).model_dump(mode="json")
-            del raw["local_providers"][provider_id]
+            del raw["providers"][provider_id]
             fallback = self.config.agent.model
             try:
-                if normalize_model_id(fallback).startswith(f"{provider_id}/"):
+                if split_model_id(fallback)[0] == provider_id:
                     raw["agent"]["model"] = ""
             except ValueError:
                 pass
@@ -778,7 +829,7 @@ class RuntimeService:
                 runtime.active = operation
                 await self._emit("operation.started", session, operation, {"kind": "turn"})
                 await self._emit_queue(session, runtime)
-                config_snapshot = self.config
+                config_snapshot = self.coordinator.snapshot(self.config)
                 agent = await self._new_agent(config_snapshot, session)
                 operation.agent = agent
                 await agent.prepare()
@@ -791,7 +842,13 @@ class RuntimeService:
                     await session.append_next_turn_consumed([entry_id for entry_id, _ in pending])
                 result = await self._invoke_input(agent, operation.input, run_id=operation.id)
                 operation.usage = result.usage.to_dict()
-                status = "cancelled" if result.stop_reason == "aborted" else "failed" if result.stop_reason == "error" else "completed"
+                status = (
+                    "cancelled"
+                    if result.stop_reason == "aborted"
+                    else "failed"
+                    if result.stop_reason == "error"
+                    else "completed"
+                )
                 operation.status = status
                 duration = round((time.monotonic() - started) * 1000)
                 await session.append_run_end(
@@ -812,7 +869,7 @@ class RuntimeService:
                     try:
                         title = await rename_session(
                             session=session,
-                            provider=agent.provider,  # type: ignore[arg-type]
+                            inference=agent.inference,  # type: ignore[arg-type]
                             model=agent.model,  # type: ignore[arg-type]
                             user_prompt=str(operation.input.get("text") or ""),
                             assistant_text=result.final_message.text,
@@ -848,7 +905,9 @@ class RuntimeService:
             if not terminal_written:
                 safe = self._sanitize(str(exc))
                 await session.append_run_end(run_id=operation.id, status="failed", error=safe)
-                await self._emit("operation.failed", session, operation, {"kind": "turn", "error": safe})
+                await self._emit(
+                    "operation.failed", session, operation, {"kind": "turn", "error": safe}
+                )
         finally:
             if operation.agent is not None:
                 await operation.agent.close()
@@ -881,7 +940,16 @@ class RuntimeService:
                 return {"operation_id": operation.id, "result": result}
             except Exception as exc:
                 operation.status = "failed"
-                await self._emit("operation.failed", session, operation, {"kind": kind, "error": self._sanitize(str(exc))})
+                await self._emit(
+                    "operation.failed",
+                    session,
+                    operation,
+                    {"kind": kind, "error": self._sanitize(str(exc))},
+                )
+                if isinstance(exc, RuntimeFailure):
+                    raise
+                if isinstance(exc, InferenceError | RunError):
+                    raise RuntimeFailure(exc.code, str(exc), cause=exc) from None
                 raise
             finally:
                 await agent.close()
@@ -897,27 +965,33 @@ class RuntimeService:
                     "agent": effective.agent.model_copy(
                         update={
                             "model": overrides.get("model_id", effective.agent.model),
-                            "thinking_level": overrides.get("thinking_level", effective.agent.thinking_level),
-                            "steering_mode": overrides.get("steering_mode", effective.agent.steering_mode),
-                            "follow_up_mode": overrides.get("follow_up_mode", effective.agent.follow_up_mode),
+                            "thinking_level": overrides.get(
+                                "thinking_level", effective.agent.thinking_level
+                            ),
+                            "steering_mode": overrides.get(
+                                "steering_mode", effective.agent.steering_mode
+                            ),
+                            "follow_up_mode": overrides.get(
+                                "follow_up_mode", effective.agent.follow_up_mode
+                            ),
                         }
                     )
                 }
             )
-        catalog = self._provider_registry(effective)
+        manager = self._provider_manager(effective)
         if self._agent_factory is not None:
-            value = self._agent_factory(effective, session, catalog)
-            return await value if inspect.isawaitable(value) else value
+            try:
+                value = self._agent_factory(effective, session, manager)
+                return await value if inspect.isawaitable(value) else value
+            except Exception:
+                await manager.close()
+                raise
         active_tools = overrides.get("active_tools")
         return SessionAgent(
             config=effective,
             session=session,
-            catalog=catalog,
-            active_tool_names=(
-                tuple(active_tools)
-                if active_tools is not None
-                else None
-            ),
+            provider_manager=manager,
+            active_tool_names=(tuple(active_tools) if active_tools is not None else None),
         )
 
     async def _should_auto_rename(self, session: Session, operation: Operation) -> bool:
@@ -925,9 +999,7 @@ class RuntimeService:
             return False
         entries = await session.get_entries()
         run_ids = [
-            str(entry.get("runId") or "")
-            for entry in entries
-            if entry.get("type") == "run_start"
+            str(entry.get("runId") or "") for entry in entries if entry.get("type") == "run_start"
         ]
         if run_ids != [operation.id]:
             return False
@@ -935,92 +1007,38 @@ class RuntimeService:
         return is_generic_session_title(str(title or ""))
 
     async def _models(self) -> dict[str, Model]:
-        return await self._provider_registry().models()
-
-    async def _model(
-        self, model_id: str, *, registry: ProviderCatalog | None = None
-    ) -> Model:
+        manager = self._provider_manager()
         try:
-            return await (registry or self._provider_registry()).model(model_id)
+            return await manager.models()
+        finally:
+            await manager.close()
+
+    async def _model(self, model_id: str, *, manager: ProviderManager | None = None) -> Model:
+        owns_manager = manager is None
+        selected = manager or self._provider_manager()
+        try:
+            return await selected.model(model_id)
         except PermissionError as exc:
             raise RuntimeFailure("authentication_failed", str(exc)) from None
         except RuntimeError as exc:
             raise RuntimeFailure("invalid_state", str(exc)) from None
         except KeyError:
             raise RuntimeFailure("invalid_argument", f"Unknown model: {model_id}") from None
+        finally:
+            if owns_manager:
+                await selected.close()
 
-    def _provider_registry(self, config: Config | None = None) -> ProviderCatalog:
-        return self._catalog_factory(config or self.config)
+    def _provider_manager(self, config: Config | None = None) -> ProviderManager:
+        return self.coordinator.provider_manager(config or self.config)
 
     async def _provider_result(self, provider_id: str) -> dict[str, Any]:
-        providers = await self._provider_registry().providers()
-        provider = next(item for item in providers if item["id"] == provider_id)
-        return {"provider": provider, "revision": self._revision}
-
-    async def _discover_local_models(
-        self,
-        base_url: str,
-        *,
-        api_key: str,
-        proxy: str | None,
-        extra_headers: Mapping[str, str],
-    ) -> list[dict[str, Any]]:
-        headers = dict(extra_headers)
-        if api_key and api_key != "no-key":
-            headers.setdefault("authorization", f"Bearer {api_key}")
+        manager = self._provider_manager()
         try:
-            async with httpx.AsyncClient(proxy=proxy, timeout=15) as client:
-                response = await client.get(f"{base_url}/models", headers=headers)
-            response.raise_for_status()
-            payload = response.json()
-        except (httpx.HTTPError, ValueError) as exc:
-            raise RuntimeFailure(
-                "invalid_argument",
-                self._sanitize(f"Could not load models from the local API: {exc}"),
-            ) from None
-        if not isinstance(payload, Mapping):
-            raise RuntimeFailure("invalid_argument", "Local API /models returned an invalid payload")
-        raw_models = payload.get("data", payload.get("models"))
-        if not isinstance(raw_models, list):
-            raise RuntimeFailure("invalid_argument", "Local API /models returned no model list")
-        models: list[dict[str, Any]] = []
-        for raw in raw_models:
-            if isinstance(raw, str):
-                models.append({"id": raw})
-                continue
-            if not isinstance(raw, Mapping):
-                continue
-            model_id = str(
-                raw.get("id")
-                or raw.get("model")
-                or raw.get("model_key")
-                or raw.get("name")
-                or ""
-            ).strip()
-            if not model_id:
-                continue
-            model: dict[str, Any] = {"id": model_id}
-            display_name = raw.get("display_name") or raw.get("displayName")
-            if display_name:
-                model["name"] = str(display_name)
-            for source, target in (
-                ("context_window", "context_window"),
-                ("contextWindow", "context_window"),
-                ("max_tokens", "max_tokens"),
-                ("maxTokens", "max_tokens"),
-            ):
-                if source in raw and target not in model:
-                    model[target] = raw[source]
-            model["reasoning"] = bool(
-                raw.get("reasoning") or raw.get("supports_reasoning")
-            )
-            model["supports_image"] = bool(
-                raw.get("supports_image") or raw.get("supportsImage")
-            )
-            models.append(model)
-        if not models:
-            raise RuntimeFailure("invalid_argument", "Local API /models returned no usable models")
-        return models
+            providers = await manager.providers()
+            provider = next(item for item in providers if item["id"] == provider_id)
+            return {"provider": provider, "revision": self._revision}
+        finally:
+            await manager.close()
 
     def _reload_config(self) -> None:
         config = load_config(self.config_path)
@@ -1029,16 +1047,16 @@ class RuntimeService:
         self.config = config
 
     @staticmethod
-    def _http_base_url(value: str) -> str:
+    def _http_endpoint(value: str) -> str:
         from urllib.parse import urlsplit
 
         parsed = urlsplit(value)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise RuntimeFailure("invalid_argument", "base_url must be an HTTP(S) URL")
+            raise RuntimeFailure("invalid_argument", "endpoint must be an HTTP(S) URL")
         if parsed.username or parsed.password or parsed.query or parsed.fragment:
             raise RuntimeFailure(
                 "invalid_argument",
-                "base_url must not contain credentials, a query, or a fragment",
+                "endpoint must not contain credentials, a query, or a fragment",
             )
         return value.rstrip("/")
 
@@ -1047,10 +1065,10 @@ class RuntimeService:
         if value is None:
             return {}
         if not isinstance(value, Mapping):
-            raise RuntimeFailure("invalid_argument", "extra_headers must be an object")
+            raise RuntimeFailure("invalid_argument", "headers must be an object")
         result = {str(key): str(item) for key, item in value.items()}
         if any(not key.strip() for key in result):
-            raise RuntimeFailure("invalid_argument", "extra_headers contains an empty name")
+            raise RuntimeFailure("invalid_argument", "headers contains an empty name")
         return result
 
     def _resource_loader(self, config: Config) -> ResourceLoader:
@@ -1080,32 +1098,13 @@ class RuntimeService:
         session: Session,
         value: dict[str, Any],
     ) -> dict[str, Any]:
-        """Resolve `/skill instructions` in runtime while preserving the public prompt."""
-
-        if value.get("kind") != "prompt":
-            return value
-        match = _SKILL_COMMAND.fullmatch(str(value.get("text") or ""))
-        if match is None:
-            return value
-        name = match.group(1)
-        effective = self.config.model_copy(
-            update={"workspace": Path(session.metadata.cwd)}
-        ).normalized()
-        loader = self._resource_loader(effective)
-        resources = await asyncio.to_thread(loader.reload)
-        skill = next((item for item in loader.available_skills if item.name == name), None)
-        if skill is None:
-            return value
-        if not any(item.name == name for item in resources.skills):
-            raise RuntimeFailure(
-                "invalid_argument",
-                f"Skill '{name}' is available but disabled in Core settings",
-            )
-        return {
-            **value,
-            "skill_id": name,
-            "_skill_instructions": (match.group(2) or "").strip() or None,
-        }
+        prepared = await self.input_resolver.resolve_slash_skill(
+            session=session,
+            value=value,
+            config=self.config,
+            resource_loader=self._resource_loader,
+        )
+        return prepared.input
 
     async def _invoke_input(
         self,
@@ -1135,20 +1134,24 @@ class RuntimeService:
                 supplements.append(f"[Assistant selection]\n{attachment.get('text', '')}")
             elif attachment["type"] == "image":
                 data = await asyncio.to_thread(Path(attachment["managed_path"]).read_bytes)
-                images.append(ImageContent(base64.b64encode(data).decode(), attachment.get("mime_type") or "image/png"))
+                images.append(
+                    ImageContent(
+                        base64.b64encode(data).decode(), attachment.get("mime_type") or "image/png"
+                    )
+                )
             elif attachment["type"] == "file":
                 path = Path(attachment["managed_path"])
                 try:
-                    content = (await asyncio.to_thread(path.read_text, encoding="utf-8"))[:TOOL_OUTPUT_LIMIT]
+                    content = (await asyncio.to_thread(path.read_text, encoding="utf-8"))[
+                        :TOOL_OUTPUT_LIMIT
+                    ]
                     supplements.append(f"[File: {attachment['name']}]\n{content}")
                 except UnicodeError:
                     supplements.append(f"[Binary file attached: {attachment['name']}]")
         if value.get("skill_id"):
             instructions = str(value.get("_skill_instructions") or "")
             if supplements:
-                instructions = "\n\n".join(
-                    item for item in (instructions, *supplements) if item
-                )
+                instructions = "\n\n".join(item for item in (instructions, *supplements) if item)
             return await agent.skill(
                 str(value["skill_id"]),
                 instructions or None,
@@ -1175,27 +1178,53 @@ class RuntimeService:
                 block_id = f"{block_type}-{index}"
                 block = next((item for item in operation.blocks if item["id"] == block_id), None)
                 if block is None:
-                    block = {"id": block_id, "type": block_type, "role": "narration" if block_type == "text" else None, "content": "", "status": "running"}
+                    block = {
+                        "id": block_id,
+                        "type": block_type,
+                        "role": "narration" if block_type == "text" else None,
+                        "content": "",
+                        "status": "running",
+                    }
                     operation.blocks.append(block)
-                    await self._emit("content.started", session, operation, {"block": self._clean_block(block)})
+                    await self._emit(
+                        "content.started", session, operation, {"block": self._clean_block(block)}
+                    )
                 delta = str(stream.get("delta") or "")
                 block["content"] = f"{block.get('content', '')}{delta}"
-                await self._emit("content.delta", session, operation, {"block_id": block_id, "delta": delta})
+                await self._emit(
+                    "content.delta", session, operation, {"block_id": block_id, "delta": delta}
+                )
             elif kind == "toolcall_delta":
                 block_id = str(stream.get("toolCallId") or f"tool-{index}")
                 block = next((item for item in operation.blocks if item["id"] == block_id), None)
                 if block is None:
-                    block = {"id": block_id, "type": "tool_call", "name": str(stream.get("toolName") or "tool"), "arguments": {}, "status": "streaming"}
+                    block = {
+                        "id": block_id,
+                        "type": "tool_call",
+                        "name": str(stream.get("toolName") or "tool"),
+                        "arguments": {},
+                        "status": "streaming",
+                    }
                     operation.blocks.append(block)
                     await self._emit("tool.started", session, operation, {"block": block})
-                await self._emit("tool.updated", session, operation, {"block_id": block_id, "patch": {"status": "streaming"}})
+                await self._emit(
+                    "tool.updated",
+                    session,
+                    operation,
+                    {"block_id": block_id, "patch": {"status": "streaming"}},
+                )
         elif event.type == "message_end":
             message = data.get("message") or {}
             if message.get("role") == "assistant":
                 self._merge_complete_message(operation, message)
                 for block in operation.blocks:
                     name = "tool.updated" if block["type"] == "tool_call" else "content.completed"
-                    await self._emit(name, session, operation, {"block_id": block["id"], "patch": self._clean_block(block)})
+                    await self._emit(
+                        name,
+                        session,
+                        operation,
+                        {"block_id": block["id"], "patch": self._clean_block(block)},
+                    )
                 usage = message.get("usage") or {}
                 operation.usage = dict(usage) if isinstance(usage, Mapping) else {}
                 context_window = operation.model.context_window if operation.model else None
@@ -1212,24 +1241,45 @@ class RuntimeService:
             block_id = str(data.get("toolCallId") or "tool")
             block = next((item for item in operation.blocks if item["id"] == block_id), None)
             if block is None:
-                block = {"id": block_id, "type": "tool_call", "name": str(data.get("toolName") or "tool"), "arguments": self._safe_mapping(data.get("args")), "status": "running"}
+                block = {
+                    "id": block_id,
+                    "type": "tool_call",
+                    "name": str(data.get("toolName") or "tool"),
+                    "arguments": self._safe_mapping(data.get("args")),
+                    "status": "running",
+                }
                 operation.blocks.append(block)
                 await self._emit("tool.started", session, operation, {"block": block})
             else:
-                block.update({"arguments": self._safe_mapping(data.get("args")), "status": "running"})
-                await self._emit("tool.updated", session, operation, {"block_id": block_id, "patch": self._clean_block(block)})
+                block.update(
+                    {"arguments": self._safe_mapping(data.get("args")), "status": "running"}
+                )
+                await self._emit(
+                    "tool.updated",
+                    session,
+                    operation,
+                    {"block_id": block_id, "patch": self._clean_block(block)},
+                )
         elif event.type in {"tool_execution_update", "tool_execution_end"}:
             block_id = str(data.get("toolCallId") or "tool")
             raw = data.get("partialResult") if event.type.endswith("update") else data.get("result")
             result = self._tool_text(raw)
-            patch = {"result": result, "status": "running" if event.type.endswith("update") else "failed" if data.get("isError") else "completed"}
-            artifacts = (
+            patch = {
+                "result": result,
+                "status": "running"
+                if event.type.endswith("update")
+                else "failed"
+                if data.get("isError")
+                else "completed",
+            }
+            typed_artifacts = (
                 artifacts_from_tool_result(raw)
                 if event.type == "tool_execution_end"
                 and data.get("toolName") == PRESENT_FILES_TOOL_NAME
                 and not data.get("isError")
                 else []
             )
+            artifacts = [artifact.to_dict() for artifact in typed_artifacts]
             if artifacts:
                 patch["artifacts"] = artifacts
             for block in operation.blocks:
@@ -1241,15 +1291,34 @@ class RuntimeService:
                     tool_call_id=block_id,
                     artifacts=artifacts,
                 )
-            await self._emit("tool.updated" if event.type.endswith("update") else "tool.completed", session, operation, {"block_id": block_id, "patch": patch})
+            await self._emit(
+                "tool.updated" if event.type.endswith("update") else "tool.completed",
+                session,
+                operation,
+                {"block_id": block_id, "patch": patch},
+            )
         elif event.type == "queue_update":
-            await self._emit("queue.updated", session, operation, {key: len(value) if isinstance(value, list) else value for key, value in data.items() if key.lower().endswith("count") or isinstance(value, list)})
+            await self._emit(
+                "queue.updated",
+                session,
+                operation,
+                {
+                    key: len(value) if isinstance(value, list) else value
+                    for key, value in data.items()
+                    if key.lower().endswith("count") or isinstance(value, list)
+                },
+            )
         elif event.type == "auto_retry_start":
             await self._emit("retry.started", session, operation, self._safe_mapping(data))
         elif event.type == "auto_retry_end":
             await self._emit("retry.completed", session, operation, self._safe_mapping(data))
-        elif event.type == "resources_update":
-            await self._emit("resources.updated", session, operation, {"skills": len((data.get("resources") or {}).get("skills") or []), "prompt_templates": len((data.get("resources") or {}).get("promptTemplates") or [])})
+        elif event.type == "context_compacted":
+            await self._emit(
+                "session.compacted",
+                session,
+                operation,
+                self._safe_mapping(data),
+            )
 
     async def _emit(
         self,
@@ -1277,14 +1346,22 @@ class RuntimeService:
 
     async def _emit_queue(self, session: Session, runtime: SessionRuntime) -> None:
         queued = [item.id for item in runtime.operations.values() if item.status == "queued"]
-        await self._emit("queue.updated", session, runtime.active, {"queued_operation_ids": queued, "active_operation_id": runtime.active.id if runtime.active else None})
+        await self._emit(
+            "queue.updated",
+            session,
+            runtime.active,
+            {
+                "queued_operation_ids": queued,
+                "active_operation_id": runtime.active.id if runtime.active else None,
+            },
+        )
 
     async def _session(self, params: Mapping[str, Any]) -> Session:
         session_id = self._required_string(params, "session_id")
         return await self.repository.open(session_id)
 
     def _runtime(self, session_id: str) -> SessionRuntime:
-        return self._runtimes.setdefault(session_id, SessionRuntime())
+        return self.coordinator.runtime(session_id)
 
     def _operation(self, params: Mapping[str, Any]) -> Operation:
         operation_id = self._required_string(params, "operation_id")
@@ -1309,30 +1386,10 @@ class RuntimeService:
         }
 
     def _turn_input(self, raw: Any) -> dict[str, Any]:
-        if not isinstance(raw, Mapping):
-            raise RuntimeFailure("invalid_argument", "turn.start.input must be an object")
-        kind = raw.get("kind")
-        if kind == "prompt":
-            return self._prompt_input(raw)
-        if kind == "skill":
-            return {"kind": "skill", "name": self._required_string(raw, "name"), "additional_instructions": str(raw.get("additional_instructions") or "") or None}
-        if kind == "prompt_template":
-            arguments = raw.get("arguments") or []
-            if not isinstance(arguments, list) or any(not isinstance(item, str) for item in arguments):
-                raise RuntimeFailure("invalid_argument", "template arguments must be strings")
-            return {"kind": "prompt_template", "name": self._required_string(raw, "name"), "arguments": arguments}
-        raise RuntimeFailure("invalid_argument", "input.kind must be prompt, skill, or prompt_template")
+        return self.input_resolver.parse(raw)
 
     def _prompt_input(self, raw: Any) -> dict[str, Any]:
-        if not isinstance(raw, Mapping):
-            raise RuntimeFailure("invalid_argument", "input must be an object")
-        text = str(raw.get("text") or "")
-        if not text.strip() or len(text) > PROMPT_LIMIT:
-            raise RuntimeFailure("invalid_argument", f"Prompt must contain 1 to {PROMPT_LIMIT:,} characters")
-        attachments = raw.get("attachments") or []
-        if not isinstance(attachments, list) or len(attachments) > ATTACHMENT_LIMIT:
-            raise RuntimeFailure("invalid_attachment", f"At most {ATTACHMENT_LIMIT} attachments are allowed")
-        return {"kind": "prompt", "text": text, "attachments": attachments}
+        return self.input_resolver.prompt(raw)
 
     async def _copy_attachments(
         self,
@@ -1350,7 +1407,14 @@ class RuntimeService:
             kind = str(raw.get("type") or "")
             if kind == "assistant_selection":
                 text = str(raw.get("text") or "")[:PROMPT_LIMIT]
-                result.append({"id": str(raw.get("id") or uuid.uuid4().hex), "type": kind, "name": str(raw.get("name") or "Assistant selection")[:255], "text": text})
+                result.append(
+                    {
+                        "id": str(raw.get("id") or uuid.uuid4().hex),
+                        "type": kind,
+                        "name": str(raw.get("name") or "Assistant selection")[:255],
+                        "text": text,
+                    }
+                )
                 continue
             if kind not in {"image", "file"}:
                 raise RuntimeFailure("invalid_attachment", f"Unsupported attachment type: {kind}")
@@ -1360,31 +1424,46 @@ class RuntimeService:
             try:
                 source = Path(source_raw).expanduser().resolve(strict=True)
             except OSError:
-                raise RuntimeFailure("invalid_attachment", "Attachment source does not exist") from None
-            if not source.is_file() or not any(source.is_relative_to(root) for root in resolved_roots):
-                raise RuntimeFailure("invalid_attachment", "Attachment is outside the declared roots")
+                raise RuntimeFailure(
+                    "invalid_attachment", "Attachment source does not exist"
+                ) from None
+            if not source.is_file() or not any(
+                source.is_relative_to(root) for root in resolved_roots
+            ):
+                raise RuntimeFailure(
+                    "invalid_attachment", "Attachment is outside the declared roots"
+                )
             size = source.stat().st_size
             maximum = IMAGE_LIMIT if kind == "image" else FILE_LIMIT
             if size > maximum:
-                raise RuntimeFailure("invalid_attachment", f"Attachment exceeds the {maximum // (1024 * 1024)} MiB limit")
+                raise RuntimeFailure(
+                    "invalid_attachment",
+                    f"Attachment exceeds the {maximum // (1024 * 1024)} MiB limit",
+                )
             name = Path(str(raw.get("name") or source.name)).name[:255]
             target = destination / f"{uuid.uuid4().hex}{source.suffix[:20]}"
             await asyncio.to_thread(shutil.copy2, source, target)
             target.chmod(0o600)
-            result.append({
-                "id": str(raw.get("id") or uuid.uuid4().hex),
-                "type": kind,
-                "name": name,
-                "mime_type": str(raw.get("mime_type") or "application/octet-stream"),
-                "size_bytes": size,
-                "managed_path": str(target),
-            })
+            result.append(
+                {
+                    "id": str(raw.get("id") or uuid.uuid4().hex),
+                    "type": kind,
+                    "name": name,
+                    "mime_type": str(raw.get("mime_type") or "application/octet-stream"),
+                    "size_bytes": size,
+                    "managed_path": str(target),
+                }
+            )
         return result
 
     def _public_input(self, value: Mapping[str, Any]) -> dict[str, Any]:
         result = {key: item for key, item in value.items() if not key.startswith("_")}
         result["attachments"] = [
-            {key: item[key] for key in ("id", "type", "name", "mime_type", "size_bytes", "text") if key in item}
+            {
+                key: item[key]
+                for key in ("id", "type", "name", "mime_type", "size_bytes", "text")
+                if key in item
+            }
             for item in value.get("attachments") or []
         ]
         return result
@@ -1400,14 +1479,18 @@ class RuntimeService:
             "created_at": operation.created_at,
         }
 
-    def _project_timeline(self, entries: list[dict[str, Any]], *, active_ids: set[str]) -> list[dict[str, Any]]:
+    def _project_timeline(
+        self, entries: list[dict[str, Any]], *, active_ids: set[str]
+    ) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
         current: dict[str, Any] | None = None
         for entry in entries:
             kind = entry.get("type")
             if kind == "run_start":
                 if current is not None:
-                    current["status"] = "interrupted" if current["turn_id"] not in active_ids else "active"
+                    current["status"] = (
+                        "interrupted" if current["turn_id"] not in active_ids else "active"
+                    )
                     result.append(current)
                 current = {
                     "type": "turn",
@@ -1417,7 +1500,9 @@ class RuntimeService:
                     "blocks": [],
                     "usage": {},
                     "model_id": str(entry.get("modelId") or self.config.agent.model),
-                    "thinking_level": str(entry.get("thinkingLevel") or self.config.agent.thinking_level),
+                    "thinking_level": str(
+                        entry.get("thinkingLevel") or self.config.agent.thinking_level
+                    ),
                     "created_at": str(entry.get("timestamp")),
                     "completed_at": None,
                     "duration_ms": None,
@@ -1430,14 +1515,21 @@ class RuntimeService:
                     blocks = self._message_blocks(message)
                     current["blocks"].extend(blocks)
                     current["usage"] = message.get("usage") or {}
-                    texts = [block.get("content", "") for block in blocks if block["type"] == "text"]
+                    texts = [
+                        block.get("content", "") for block in blocks if block["type"] == "text"
+                    ]
                     if texts:
                         current["final_content"] = "".join(texts)
                 elif message.get("role") == "toolResult":
                     tool_id = str(message.get("toolCallId") or "")
                     for block in current["blocks"]:
                         if block["id"] == tool_id:
-                            block.update({"status": "failed" if message.get("isError") else "completed", "result": self._content_text(message.get("content"))})
+                            block.update(
+                                {
+                                    "status": "failed" if message.get("isError") else "completed",
+                                    "result": self._content_text(message.get("content")),
+                                }
+                            )
             elif kind == "artifact_delivery" and current is not None:
                 if str(entry.get("runId") or "") != current["turn_id"]:
                     continue
@@ -1448,23 +1540,31 @@ class RuntimeService:
                 for block in current["blocks"]:
                     if block["id"] == tool_id:
                         block["artifacts"] = artifacts
-            elif kind == "run_end" and current is not None and entry.get("runId") == current["turn_id"]:
-                current.update({
-                    "status": str(entry.get("status") or "completed"),
-                    "completed_at": str(entry.get("timestamp")),
-                    "duration_ms": entry.get("durationMs"),
-                    "error": self._sanitize(str(entry.get("error") or "")) or None,
-                })
+            elif (
+                kind == "run_end"
+                and current is not None
+                and entry.get("runId") == current["turn_id"]
+            ):
+                current.update(
+                    {
+                        "status": str(entry.get("status") or "completed"),
+                        "completed_at": str(entry.get("timestamp")),
+                        "duration_ms": entry.get("durationMs"),
+                        "error": self._sanitize(str(entry.get("error") or "")) or None,
+                    }
+                )
                 result.append(current)
                 current = None
             elif kind == "compaction":
-                result.append({
-                    "type": "compaction",
-                    "id": str(entry.get("id")),
-                    "created_at": str(entry.get("timestamp")),
-                    "tokens_before": int(entry.get("tokensBefore") or 0),
-                    "summary": str(entry.get("summary") or "")[:TOOL_OUTPUT_LIMIT],
-                })
+                result.append(
+                    {
+                        "type": "compaction",
+                        "id": str(entry.get("id")),
+                        "created_at": str(entry.get("timestamp")),
+                        "tokens_before": int(entry.get("tokensBefore") or 0),
+                        "summary": str(entry.get("summary") or "")[:TOOL_OUTPUT_LIMIT],
+                    }
+                )
         if current is not None:
             result.append(current)
         return result
@@ -1477,11 +1577,34 @@ class RuntimeService:
                 continue
             kind = raw.get("type")
             if kind == "text":
-                result.append({"id": f"text-{len(result)}", "type": "text", "role": "final", "content": str(raw.get("text") or ""), "status": "completed"})
+                result.append(
+                    {
+                        "id": f"text-{len(result)}",
+                        "type": "text",
+                        "role": "final",
+                        "content": str(raw.get("text") or ""),
+                        "status": "completed",
+                    }
+                )
             elif kind == "thinking":
-                result.append({"id": f"thinking-{len(result)}", "type": "thinking", "content": str(raw.get("thinking") or ""), "status": "completed"})
+                result.append(
+                    {
+                        "id": f"thinking-{len(result)}",
+                        "type": "thinking",
+                        "content": str(raw.get("thinking") or ""),
+                        "status": "completed",
+                    }
+                )
             elif kind == "toolCall":
-                result.append({"id": str(raw.get("id") or f"tool-{index}"), "type": "tool_call", "name": str(raw.get("name") or "tool"), "arguments": self._safe_mapping(raw.get("arguments")), "status": "running"})
+                result.append(
+                    {
+                        "id": str(raw.get("id") or f"tool-{index}"),
+                        "type": "tool_call",
+                        "name": str(raw.get("name") or "tool"),
+                        "arguments": self._safe_mapping(raw.get("arguments")),
+                        "status": "running",
+                    }
+                )
         return result
 
     def _merge_complete_message(self, operation: Operation, message: Mapping[str, Any]) -> None:
@@ -1517,10 +1640,20 @@ class RuntimeService:
         *,
         valid_model_ids: list[str],
     ) -> None:
-        allowed = {"default_model_id", "default_thinking_level", "retry", "compaction", "resources", "tools", "deepseek", "cloud"}
+        allowed = {
+            "default_model_id",
+            "default_thinking_level",
+            "retry",
+            "compaction",
+            "resources",
+            "tools",
+            "providers",
+        }
         unknown = set(patch) - allowed
         if unknown:
-            raise RuntimeFailure("invalid_argument", f"Unknown settings fields: {', '.join(sorted(unknown))}")
+            raise RuntimeFailure(
+                "invalid_argument", f"Unknown settings fields: {', '.join(sorted(unknown))}"
+            )
         if "default_model_id" in patch:
             requested_model_id = str(patch["default_model_id"])
             try:
@@ -1553,18 +1686,59 @@ class RuntimeService:
                     "invalid_argument",
                     "resources.enabled_skill_ids must be a list of skill ids or null",
                 )
-            raw["resources"].update({
-                "roots": value.get("roots", raw["resources"]["roots"]),
-                "enabled_skills": (
-                    None
-                    if enabled_skill_ids is None
-                    else list(dict.fromkeys(item.strip() for item in enabled_skill_ids))
-                ),
-                "no_skills": not bool(value.get("load_skills", not raw["resources"]["no_skills"])),
-                "no_prompt_templates": not bool(value.get("load_prompt_templates", not raw["resources"]["no_prompt_templates"])),
-                "no_context_files": not bool(value.get("load_context_files", not raw["resources"]["no_context_files"])),
-            })
-        for key in ("tools", "deepseek", "cloud"):
+            raw["resources"].update(
+                {
+                    "roots": value.get("roots", raw["resources"]["roots"]),
+                    "enabled_skills": (
+                        None
+                        if enabled_skill_ids is None
+                        else list(dict.fromkeys(item.strip() for item in enabled_skill_ids))
+                    ),
+                    "no_skills": not bool(
+                        value.get("load_skills", not raw["resources"]["no_skills"])
+                    ),
+                    "no_prompt_templates": not bool(
+                        value.get(
+                            "load_prompt_templates", not raw["resources"]["no_prompt_templates"]
+                        )
+                    ),
+                    "no_context_files": not bool(
+                        value.get("load_context_files", not raw["resources"]["no_context_files"])
+                    ),
+                }
+            )
+        if "providers" in patch:
+            providers = patch["providers"]
+            if not isinstance(providers, Mapping):
+                raise RuntimeFailure("invalid_argument", "providers must be an object")
+            for provider_id, provider_patch in providers.items():
+                if provider_id not in raw["providers"]:
+                    raise RuntimeFailure(
+                        "invalid_argument",
+                        f"Unknown Provider: {provider_id}",
+                    )
+                if not isinstance(provider_patch, Mapping):
+                    raise RuntimeFailure(
+                        "invalid_argument",
+                        f"providers.{provider_id} must be an object",
+                    )
+                if "api_key" in provider_patch:
+                    raise RuntimeFailure(
+                        "invalid_argument",
+                        "API keys must be changed through secret_actions",
+                    )
+                if (
+                    "driver" in provider_patch
+                    and provider_patch["driver"] != raw["providers"][provider_id]["driver"]
+                ):
+                    raise RuntimeFailure(
+                        "invalid_argument",
+                        f"Provider driver cannot be changed: {provider_id}",
+                    )
+                if "endpoint" in provider_patch:
+                    self._http_endpoint(str(provider_patch["endpoint"]))
+                raw["providers"][provider_id].update(provider_patch)
+        for key in ("tools",):
             if key in patch:
                 if not isinstance(patch[key], Mapping):
                     raise RuntimeFailure("invalid_argument", f"{key} must be an object")
@@ -1581,32 +1755,39 @@ class RuntimeService:
     def _content_text(self, raw: Any) -> str:
         if not isinstance(raw, list):
             return ""
-        return "\n".join(str(item.get("text") or "") for item in raw if isinstance(item, Mapping))[:TOOL_OUTPUT_LIMIT]
+        return "\n".join(str(item.get("text") or "") for item in raw if isinstance(item, Mapping))[
+            :TOOL_OUTPUT_LIMIT
+        ]
 
     def _safe_mapping(self, value: Any) -> dict[str, Any]:
-        if not isinstance(value, Mapping):
-            return {}
-        return {str(key): self._json_safe(item) for key, item in value.items()}
+        return self.projection.safe_mapping(value)
 
     def _json_safe(self, value: Any) -> Any:
-        if value is None or isinstance(value, str | int | float | bool):
-            return value
-        if isinstance(value, Mapping):
-            return {str(key): self._json_safe(item) for key, item in value.items() if str(key).lower() not in {"api_key", "authorization", "systemprompt", "payload"}}
-        if isinstance(value, list | tuple):
-            return [self._json_safe(item) for item in value]
-        return str(value)[:TOOL_OUTPUT_LIMIT]
+        return self.projection.json_safe(value)
 
     def _sanitize(self, message: str) -> str:
-        value = message[:4_000]
-        secrets = [
-            self.config.deepseek.api_key,
-            *(provider.api_key for provider in self.config.local_providers.values()),
-        ]
-        for secret in secrets:
-            if secret and secret != "no-key":
-                value = value.replace(secret, "***")
+        return self.projection.sanitize(message)
+
+    def _public_provider_config(self, provider: Any) -> dict[str, Any]:
+        value = provider.model_dump(mode="json", exclude={"api_key"})
+        value["credential_configured"] = bool(getattr(provider, "api_key", None))
+        headers = value.get("headers")
+        if isinstance(headers, dict):
+            redact_sensitive_headers(headers)
+        if provider.driver == "cloud":
+            value["credential_configured"] = bool(self.account.status().get("authenticated"))
         return value
+
+    def _tool_set(
+        self,
+        *,
+        workspace: Path | None = None,
+    ) -> RuntimeToolSet:
+        return RuntimeToolSet(
+            workspace or self.config.workspace,
+            shell_path=self.config.tools.shell_path,
+            auto_resize_images=self.config.tools.auto_resize_images,
+        )
 
     @staticmethod
     def _required_string(params: Mapping[str, Any], key: str) -> str:

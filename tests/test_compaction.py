@@ -7,10 +7,8 @@ import pytest
 
 from aeloon_core.config import Config
 from aeloon_core.core import (
-    DEEPSEEK_V4_FLASH,
     AssistantMessage,
     ContextPolicy,
-    ScriptedProvider,
     TextContent,
     ToolCall,
     Usage,
@@ -21,6 +19,8 @@ from aeloon_core.core.compaction import should_compact
 from aeloon_core.runtime import JsonlSessionRepository
 from aeloon_core.runtime.agent import SessionAgent
 from aeloon_core.runtime.compaction import CompactionSettings, prepare_compaction
+from aeloon_core.runtime.providers import DEEPSEEK_V4_FLASH
+from aeloon_core.runtime.providers.testing import ScriptedProvider
 
 
 def _assistant(text: str, tokens: int = 0) -> AssistantMessage:
@@ -54,14 +54,21 @@ def _session_agent(
         },
     ).normalized()
 
-    class StaticCatalog:
+    class StaticManager:
         async def model(self, _model_id):
             return model
 
-        def provider(self, _model):
+        def inference(self, _model):
             return provider
 
-    return SessionAgent(config=config, session=session, catalog=StaticCatalog())  # type: ignore[arg-type]
+        async def close(self):
+            return None
+
+    return SessionAgent(
+        config=config,
+        session=session,
+        provider_manager=StaticManager(),  # type: ignore[arg-type]
+    )
 
 
 @pytest.mark.asyncio

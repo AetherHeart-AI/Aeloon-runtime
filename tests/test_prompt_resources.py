@@ -7,8 +7,12 @@ from pathlib import Path
 
 import pytest
 
-from aeloon_core.core import build_system_prompt, create_all_tools
-from aeloon_core.runtime import ResourceLoader
+from aeloon_core.runtime import ResourceLoader, build_system_prompt
+from aeloon_core.tool import BuiltinToolSet
+
+
+def create_all_tools(cwd: Path):
+    return BuiltinToolSet(cwd).by_name
 
 
 def test_default_prompt_is_deterministic_and_tracks_active_tools(tmp_path: Path) -> None:
@@ -117,7 +121,7 @@ def test_skills_are_discovered_as_metadata_then_loaded_on_demand(tmp_path: Path)
 
     resources = loader.reload()
 
-    assert resources.skills[0].content == ""
+    assert not hasattr(resources.skills[0], "content")
     assert loader.available_skills[0].source == "user"
     assert loader.load_skill("review").content == "FULL INSTRUCTIONS"
 

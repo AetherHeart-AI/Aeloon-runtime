@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from aeloon_core.core import AgentTool, ToolResult
+from aeloon_core.core.types import ToolResult, ToolUpdateCallback
+from aeloon_core.tool import BaseTool
 
 PRESENT_FILES_TOOL_NAME = "present_files"
 MAX_PRESENTED_FILES = 24
@@ -35,18 +37,41 @@ _ARTIFACT_FORMATS: dict[str, tuple[str, str]] = {
     ".svg": ("image", "image/svg+xml"),
     ".webp": ("image", "image/webp"),
     ".xls": ("spreadsheet", "application/vnd.ms-excel"),
-    ".xlsx": (
-        "spreadsheet",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    ),
+    ".xlsx": ("spreadsheet", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
 }
 
 
-def create_present_files_tool(cwd: Path | str) -> AgentTool:
-    """Create the runtime tool that declares verified user-facing files."""
+@dataclass(frozen=True, slots=True)
+class Artifact:
+    path: str
+    name: str
+    mime_type: str
+    size_bytes: int
+    kind: str
 
-    root = Path(cwd).expanduser().resolve(strict=False)
-    schema = {
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+class PresentFilesTool(BaseTool):
+    name = PRESENT_FILES_TOOL_NAME
+    label = "present files"
+    description = (
+        "Declare completed user-facing deliverable files so clients can show them as final "
+        "results. Only present the finished office document, PDF, image, Markdown, or HTML "
+        "files; never present generator scripts, source code, logs, caches, or temporary files."
+    )
+    prompt_snippet = "Present verified final deliverable files to the user"
+    prompt_guidelines = (
+        "When a task produces user-facing files, finish and verify them, then call "
+        "present_files exactly once with every final deliverable. Do not include generator "
+        "scripts, source code, logs, caches, or temporary files.",
+        "After presenting files, keep the final response to a concise delivery summary, "
+        "assumptions, and unresolved items. Do not paste generation code or duplicate the "
+        "files as local Markdown links unless the user explicitly asks for source code.",
+    )
+    execution_mode = "sequential"
+    parameters = {
         "type": "object",
         "properties": {
             "paths": {
@@ -61,51 +86,31 @@ def create_present_files_tool(cwd: Path | str) -> AgentTool:
         "additionalProperties": False,
     }
 
+    def __init__(self, cwd: Path | str) -> None:
+        self.root = Path(cwd).expanduser().resolve(strict=False)
+
     async def execute(
+        self,
         _call_id: str,
-        params: dict[str, Any],
-        _on_update: Any,
+        arguments: dict[str, Any],
+        _on_update: ToolUpdateCallback | None,
     ) -> ToolResult:
-        paths = params.get("paths")
+        paths = arguments.get("paths")
         if not isinstance(paths, list) or not 1 <= len(paths) <= MAX_PRESENTED_FILES:
             raise ValueError(
                 f"paths must contain 1 to {MAX_PRESENTED_FILES} final deliverable files"
             )
-        artifacts = normalize_artifact_paths(root, paths)
-        rendered = "\n".join(f"- {artifact['path']}" for artifact in artifacts)
+        artifacts = normalize_artifact_paths(self.root, paths)
+        rendered = "\n".join(f"- {artifact.path}" for artifact in artifacts)
         return ToolResult.text(
             f"Presented {len(artifacts)} final deliverable file(s):\n{rendered}",
             details={"artifacts": artifacts},
         )
 
-    return AgentTool(
-        name=PRESENT_FILES_TOOL_NAME,
-        label="present files",
-        description=(
-            "Declare completed user-facing deliverable files so clients can show them as final "
-            "results. Only present the finished office document, PDF, image, Markdown, or HTML "
-            "files; never present generator scripts, source code, logs, caches, or temporary files."
-        ),
-        prompt_snippet="Present verified final deliverable files to the user",
-        prompt_guidelines=(
-            "When a task produces user-facing files, finish and verify them, then call "
-            "present_files exactly once with every final deliverable. Do not include generator "
-            "scripts, source code, logs, caches, or temporary files.",
-            "After presenting files, keep the final response to a concise delivery summary, "
-            "assumptions, and unresolved items. Do not paste generation code or duplicate the "
-            "files as local Markdown links unless the user explicitly asks for source code.",
-        ),
-        parameters=schema,
-        execute=execute,
-        execution_mode="sequential",
-    )
 
-
-def normalize_artifact_paths(root: Path, values: Sequence[Any]) -> list[dict[str, Any]]:
-    """Validate and normalize paths atomically into public runtime artifact records."""
-
+def normalize_artifact_paths(root: Path, values: Sequence[Any]) -> list[Artifact]:
     canonical_root = root.expanduser().resolve(strict=True)
-    artifacts: list[dict[str, Any]] = []
+    artifacts: list[Artifact] = []
     seen: set[Path] = set()
     for raw in values:
         if not isinstance(raw, str) or not raw.strip():
@@ -128,22 +133,20 @@ def normalize_artifact_paths(root: Path, values: Sequence[Any]) -> list[dict[str
         seen.add(resolved)
         kind, mime_type = format_value
         artifacts.append(
-            {
-                "path": resolved.relative_to(canonical_root).as_posix(),
-                "name": resolved.name,
-                "mime_type": mime_type,
-                "size_bytes": resolved.stat().st_size,
-                "kind": kind,
-            }
+            Artifact(
+                path=resolved.relative_to(canonical_root).as_posix(),
+                name=resolved.name,
+                mime_type=mime_type,
+                size_bytes=resolved.stat().st_size,
+                kind=kind,
+            )
         )
     if not artifacts:
         raise ValueError("At least one unique final deliverable file is required")
     return artifacts
 
 
-def artifacts_from_tool_result(raw: Any) -> list[dict[str, Any]]:
-    """Read bounded, JSON-safe artifact metadata from a runtime tool result."""
-
+def artifacts_from_tool_result(raw: Any) -> list[Artifact]:
     if not isinstance(raw, Mapping):
         return []
     details = raw.get("details")
@@ -152,33 +155,31 @@ def artifacts_from_tool_result(raw: Any) -> list[dict[str, Any]]:
     values = details.get("artifacts")
     if not isinstance(values, list):
         return []
-    artifacts: list[dict[str, Any]] = []
+    artifacts: list[Artifact] = []
     for value in values[:MAX_PRESENTED_FILES]:
-        if not isinstance(value, Mapping):
-            continue
-        path = value.get("path")
-        if not isinstance(path, str) or not path:
-            continue
-        artifact = {
-            key: value[key]
-            for key in ("path", "name", "mime_type", "size_bytes", "kind")
-            if key in value and isinstance(value[key], str | int)
-        }
-        artifacts.append(artifact)
+        if isinstance(value, Artifact):
+            artifacts.append(value)
+        elif isinstance(value, Mapping):
+            try:
+                artifacts.append(
+                    Artifact(
+                        path=str(value["path"]),
+                        name=str(value["name"]),
+                        mime_type=str(value["mime_type"]),
+                        size_bytes=int(value["size_bytes"]),
+                        kind=str(value["kind"]),
+                    )
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
     return artifacts
 
 
-def with_present_files(names: Iterable[str]) -> tuple[str, ...]:
-    """Append the intrinsic runtime delivery tool without duplicating configured tools."""
-
-    return tuple(dict.fromkeys((*names, PRESENT_FILES_TOOL_NAME)))
-
-
 __all__ = [
+    "Artifact",
     "MAX_PRESENTED_FILES",
     "PRESENT_FILES_TOOL_NAME",
+    "PresentFilesTool",
     "artifacts_from_tool_result",
-    "create_present_files_tool",
     "normalize_artifact_paths",
-    "with_present_files",
 ]

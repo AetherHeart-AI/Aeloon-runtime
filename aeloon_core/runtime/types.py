@@ -6,11 +6,14 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from aeloon_core.core import RunError
 
-
-class RuntimeFailure(RunError):
+class RuntimeFailure(RuntimeError):
     """Stable application-layer failure independent of any wire protocol."""
+
+    def __init__(self, code: str, message: str, *, cause: Exception | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.cause = cause
 
 
 @dataclass(frozen=True, slots=True)

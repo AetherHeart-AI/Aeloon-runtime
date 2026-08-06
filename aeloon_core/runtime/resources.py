@@ -2,15 +2,59 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-from aeloon_core.core.types import PromptTemplate, Resources, Skill
-
 _CONTEXT_NAMES = ("AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD")
+
+
+@dataclass(frozen=True, slots=True)
+class Skill:
+    name: str
+    description: str
+    file_path: str
+    disable_model_invocation: bool = False
+    source: str = "unknown"
+
+
+@dataclass(frozen=True, slots=True)
+class LoadedSkill:
+    skill: Skill
+    content: str
+
+    @property
+    def name(self) -> str:
+        return self.skill.name
+
+    @property
+    def file_path(self) -> str:
+        return self.skill.file_path
+
+
+@dataclass(frozen=True, slots=True)
+class PromptTemplate:
+    name: str
+    content: str
+    description: str | None = None
+
+    def format(self, arguments: Sequence[str] = ()) -> str:
+        rendered = self.content
+        for index, argument in enumerate(arguments, 1):
+            rendered = rendered.replace(f"${index}", argument)
+        return rendered.replace("$@", " ".join(arguments))
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeResources:
+    skills: tuple[Skill, ...] = ()
+    prompt_templates: tuple[PromptTemplate, ...] = ()
+    context_files: tuple[tuple[str, str], ...] = ()
+    system_prompt: str | None = None
+    append_system_prompt: tuple[str, ...] = ()
 
 
 class ResourceLoader:
@@ -32,17 +76,15 @@ class ResourceLoader:
         self.additional_roots = tuple(
             Path(path).expanduser().resolve(strict=False) for path in additional_roots
         )
-        self.enabled_skills = (
-            None if enabled_skills is None else frozenset(enabled_skills)
-        )
+        self.enabled_skills = None if enabled_skills is None else frozenset(enabled_skills)
         self.no_skills = no_skills
         self.no_prompt_templates = no_prompt_templates
         self.no_context_files = no_context_files
-        self._resources = Resources()
+        self._resources = RuntimeResources()
         self._available_skills: tuple[Skill, ...] = ()
 
     @property
-    def resources(self) -> Resources:
+    def resources(self) -> RuntimeResources:
         return self._resources
 
     @property
@@ -51,7 +93,7 @@ class ResourceLoader:
 
         return self._available_skills
 
-    def reload(self) -> Resources:
+    def reload(self) -> RuntimeResources:
         project_dir = self.cwd / ".aeloon-core"
         system_source = _first_file(project_dir / "SYSTEM.md", self.agent_dir / "SYSTEM.md")
         append_source = _first_file(
@@ -69,7 +111,7 @@ class ResourceLoader:
         )
         prompts = () if self.no_prompt_templates else self._load_prompts(project_dir)
         context = () if self.no_context_files else self._load_context_files()
-        self._resources = Resources(
+        self._resources = RuntimeResources(
             skills=skills,
             prompt_templates=prompts,
             context_files=context,
@@ -80,7 +122,7 @@ class ResourceLoader:
         )
         return self._resources
 
-    def load_skill(self, name: str) -> Skill:
+    def load_skill(self, name: str) -> LoadedSkill:
         """Load one enabled skill body after metadata-only discovery."""
 
         skill = next((item for item in self._resources.skills if item.name == name), None)
@@ -94,7 +136,7 @@ class ResourceLoader:
         loaded_name = str(metadata.get("name") or Path(skill.file_path).parent.name).strip()
         if loaded_name != skill.name:
             raise ValueError(f"Skill metadata changed while loading: {name}")
-        return replace(skill, content=content.strip())
+        return LoadedSkill(skill=skill, content=content.strip())
 
     def _load_context_files(self) -> tuple[tuple[str, str], ...]:
         files: list[Path] = []
@@ -201,7 +243,6 @@ def _parse_skill(path: Path, *, source: str) -> Skill | None:
     return Skill(
         name=name,
         description=description,
-        content="",
         file_path=str(path.resolve(strict=False)),
         disable_model_invocation=bool(metadata.get("disable-model-invocation", False)),
         source=source,
@@ -246,4 +287,10 @@ def _parse_prompt(path: Path) -> PromptTemplate:
     )
 
 
-__all__ = ["ResourceLoader"]
+__all__ = [
+    "LoadedSkill",
+    "PromptTemplate",
+    "ResourceLoader",
+    "RuntimeResources",
+    "Skill",
+]

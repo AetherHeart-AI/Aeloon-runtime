@@ -10,12 +10,10 @@ from typing import Any
 
 from aeloon_core.config import Config
 from aeloon_core.core import (
-    DEFAULT_ACTIVE_TOOLS,
     AgentMessage,
-    AgentTool,
     ImageContent,
+    InferencePort,
     Model,
-    Provider,
     RunController,
     RunEvent,
     RunRequest,
@@ -24,17 +22,10 @@ from aeloon_core.core import (
     TextContent,
     Usage,
     UserMessage,
-    build_system_prompt,
-    create_all_tools,
     message_from_dict,
     run_agent,
 )
 from aeloon_core.core.compaction import ContextPolicy, ContextUpdate
-from aeloon_core.runtime.artifacts import (
-    create_present_files_tool,
-    with_present_files,
-)
-from aeloon_core.runtime.catalog import ProviderCatalog
 from aeloon_core.runtime.compaction import (
     CompactionResult,
     CompactionSettings,
@@ -42,8 +33,11 @@ from aeloon_core.runtime.compaction import (
     prepare_compaction,
     summarize_branch,
 )
+from aeloon_core.runtime.prompt import build_system_prompt
+from aeloon_core.runtime.providers import ProviderManager
 from aeloon_core.runtime.resources import ResourceLoader
 from aeloon_core.runtime.session import Session
+from aeloon_core.runtime.tooling import RuntimeToolSet
 
 RunObserver = Callable[[RunEvent], Awaitable[None] | None]
 
@@ -55,13 +49,13 @@ class SessionContextCompactor:
         self,
         *,
         session: Session | None,
-        provider: Provider,
+        inference: InferencePort,
         model: Model,
         options: StreamOptions,
         settings: CompactionSettings,
     ) -> None:
         self.session = session
-        self.provider = provider
+        self.inference = inference
         self.model = model
         self.options = options
         self.settings = settings
@@ -94,7 +88,7 @@ class SessionContextCompactor:
             raise RuntimeError("Session does not need compaction")
         result = await compact_preparation(
             preparation,
-            provider=self.provider,
+            inference=self.inference,
             model=self.model,
             stream_options=self.options,
             settings=self.settings,
@@ -117,21 +111,26 @@ class SessionAgent:
         self,
         *,
         config: Config,
-        session: Session,
-        catalog: ProviderCatalog,
+        session: Session | None,
+        provider_manager: ProviderManager,
         active_tool_names: tuple[str, ...] | None = None,
     ) -> None:
         self.config = config
         self.session = session
-        self.catalog = catalog
+        self.provider_manager = provider_manager
         self._configured_active_tools = active_tool_names
-        self.provider: Provider | None = None
+        self.inference: InferencePort | None = None
         self.model: Model | None = None
         self.controller: RunController | None = None
         self._observers: list[RunObserver] = []
         self._resources = None
         self._resource_loader_instance: ResourceLoader | None = None
         self._pending_next_turn: list[UserMessage] = []
+        self._tool_set = RuntimeToolSet(
+            self.config.workspace,
+            shell_path=self.config.tools.shell_path,
+            auto_resize_images=self.config.tools.auto_resize_images,
+        )
 
     def subscribe(self, observer: RunObserver) -> Callable[[], None]:
         self._observers.append(observer)
@@ -145,8 +144,8 @@ class SessionAgent:
     async def prepare(self) -> None:
         if self.model is not None:
             return
-        self.model = await self.catalog.model(self.config.agent.model)
-        self.provider = self.catalog.provider(self.model)
+        self.model = await self.provider_manager.model(self.config.agent.model)
+        self.inference = self.provider_manager.inference(self.model)
         self._resource_loader_instance = self._resource_loader()
         self._resources = await asyncio.to_thread(self._resource_loader_instance.reload)
 
@@ -158,25 +157,25 @@ class SessionAgent:
         run_id: str,
     ) -> RunResult:
         await self.prepare()
-        assert self.provider is not None and self.model is not None and self._resources is not None
+        assert self.inference is not None and self.model is not None and self._resources is not None
         context = await self.session.build_context() if self.session is not None else None
         content = text if not images else (TextContent(text), *tuple(images))
-        tools = self._all_tools()
-        active_tool_names = self._active_tool_names(
-            context.active_tool_names if context is not None else None
+        active_tool_names = self._tool_set.active_names(
+            self._configured_active_tools,
+            context.active_tool_names if context is not None else None,
         )
         request = RunRequest(
             run_id=run_id,
-            provider=self.provider,
+            inference=self.inference,
             model=self.model,
             messages=context.messages if context is not None else (),
             input=(*self._pending_next_turn, UserMessage(content)),
             system_prompt=build_system_prompt(
                 cwd=str(self.config.workspace),
-                tools=tuple(tools[name] for name in active_tool_names),
+                tools=tuple(self._tool_set.by_name[name] for name in active_tool_names),
                 resources=self._resources,
             ),
-            tools=tuple(tools.values()),
+            tools=self._tool_set.tools,
             active_tool_names=active_tool_names,
             stream_options=self._stream_options(),
             context_policy=ContextPolicy(
@@ -196,7 +195,7 @@ class SessionAgent:
         compactor = (
             SessionContextCompactor(
                 session=self.session,
-                provider=self.provider,
+                inference=self.inference,
                 model=self.model,
                 options=request.stream_options,
                 settings=CompactionSettings(
@@ -233,8 +232,7 @@ class SessionAgent:
         except KeyError:
             raise ValueError(f"Unknown skill: {name}") from None
         prompt = (
-            f'<skill name="{skill.name}" location="{skill.file_path}">\n'
-            f"{skill.content}\n</skill>"
+            f'<skill name="{skill.name}" location="{skill.file_path}">\n{skill.content}\n</skill>'
         )
         if additional_instructions:
             prompt += f"\n\n{additional_instructions}"
@@ -277,12 +275,12 @@ class SessionAgent:
 
     async def compact(self, custom_instructions: str | None = None) -> CompactionResult:
         await self.prepare()
-        assert self.provider is not None and self.model is not None
+        assert self.inference is not None and self.model is not None
         if self.session is None:
             raise RuntimeError("Compaction requires a persistent session")
         compactor = SessionContextCompactor(
             session=self.session,
-            provider=self.provider,
+            inference=self.inference,
             model=self.model,
             options=self._stream_options(),
             settings=CompactionSettings(
@@ -307,7 +305,7 @@ class SessionAgent:
         label: str | None = None,
     ) -> dict[str, Any]:
         await self.prepare()
-        assert self.provider is not None and self.model is not None
+        assert self.inference is not None and self.model is not None
         if self.session is None:
             raise RuntimeError("Tree navigation requires a persistent session")
         if await self.session.get_entry(target_id) is None:
@@ -327,7 +325,7 @@ class SessionAgent:
             )
             summary_payload = await summarize_branch(
                 messages,
-                provider=self.provider,
+                inference=self.inference,
                 model=self.model,
                 stream_options=self._stream_options(),
                 custom_instructions=custom_instructions,
@@ -352,14 +350,8 @@ class SessionAgent:
         }
 
     async def close(self) -> None:
-        if self.provider is None:
-            return
-        close = getattr(self.provider, "close", None)
-        if close is not None:
-            result = close()
-            if inspect.isawaitable(result):
-                await result
-        self.provider = None
+        await self.provider_manager.close()
+        self.inference = None
 
     async def _emit(self, event: RunEvent) -> None:
         if (
@@ -374,25 +366,6 @@ class SessionAgent:
             result = observer(event)
             if inspect.isawaitable(result):
                 await result
-
-    def _active_tool_names(self, restored: tuple[str, ...] | None) -> tuple[str, ...]:
-        if self._configured_active_tools is not None:
-            selected = self._configured_active_tools
-        elif restored is not None:
-            selected = restored
-        else:
-            selected = DEFAULT_ACTIVE_TOOLS
-        return with_present_files(selected)
-
-    def _all_tools(self) -> dict[str, AgentTool]:
-        tools = create_all_tools(
-            self.config.workspace,
-            shell_path=self.config.tools.shell_path,
-            auto_resize_images=self.config.tools.auto_resize_images,
-        )
-        delivery = create_present_files_tool(self.config.workspace)
-        tools[delivery.name] = delivery
-        return tools
 
     def _stream_options(self) -> StreamOptions:
         retry = self.config.agent.retry
@@ -423,7 +396,7 @@ class SessionAgent:
 
 
 SessionAgentFactory = Callable[
-    [Config, Session, ProviderCatalog],
+    [Config, Session | None, ProviderManager],
     SessionAgent | Awaitable[SessionAgent],
 ]
 

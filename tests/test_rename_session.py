@@ -6,12 +6,9 @@ import pytest
 
 from aeloon_core.bridge import BridgeRpcAdapter
 from aeloon_core.config import Config, save_config
-from aeloon_core.core import (
-    AssistantMessage,
-    ScriptedProvider,
-    TextContent,
-)
-from aeloon_core.runtime import ProviderCatalog, RuntimeService
+from aeloon_core.core import AssistantMessage, TextContent
+from aeloon_core.runtime import ProviderManager, RuntimeService
+from aeloon_core.runtime.providers.testing import ScriptedProvider
 from aeloon_core.runtime.rename import normalize_session_title
 
 
@@ -54,9 +51,9 @@ async def test_first_completed_turn_generates_one_semantic_session_title(tmp_pat
 
     runtime = RuntimeService(
         config_path=config_path,
-        catalog_factory=lambda config: ProviderCatalog(
+        provider_manager_factory=lambda config: ProviderManager(
             config,
-            local_provider_factory=provider_factory,
+            driver_factories={"deepseek": lambda *_args: provider_factory()},
         ),
     )
     bridge = BridgeRpcAdapter(runtime)

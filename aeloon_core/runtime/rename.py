@@ -5,11 +5,11 @@ from __future__ import annotations
 import re
 from dataclasses import replace
 
-from aeloon_core.core.providers import collect_assistant
+from aeloon_core.core.inference_runtime import collect_assistant
 from aeloon_core.core.types import (
+    InferenceContext,
+    InferencePort,
     Model,
-    Provider,
-    ProviderContext,
     StreamOptions,
     UserMessage,
 )
@@ -57,7 +57,7 @@ def normalize_session_title(value: str, *, maximum: int = 60) -> str | None:
 async def rename_session(
     *,
     session: Session,
-    provider: Provider,
+    inference: InferencePort,
     model: Model,
     user_prompt: str,
     assistant_text: str,
@@ -79,14 +79,14 @@ async def rename_session(
         "Assistant outcome:\n"
         f"{assistant_text.strip()[:4_000]}"
     )
-    context = ProviderContext(
+    context = InferenceContext(
         system_prompt=_SYSTEM_PROMPT,
         messages=(UserMessage(prompt),),
         tools=(),
         session_id=f"{session.id}:rename",
     )
     response = await collect_assistant(
-        provider,
+        inference,
         model,
         context,
         replace(

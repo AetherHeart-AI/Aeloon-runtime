@@ -8,9 +8,7 @@ import pytest
 
 from aeloon_core.config import Config
 from aeloon_core.core import (
-    DEEPSEEK_V4_FLASH,
     AssistantMessage,
-    ScriptedProvider,
     TextContent,
     ToolResultMessage,
     Usage,
@@ -18,6 +16,8 @@ from aeloon_core.core import (
 )
 from aeloon_core.runtime import JsonlSessionRepository
 from aeloon_core.runtime.agent import SessionAgent
+from aeloon_core.runtime.providers import DEEPSEEK_V4_FLASH
+from aeloon_core.runtime.providers.testing import ScriptedProvider
 
 
 def _assistant(text: str) -> AssistantMessage:
@@ -48,9 +48,7 @@ async def test_session_stats_report_context_mix_and_cache_hits(tmp_path: Path) -
             ),
         )
     )
-    await session.append_message(
-        ToolResultMessage("call", "read", (TextContent("t" * 8),))
-    )
+    await session.append_message(ToolResultMessage("call", "read", (TextContent("t" * 8),)))
     await session.append_message(UserMessage("u" * 4))
 
     stats = await session.stats(context_window=100)
@@ -204,12 +202,16 @@ async def test_tree_navigation_can_summarize_and_label_abandoned_branch(tmp_path
     await session.append_message(UserMessage("branch work"))
     await session.append_message(_assistant("branch result"))
     provider = ScriptedProvider([_assistant("branch checkpoint")])
-    class StaticCatalog:
+
+    class StaticManager:
         async def model(self, _model_id):
             return DEEPSEEK_V4_FLASH
 
-        def provider(self, _model):
+        def inference(self, _model):
             return provider
+
+        async def close(self):
+            return None
 
     agent = SessionAgent(
         config=Config(
@@ -218,7 +220,7 @@ async def test_tree_navigation_can_summarize_and_label_abandoned_branch(tmp_path
             agent={"model": DEEPSEEK_V4_FLASH.id},
         ).normalized(),
         session=session,
-        catalog=StaticCatalog(),  # type: ignore[arg-type]
+        provider_manager=StaticManager(),  # type: ignore[arg-type]
     )
 
     result = await agent.navigate_tree(target, summarize=True, label="abandoned")

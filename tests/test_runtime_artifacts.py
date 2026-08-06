@@ -7,20 +7,23 @@ import pytest
 from aeloon_core.bridge import BridgeRpcAdapter
 from aeloon_core.config import Config, save_config
 from aeloon_core.core import (
-    ALL_TOOL_NAMES,
-    DEFAULT_ACTIVE_TOOLS,
     AssistantMessage,
-    ScriptedProvider,
     TextContent,
     ToolCall,
 )
 from aeloon_core.runtime import (
     PRESENT_FILES_TOOL_NAME,
+    Artifact,
     JsonlSessionRepository,
-    ProviderCatalog,
+    PresentFilesTool,
+    ProviderManager,
     RuntimeService,
-    create_present_files_tool,
 )
+from aeloon_core.runtime.providers.testing import ScriptedProvider
+from aeloon_core.tool import BuiltinToolSet
+
+ALL_TOOL_NAMES = BuiltinToolSet.all_names
+DEFAULT_ACTIVE_TOOLS = BuiltinToolSet.default_active_names
 
 
 @pytest.mark.asyncio
@@ -31,7 +34,7 @@ async def test_present_files_normalizes_supported_deliverables(tmp_path: Path) -
     presentation.write_bytes(b"presentation")
     document = output / "brief.md"
     document.write_text("# Brief\n", encoding="utf-8")
-    tool = create_present_files_tool(tmp_path)
+    tool = PresentFilesTool(tmp_path)
 
     result = await tool.execute(
         "present",
@@ -41,28 +44,26 @@ async def test_present_files_normalizes_supported_deliverables(tmp_path: Path) -
 
     assert tool.name == PRESENT_FILES_TOOL_NAME
     assert result.details["artifacts"] == [
-        {
-            "path": "output/Quarterly.PPTX",
-            "name": "Quarterly.PPTX",
-            "mime_type": (
-                "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-            ),
-            "size_bytes": len(b"presentation"),
-            "kind": "presentation",
-        },
-        {
-            "path": "output/brief.md",
-            "name": "brief.md",
-            "mime_type": "text/markdown",
-            "size_bytes": len("# Brief\n"),
-            "kind": "document",
-        },
+        Artifact(
+            path="output/Quarterly.PPTX",
+            name="Quarterly.PPTX",
+            mime_type=("application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+            size_bytes=len(b"presentation"),
+            kind="presentation",
+        ),
+        Artifact(
+            path="output/brief.md",
+            name="brief.md",
+            mime_type="text/markdown",
+            size_bytes=len("# Brief\n"),
+            kind="document",
+        ),
     ]
 
 
 @pytest.mark.asyncio
 async def test_present_files_rejects_unsafe_or_intermediate_paths(tmp_path: Path) -> None:
-    tool = create_present_files_tool(tmp_path)
+    tool = PresentFilesTool(tmp_path)
     (tmp_path / "generator.py").write_text("print('generate')", encoding="utf-8")
     directory = tmp_path / "folder"
     directory.mkdir()
@@ -129,9 +130,9 @@ async def test_runtime_projects_presented_files_live_and_from_history(tmp_path: 
     )
     runtime = RuntimeService(
         config_path=config_path,
-        catalog_factory=lambda config: ProviderCatalog(
+        provider_manager_factory=lambda config: ProviderManager(
             config,
-            local_provider_factory=lambda **_kwargs: provider,
+            driver_factories={"deepseek": lambda *_args: provider},
         ),
     )
     bridge = BridgeRpcAdapter(runtime)
@@ -158,8 +159,7 @@ async def test_runtime_projects_presented_files_live_and_from_history(tmp_path: 
     completed = next(
         event
         for event in bridge._events
-        if event["name"] == "tool.completed"
-        and event["operation_id"] == started["operation_id"]
+        if event["name"] == "tool.completed" and event["operation_id"] == started["operation_id"]
     )
     assert completed["payload"]["patch"]["artifacts"][0]["path"] == "report.pptx"
     snapshot = await bridge.dispatch("session.get", {"session_id": session["session_id"]})

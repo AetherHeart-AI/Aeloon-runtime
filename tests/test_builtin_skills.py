@@ -19,8 +19,7 @@ def test_provision_builtin_skills_is_idempotent_and_preserves_existing(tmp_path:
     assert custom.read_text(encoding="utf-8") == "custom office skill\n"
     assert provision_builtin_skills(tmp_path) == ()
     assert all(
-        (tmp_path / "skills" / skill_id / "SKILL.md").is_file()
-        for skill_id in BUILTIN_SKILL_IDS
+        (tmp_path / "skills" / skill_id / "SKILL.md").is_file() for skill_id in BUILTIN_SKILL_IDS
     )
     assert all(
         (tmp_path / "skills" / skill_id / "agents" / "openai.yaml").is_file()
@@ -37,10 +36,9 @@ def test_runtime_bootstrap_copies_and_discovers_builtin_skills(tmp_path: Path) -
     loader = ResourceLoader(cwd=tmp_path, agent_dir=data_dir)
     resources = loader.reload()
     assert {skill.name for skill in resources.skills} == set(BUILTIN_SKILL_IDS)
-    assert all(skill.content == "" for skill in resources.skills)
+    assert all(not hasattr(skill, "content") for skill in resources.skills)
     loaded = loader.load_skill("ppt")
     assert "定义演示策略" in loaded.content
     assert all(
-        "present_files" in loader.load_skill(skill_id).content
-        for skill_id in BUILTIN_SKILL_IDS
+        "present_files" in loader.load_skill(skill_id).content for skill_id in BUILTIN_SKILL_IDS
     )
