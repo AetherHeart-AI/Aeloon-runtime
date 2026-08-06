@@ -8,18 +8,18 @@ from typing import Any
 import httpx
 import pytest
 
-from aeloon_core.bootstrap import cloud_provider_source
 from aeloon_core.bridge import BridgeRpcAdapter
 from aeloon_core.cloud import (
     CloudAccountService,
-    CloudProvider,
+    CloudConfig,
     CloudTokenBundle,
     InMemoryTokenVault,
 )
-from aeloon_core.config import CloudConfig, Config, save_config
-from aeloon_core.core import Model, ProviderContext, StreamOptions, UserMessage
-from aeloon_core.core.providers import collect_assistant
-from aeloon_core.runtime import ProviderCatalog, RuntimeService
+from aeloon_core.config import Config, save_config
+from aeloon_core.core import InferenceContext, Model, StreamOptions, UserMessage
+from aeloon_core.core.inference_runtime import collect_assistant
+from aeloon_core.runtime import RuntimeService
+from aeloon_core.runtime.providers import CloudProvider
 
 
 class FakeCloudClient:
@@ -78,7 +78,7 @@ def account(tmp_path: Path) -> tuple[CloudAccountService, FakeCloudClient, InMem
 
 
 @pytest.mark.asyncio
-async def test_account_owns_refresh_token_and_qualified_catalog(tmp_path: Path) -> None:
+async def test_account_owns_refresh_token_and_raw_catalog(tmp_path: Path) -> None:
     service, client, vault = account(tmp_path)
     assert service.status()["authenticated"] is False
 
@@ -91,8 +91,8 @@ async def test_account_owns_refresh_token_and_qualified_catalog(tmp_path: Path) 
     assert "refresh-1" not in service.state_path.read_text(encoding="utf-8")
     assert service.state_path.stat().st_mode & 0o777 == 0o600
     models = await service.models()
-    assert list(models) == ["aeloon-cloud/reasoner"]
-    assert models["aeloon-cloud/reasoner"].context_window == 200_000
+    assert models[0]["model_key"] == "reasoner"
+    assert models[0]["context_window"] == 200_000
     assert client.login_calls[0]["device_name"] == "Aeloon Core"
 
     service._access_expires_at = datetime.now(UTC)
@@ -111,10 +111,6 @@ async def test_bridge_exposes_account_without_credentials_and_adds_cloud_models(
     runtime = RuntimeService(
         config_path=config_path,
         account_gateway=cloud,  # type: ignore[arg-type]
-        catalog_factory=lambda config: ProviderCatalog(
-            config,
-            remote_sources=(cloud_provider_source(cloud),),
-        ),
     )
     service = BridgeRpcAdapter(runtime)
 
@@ -131,8 +127,7 @@ async def test_bridge_exposes_account_without_credentials_and_adds_cloud_models(
 
     session = await service.dispatch("session.create", {"workspace": str(tmp_path)})
     configured = await service.dispatch(
-        "session.configure",
-        {"session_id": session["session_id"], "model_id": cloud_model["id"]}
+        "session.configure", {"session_id": session["session_id"], "model_id": cloud_model["id"]}
     )
     assert configured["model_id"] == "aeloon-cloud/reasoner"
     replay = await service.dispatch("events.subscribe", {"session_ids": [], "after_seq": 0})
@@ -154,6 +149,12 @@ class ProviderAccount:
         self.forces.append(force)
         return "fresh" if force else "expired"
 
+    def status(self):
+        return {"authenticated": True, "user": None}
+
+    async def models(self):
+        return []
+
 
 @pytest.mark.asyncio
 async def test_cloud_provider_strips_provider_prefix_and_refreshes_after_401() -> None:
@@ -174,19 +175,21 @@ async def test_cloud_provider_strips_provider_prefix_and_refreshes_after_401() -
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     account = ProviderAccount()
-    provider = CloudProvider(account, client=client)  # type: ignore[arg-type]
+    provider = CloudProvider(
+        account,  # type: ignore[arg-type]
+        endpoint="https://cloud.example",
+        client=client,
+    )
     model = Model(
         id="aeloon-cloud/reasoner",
         name="Cloud Reasoner",
         provider="aeloon-cloud",
-        base_url="https://cloud.example",
         reasoning=True,
-        thinking_level_map={"high": "high", "max": "max"},
     )
     message = await collect_assistant(
         provider,
         model,
-        ProviderContext("", (UserMessage("hello"),), (), "session"),
+        InferenceContext("", (UserMessage("hello"),), (), "session"),
         StreamOptions(max_retries=0, thinking_level="high"),
     )
     await client.aclose()

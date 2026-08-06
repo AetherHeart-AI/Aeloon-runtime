@@ -7,7 +7,7 @@ from typing import Any, Protocol
 
 class AccountConfig(Protocol):
     enabled: bool
-    base_url: str
+    endpoint: str
     proxy: str | None
     device_name: str
     allow_insecure_http: bool
@@ -15,6 +15,10 @@ class AccountConfig(Protocol):
 
 class AccountGateway(Protocol):
     def status(self) -> dict[str, Any]: ...
+
+    async def models(self) -> list[dict[str, Any]]: ...
+
+    async def access_token(self, *, force: bool = False) -> str: ...
 
     async def login(self, *, username: str, password: str) -> dict[str, Any]: ...
 
@@ -30,12 +34,19 @@ class NullAccountGateway:
         return {
             "enabled": False,
             "authenticated": False,
-            "base_url": None,
+            "endpoint": None,
             "user": None,
         }
 
     async def login(self, *, username: str, password: str) -> dict[str, Any]:
         del username, password
+        raise RuntimeError("No account provider is configured")
+
+    async def models(self) -> list[dict[str, Any]]:
+        return []
+
+    async def access_token(self, *, force: bool = False) -> str:
+        del force
         raise RuntimeError("No account provider is configured")
 
     def logout(self) -> dict[str, Any]:

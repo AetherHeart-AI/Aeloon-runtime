@@ -15,9 +15,7 @@ from typing import Any
 from aeloon_core.cloud.client import CloudClient, CloudError, CloudTokenBundle
 from aeloon_core.cloud.config import CloudConfig
 from aeloon_core.cloud.vault import TokenVault, default_token_vault
-from aeloon_core.core import Model
 
-CLOUD_PROVIDER_ID = "aeloon-cloud"
 CATALOG_TTL_SECONDS = 3_600
 
 
@@ -100,7 +98,7 @@ class CloudAccountService:
                 raise CloudError("Aeloon Cloud token refresh failed", status_code=401)
             return self._access_token
 
-    async def models(self, *, force: bool = False) -> dict[str, Model]:
+    async def models(self, *, force: bool = False) -> list[dict[str, Any]]:
         if not force and self._catalog is not None:
             if time.monotonic() - self._catalog_at < CATALOG_TTL_SECONDS:
                 return self._models_from_payload(self._catalog)
@@ -186,51 +184,10 @@ class CloudAccountService:
         if os.name != "nt":
             os.chmod(self.state_path, 0o600)
 
-    def _models_from_payload(self, payload: dict[str, Any]) -> dict[str, Model]:
+    @staticmethod
+    def _models_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
         raw_models = payload.get("models")
         if not isinstance(raw_models, list):
             data = payload.get("data")
             raw_models = data.get("models") if isinstance(data, dict) else []
-        models: dict[str, Model] = {}
-        for raw in raw_models if isinstance(raw_models, list) else []:
-            if not isinstance(raw, dict):
-                continue
-            key = str(
-                raw.get("model_key")
-                or raw.get("modelKey")
-                or raw.get("id")
-                or raw.get("model")
-                or ""
-            ).strip()
-            if not key:
-                continue
-            model_id = f"{CLOUD_PROVIDER_ID}/{key}"
-            context_window = self._positive_int(
-                raw.get("context_window") or raw.get("contextWindow"), 128_000
-            )
-            max_tokens = self._positive_int(
-                raw.get("max_tokens") or raw.get("maxTokens"), min(32_768, context_window)
-            )
-            inputs = ["text"]
-            if raw.get("supports_image") is True or raw.get("supportsImage") is True:
-                inputs.append("image")
-            models[model_id] = Model(
-                id=model_id,
-                name=str(raw.get("display_name") or raw.get("name") or key),
-                provider=CLOUD_PROVIDER_ID,
-                base_url=self.client.base_url,
-                reasoning=bool(raw.get("reasoning") or raw.get("supports_reasoning")),
-                input=tuple(inputs),
-                context_window=context_window,
-                max_tokens=max_tokens,
-                thinking_level_map={"high": "high", "max": "max"},
-            )
-        return models
-
-    @staticmethod
-    def _positive_int(value: Any, default: int) -> int:
-        try:
-            parsed = int(value)
-        except (TypeError, ValueError):
-            return default
-        return parsed if parsed > 0 else default
+        return [dict(item) for item in raw_models if isinstance(item, dict)]

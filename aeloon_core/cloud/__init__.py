@@ -1,9 +1,8 @@
-"""Optional Aeloon Cloud account and provider integration."""
+"""Aeloon Cloud identity, token vault, and raw catalog integration."""
 
 from aeloon_core.cloud.account import CloudAccountService
 from aeloon_core.cloud.client import CloudClient, CloudError, CloudTokenBundle
 from aeloon_core.cloud.config import CloudConfig
-from aeloon_core.cloud.provider import CloudProvider
 from aeloon_core.cloud.vault import InMemoryTokenVault, TokenVault
 
 __all__ = [
@@ -11,7 +10,6 @@ __all__ = [
     "CloudClient",
     "CloudConfig",
     "CloudError",
-    "CloudProvider",
     "CloudTokenBundle",
     "InMemoryTokenVault",
     "TokenVault",

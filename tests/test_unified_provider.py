@@ -7,80 +7,252 @@ from typing import Any
 import httpx
 import pytest
 
-from aeloon_core.bootstrap import create_runtime_service
 from aeloon_core.bridge import BridgeRpcAdapter
-from aeloon_core.config import Config, LocalModelConfig, LocalProviderConfig, save_config
-from aeloon_core.core import DeepSeekProvider, ProviderContext, StreamOptions, UserMessage
-from aeloon_core.core.providers import collect_assistant
+from aeloon_core.config import (
+    Config,
+    OllamaProviderConfig,
+    OpenAICompatibleProviderConfig,
+    ProviderModelConfig,
+    save_config,
+)
+from aeloon_core.core import InferenceContext, Model, StreamOptions, UserMessage
+from aeloon_core.core.inference_runtime import collect_assistant
 from aeloon_core.runtime import (
-    ProviderCatalog,
+    ProviderManager,
+    RuntimeService,
     normalize_model_id,
     qualify_model_id,
     resolve_model_id,
     split_model_id,
 )
+from aeloon_core.runtime.providers import BaseProvider, OllamaProvider
 
 
-class OfflineCloudAccount:
-    def status(self) -> dict[str, Any]:
-        return {
-            "enabled": True,
-            "authenticated": False,
-            "user": None,
-            "base_url": "https://cloud.example",
+class TrackingProvider(BaseProvider):
+    def __init__(
+        self,
+        provider_id: str,
+        *,
+        models: tuple[Model, ...] = (),
+        authenticated: bool | None = None,
+        fail_models: bool = False,
+        enabled: bool = True,
+    ) -> None:
+        super().__init__(
+            provider_id=provider_id,
+            name=provider_id,
+            endpoint="https://provider.example/v1",
+            enabled=enabled,
+        )
+        self._models = {model.id: model for model in models}
+        self.authenticated = authenticated
+        self.fail_models = fail_models
+        self.close_calls = 0
+
+    async def models(self):
+        if self.fail_models:
+            raise RuntimeError("temporary discovery failure")
+        return dict(self._models)
+
+    def stream(self, _model, _context, _options):
+        async def empty():
+            if False:
+                yield None
+
+        return empty()
+
+    def status(self):
+        return {**super().status(), "authenticated": self.authenticated}
+
+    async def close(self):
+        self.close_calls += 1
+
+
+def _provider_config(
+    provider_id: str,
+    *,
+    enabled: bool = True,
+) -> OpenAICompatibleProviderConfig:
+    return OpenAICompatibleProviderConfig(
+        name=provider_id,
+        endpoint=f"https://{provider_id}.example/v1",
+        enabled=enabled,
+        models=[ProviderModelConfig(id="model")],
+    )
+
+
+def _provider_only_config(**providers) -> Config:
+    defaults = Config().providers
+    return Config(
+        providers={
+            "deepseek": defaults["deepseek"].model_copy(update={"enabled": False}),
+            "aeloon-cloud": defaults["aeloon-cloud"].model_copy(update={"enabled": False}),
+            **providers,
         }
+    )
 
 
-def test_model_ids_use_one_provider_prefix_and_upgrade_legacy_deepseek() -> None:
+def test_model_ids_use_one_provider_prefix_without_legacy_upgrade() -> None:
+    available = ["deepseek/deepseek-v4-pro", "studio/coder"]
     assert qualify_model_id("ollama", "llama/3.3") == "ollama/llama/3.3"
     assert qualify_model_id("ollama", "ollama/llama/3.3") == "ollama/llama/3.3"
     assert split_model_id("ollama/llama/3.3") == ("ollama", "llama/3.3")
-    assert normalize_model_id("deepseek-v4-pro") == "deepseek/deepseek-v4-pro"
-    with pytest.raises(ValueError, match="provider/model"):
-        normalize_model_id("unqualified-model")
+    assert normalize_model_id("coder", available) == "studio/coder"
+    with pytest.raises(KeyError, match="Unknown model"):
+        normalize_model_id("unqualified-model", available)
 
 
 def test_unqualified_model_id_uses_first_matching_provider() -> None:
     available = ["studio/coder", "backup/coder", "studio/org/model"]
-
     assert resolve_model_id("coder", available) == "studio/coder"
     assert resolve_model_id("org/model", available) == "studio/org/model"
     assert resolve_model_id("backup/coder", available) == "backup/coder"
 
 
 @pytest.mark.asyncio
-async def test_registry_resolves_unqualified_model_to_first_provider() -> None:
+async def test_manager_resolves_unqualified_model_in_configuration_order() -> None:
+    studio = OpenAICompatibleProviderConfig(
+        name="Studio",
+        endpoint="http://127.0.0.1:8000/v1",
+        models=[ProviderModelConfig(id="coder")],
+    )
+    backup = OpenAICompatibleProviderConfig(
+        name="Backup",
+        endpoint="http://127.0.0.1:9000/v1",
+        models=[ProviderModelConfig(id="coder")],
+    )
     config = Config(
-        local_providers={
-            "studio": LocalProviderConfig(
-                name="Studio",
-                base_url="http://127.0.0.1:8000/v1",
-                models=[
-                    LocalModelConfig(id="coder"),
-                    LocalModelConfig(id="deepseek-v4-flash"),
-                ],
-            ),
-            "backup": LocalProviderConfig(
-                name="Backup",
-                base_url="http://127.0.0.1:9000/v1",
-                models=[
-                    LocalModelConfig(id="coder"),
-                    LocalModelConfig(id="deepseek-v4-flash"),
-                ],
-            ),
+        providers={
+            **Config().providers,
+            "studio": studio,
+            "backup": backup,
         }
     ).normalized()
-    registry = ProviderCatalog(config)
-
-    assert (await registry.model("coder")).id == "studio/coder"
-    assert (
-        await registry.model("deepseek-v4-flash")
-    ).id == "studio/deepseek-v4-flash"
-    assert (await registry.model("backup/coder")).id == "backup/coder"
+    manager = ProviderManager(config)
+    try:
+        assert (await manager.model("coder")).id == "studio/coder"
+        assert (await manager.model("backup/coder")).id == "backup/coder"
+    finally:
+        await manager.close()
 
 
 @pytest.mark.asyncio
-async def test_local_provider_routes_qualified_model_to_unprefixed_api_model() -> None:
+async def test_manager_is_lazy_isolates_failures_and_closes_idempotently() -> None:
+    created: dict[str, TrackingProvider] = {}
+    calls: list[str] = []
+
+    def factory(provider_id: str, _configured: Any, _account: Any) -> BaseProvider:
+        calls.append(provider_id)
+        provider = TrackingProvider(
+            provider_id,
+            models=(Model(f"{provider_id}/model", "model", provider_id),),
+            fail_models=provider_id == "broken",
+        )
+        created[provider_id] = provider
+        return provider
+
+    manager = ProviderManager(
+        _provider_only_config(
+            broken=_provider_config("broken"),
+            studio=_provider_config("studio"),
+        ),
+        driver_factories={"openai-compatible": factory},
+    )
+    assert calls == []
+
+    models = await manager.models()
+
+    assert list(models) == ["studio/model"]
+    assert calls == ["broken", "studio"]
+    selected = await manager.model("studio/model")
+    assert manager.inference(selected) is created["studio"]
+    assert calls == ["broken", "studio"]
+
+    await manager.close()
+    await manager.close()
+    assert created["broken"].close_calls == 1
+    assert created["studio"].close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_manager_lazily_owns_and_closes_snapshot_account_gateway() -> None:
+    accounts = []
+
+    class Account:
+        close_calls = 0
+
+        def status(self):
+            return {"authenticated": False, "user": None}
+
+        async def models(self):
+            return []
+
+        async def close(self):
+            self.close_calls += 1
+
+    def account_factory():
+        value = Account()
+        accounts.append(value)
+        return value
+
+    defaults = Config().providers
+    config = Config(
+        providers={
+            "deepseek": defaults["deepseek"].model_copy(update={"enabled": False}),
+            "aeloon-cloud": defaults["aeloon-cloud"],
+        }
+    )
+    manager = ProviderManager(
+        config,
+        account_factory=account_factory,
+        close_account=True,
+    )
+    assert accounts == []
+
+    await manager.providers()
+
+    assert len(accounts) == 1
+    await manager.close()
+    await manager.close()
+    assert accounts[0].close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_manager_rejects_disabled_and_unauthenticated_providers() -> None:
+    providers = {
+        "disabled": TrackingProvider(
+            "disabled",
+            models=(Model("disabled/model", "model", "disabled"),),
+        ),
+        "locked": TrackingProvider(
+            "locked",
+            models=(Model("locked/model", "model", "locked"),),
+            authenticated=False,
+        ),
+    }
+
+    def factory(provider_id: str, configured: Any, _account: Any) -> BaseProvider:
+        providers[provider_id].enabled = configured.enabled
+        return providers[provider_id]
+
+    manager = ProviderManager(
+        _provider_only_config(
+            disabled=_provider_config("disabled", enabled=False),
+            locked=_provider_config("locked"),
+        ),
+        driver_factories={"openai-compatible": factory},
+    )
+    try:
+        with pytest.raises(RuntimeError, match="disabled"):
+            await manager.model("disabled/model")
+        with pytest.raises(PermissionError, match="Authenticate"):
+            await manager.model("locked/model")
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_ollama_routes_qualified_model_to_unprefixed_api_model() -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -95,119 +267,114 @@ async def test_local_provider_routes_qualified_model_to_unprefixed_api_model() -
         )
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    config = Config(
-        local_providers={
-            "ollama": LocalProviderConfig(
-                name="Ollama",
-                base_url="http://127.0.0.1:11434/v1",
-                models=[LocalModelConfig(id="llama/3.3")],
-            )
-        }
-    ).normalized()
-    registry = ProviderCatalog(
-        config,
-        local_provider_factory=lambda **kwargs: DeepSeekProvider(client=client, **kwargs),
+    model_config = ProviderModelConfig(id="llama/3.3")
+    config = OllamaProviderConfig(name="Ollama", models=[model_config])
+    model = ProviderManager(Config(providers={**Config().providers, "ollama": config}))
+    selected = await model.model("ollama/llama/3.3")
+    provider = OllamaProvider(
+        provider_id="ollama",
+        name="Ollama",
+        models=(selected,),
+        client=client,
     )
-
-    model = await registry.model("ollama/llama/3.3")
     message = await collect_assistant(
-        registry.provider(model),
-        model,
-        ProviderContext("", (UserMessage("hello"),), (), "session"),
+        provider,
+        selected,
+        InferenceContext("", (UserMessage("hello"),), (), "session"),
         StreamOptions(max_retries=0),
     )
+    await model.close()
     await client.aclose()
 
     assert message.text == "local"
-    assert model.id == "ollama/llama/3.3"
     assert json.loads(requests[0].content)["model"] == "llama/3.3"
     assert "authorization" not in requests[0].headers
 
 
 @pytest.mark.asyncio
-async def test_bridge_adds_and_removes_local_provider_without_exposing_secret(
+async def test_bridge_adds_and_removes_provider_without_exposing_secret(
     tmp_path: Path,
 ) -> None:
     config_path = tmp_path / "config.json"
     save_config(Config(workspace=tmp_path, data_dir=tmp_path / "data"), config_path)
-    runtime = create_runtime_service(config_path=config_path)
+    runtime = RuntimeService(config_path=config_path)
     service = BridgeRpcAdapter(runtime)
 
     added = await service.dispatch(
-        "provider.local.add",
+        "provider.add",
         {
             "provider_id": "studio",
+            "driver": "openai-compatible",
             "name": "Studio API",
-            "base_url": "http://127.0.0.1:9000/v1/",
+            "endpoint": "http://127.0.0.1:9000/v1/",
             "api_key": "local-secret",
             "models": ["coder", {"id": "vision", "supports_image": True}],
         },
     )
     catalog = await service.dispatch("catalog.get")
     settings = await service.dispatch("settings.get")
-    listed = await service.dispatch("provider.list")
 
-    assert added["provider"]["id"] == "studio"
+    assert added["provider"]["driver"] == "openai-compatible"
     assert added["provider"]["model_ids"] == ["studio/coder", "studio/vision"]
     assert "local-secret" not in json.dumps(added)
-    assert {model["id"] for model in catalog["models"]} >= {
-        "deepseek/deepseek-v4-flash",
-        "studio/coder",
-        "studio/vision",
-    }
     catalog_models = {model["id"]: model for model in catalog["models"]}
     assert catalog_models["studio/coder"]["supports_image"] is False
     assert catalog_models["studio/vision"]["supports_image"] is True
-    assert {provider["id"] for provider in listed["providers"]} >= {
-        "deepseek",
-        "studio",
-        "aeloon-cloud",
-    }
-    assert settings["local_providers"]["studio"]["credential_configured"] is True
+    assert settings["providers"]["studio"]["credential_configured"] is True
     assert "local-secret" not in json.dumps(settings)
     persisted = json.loads(config_path.read_text(encoding="utf-8"))
-    assert persisted["local_providers"]["studio"]["api_key"] == "local-secret"
+    assert persisted["providers"]["studio"]["api_key"] == "local-secret"
 
-    removed = await service.dispatch("provider.local.remove", {"provider_id": "studio"})
+    removed = await service.dispatch("provider.remove", {"provider_id": "studio"})
     assert removed["removed"] is True
-    assert all(
-        model["provider_id"] != "studio"
-        for model in (await service.dispatch("catalog.get"))["models"]
-    )
     await service.close()
 
 
 @pytest.mark.asyncio
-async def test_bridge_discovers_models_when_local_provider_omits_model_list(
-    tmp_path: Path,
-) -> None:
+async def test_bridge_discovers_models_through_selected_driver(tmp_path: Path) -> None:
     config_path = tmp_path / "config.json"
     save_config(Config(workspace=tmp_path, data_dir=tmp_path / "data"), config_path)
-    runtime = create_runtime_service(config_path=config_path)
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "id": "discovered",
+                        "name": "Discovered Model",
+                        "context_window": 64_000,
+                    }
+                ]
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    def factory(config: Config) -> ProviderManager:
+        def ollama(provider_id: str, configured: Any, _account: Any):
+            return OllamaProvider(
+                provider_id=provider_id,
+                name=configured.name,
+                endpoint=configured.endpoint,
+                client=client,
+            )
+
+        return ProviderManager(config, driver_factories={"ollama": ollama})
+
+    runtime = RuntimeService(
+        config_path=config_path,
+        provider_manager_factory=factory,
+    )
     service = BridgeRpcAdapter(runtime)
-    calls: list[dict[str, Any]] = []
-
-    async def discover(base_url: str, **kwargs: Any) -> list[dict[str, Any]]:
-        calls.append({"base_url": base_url, **kwargs})
-        return [{"id": "discovered", "name": "Discovered Model", "context_window": 64_000}]
-
-    runtime._discover_local_models = discover  # type: ignore[method-assign]
     added = await service.dispatch(
-        "provider.local.add",
-        {
-            "provider_id": "desktop",
-            "base_url": "http://127.0.0.1:8080/v1/",
-            "api_key": "no-key",
-        },
+        "provider.add",
+        {"provider_id": "desktop", "driver": "ollama"},
     )
 
     assert added["provider"]["model_ids"] == ["desktop/discovered"]
-    assert calls == [
-        {
-            "base_url": "http://127.0.0.1:8080/v1",
-            "api_key": "no-key",
-            "proxy": None,
-            "extra_headers": {},
-        }
-    ]
+    assert requests[0].url.path == "/v1/models"
     await service.close()
+    await client.aclose()

@@ -5,21 +5,19 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from aeloon_core.cloud import CloudAccountService, CloudProvider
+from aeloon_core.cloud import CloudAccountService
 from aeloon_core.cloud import CloudConfig as CloudServiceConfig
-from aeloon_core.cloud.account import CLOUD_PROVIDER_ID
-from aeloon_core.config import Config, load_config
-from aeloon_core.core import Provider
+from aeloon_core.config import CloudProviderConfig, Config, load_config
 from aeloon_core.runtime.agent import SessionAgentFactory
-from aeloon_core.runtime.catalog import ProviderCatalog, RemoteProviderSource
 from aeloon_core.runtime.ports import AccountConfig
+from aeloon_core.runtime.providers import ProviderManager, ProviderManagerFactory
 from aeloon_core.runtime.service import RuntimeService
 
 
 def _cloud_config(config: AccountConfig) -> CloudServiceConfig:
     return CloudServiceConfig(
         enabled=config.enabled,
-        base_url=config.base_url,
+        base_url=config.endpoint,
         proxy=config.proxy,
         device_name=config.device_name,
         allow_insecure_http=config.allow_insecure_http,
@@ -36,11 +34,11 @@ class CloudAccountGateway:
     def status(self) -> dict[str, Any]:
         return self._service.status()
 
-    async def models(self):
+    async def models(self) -> list[dict[str, Any]]:
         return await self._service.models()
 
-    def create_provider(self) -> Provider:
-        return CloudProvider(self._service)
+    async def access_token(self, *, force: bool = False) -> str:
+        return await self._service.access_token(force=force)
 
     async def login(self, *, username: str, password: str) -> dict[str, Any]:
         return await self._service.login(username=username, password=password)
@@ -62,19 +60,6 @@ class CloudAccountGateway:
         await self._service.close()
 
 
-def cloud_provider_source(account: CloudAccountService) -> RemoteProviderSource:
-    """Adapt an existing cloud account for a provider-neutral catalog."""
-
-    return RemoteProviderSource(
-        id=CLOUD_PROVIDER_ID,
-        name="Aeloon Cloud",
-        kind="cloud",
-        status=account.status,
-        models=account.models,
-        create_provider=lambda: CloudProvider(account),
-    )
-
-
 def create_runtime_service(
     *,
     config_path: Path | str | None = None,
@@ -85,27 +70,32 @@ def create_runtime_service(
     config = load_config(config_path)
     if data_dir is not None:
         config = config.model_copy(update={"data_dir": Path(data_dir)}).normalized()
-    account = CloudAccountGateway(config.cloud, data_dir=config.data_dir)
-    source = RemoteProviderSource(
-        id=CLOUD_PROVIDER_ID,
-        name="Aeloon Cloud",
-        kind="cloud",
-        status=account.status,
-        models=account.models,
-        create_provider=account.create_provider,
-    )
+    cloud_config = config.providers["aeloon-cloud"]
+    assert isinstance(cloud_config, CloudProviderConfig)
+    account = CloudAccountGateway(cloud_config, data_dir=config.data_dir)
 
-    def catalog_factory(value: Config) -> ProviderCatalog:
-        return ProviderCatalog(value, remote_sources=(source,))
+    def create_provider_manager(snapshot: Config) -> ProviderManager:
+        snapshot_cloud = snapshot.providers["aeloon-cloud"]
+        assert isinstance(snapshot_cloud, CloudProviderConfig)
+        return ProviderManager(
+            snapshot,
+            account_factory=lambda: CloudAccountGateway(
+                snapshot_cloud,
+                data_dir=snapshot.data_dir,
+            ),
+            close_account=True,
+        )
+
+    manager_factory: ProviderManagerFactory = create_provider_manager
 
     return RuntimeService(
         config_path=config_path,
         data_dir=data_dir,
         max_concurrent_operations=max_concurrent_operations,
         agent_factory=agent_factory,
-        catalog_factory=catalog_factory,
+        provider_manager_factory=manager_factory,
         account_gateway=account,
     )
 
 
-__all__ = ["CloudAccountGateway", "cloud_provider_source", "create_runtime_service"]
+__all__ = ["CloudAccountGateway", "create_runtime_service"]
