@@ -61,7 +61,7 @@ Consider: Purpose (corporate/educational/creative), Audience, Tone, Content Volu
 1. **Analyze**: Understand topic, audience, purpose
 2. **Choose Layout**: Select based on content
 3. **Write Slide**: Use PptxGenJS. Use shapes and SVG elements for visual interest.
-4. **Verify**: Generate preview as `slide-XX-preview.pptx`. Extract text with `python -m markitdown slide-XX-preview.pptx`, verify all content present and no placeholder text remains.
+4. **Verify**: Generate preview as `slide-XX-preview.pptx`. Extract text with `aeloon system skill markitdown convert slide-XX-preview.pptx slide-XX-preview.md --overwrite`, verify all content present and no placeholder text remains.
 
 ---
 

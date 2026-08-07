@@ -13,8 +13,7 @@ description: 使用 Microsoft MarkItDown 在本地读取和转换 WPS 或 Micros
 2. 运行技能自带的安全本地转换器：
 
 ```bash
-uv run --with 'markitdown[pdf,docx,pptx,xlsx]' \
-  python scripts/convert.py input.docx output.md
+aeloon system skill markitdown convert input.docx output.md
 ```
 
 3. 检查输出是否非空，并与源文件抽查标题、列表、表格、超链接、工作表边界和演示备注。
@@ -22,7 +21,8 @@ uv run --with 'markitdown[pdf,docx,pptx,xlsx]' \
 
 ## 约束
 
-- 优先使用 `scripts/convert.py`，它拒绝 URL 并只调用本地转换接口。
+- 使用 Aeloon 内置运行器调用转换器；MarkItDown 及 DOCX、PPTX、XLSX、PDF 解析依赖随 Aeloon 安装。
+- 转换器拒绝 URL 并只调用本地转换接口。
 - MarkItDown 的目标是适合分析的结构化文本，不承诺像素级版面还原。
 - 私密文档不得启用云端、远程 URI、Azure、视觉模型或第三方插件。
 - 保留原文件作为权威版本；输出中记录源文件名和转换失败项。

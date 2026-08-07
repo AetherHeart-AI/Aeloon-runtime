@@ -108,9 +108,10 @@ with the `markitdown`, `pdf`, `paddleocr-doc-parsing`, `pptx-generator`, and
 `document-format-skills` execution presets. On first startup after installation, any missing
 presets are copied from the package resources into `<data_dir>/skills` (normally
 `~/.aeloon-core/skills`). Existing same-named files and directories are preserved, so local
-customizations are not overwritten. Office execution dependencies and local OCR models are
-optional external runtimes; they are checked by their skills and are not embedded in the base
-single-file executable.
+customizations are not overwritten. Official packages include the Python, Node.js, PptxGenJS,
+PDF, DOCX, and local OCR execution dependencies used by these built-in skills. OCR model weights
+are downloaded once to the Aeloon data directory and can be prewarmed for offline use. LibreOffice
+remains optional and is used only to render DOCX/PPTX files for visual QA.
 
 Skill discovery is progressive: Runtime reads only each `SKILL.md` frontmatter for the catalog and
 system-prompt index. The full instructions are read only when the model chooses an enabled skill or
@@ -197,15 +198,19 @@ uv run --isolated --frozen --no-default-groups \
   pyinstaller --clean --noconfirm aeloon.spec
 ```
 
-The executable is written to `dist/aeloon`. It includes Python, runtime dependencies, the Bridge
-schema, and bundled skills, so the target Mac does not need Python or `uv`. Install it somewhere on
-your `PATH`:
+The executable is written to `dist/aeloon`. It includes Python, Node.js, office Skill runtime
+dependencies, the Bridge schema, and bundled skills, so the target Mac does not need Python,
+Node.js, npm, or `uv`. Install it somewhere on your `PATH`:
 
 ```bash
 mkdir -p ~/.local/bin
 install -m 755 dist/aeloon ~/.local/bin/aeloon
 aeloon --version
 ```
+
+Tagged releases also attach a wheel and source distribution. Installing the official wheel with
+`uv tool install ./aeloon_core-<version>-py3-none-any.whl` installs the declared Python, Node.js,
+PDF, DOCX, and PaddleOCR dependencies, while the wheel itself carries the pinned PptxGenJS assets.
 
 This build targets Apple Silicon Macs and uses an ad-hoc signature. It is intended for local use;
 public distribution requires Developer ID signing and notarization. A PyInstaller binary must be

@@ -10,6 +10,7 @@ __pycache__/
 
 aeloon_core/web/node_modules/
 aeloon_core/pi_runtime/node_modules/
+aeloon_core/resources/skills/pptx-generator/runtime/node_modules/
 
 .benchmark-workspaces/
 benchmarks/results/

@@ -7,14 +7,14 @@ description: 统筹 Word、PowerPoint、表格和业务报告等跨格式办公�
 
 ## 运行环境预检
 
-在首次执行或依赖报错时运行总预检；它只读取环境状态，不安装依赖或下载模型：
+在首次执行或依赖报错时运行总预检；它只读取内置运行时和外部渲染工具状态，不安装依赖或下载模型：
 
 ```bash
-python scripts/preflight.py
-python scripts/preflight.py --require markitdown --require pdf
+aeloon system skill office preflight
+aeloon system skill office preflight --require markitdown --require pdf
 ```
 
-`--require` 可选值为 `markitdown`、`pdf`、`ocr`、`pptx` 和 `docx`。指定的运行环境不完整时命令返回非零状态，并显示对应安装提示。
+`--require` 可选值为 `markitdown`、`pdf`、`ocr`、`pptx`、`pptx-render` 和 `docx`。`pptx` 只检查内置生成运行时，`pptx-render` 还要求可选的 LibreOffice。指定的运行环境不完整时命令返回非零状态，并显示对应提示。
 
 ## 明确交付目标
 

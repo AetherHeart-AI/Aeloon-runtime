@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
-"""Render a local PDF to PNG pages with Poppler."""
+"""Render a local PDF to PNG pages with packaged pypdfium2."""
 
 from __future__ import annotations
 
 import argparse
-import shutil
-import subprocess
 import sys
 from pathlib import Path
+
+
+def import_pdfium():
+    try:
+        import pypdfium2
+    except ImportError as exc:
+        raise RuntimeError("bundled pypdfium2 runtime is missing; reinstall Aeloon Core") from exc
+    return pypdfium2
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -18,10 +24,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args(argv)
 
-    executable = shutil.which("pdftoppm")
     if args.check:
-        print(f"pdftoppm={executable or 'missing'}")
-        return 0 if executable else 2
+        try:
+            import_pdfium()
+        except RuntimeError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print("pypdfium2=available")
+        return 0
     if not args.input:
         print("error: input is required unless --check is used", file=sys.stderr)
         return 2
@@ -29,21 +39,29 @@ def main(argv: list[str] | None = None) -> int:
     if not source.is_file() or source.suffix.lower() != ".pdf":
         print("error: input must be an existing local PDF", file=sys.stderr)
         return 2
-    if executable is None:
-        print("error: pdftoppm is missing; install Poppler", file=sys.stderr)
-        return 2
     output_dir = Path(args.output_dir).expanduser().resolve(strict=False)
     output_dir.mkdir(parents=True, exist_ok=True)
-    prefix = output_dir / source.stem
-    completed = subprocess.run(
-        [executable, "-png", "-r", str(args.dpi), str(source), str(prefix)],
-        check=False,
-    )
-    if completed.returncode:
-        return completed.returncode
-    pages = sorted(output_dir.glob(f"{source.stem}-*.png"))
+    try:
+        pdfium = import_pdfium()
+        document = pdfium.PdfDocument(str(source))
+        pages = []
+        try:
+            for index in range(len(document)):
+                page = document[index]
+                try:
+                    image = page.render(scale=args.dpi / 72).to_pil()
+                    output = output_dir / f"{source.stem}-{index + 1}.png"
+                    image.save(output)
+                    pages.append(output)
+                finally:
+                    page.close()
+        finally:
+            document.close()
+    except (OSError, RuntimeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     if not pages:
-        print("error: Poppler produced no pages", file=sys.stderr)
+        print("error: PDF renderer produced no pages", file=sys.stderr)
         return 2
     for page in pages:
         print(page)

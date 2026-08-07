@@ -9,6 +9,8 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
+from aeloon_core import __main__ as cli
+from aeloon_core.runtime import skill_runtime
 from aeloon_core.runtime.builtin_skills import BUILTIN_SKILL_IDS
 
 RESOURCE_ROOT = Path(__file__).parents[1] / "aeloon_core" / "resources" / "skills"
@@ -61,6 +63,59 @@ def test_bundled_office_scripts_compile() -> None:
     for skill_id in (*OFFICE_SKILL_IDS, "office"):
         for script in (RESOURCE_ROOT / skill_id / "scripts").glob("*.py"):
             compile(script.read_text(encoding="utf-8"), str(script), "exec")
+
+
+def test_bundled_skill_runtime_dispatches_python_script(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    script = tmp_path / "pdf" / "scripts" / "render_pdf.py"
+    script.parent.mkdir(parents=True)
+    script.write_text("raise SystemExit(7)\n", encoding="utf-8")
+    monkeypatch.setattr(skill_runtime, "bundled_skill_root", lambda: tmp_path)
+    original_argv = list(sys.argv)
+
+    assert skill_runtime.run_bundled_skill("pdf", "render", ["--check"]) == 7
+    assert sys.argv == original_argv
+
+
+@pytest.mark.asyncio
+async def test_cli_dispatches_bundled_skill_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+
+    def fake_runner(skill_id: str, action: str, arguments: list[str]) -> int:
+        calls.append((skill_id, action, arguments))
+        return 9
+
+    monkeypatch.setattr(cli, "run_bundled_skill", fake_runner)
+    code = await cli.async_main(
+        ["system", "skill", "pdf", "render", "--check", "--dpi", "96"]
+    )
+
+    assert code == 9
+    assert calls == [("pdf", "render", ["--check", "--dpi", "96"])]
+
+
+def test_packaging_includes_skill_scripts_and_runtime_dependencies() -> None:
+    manifest = (RESOURCE_ROOT.parents[2] / "pyproject.toml").read_text(encoding="utf-8")
+    spec = (RESOURCE_ROOT.parents[2] / "aeloon.spec").read_text(encoding="utf-8")
+    package_lock = (
+        RESOURCE_ROOT / "pptx-generator" / "runtime" / "package-lock.json"
+    ).read_text(encoding="utf-8")
+
+    for dependency in (
+        "markitdown",
+        "nodejs-wheel",
+        "paddleocr",
+        "paddlepaddle",
+        "pypdfium2",
+        "python-docx",
+    ):
+        assert dependency in manifest
+    assert "include_py_files=True" in spec
+    assert '"nodejs-wheel-binaries"' in spec
+    assert '"pptxgenjs": "4.0.1"' in package_lock
 
 
 def test_office_preflight_can_require_available_python(monkeypatch) -> None:

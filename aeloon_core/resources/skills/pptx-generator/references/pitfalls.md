@@ -9,7 +9,7 @@ Your first render is almost never correct. Approach QA as a bug hunt, not a conf
 ### Content QA
 
 ```bash
-python -m markitdown output.pptx
+aeloon system skill markitdown convert output.pptx output.md --overwrite
 ```
 
 Check for missing content, typos, wrong order.
@@ -17,14 +17,15 @@ Check for missing content, typos, wrong order.
 **Check for leftover placeholder text:**
 
 ```bash
-python -m markitdown output.pptx | grep -iE "xxxx|lorem|ipsum|placeholder|this.*(page|slide).*layout"
+aeloon system skill markitdown convert output.pptx output.md --overwrite
+grep -iE "xxxx|lorem|ipsum|placeholder|this.*(page|slide).*layout" output.md
 ```
 
 If grep returns results, fix them before declaring success.
 
 ### Verification Loop
 
-1. Generate slides -> Extract text with `python -m markitdown output.pptx` -> Review content
+1. Generate slides -> Extract text with `aeloon system skill markitdown convert output.pptx output.md --overwrite` -> Review content
 2. **List issues found** (if none found, look again more critically)
 3. Fix issues
 4. **Re-verify affected slides** — one fix often creates another problem
@@ -35,7 +36,7 @@ If grep returns results, fix them before declaring success.
 ### Per-Slide QA (for from-scratch creation)
 
 ```bash
-python -m markitdown slide-XX-preview.pptx
+aeloon system skill markitdown convert slide-XX-preview.pptx slide-XX-preview.md --overwrite
 ```
 
 Check for missing content, placeholder text, missing page number badge.

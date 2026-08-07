@@ -1,14 +1,14 @@
 ---
 name: pdf
-description: 在本地读取、创建和审阅 PDF，特别适用于需要同时核对文本与页面版面的任务。使用 pdfplumber 或 pypdf 提取文本，使用 Poppler 渲染页面进行视觉检查；扫描件、中文 OCR、复杂表格和公式改用 paddleocr-doc-parsing。
+description: 在本地读取、创建和审阅 PDF，特别适用于需要同时核对文本与页面版面的任务。使用内置 pdfplumber 或 pypdf 提取文本，使用内置 pypdfium2 渲染页面进行视觉检查；扫描件、中文 OCR、复杂表格和公式改用 paddleocr-doc-parsing。
 ---
 
 # PDF 读取与检查
 
-先检查 Poppler 是否可用：
+先检查内置 PDF 渲染器是否可用：
 
 ```bash
-python scripts/render_pdf.py --check
+aeloon system skill pdf render --check
 ```
 
 ## 读取
@@ -17,16 +17,12 @@ python scripts/render_pdf.py --check
 2. 页面布局会影响理解时，运行：
 
 ```bash
-python scripts/render_pdf.py input.pdf --output-dir tmp/pdf-pages
+aeloon system skill pdf render input.pdf --output-dir tmp/pdf-pages
 ```
 
 3. 检查渲染图中的分栏、图表、脚注、页眉页脚和文字顺序。文本为空或与页面可见内容明显不符时，改用 `paddleocr-doc-parsing`。
 
-需要临时 Python 依赖时使用隔离环境：
-
-```bash
-uv run --with pdfplumber --with pypdf python your_script.py
-```
+`pdfplumber`、`pypdf`、`pypdfium2` 和 `reportlab` 随 Aeloon 安装，不应在用户任务中另建环境或静默安装全局包。
 
 ## 创建与修改
 

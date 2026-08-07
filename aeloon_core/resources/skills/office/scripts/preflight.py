@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Report optional local runtimes used by the bundled office skills."""
+"""Report packaged and external runtimes used by the bundled office skills."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import argparse
 import importlib.util
 import os
 import shutil
-import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,18 +30,20 @@ def executable_check(*names: str, label: str, hint: str) -> Check:
 
 
 def pptxgenjs_check(node: Check) -> Check:
-    hint = "install pptxgenjs in the task's isolated Node workspace"
+    hint = "reinstall an official Aeloon release containing the bundled PPTX runtime"
     if not node.available:
-        return Check(False, "PptxGenJS unavailable because Node.js is missing", hint)
-    completed = subprocess.run(
-        [node.detail, "-e", "require.resolve('pptxgenjs')"],
-        check=False,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        return Check(False, "PptxGenJS unavailable because bundled Node.js is missing", hint)
+    package = (
+        Path(__file__).resolve().parents[2]
+        / "pptx-generator"
+        / "runtime"
+        / "node_modules"
+        / "pptxgenjs"
+        / "package.json"
     )
     return Check(
-        completed.returncode == 0,
-        "PptxGenJS available" if completed.returncode == 0 else "PptxGenJS missing",
+        package.is_file(),
+        str(package) if package.is_file() else "PptxGenJS missing",
         hint,
     )
 
@@ -62,8 +63,10 @@ def model_cache_check() -> Check:
 
 
 def collect_checks() -> dict[str, Check]:
-    node = executable_check(
-        "node", label="Node.js", hint="install a supported Node.js runtime"
+    node = module_check(
+        "nodejs_wheel",
+        label="bundled Node.js",
+        hint="reinstall Aeloon Core with its built-in Skill dependencies",
     )
     pdfplumber = importlib.util.find_spec("pdfplumber") is not None
     pypdf = importlib.util.find_spec("pypdf") is not None
@@ -72,17 +75,27 @@ def collect_checks() -> dict[str, Check]:
         "markitdown": module_check(
             "markitdown",
             label="MarkItDown",
-            hint="use an isolated environment with markitdown[pdf,docx,pptx,xlsx]",
+            hint="reinstall Aeloon Core with its built-in Skill dependencies",
         ),
         "pdf-text": Check(
             pdfplumber or pypdf,
             "pdfplumber/pypdf available" if pdfplumber or pypdf else "PDF text library missing",
-            "use an isolated environment with pdfplumber and pypdf",
+            "reinstall Aeloon Core with its built-in Skill dependencies",
+        ),
+        "pdf-render": module_check(
+            "pypdfium2",
+            label="pypdfium2",
+            hint="reinstall Aeloon Core with its built-in Skill dependencies",
+        ),
+        "paddlepaddle": module_check(
+            "paddle",
+            label="PaddlePaddle",
+            hint="reinstall Aeloon Core with its built-in Skill dependencies",
         ),
         "paddleocr": module_check(
             "paddleocr",
             label="PaddleOCR",
-            hint="install paddlepaddle and paddleocr[doc-parser] in an isolated environment",
+            hint="reinstall Aeloon Core with its built-in Skill dependencies",
         ),
         "ocr-model-cache": model_cache_check(),
         "node": node,
@@ -90,10 +103,7 @@ def collect_checks() -> dict[str, Check]:
         "python-docx": module_check(
             "docx",
             label="python-docx",
-            hint="use an isolated environment with python-docx",
-        ),
-        "poppler": executable_check(
-            "pdftoppm", label="Poppler", hint="install Poppler for page rendering"
+            hint="reinstall Aeloon Core with its built-in Skill dependencies",
         ),
         "libreoffice": executable_check(
             "soffice",
@@ -106,9 +116,10 @@ def collect_checks() -> dict[str, Check]:
 
 COMPONENTS = {
     "markitdown": ("python", "markitdown"),
-    "pdf": ("python", "pdf-text", "poppler"),
-    "ocr": ("python", "paddleocr", "ocr-model-cache"),
-    "pptx": ("node", "pptxgenjs", "libreoffice", "poppler"),
+    "pdf": ("python", "pdf-text", "pdf-render"),
+    "ocr": ("python", "paddlepaddle", "paddleocr", "ocr-model-cache"),
+    "pptx": ("node", "pptxgenjs"),
+    "pptx-render": ("node", "pptxgenjs", "libreoffice", "pdf-render"),
     "docx": ("python", "python-docx"),
 }
 

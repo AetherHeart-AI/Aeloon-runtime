@@ -56,9 +56,20 @@ def import_pipeline():
         from paddleocr import PPStructureV3
     except ImportError as exc:
         raise RuntimeError(
-            "local PaddleOCR is missing; install paddlepaddle and paddleocr[doc-parser]"
+            "bundled PaddleOCR runtime is missing; reinstall Aeloon Core"
         ) from exc
     return PPStructureV3
+
+
+def check_runtime() -> None:
+    try:
+        import paddle
+        paddle.utils.run_check()
+    except Exception as exc:
+        raise RuntimeError(
+            f"bundled PaddlePaddle runtime check failed: {exc}"
+        ) from exc
+    import_pipeline()
 
 
 def safe_asset_path(output_dir: Path, relative_path: str) -> Path:
@@ -166,7 +177,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         if args.check:
-            import_pipeline()
+            check_runtime()
             print("local PaddleOCR runtime is available")
             return 0
         if not args.input:

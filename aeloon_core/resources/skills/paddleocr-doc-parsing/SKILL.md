@@ -9,20 +9,14 @@ description: 使用本地 PaddleOCR PP-StructureV3 从扫描 PDF 和文档图片
 
 ## 首次准备
 
-在独立环境安装本地推理依赖，不把模型和框架打入 Aeloon 基础二进制：
-
-```bash
-python -m venv .venv-paddleocr
-source .venv-paddleocr/bin/activate
-python -m pip install paddlepaddle 'paddleocr[doc-parser]'
-```
+PaddlePaddle、PaddleOCR 和 PP-StructureV3 文档解析依赖随 Aeloon 安装，不应另建 Python 环境或静默安装全局包。
 
 首次运行会从 Paddle 支持的模型源下载权重，并缓存到 `~/.aeloon-core/models/paddleocr`。机密或完全断网环境应预先准备该缓存；没有缓存时不得偷偷切换云服务。
 
 ## 解析
 
 ```bash
-python scripts/local_parse.py scan.pdf \
+aeloon system skill paddleocr-doc-parsing parse scan.pdf \
   --output-dir output/scan \
   --model-cache ~/.aeloon-core/models/paddleocr
 ```

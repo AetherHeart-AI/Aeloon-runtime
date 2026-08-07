@@ -7,7 +7,7 @@ When using an existing presentation as a template:
 1. **Copy and analyze**:
    ```bash
    cp /path/to/user-provided.pptx template.pptx
-   python -m markitdown template.pptx > template.md
+   aeloon system skill markitdown convert template.pptx template.md
    ```
    Review `template.md` to see placeholder text and slide structure.
 

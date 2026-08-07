@@ -9,28 +9,28 @@ description: 创建、诊断、清理和排版中文 DOCX 文档，支持把纯�
 
 ## 环境检查
 
-本技能只需要可选的 `python-docx`，不打入 Aeloon 基础二进制：
+`python-docx` 随 Aeloon 安装；使用内置运行器检查命令入口：
 
 ```bash
-uv run --with python-docx python scripts/process.py --help
+aeloon system skill document-format-skills process --help
 ```
 
-依赖缺失时明确报告，不静默安装全局包。
+依赖缺失时提示重新安装完整 Aeloon 包，不静默安装全局包。
 
 ## 创建 DOCX
 
 从 Markdown 或纯文本创建并应用中文排版：
 
 ```bash
-uv run --with python-docx python scripts/from_text.py \
+aeloon system skill document-format-skills from-text \
   input.md output.docx --title "文档标题"
 ```
 
 ## 诊断与整理
 
 ```bash
-uv run --with python-docx python scripts/process.py analyze input.docx --json
-uv run --with python-docx python scripts/process.py smart input.docx output.docx --preset official
+aeloon system skill document-format-skills process analyze input.docx --json
+aeloon system skill document-format-skills process smart input.docx output.docx --preset official
 ```
 
 可选预设包括 `official`、`academic` 和 `legal`。只修复标点时使用 `punctuation` 子命令，只调整排版时使用 `format` 子命令。对现有文档先复制到新输出路径，不覆盖原件。

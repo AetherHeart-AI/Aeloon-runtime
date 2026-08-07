@@ -20,7 +20,7 @@ jobs:
   build:
     name: Build and verify
     runs-on: ubuntu-22.04-arm
-    timeout-minutes: 20
+    timeout-minutes: 45
 
     steps:
       - name: Check out repository
@@ -40,6 +40,12 @@ jobs:
           set -euo pipefail
           test "$(uname -m)" = "aarch64"
           test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.35"
+
+      - name: Prepare bundled PptxGenJS runtime
+        run: >-
+          npm ci
+          --prefix aeloon_core/resources/skills/pptx-generator/runtime
+          --omit=dev --ignore-scripts
 
       - name: Build single-file executable
         run: >-
@@ -103,6 +109,19 @@ jobs:
           test -f "$data_path/skills/paddleocr-doc-parsing/scripts/local_parse.py"
           test -f "$data_path/skills/pptx-generator/scripts/render_slides.py"
           test -f "$data_path/skills/document-format-skills/scripts/process.py"
+          test -f "$data_path/skills/pptx-generator/runtime/check.cjs"
+          test -f "$data_path/skills/pptx-generator/runtime/node_modules/pptxgenjs/package.json"
+
+          env -i HOME="$smoke_root/home" PATH=/usr/bin:/bin TMPDIR=/tmp \
+            "$binary_path" system skill office preflight \
+            --require markitdown --require pdf --require pptx --require docx
+          env -i HOME="$smoke_root/home" PATH=/usr/bin:/bin TMPDIR=/tmp \
+            "$binary_path" system skill pdf render --check
+          env -i HOME="$smoke_root/home" PATH=/usr/bin:/bin TMPDIR=/tmp \
+            "$binary_path" system skill paddleocr-doc-parsing parse --check
+          env -i HOME="$smoke_root/home" PATH=/usr/bin:/bin TMPDIR=/tmp \
+            "$binary_path" system skill pptx-generator node \
+            "$data_path/skills/pptx-generator/runtime/check.cjs"
           stop_daemon
           trap - EXIT
           test ! -e "$socket_path"
