@@ -1,0 +1,4 @@
+interface:
+  display_name: "PDF 读取与检查"
+  short_description: "Read, render, create, and verify PDF files locally"
+  default_prompt: "使用 $pdf 在本地读取并核验这份 PDF 的内容和版面。"

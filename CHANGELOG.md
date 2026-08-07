@@ -5,6 +5,15 @@ release is cut, those entries should move to a versioned section with an ISO dat
 
 ## Unreleased
 
+## 0.0.4 - 2026-08-07
+
+### Added
+
+- Bundled local-first office execution skills for MarkItDown document extraction, PDF inspection,
+  PaddleOCR PP-StructureV3 parsing, editable PPTX generation, and Chinese DOCX formatting. The
+  office router now delegates digital, scanned, presentation, and document-writing workflows to
+  these skills while keeping their heavyweight runtimes optional.
+
 ## 0.0.3 - 2026-08-07
 
 ### Changed

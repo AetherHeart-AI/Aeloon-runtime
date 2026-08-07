@@ -103,10 +103,14 @@ Global resources live in `~/.aeloon-core`; workspace resources live in
 and the working directory are appended in a deterministic order. Workspace resources override
 same-named global resources and are reloaded at every turn boundary.
 
-Runtime bundles the `office`, `ppt`, `document-writing`, and `reports` presets. On first startup
-after installation, any missing presets are copied from the package resources into
-`<data_dir>/skills` (normally `~/.aeloon-core/skills`). Existing same-named files and directories
-are preserved, so local customizations are not overwritten.
+Runtime bundles the `office`, `ppt`, `document-writing`, and `reports` workflow presets together
+with the `markitdown`, `pdf`, `paddleocr-doc-parsing`, `pptx-generator`, and
+`document-format-skills` execution presets. On first startup after installation, any missing
+presets are copied from the package resources into `<data_dir>/skills` (normally
+`~/.aeloon-core/skills`). Existing same-named files and directories are preserved, so local
+customizations are not overwritten. Office execution dependencies and local OCR models are
+optional external runtimes; they are checked by their skills and are not embedded in the base
+single-file executable.
 
 Skill discovery is progressive: Runtime reads only each `SKILL.md` frontmatter for the catalog and
 system-prompt index. The full instructions are read only when the model chooses an enabled skill or

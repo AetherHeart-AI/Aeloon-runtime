@@ -15,7 +15,7 @@ def test_provision_builtin_skills_is_idempotent_and_preserves_existing(tmp_path:
 
     copied = provision_builtin_skills(tmp_path)
 
-    assert copied == ("ppt", "document-writing", "reports")
+    assert copied == tuple(skill_id for skill_id in BUILTIN_SKILL_IDS if skill_id != "office")
     assert custom.read_text(encoding="utf-8") == "custom office skill\n"
     assert provision_builtin_skills(tmp_path) == ()
     assert all(
@@ -42,3 +42,4 @@ def test_runtime_bootstrap_copies_and_discovers_builtin_skills(tmp_path: Path) -
     assert all(
         "present_files" in loader.load_skill(skill_id).content for skill_id in BUILTIN_SKILL_IDS
     )
+    assert "paddleocr-doc-parsing" in loader.load_skill("office").content

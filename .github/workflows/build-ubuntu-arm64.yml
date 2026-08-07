@@ -88,7 +88,21 @@ jobs:
             --data-dir "$data_path" \
             --socket "$socket_path"
 
-          test "$(find "$data_path/skills" -maxdepth 3 -type f | wc -l | tr -d ' ')" = "8"
+          for skill_id in \
+            office ppt document-writing reports markitdown pdf \
+            paddleocr-doc-parsing pptx-generator document-format-skills; do
+            test -f "$data_path/skills/$skill_id/SKILL.md"
+          done
+          for skill_id in \
+            markitdown pdf paddleocr-doc-parsing pptx-generator document-format-skills; do
+            test -f "$data_path/skills/$skill_id/LICENSE.txt"
+          done
+          test -f "$data_path/skills/office/scripts/preflight.py"
+          test -f "$data_path/skills/markitdown/scripts/convert.py"
+          test -f "$data_path/skills/pdf/scripts/render_pdf.py"
+          test -f "$data_path/skills/paddleocr-doc-parsing/scripts/local_parse.py"
+          test -f "$data_path/skills/pptx-generator/scripts/render_slides.py"
+          test -f "$data_path/skills/document-format-skills/scripts/process.py"
           stop_daemon
           trap - EXIT
           test ! -e "$socket_path"
