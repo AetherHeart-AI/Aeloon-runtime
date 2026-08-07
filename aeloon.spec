@@ -1,16 +1,54 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_all, collect_data_files, copy_metadata
 
 
 datas = collect_data_files("aeloon_core")
+datas += collect_data_files(
+    "aeloon_core",
+    include_py_files=True,
+    includes=["resources/skills/**/*.py"],
+)
+binaries = []
+hiddenimports = []
+
+for package in (
+    "docx",
+    "markitdown",
+    "nodejs_wheel",
+    "paddle",
+    "paddleocr",
+    "paddlex",
+    "pdfplumber",
+    "pypdf",
+    "pypdfium2",
+    "reportlab",
+):
+    package_datas, package_binaries, package_hiddenimports = collect_all(package)
+    datas += package_datas
+    binaries += package_binaries
+    hiddenimports += package_hiddenimports
+
+for distribution in (
+    "markitdown",
+    "nodejs-wheel",
+    "nodejs-wheel-binaries",
+    "paddleocr",
+    "paddlepaddle",
+    "pdfplumber",
+    "pypdf",
+    "pypdfium2",
+    "python-docx",
+    "reportlab",
+):
+    datas += copy_metadata(distribution, recursive=True)
 
 a = Analysis(
     ["aeloon_core/__main__.py"],
     pathex=[],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
-    hiddenimports=[],
+    hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

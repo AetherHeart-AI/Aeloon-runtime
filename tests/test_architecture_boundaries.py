@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / "aeloon_core"
 
 
-def test_runtime_is_python_only_and_removed_subsystems_are_absent() -> None:
+def test_runtime_has_no_application_javascript_and_removed_subsystems_are_absent() -> None:
     forbidden_paths = (
         PACKAGE / "pi_runtime",
         PACKAGE / "web",
@@ -25,9 +25,18 @@ def test_runtime_is_python_only_and_removed_subsystems_are_absent() -> None:
         PACKAGE / "rename_session.py",
     )
     assert all(not path.exists() for path in forbidden_paths)
-    assert not list(PACKAGE.rglob("*.js"))
-    assert not list(PACKAGE.rglob("*.ts"))
-    assert not list(PACKAGE.rglob("package.json"))
+    pptx_runtime = PACKAGE / "resources" / "skills" / "pptx-generator" / "runtime"
+    assert not [
+        path for path in PACKAGE.rglob("*.js") if not path.is_relative_to(pptx_runtime)
+    ]
+    assert not [
+        path for path in PACKAGE.rglob("*.ts") if not path.is_relative_to(pptx_runtime)
+    ]
+    assert not [
+        path
+        for path in PACKAGE.rglob("package.json")
+        if not path.is_relative_to(pptx_runtime)
+    ]
     assert not list(PACKAGE.rglob("bun.lock"))
 
 

@@ -5,6 +5,18 @@ release is cut, those entries should move to a versioned section with an ISO dat
 
 ## Unreleased
 
+## 0.0.4 - 2026-08-07
+
+### Added
+
+- Bundled local-first office execution skills for MarkItDown document extraction, PDF inspection,
+  PaddleOCR PP-StructureV3 parsing, editable PPTX generation, and Chinese DOCX formatting. The
+  office router now delegates digital, scanned, presentation, and document-writing workflows to
+  these skills.
+- Official packages now include the Python, Node.js, PptxGenJS, PDF, DOCX, PaddlePaddle, and
+  PaddleOCR execution dependencies required by the built-in office skills. OCR model weights are
+  cached separately after first use, and LibreOffice remains an optional visual-QA dependency.
+
 ## 0.0.3 - 2026-08-07
 
 ### Changed

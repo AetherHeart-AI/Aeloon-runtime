@@ -5,16 +5,32 @@ description: 统筹 Word、PowerPoint、表格和业务报告等跨格式办公�
 
 # Office 办公协作
 
+## 运行环境预检
+
+在首次执行或依赖报错时运行总预检；它只读取内置运行时和外部渲染工具状态，不安装依赖或下载模型：
+
+```bash
+aeloon system skill office preflight
+aeloon system skill office preflight --require markitdown --require pdf
+```
+
+`--require` 可选值为 `markitdown`、`pdf`、`ocr`、`pptx`、`pptx-render` 和 `docx`。`pptx` 只检查内置生成运行时，`pptx-render` 还要求可选的 LibreOffice。指定的运行环境不完整时命令返回非零状态，并显示对应提示。
+
 ## 明确交付目标
 
 先确认受众、用途、截止时间、交付格式、语言、品牌规范和必须引用的数据来源。信息不足但不影响推进时，明确合理假设；缺少关键数据时，保留醒目的占位符，不编造内容。
 
 ## 选择工作路径
 
-- 以演示和口头讲解为主时，采用 `ppt` 的叙事与页面设计方法。
-- 以正式阅读、审批或归档为主时，采用 `document-writing` 的文档方法。
+- 读取 WPS 或 Microsoft Office 保存的 `.docx`、`.pptx`、`.xlsx` 时，使用 `markitdown`；它不处理 WPS 原生 `.wps/.dps/.et`。
+- 读取文本型 PDF 时使用 `pdf`，先提取内容并在版面重要时渲染核验。
+- PDF 或图片是扫描件、提取结果明显缺失，或任务涉及复杂表格、公式、多栏阅读顺序时，使用本地 `paddleocr-doc-parsing`。不得将文档发送到云端 OCR。
+- 以演示和口头讲解为主时，先采用 `ppt` 的叙事与页面设计方法；需要真实可编辑 `.pptx` 时，再使用 `pptx-generator` 生成和渲染检查。
+- 以正式阅读、审批或归档为主时，先采用 `document-writing` 的内容方法；需要真实 `.docx` 时，再使用 `document-format-skills` 生成和排版。
 - 以指标、数据核对和周期汇报为主时，采用 `reports` 的报表方法。
 - 同时包含多种交付物时，先建立一份统一事实源，再按目标格式分别组织，避免各文件中的数字、术语和结论不一致。
+
+读取失败时先报告缺少的本地依赖，不要静默切换到外部服务。Office/WPS 通用格式均按 OOXML 处理，不尝试转换 `.wps/.dps/.et`。
 
 ## 执行办公任务
 

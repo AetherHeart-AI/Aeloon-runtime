@@ -9,7 +9,17 @@ from importlib.resources import files
 from importlib.resources.abc import Traversable
 from pathlib import Path
 
-BUILTIN_SKILL_IDS = ("office", "ppt", "document-writing", "reports")
+BUILTIN_SKILL_IDS = (
+    "office",
+    "ppt",
+    "document-writing",
+    "reports",
+    "markitdown",
+    "pdf",
+    "paddleocr-doc-parsing",
+    "pptx-generator",
+    "document-format-skills",
+)
 
 
 def provision_builtin_skills(data_dir: Path | str) -> tuple[str, ...]:

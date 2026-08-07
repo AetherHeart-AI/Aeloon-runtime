@@ -1,0 +1,4 @@
+interface:
+  display_name: "PPTX 文件生成"
+  short_description: "Create editable PowerPoint decks and render them for QA"
+  default_prompt: "使用 $pptx-generator 生成并渲染检查这份可编辑 PPTX。"

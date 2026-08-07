@@ -52,6 +52,7 @@ from aeloon_core.runtime.providers import (
     qualify_model_id,
     resolve_model_id,
 )
+from aeloon_core.runtime.skill_runtime import run_bundled_skill
 from aeloon_core.version import __version__
 
 CONFIG_PATHS: dict[str, tuple[str, ...]] = {
@@ -355,6 +356,12 @@ def build_parser() -> argparse.ArgumentParser:
     system_commands = system.add_subparsers(dest="system_command", required=True, metavar="COMMAND")
     system_bridge = system_commands.add_parser("bridge", help="Manage the local Bridge daemon.")
     _add_bridge_commands(system_bridge)
+    system_skill = system_commands.add_parser(
+        "skill", help="Run one trusted bundled Skill entry point."
+    )
+    system_skill.add_argument("skill_id")
+    system_skill.add_argument("skill_action")
+    system_skill.add_argument("skill_arguments", nargs=argparse.REMAINDER)
 
     cloud = commands.add_parser("cloud", help=argparse.SUPPRESS)
     cloud_commands = cloud.add_subparsers(dest="cloud_command", required=True)
@@ -1603,8 +1610,16 @@ async def async_main(argv: list[str] | None = None) -> int:
         return completion_command(args)
     if args.command == "session":
         return await session_command(args)
-    if args.command in {"bridge", "system"}:
+    if args.command == "bridge":
         return await bridge_command(args)
+    if args.command == "system":
+        if args.system_command == "bridge":
+            return await bridge_command(args)
+        return run_bundled_skill(
+            args.skill_id,
+            args.skill_action,
+            list(args.skill_arguments),
+        )
     if args.command == "cloud":
         return await cloud_command(args)
     if args.command == "provider":
@@ -1660,7 +1675,7 @@ def main(argv: list[str] | None = None) -> int:
     except (BridgeError, RunError, SessionError) as exc:
         _print_cli_error(exc.code, str(exc), as_json=json_errors)
         return 2
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
         _print_cli_error("invalid_argument", str(exc), as_json=json_errors)
         return 2
 
