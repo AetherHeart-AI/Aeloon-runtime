@@ -18,7 +18,7 @@
       "session.rename", "session.configure", "session.tree", "session.navigate",
       "session.compact", "session.next_turn", "turn.start", "turn.cancel",
       "turn.steer", "turn.follow_up", "catalog.get", "provider.list",
-      "provider.add", "provider.remove", "settings.get", "settings.update",
+      "provider.refresh", "provider.add", "provider.remove", "settings.get", "settings.update",
       "cloud.account.status", "cloud.account.login", "cloud.account.logout"
     ],
     "events": [

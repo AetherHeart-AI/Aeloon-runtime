@@ -34,8 +34,8 @@ class CloudAccountGateway:
     def status(self) -> dict[str, Any]:
         return self._service.status()
 
-    async def models(self) -> list[dict[str, Any]]:
-        return await self._service.models()
+    async def models(self, *, force: bool = False) -> list[dict[str, Any]]:
+        return await self._service.models(force=force)
 
     async def access_token(self, *, force: bool = False) -> str:
         return await self._service.access_token(force=force)

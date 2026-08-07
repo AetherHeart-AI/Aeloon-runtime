@@ -29,6 +29,7 @@ METHODS = (
     "turn.follow_up",
     "catalog.get",
     "provider.list",
+    "provider.refresh",
     "provider.add",
     "provider.remove",
     "settings.get",

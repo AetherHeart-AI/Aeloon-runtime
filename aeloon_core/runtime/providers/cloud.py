@@ -48,7 +48,13 @@ class CloudProvider(BaseProvider):
         self._owns_client = client is None
 
     async def models(self) -> dict[str, Model]:
-        values = await self.account.models()
+        return self._models_from_values(await self.account.models())
+
+    async def discover_models(self) -> list[Model]:
+        return list(self._models_from_values(await self.account.models(force=True)).values())
+
+    @staticmethod
+    def _models_from_values(values: list[dict[str, Any]]) -> dict[str, Model]:
         result: dict[str, Model] = {}
         for value in values:
             if not isinstance(value, Mapping):

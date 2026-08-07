@@ -98,6 +98,7 @@ class BridgeRpcAdapter:
             "turn.follow_up": self._turn_follow_up,
             "catalog.get": self.runtime.catalog_get,
             "provider.list": self.runtime.provider_list,
+            "provider.refresh": self.runtime.provider_refresh,
             "provider.add": self.runtime.provider_add,
             "provider.remove": self.runtime.provider_remove,
             "settings.get": self.runtime.settings_get,

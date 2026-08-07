@@ -309,7 +309,7 @@ def provider_manager_factory(
 
 def _configured_models(
     provider_id: str,
-    configured: CustomProviderConfig,
+    configured: CustomProviderConfig | DeepSeekProviderConfig,
 ) -> tuple[Model, ...]:
     return tuple(model_from_config(provider_id, item) for item in configured.models)
 
@@ -319,7 +319,7 @@ def _create_deepseek(
     configured: ProviderConfig,
     account: AccountGateway,
 ) -> BaseProvider:
-    del provider_id, account
+    del account
     assert isinstance(configured, DeepSeekProviderConfig)
     return DeepSeekProvider(
         name=configured.name,
@@ -327,6 +327,7 @@ def _create_deepseek(
         api_key=configured.api_key,
         proxy=configured.proxy,
         headers=configured.headers,
+        models=_configured_models(provider_id, configured) or None,
         enabled=configured.enabled,
     )
 

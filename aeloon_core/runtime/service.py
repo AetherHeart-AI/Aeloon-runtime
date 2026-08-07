@@ -19,6 +19,7 @@ from aeloon_core.config import (
     CloudProviderConfig,
     Config,
     CustomProviderConfig,
+    DeepSeekProviderConfig,
     ProviderModelConfig,
     load_config,
     redact_sensitive_headers,
@@ -678,6 +679,70 @@ class RuntimeService:
             return {"providers": await manager.providers()}
         finally:
             await manager.close()
+
+    async def provider_refresh(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        provider_id = validate_provider_id(self._required_string(params, "provider_id"))
+        configured = self.config.providers.get(provider_id)
+        if configured is None:
+            raise RuntimeFailure("invalid_argument", f"Unknown Provider: {provider_id}")
+        manager = self._provider_manager()
+        try:
+            discovered = await manager.discover_models(provider_id)
+            resolved_endpoint = manager.provider_endpoint(provider_id)
+        except PermissionError as exc:
+            raise RuntimeFailure("authentication_failed", self._sanitize(str(exc))) from None
+        except Exception as exc:
+            raise RuntimeFailure(
+                "invalid_argument",
+                self._sanitize(f"Could not refresh Provider models: {exc}"),
+            ) from None
+        finally:
+            await manager.close()
+
+        if isinstance(configured, (CustomProviderConfig, DeepSeekProviderConfig)):
+            models = [
+                ProviderModelConfig(
+                    id=split_model_id(model.id)[1],
+                    name=model.name,
+                    reasoning=model.reasoning,
+                    supports_image="image" in model.input,
+                    context_window=model.context_window,
+                    max_tokens=model.max_tokens,
+                    cost=model.cost,
+                )
+                for model in discovered
+            ]
+            revision = params.get("revision")
+            async with self._settings_lock:
+                if revision is not None and revision != self._revision:
+                    raise RuntimeFailure(
+                        "revision_conflict", "Core settings changed; refresh and try again"
+                    )
+                raw = load_config(self.config_path).model_dump(mode="json")
+                raw["providers"][provider_id].update(
+                    {
+                        "endpoint": resolved_endpoint,
+                        "models": [model.model_dump(mode="json") for model in models],
+                    }
+                )
+                current_default = str(raw["agent"].get("model") or "")
+                if current_default.startswith(f"{provider_id}/"):
+                    refreshed_ids = {model.id for model in discovered}
+                    if current_default not in refreshed_ids:
+                        raw["agent"]["model"] = discovered[0].id if discovered else ""
+                await asyncio.to_thread(
+                    save_config, Config.model_validate(raw).normalized(), self.config_path
+                )
+                self._reload_config()
+                self._revision += 1
+            await self._emit("settings.updated", None, None, {"revision": self._revision})
+
+        await self._emit(
+            "provider.updated", None, None, {"provider_id": provider_id, "action": "refreshed"}
+        )
+        result = await self._provider_result(provider_id)
+        result["provider"]["model_ids"] = [model.id for model in discovered]
+        return result
 
     async def provider_add(self, params: Mapping[str, Any]) -> dict[str, Any]:
         provider_id = validate_provider_id(self._required_string(params, "provider_id"))

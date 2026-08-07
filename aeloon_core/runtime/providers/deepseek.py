@@ -45,6 +45,7 @@ class DeepSeekProvider(OpenAICompatibleProvider):
         api_key: str | None = None,
         proxy: str | None = None,
         headers: dict[str, str] | None = None,
+        models: tuple[Model, ...] | None = None,
         enabled: bool = True,
         client: httpx.AsyncClient | None = None,
     ) -> None:
@@ -52,7 +53,7 @@ class DeepSeekProvider(OpenAICompatibleProvider):
             provider_id=DEEPSEEK_PROVIDER_ID,
             name=name,
             endpoint=endpoint,
-            models=tuple(DEEPSEEK_MODELS.values()),
+            models=models if models is not None else tuple(DEEPSEEK_MODELS.values()),
             enabled=enabled,
             api_key=api_key,
             proxy=proxy,

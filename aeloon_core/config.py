@@ -39,6 +39,7 @@ class DeepSeekProviderConfig(BaseModel):
     api_key: str | None = None
     proxy: str | None = None
     headers: dict[str, str] = Field(default_factory=dict)
+    models: list[ProviderModelConfig] = Field(default_factory=list)
 
     @field_validator("api_key", mode="before")
     @classmethod

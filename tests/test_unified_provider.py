@@ -432,3 +432,76 @@ async def test_bridge_discovers_models_and_persists_resolved_v1_endpoint(tmp_pat
     assert [request.url.path for request in requests] == ["/models", "/v1/models"]
     await service.close()
     await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_bridge_refreshes_provider_models_without_using_configured_cache(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.json"
+    config = Config(
+        workspace=tmp_path,
+        data_dir=tmp_path / "data",
+        providers={
+            **Config().providers,
+            "studio": CustomProviderConfig(
+                name="Studio",
+                endpoint="http://127.0.0.1:9000/v1",
+                models=[ProviderModelConfig(id="cached")],
+            ),
+        },
+    )
+    save_config(config, config_path)
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "id": "fresh",
+                        "name": "Fresh Model",
+                        "supports_image": False,
+                        "context_window": 96_000,
+                    }
+                ]
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    def factory(snapshot: Config) -> ProviderManager:
+        def custom(provider_id: str, configured: Any, _account: Any):
+            return CustomProvider(
+                provider_id=provider_id,
+                name=configured.name,
+                endpoint=configured.endpoint,
+                models=tuple(
+                    model_from_config(provider_id, model) for model in configured.models
+                ),
+                client=client,
+            )
+
+        return ProviderManager(snapshot, driver_factories={"custom": custom})
+
+    runtime = RuntimeService(config_path=config_path, provider_manager_factory=factory)
+    service = BridgeRpcAdapter(runtime)
+    refreshed = await service.dispatch(
+        "provider.refresh",
+        {"provider_id": "studio", "force": True, "revision": 1},
+    )
+
+    assert refreshed["provider"]["model_ids"] == ["studio/fresh"]
+    assert refreshed["revision"] == 2
+    assert [request.url.path for request in requests] == ["/v1/models"]
+    persisted = json.loads(config_path.read_text(encoding="utf-8"))
+    assert [model["id"] for model in persisted["providers"]["studio"]["models"]] == [
+        "fresh"
+    ]
+    catalog = await service.dispatch("catalog.get")
+    assert any(model["id"] == "studio/fresh" for model in catalog["models"])
+    assert all(model["id"] != "studio/cached" for model in catalog["models"])
+    await service.close()
+    await client.aclose()

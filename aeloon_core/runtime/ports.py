@@ -16,7 +16,7 @@ class AccountConfig(Protocol):
 class AccountGateway(Protocol):
     def status(self) -> dict[str, Any]: ...
 
-    async def models(self) -> list[dict[str, Any]]: ...
+    async def models(self, *, force: bool = False) -> list[dict[str, Any]]: ...
 
     async def access_token(self, *, force: bool = False) -> str: ...
 
@@ -42,7 +42,8 @@ class NullAccountGateway:
         del username, password
         raise RuntimeError("No account provider is configured")
 
-    async def models(self) -> list[dict[str, Any]]:
+    async def models(self, *, force: bool = False) -> list[dict[str, Any]]:
+        del force
         return []
 
     async def access_token(self, *, force: bool = False) -> str:
