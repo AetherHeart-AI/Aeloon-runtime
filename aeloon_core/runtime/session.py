@@ -40,6 +40,18 @@ def _iso_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _timestamp_ms(value: Any) -> int | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return int(parsed.timestamp() * 1000)
+
+
 @dataclass(frozen=True, slots=True)
 class SessionMetadata:
     id: str
@@ -56,6 +68,8 @@ class SessionContext:
     thinking_level: str | None = None
     model: tuple[str, str] | None = None
     active_tool_names: tuple[str, ...] | None = None
+    compaction_boundary_ms: int | None = None
+    compaction_boundary_index: int | None = None
 
 
 class Session:
@@ -305,6 +319,8 @@ class Session:
         thinking: str | None = None
         model: tuple[str, str] | None = None
         active_tools: tuple[str, ...] | None = None
+        compaction_boundary_ms: int | None = None
+        compaction_boundary_index: int | None = None
         for entry in state_branch:
             if entry.get("type") == "thinking_level_change":
                 thinking = str(entry.get("thinkingLevel") or "off")
@@ -320,14 +336,31 @@ class Session:
                 model = (str(raw.get("provider")), str(raw.get("model")))
         messages: list[AgentMessage] = []
         ordered_branch = branch
+        latest_compaction_index: int | None = None
         for index in range(len(branch) - 1, -1, -1):
             entry = branch[index]
             if entry.get("type") == "compaction" and not entry.get("retainedTail"):
                 # The compaction is appended after the messages it retains in the tree,
                 # but its synthetic summary must precede that retained tail for the model.
                 ordered_branch = [entry, *branch[:index], *branch[index + 1 :]]
+                latest_compaction_index = index
                 break
+            if entry.get("type") == "compaction" and latest_compaction_index is None:
+                latest_compaction_index = index
+        post_compaction_ids = (
+            {str(entry.get("id")) for entry in branch[latest_compaction_index + 1 :]}
+            if latest_compaction_index is not None
+            else set()
+        )
+        fresh_context_started = False
         for entry in ordered_branch:
+            if (
+                latest_compaction_index is not None
+                and not fresh_context_started
+                and str(entry.get("id")) in post_compaction_ids
+            ):
+                compaction_boundary_index = len(messages) - 1
+                fresh_context_started = True
             entry_type = entry.get("type")
             if entry_type == "message":
                 messages.append(message_from_dict(entry["message"]))
@@ -335,6 +368,7 @@ class Session:
                 content = entry.get("content")
                 messages.append(UserMessage(str(content or "")))
             elif entry_type == "compaction":
+                compaction_boundary_ms = _timestamp_ms(entry.get("timestamp"))
                 summary = str(entry.get("summary") or "")
                 messages.append(
                     UserMessage(COMPACTION_SUMMARY_PREFIX + summary + COMPACTION_SUMMARY_SUFFIX)
@@ -347,7 +381,16 @@ class Session:
                         BRANCH_SUMMARY_PREFIX + str(entry["summary"]) + BRANCH_SUMMARY_SUFFIX
                     )
                 )
-        return SessionContext(tuple(messages), thinking, model, active_tools)
+        if latest_compaction_index is not None and compaction_boundary_index is None:
+            compaction_boundary_index = len(messages) - 1
+        return SessionContext(
+            tuple(messages),
+            thinking,
+            model,
+            active_tools,
+            compaction_boundary_ms,
+            compaction_boundary_index,
+        )
 
     async def _get_full_branch(self) -> list[dict[str, Any]]:
         current = self._by_id.get(self._current_leaf_id) if self._current_leaf_id else None
@@ -387,7 +430,12 @@ class Session:
             "messageCount": message_count,
             "totalTokens": total_tokens,
             "costTotal": cost,
-            **context_statistics(context.messages, context_window=context_window),
+            **context_statistics(
+                context.messages,
+                context_window=context_window,
+                usage_after_ms=context.compaction_boundary_ms,
+                usage_after_index=context.compaction_boundary_index,
+            ),
             "cache": cache_statistics(usages),
         }
 

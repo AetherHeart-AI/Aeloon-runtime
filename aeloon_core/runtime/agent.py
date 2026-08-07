@@ -59,6 +59,10 @@ class SessionContextCompactor:
         self.model = model
         self.options = options
         self.settings = settings
+        self._cancellation = asyncio.Event()
+
+    def cancel(self) -> None:
+        self._cancellation.set()
 
     async def compact(
         self,
@@ -75,6 +79,12 @@ class SessionContextCompactor:
             first_kept_id=result.first_kept_entry_id,
             usage=result.usage,
             details={**result.details, "compactionEntryId": entry_id},
+            compaction_boundary_ms=(
+                context.compaction_boundary_ms if context is not None else None
+            ),
+            compaction_boundary_index=(
+                context.compaction_boundary_index if context is not None else None
+            ),
         )
 
     async def compact_session(
@@ -83,7 +93,11 @@ class SessionContextCompactor:
         reason: str,
         custom_instructions: str | None = None,
     ) -> tuple[CompactionResult, str]:
-        preparation = await prepare_compaction(self.session, self.settings)
+        preparation = await prepare_compaction(
+            self.session,
+            self.settings,
+            force=reason == "overflow",
+        )
         if preparation is None:
             raise RuntimeError("Session does not need compaction")
         result = await compact_preparation(
@@ -93,6 +107,7 @@ class SessionContextCompactor:
             stream_options=self.options,
             settings=self.settings,
             custom_instructions=custom_instructions,
+            cancellation_event=self._cancellation,
         )
         entry_id = await self.session.append_compaction(
             summary=result.summary,
@@ -186,6 +201,12 @@ class SessionAgent:
             steering_mode=self.config.agent.steering_mode,
             follow_up_mode=self.config.agent.follow_up_mode,
             context_id=self.session.id if self.session is not None else run_id,
+            compaction_boundary_ms=(
+                context.compaction_boundary_ms if context is not None else None
+            ),
+            compaction_boundary_index=(
+                context.compaction_boundary_index if context is not None else None
+            ),
         )
         self._pending_next_turn.clear()
         self.controller = RunController(
@@ -367,6 +388,10 @@ class SessionAgent:
             if inspect.isawaitable(result):
                 await result
 
+    async def _summarization_retry(self, data: dict[str, Any]) -> None:
+        event_type = "auto_retry_start" if data.get("stage") == "start" else "auto_retry_end"
+        await self._emit(RunEvent(event_type, data))  # type: ignore[arg-type]
+
     def _stream_options(self) -> StreamOptions:
         retry = self.config.agent.retry
         return StreamOptions(
@@ -377,6 +402,7 @@ class SessionAgent:
             max_retries=retry.max_retries if retry.enabled else 0,
             base_delay_ms=retry.base_delay_ms,
             max_retry_delay_ms=retry.max_retry_delay_ms,
+            metadata={"on_retry": self._summarization_retry},
         )
 
     def _resource_loader(self) -> ResourceLoader:

@@ -50,6 +50,21 @@ class RunError(RuntimeError):
 class InferenceError(RunError):
     """Inference or transport failure."""
 
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        cause: Exception | None = None,
+        retryable: bool = False,
+        retry_after_ms: int | None = None,
+        status_code: int | None = None,
+    ) -> None:
+        super().__init__(code, message, cause=cause)
+        self.retryable = retryable
+        self.retry_after_ms = retry_after_ms
+        self.status_code = status_code
+
 
 @dataclass(frozen=True, slots=True)
 class TextContent:

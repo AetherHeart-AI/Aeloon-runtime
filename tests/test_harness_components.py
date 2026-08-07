@@ -5,8 +5,22 @@ from typing import Any
 
 import pytest
 
-from aeloon_core.core import RunController, ToolCall, ToolResult
+from aeloon_core.core import (
+    AssistantMessage,
+    RunController,
+    TextContent,
+    ToolCall,
+    ToolResult,
+    ToolResultMessage,
+    Usage,
+    UserMessage,
+    estimate_context_tokens,
+)
 from aeloon_core.core.events import RunEventDispatcher
+from aeloon_core.core.inference_runtime import (
+    normalize_inference_messages,
+    project_inference_messages,
+)
 from aeloon_core.core.tool_runtime import ToolRuntime
 from aeloon_core.tool import BaseTool
 
@@ -113,3 +127,126 @@ async def test_tool_runtime_can_cancel_a_sequential_tool() -> None:
 
     assert messages[0].is_error is True
     assert messages[0].content[0].text == "Operation aborted"
+
+
+@pytest.mark.asyncio
+async def test_sequential_abort_generates_results_for_every_unexecuted_call() -> None:
+    aborted = False
+    executed: list[str] = []
+
+    async def execute(call_id: str, _params: dict[str, Any], _update: Any) -> ToolResult:
+        nonlocal aborted
+        executed.append(call_id)
+        aborted = True
+        return ToolResult.text("first completed")
+
+    tool = FunctionTool("step", execute, execution_mode="sequential")
+    runtime = ToolRuntime((tool,), ("step",), RunEventDispatcher())
+    messages, _terminate = await runtime.execute_calls(
+        (
+            ToolCall("one", "step", {}),
+            ToolCall("two", "step", {}),
+            ToolCall("three", "step", {}),
+        ),
+        is_aborted=lambda: aborted,
+    )
+
+    assert executed == ["one"]
+    assert [message.tool_call_id for message in messages] == ["one", "two", "three"]
+    assert [message.content[0].text for message in messages[1:]] == [
+        "Operation aborted before execution",
+        "Operation aborted before execution",
+    ]
+    assert all(message.is_error for message in messages[1:])
+
+
+def test_inference_projection_filters_failures_and_repairs_orphan_tool_calls() -> None:
+    failed = AssistantMessage(
+        (),
+        provider="test",
+        model="model",
+        stop_reason="error",
+        error_message="temporary failure",
+    )
+    calls = AssistantMessage(
+        (ToolCall("one", "read", {}), ToolCall("two", "write", {})),
+        provider="test",
+        model="model",
+        stop_reason="toolUse",
+    )
+    first_result = ToolResultMessage("one", "read", (TextContent("done"),))
+
+    projected = normalize_inference_messages(
+        (UserMessage("start"), failed, calls, first_result, UserMessage("continue"))
+    )
+
+    assert failed not in projected
+    assert [message.role for message in projected] == [
+        "user",
+        "assistant",
+        "toolResult",
+        "toolResult",
+        "user",
+    ]
+    synthetic = projected[-2]
+    assert isinstance(synthetic, ToolResultMessage)
+    assert synthetic.tool_call_id == "two"
+    assert synthetic.is_error is True
+    assert synthetic.content[0].text == "No result provided"
+
+
+def test_inference_projection_rebases_compaction_boundary() -> None:
+    calls = AssistantMessage(
+        (ToolCall("one", "read", {}), ToolCall("two", "write", {})),
+        provider="test",
+        model="model",
+        usage=Usage(input=899, output=1, total_tokens=900),
+        stop_reason="toolUse",
+    )
+    failed_before_boundary = AssistantMessage(
+        (TextContent("failed" * 1_000),),
+        provider="test",
+        model="model",
+        stop_reason="error",
+        error_message="temporary failure",
+    )
+    failed_after_boundary = AssistantMessage(
+        (TextContent("failed again" * 1_000),),
+        provider="test",
+        model="model",
+        stop_reason="aborted",
+        error_message="Operation aborted",
+    )
+    completed = AssistantMessage(
+        (TextContent("done"),),
+        provider="test",
+        model="model",
+        usage=Usage(input=19, output=1, total_tokens=20),
+    )
+
+    projected, boundary_index = project_inference_messages(
+        (
+            UserMessage("old"),
+            calls,
+            ToolResultMessage("one", "read", (TextContent("result"),)),
+            failed_before_boundary,
+            UserMessage("fresh"),
+            failed_after_boundary,
+            completed,
+        ),
+        boundary_index=3,
+    )
+
+    assert [message.role for message in projected] == [
+        "user",
+        "assistant",
+        "toolResult",
+        "toolResult",
+        "user",
+        "assistant",
+    ]
+    assert boundary_index == 3
+    synthetic = projected[3]
+    assert isinstance(synthetic, ToolResultMessage)
+    assert synthetic.tool_call_id == "two"
+    assert estimate_context_tokens(projected, usage_after_index=boundary_index) == 20

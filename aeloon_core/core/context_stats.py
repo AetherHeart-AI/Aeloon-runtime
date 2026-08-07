@@ -43,7 +43,12 @@ def estimate_tokens(message: AgentMessage) -> int:
     return (chars + 3) // 4
 
 
-def estimate_context_tokens(messages: Sequence[AgentMessage]) -> int:
+def estimate_context_tokens(
+    messages: Sequence[AgentMessage],
+    *,
+    usage_after_ms: int | None = None,
+    usage_after_index: int | None = None,
+) -> int:
     """Prefer provider usage for the last completed response, then estimate its tail."""
 
     for index in range(len(messages) - 1, -1, -1):
@@ -52,6 +57,11 @@ def estimate_context_tokens(messages: Sequence[AgentMessage]) -> int:
             isinstance(message, AssistantMessage)
             and message.stop_reason not in {"error", "aborted"}
             and message.usage.total_tokens > 0
+            and (
+                index > usage_after_index
+                if usage_after_index is not None
+                else usage_after_ms is None or message.timestamp > usage_after_ms
+            )
         ):
             return message.usage.total_tokens + sum(
                 estimate_tokens(trailing) for trailing in messages[index + 1 :]
@@ -63,10 +73,16 @@ def context_statistics(
     messages: Sequence[AgentMessage],
     *,
     context_window: int | None = None,
+    usage_after_ms: int | None = None,
+    usage_after_index: int | None = None,
 ) -> dict[str, Any]:
     """Build context-window and token-share statistics for an effective context."""
 
-    used_tokens = estimate_context_tokens(messages)
+    used_tokens = estimate_context_tokens(
+        messages,
+        usage_after_ms=usage_after_ms,
+        usage_after_index=usage_after_index,
+    )
     window_tokens = max(1, int(context_window)) if context_window is not None else None
     remaining_tokens = max(0, window_tokens - used_tokens) if window_tokens is not None else None
     usage_percent = _percent(used_tokens, window_tokens) if window_tokens is not None else None

@@ -5,7 +5,12 @@ from __future__ import annotations
 from typing import Any
 
 from aeloon_core.core.context_stats import estimate_context_tokens, estimate_tokens
-from aeloon_core.core.types import AgentMessage, UserMessage, message_from_dict
+from aeloon_core.core.types import (
+    AgentMessage,
+    AssistantMessage,
+    UserMessage,
+    message_from_dict,
+)
 from aeloon_core.runtime.session import Session
 from aeloon_core.runtime.summarization import (
     BRANCH_SUMMARY_PROMPT,
@@ -24,12 +29,18 @@ from aeloon_core.runtime.summarization import (
 async def prepare_compaction(
     session: Session,
     settings: CompactionSettings,
+    *,
+    force: bool = False,
 ) -> CompactionPreparation | None:
     entries = await session.get_branch()
     if not entries or entries[-1].get("type") == "compaction":
         return None
     context = await session.build_context()
-    tokens_before = estimate_context_tokens(context.messages)
+    tokens_before = estimate_context_tokens(
+        context.messages,
+        usage_after_ms=context.compaction_boundary_ms,
+        usage_after_index=context.compaction_boundary_index,
+    )
     previous_summary: str | None = None
     start = 0
     for index in range(len(entries) - 1, -1, -1):
@@ -39,38 +50,70 @@ async def prepare_compaction(
             start = 0
             break
 
+    valid_cut_points = [
+        index
+        for index in range(start, len(entries))
+        if isinstance(_entry_message(entries[index]), UserMessage | AssistantMessage)
+    ]
+    if not valid_cut_points:
+        return None
     accumulated = 0
-    cut = start
+    cut = valid_cut_points[0]
+    reached_budget = False
     for index in range(len(entries) - 1, start - 1, -1):
         message = _entry_message(entries[index])
         if message is None:
             continue
         accumulated += estimate_tokens(message)
-        cut = index
         if accumulated >= settings.keep_recent_tokens:
+            cut = next((point for point in valid_cut_points if point >= index), cut)
+            reached_budget = True
             break
-    while cut > start:
-        message = _entry_message(entries[cut])
-        if isinstance(message, UserMessage):
-            break
-        cut -= 1
-    if cut > start and entries[cut - 1].get("type") == "run_start":
-        cut -= 1
+    if force and not reached_budget and accumulated > 0:
+        forced_budget = max(1, accumulated // 2)
+        accumulated = 0
+        for index in range(len(entries) - 1, start - 1, -1):
+            message = _entry_message(entries[index])
+            if message is None:
+                continue
+            accumulated += estimate_tokens(message)
+            if accumulated >= forced_budget:
+                cut = next((point for point in valid_cut_points if point >= index), cut)
+                break
+    cut_message = _entry_message(entries[cut])
+    is_split_turn = isinstance(cut_message, AssistantMessage)
+    turn_start = -1
+    if is_split_turn:
+        for index in range(cut - 1, start - 1, -1):
+            if isinstance(_entry_message(entries[index]), UserMessage):
+                turn_start = index
+                break
+        is_split_turn = turn_start >= start
     first_kept = entries[cut] if cut < len(entries) else None
     if first_kept is None:
         return None
+    history_end = turn_start if is_split_turn else cut
     to_summarize = tuple(
-        message for entry in entries[start:cut] if (message := _entry_message(entry)) is not None
+        message
+        for entry in entries[start:history_end]
+        if (message := _entry_message(entry)) is not None
+    )
+    turn_prefix = tuple(
+        message
+        for entry in entries[turn_start:cut]
+        if is_split_turn and (message := _entry_message(entry)) is not None
     )
     retained = tuple(
         message for entry in entries[cut:] if (message := _entry_message(entry)) is not None
     )
-    if not to_summarize:
+    if not to_summarize and not turn_prefix:
         return None
-    read_files, modified_files = file_operations((*to_summarize, *retained))
+    read_files, modified_files = file_operations((*to_summarize, *turn_prefix, *retained))
     return CompactionPreparation(
         first_kept_entry_id=str(first_kept["id"]),
         messages_to_summarize=to_summarize,
+        turn_prefix_messages=turn_prefix,
+        is_split_turn=is_split_turn,
         retained_tail=retained,
         tokens_before=tokens_before,
         previous_summary=previous_summary,

@@ -6,6 +6,7 @@ import json
 import socket
 import tempfile
 from collections import defaultdict
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -164,6 +165,167 @@ async def test_stable_turn_projection_and_replay(tmp_path: Path) -> None:
     assert usage_event["payload"]["stats"]["contextWindow"]["usedTokens"] == 5
     assert usage_event["payload"]["stats"]["contextWindow"]["windowTokens"] == 1_000_000
     assert all("traceback" not in json.dumps(event).lower() for event in replay["events"])
+
+
+@pytest.mark.asyncio
+async def test_oversized_input_persists_failure_with_one_operation_terminal(
+    tmp_path: Path,
+) -> None:
+    tiny_model = replace(next(iter(DEEPSEEK_MODELS.values())), context_window=100)
+    provider = ScriptedProvider([])
+
+    class TinyManagedInference(ManagedInference):
+        async def models(self):
+            return {tiny_model.id: tiny_model}
+
+    config_path = tmp_path / "config.json"
+    save_config(
+        Config(
+            workspace=tmp_path,
+            data_dir=tmp_path / "data",
+            agent={
+                "model": tiny_model.id,
+                "compaction": {"enabled": False, "reserve_tokens": 10},
+            },
+        ),
+        config_path,
+    )
+    runtime = RuntimeService(
+        config_path=config_path,
+        provider_manager_factory=lambda config: ProviderManager(
+            config,
+            driver_factories={
+                "deepseek": lambda _provider_id, _configured, _account: TinyManagedInference(
+                    provider
+                )
+            },
+        ),
+    )
+    service = BridgeRpcAdapter(runtime)
+    observed = []
+    runtime.add_event_listener(lambda event: observed.append(event))
+    metadata = await service.dispatch("session.create", {"workspace": str(tmp_path)})
+
+    started = await service.dispatch(
+        "turn.start",
+        {
+            "session_id": metadata["session_id"],
+            "input": {"kind": "prompt", "text": "x" * 361},
+        },
+    )
+    operation = runtime._operation({"operation_id": started["operation_id"]})
+    assert operation.task is not None
+    await operation.task
+
+    assert operation.status == "failed"
+    assert provider.requests == []
+    terminals = [
+        event.name
+        for event in observed
+        if event.name in {"operation.completed", "operation.failed", "operation.cancelled"}
+    ]
+    assert terminals == ["operation.failed"]
+    snapshot = await service.dispatch("session.get", {"session_id": metadata["session_id"]})
+    turn = snapshot["timeline"][0]
+    assert turn["status"] == "failed"
+    assert turn["error"] == (
+        "User input exceeds usable context budget: estimated 91 tokens, budget 90 tokens "
+        "(context window 100, reserve 10). "
+        "Historical compaction cannot reduce a single oversized input."
+    )
+    session = await runtime.repository.open(metadata["session_id"])
+    messages = await session.find_entries("message")
+    assert [entry["message"]["role"] for entry in messages] == ["user", "assistant"]
+    assert messages[-1]["message"]["stopReason"] == "error"
+    assert await session.find_entries("compaction") == []
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_bridge_retry_attempt_blocks_are_isolated_and_events_are_ordered(
+    tmp_path: Path,
+) -> None:
+    class AttemptProvider:
+        def __init__(self) -> None:
+            self.attempt = 0
+
+        def stream(self, model, _context, _options):
+            async def events():
+                attempt = self.attempt
+                self.attempt += 1
+                yield AssistantStreamEvent("start")
+                if attempt == 0:
+                    yield AssistantStreamEvent("text_delta", delta="partial", content_index=0)
+                    yield AssistantStreamEvent(
+                        "error",
+                        message=AssistantMessage(
+                            (TextContent("partial"),),
+                            model.provider,
+                            model.id,
+                            stop_reason="error",
+                            error_message="service unavailable",
+                        ),
+                    )
+                    return
+                message = AssistantMessage(
+                    (TextContent("complete"),),
+                    model.provider,
+                    model.id,
+                )
+                yield AssistantStreamEvent("text_delta", delta="complete", content_index=0)
+                yield AssistantStreamEvent("done", message=message)
+
+            return events()
+
+    provider = AttemptProvider()
+    config_path = tmp_path / "config.json"
+    save_config(
+        Config(
+            workspace=tmp_path,
+            data_dir=tmp_path / "data",
+            agent={
+                "model": "deepseek/deepseek-v4-flash",
+                "retry": {"max_retries": 1, "base_delay_ms": 0},
+            },
+        ),
+        config_path,
+    )
+    runtime = RuntimeService(
+        config_path=config_path,
+        provider_manager_factory=manager_factory(lambda: provider),
+    )
+    service = BridgeRpcAdapter(runtime)
+    observed = []
+    runtime.add_event_listener(lambda event: observed.append(event))
+    metadata = await service.dispatch(
+        "session.create",
+        {"workspace": str(tmp_path), "title": "Named"},
+    )
+    started = await service.dispatch(
+        "turn.start",
+        {
+            "session_id": metadata["session_id"],
+            "input": {"kind": "prompt", "text": "retry"},
+        },
+    )
+    operation = runtime._operation({"operation_id": started["operation_id"]})
+    assert operation.task is not None
+    await operation.task
+
+    text_blocks = [block for block in operation.blocks if block["type"] == "text"]
+    assert [(block["id"], block["content"], block["status"]) for block in text_blocks] == [
+        ("text-0", "partial", "failed"),
+        ("error-0", "service unavailable", "failed"),
+        ("attempt-1-text-0", "complete", "completed"),
+    ]
+    retry_events = [
+        event for event in observed if event.name in {"retry.started", "retry.completed"}
+    ]
+    assert [event.name for event in retry_events] == ["retry.started", "retry.completed"]
+    assert retry_events[0].payload["attempt"] == 1
+    assert retry_events[0].payload["maxAttempts"] == 2
+    assert operation.status == "completed"
+    await service.close()
 
 
 @pytest.mark.asyncio
