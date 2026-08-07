@@ -21,6 +21,8 @@ from aeloon_core.runtime.service import RuntimeService
 from aeloon_core.version import __version__
 
 MAX_REQUEST_BYTES = 1024 * 1024
+DAEMON_STARTUP_POLL_ATTEMPTS = 600
+DAEMON_POLL_INTERVAL_SECONDS = 0.05
 
 
 def runtime_directory(data_dir: Path | str) -> Path:
@@ -376,8 +378,8 @@ async def ensure_daemon(
             start_new_session=True,
             close_fds=True,
         )
-        for _ in range(100):
-            await asyncio.sleep(0.05)
+        for _ in range(DAEMON_STARTUP_POLL_ATTEMPTS):
+            await asyncio.sleep(DAEMON_POLL_INTERVAL_SECONDS)
             existing = await _existing(resolved_socket)
             if existing is not None:
                 _verify_identity(existing, resolved_config, resolved_data, resolved_socket)
