@@ -16,6 +16,8 @@ release is cut, those entries should move to a versioned section with an ISO dat
 - Official packages now include the Python, Node.js, PptxGenJS, PDF, DOCX, PaddlePaddle, and
   PaddleOCR execution dependencies required by the built-in office skills. OCR model weights are
   cached separately after first use, and LibreOffice remains an optional visual-QA dependency.
+- Extended the Bridge daemon startup window for large single-file packages so cold extraction on
+  slower disks does not fail after five seconds.
 
 ## 0.0.3 - 2026-08-07
 

@@ -576,6 +576,50 @@ def test_daemon_launch_restarts_frozen_executable_independently(
 
 
 @pytest.mark.asyncio
+async def test_ensure_daemon_allows_large_frozen_executable_to_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.json"
+    data_dir = tmp_path / "data"
+    socket_path = tmp_path / "bridge.sock"
+    save_config(Config(workspace=tmp_path, data_dir=data_dir), config_path)
+    calls = 0
+
+    async def delayed_existing(_path: Path):
+        nonlocal calls
+        calls += 1
+        if calls <= 102:
+            return None
+        return {
+            "status": "running",
+            "config_path": str(config_path),
+            "data_dir": str(data_dir),
+            "methods": ["system.handshake"],
+        }
+
+    async def no_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(bridge_daemon, "_existing", delayed_existing)
+    monkeypatch.setattr(bridge_daemon.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(
+        bridge_daemon.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: object(),
+    )
+
+    result = await bridge_daemon.ensure_daemon(
+        config_path=config_path,
+        data_dir=data_dir,
+        socket_path=socket_path,
+    )
+
+    assert result["status"] == "started"
+    assert calls == 103
+
+
+@pytest.mark.asyncio
 async def test_ensure_daemon_upgrades_idle_daemon_missing_required_method(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
