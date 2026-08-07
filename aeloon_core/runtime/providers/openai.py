@@ -165,7 +165,17 @@ class OpenAICompatibleProvider(BaseProvider):
                         )
                     break
                 body = self._sanitize((await response.aread()).decode(errors="replace")[:4_000])
-                if not _retryable_status(response.status_code) or attempt >= max_retries:
+                retryable = _retryable_status(response.status_code) and not _quota_error(body)
+                retry_after_ms = round(
+                    _retry_delay(
+                        response,
+                        attempt,
+                        options.base_delay_ms,
+                        options.max_retry_delay_ms,
+                    )
+                    * 1000
+                )
+                if not retryable or attempt >= max_retries:
                     await response.aclose()
                     if retrying:
                         await _notify_retry(
@@ -178,13 +188,11 @@ class OpenAICompatibleProvider(BaseProvider):
                     raise InferenceError(
                         "http_error",
                         f"{self.name} returned HTTP {response.status_code}: {body}",
+                        retryable=retryable,
+                        retry_after_ms=retry_after_ms if retryable else None,
+                        status_code=response.status_code,
                     )
-                delay = _retry_delay(
-                    response,
-                    attempt,
-                    options.base_delay_ms,
-                    options.max_retry_delay_ms,
-                )
+                delay = retry_after_ms / 1000
                 await response.aclose()
                 await _notify_retry(
                     options,
@@ -206,7 +214,10 @@ class OpenAICompatibleProvider(BaseProvider):
                             error=str(exc),
                         )
                     raise InferenceError(
-                        "transport", f"{self.name} request failed: {exc}", cause=exc
+                        "transport",
+                        f"{self.name} request failed: {exc}",
+                        cause=exc,
+                        retryable=True,
                     ) from exc
                 delay = min(
                     options.base_delay_ms / 1000 * (2**attempt),
@@ -222,12 +233,16 @@ class OpenAICompatibleProvider(BaseProvider):
                 retrying = True
                 await asyncio.sleep(delay)
         if response is None:
-            raise InferenceError("transport", f"{self.name} request produced no response")
+            raise InferenceError(
+                "transport",
+                f"{self.name} request produced no response",
+                retryable=True,
+            )
 
         text_parts: dict[int, str] = {}
         thinking_parts: dict[int, str] = {}
         calls: dict[int, dict[str, str]] = {}
-        finish_reason = "stop"
+        finish_reason: str | None = None
         usage = Usage()
         saw_chunk = False
         yield AssistantStreamEvent("start")
@@ -245,6 +260,7 @@ class OpenAICompatibleProvider(BaseProvider):
                         "invalid_response",
                         f"{self.name} emitted invalid SSE JSON",
                         cause=exc,
+                        retryable=True,
                     ) from exc
                 saw_chunk = True
                 if isinstance(chunk.get("error"), Mapping):
@@ -258,6 +274,7 @@ class OpenAICompatibleProvider(BaseProvider):
                                 or f"{self.name} stream error"
                             )
                         ),
+                        retryable=_retryable_provider_error(error),
                     )
                 if isinstance(chunk.get("usage"), Mapping):
                     usage = _price_usage(Usage.from_dict(chunk["usage"]), model)
@@ -297,7 +314,10 @@ class OpenAICompatibleProvider(BaseProvider):
             raise
         except httpx.HTTPError as exc:
             raise InferenceError(
-                "transport", f"{self.name} stream failed: {exc}", cause=exc
+                "transport",
+                f"{self.name} stream failed: {exc}",
+                cause=exc,
+                retryable=True,
             ) from exc
         finally:
             await response.aclose()
@@ -306,7 +326,29 @@ class OpenAICompatibleProvider(BaseProvider):
             raise InferenceError(
                 "invalid_response",
                 f"{self.name} stream ended without any chunks",
+                retryable=True,
             )
+        if finish_reason is None:
+            raise InferenceError(
+                "invalid_response",
+                f"{self.name} stream ended without finish_reason",
+                retryable=True,
+            )
+
+        if finish_reason not in {"stop", "tool_calls", "length"}:
+            label = "content filter" if finish_reason == "content_filter" else "unknown"
+            yield AssistantStreamEvent(
+                "error",
+                message=AssistantMessage(
+                    content=(),
+                    provider=model.provider,
+                    model=model.id,
+                    usage=usage,
+                    stop_reason="error",
+                    error_message=f"Provider returned {label} finish_reason: {finish_reason}",
+                ),
+            )
+            return
 
         assistant_content: list[TextContent | ThinkingContent | ToolCall] = []
         if thinking_parts:
@@ -326,12 +368,9 @@ class OpenAICompatibleProvider(BaseProvider):
                     arguments=_parse_tool_arguments(state["arguments"]),
                 )
             )
-        stop_reason = {
-            "tool_calls": "toolUse",
-            "length": "length",
-            "content_filter": "error",
-            "stop": "stop",
-        }.get(finish_reason, "stop")
+        stop_reason = {"tool_calls": "toolUse", "length": "length", "stop": "stop"}[
+            finish_reason
+        ]
         message = AssistantMessage(
             content=tuple(assistant_content),
             provider=model.provider,
@@ -487,7 +526,10 @@ def _openai_message(
         part.thinking for part in message.content if isinstance(part, ThinkingContent)
     )
     calls = [part for part in message.content if isinstance(part, ToolCall)]
-    value: dict[str, Any] = {"role": "assistant", "content": text or None}
+    value: dict[str, Any] = {
+        "role": "assistant",
+        "content": text if text else (None if calls else ""),
+    }
     if thinking or requires_reasoning_content:
         value["reasoning_content"] = thinking
     if calls:
@@ -531,6 +573,40 @@ def _price_usage(usage: Usage, model: Model) -> Usage:
 
 def _retryable_status(status: int) -> bool:
     return status in {408, 409, 429} or status >= 500
+
+
+def _quota_error(value: str) -> bool:
+    lowered = value.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "insufficient_quota",
+            "quota exceeded",
+            "billing",
+            "usage limit",
+            "out of budget",
+            "available balance",
+        )
+    )
+
+
+def _retryable_provider_error(error: Mapping[str, Any]) -> bool:
+    value = " ".join(str(error.get(key) or "") for key in ("type", "code", "message"))
+    lowered = value.lower()
+    if _quota_error(value):
+        return False
+    return any(
+        marker in lowered
+        for marker in (
+            "overload",
+            "rate limit",
+            "too many requests",
+            "timeout",
+            "temporarily unavailable",
+            "server error",
+            "internal error",
+        )
+    )
 
 
 def _retry_delay(

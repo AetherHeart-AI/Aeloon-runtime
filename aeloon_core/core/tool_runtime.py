@@ -70,13 +70,15 @@ class ToolRuntime:
         )
         results: list[tuple[ToolResultMessage, bool]] = []
         if sequential:
-            for call in calls:
+            for index, call in enumerate(calls):
                 task = self._start_call(call)
                 try:
                     results.append(await task)
                 finally:
                     self._tasks.discard(task)
                 if is_aborted():
+                    for skipped in calls[index + 1 :]:
+                        results.append(await self._fail_unexecuted_call(skipped))
                     break
         else:
             tasks = [self._start_call(call) for call in calls]
@@ -86,6 +88,34 @@ class ToolRuntime:
                 self._tasks.difference_update(tasks)
         terminate = any(item[1] for item in results)
         return [item[0] for item in results], terminate
+
+    async def _fail_unexecuted_call(
+        self,
+        call: ToolCall,
+    ) -> tuple[ToolResultMessage, bool]:
+        await self._events.emit(
+            "tool_execution_start",
+            {"toolCallId": call.id, "toolName": call.name, "args": call.arguments},
+        )
+        result = ToolResult.text("Operation aborted before execution", is_error=True)
+        await self._events.emit(
+            "tool_execution_end",
+            {
+                "toolCallId": call.id,
+                "toolName": call.name,
+                "result": tool_result_to_dict(result),
+                "isError": True,
+            },
+        )
+        return (
+            ToolResultMessage(
+                call.id,
+                call.name,
+                result.content,
+                is_error=True,
+            ),
+            False,
+        )
 
     async def fail_truncated_calls(self, calls: tuple[ToolCall, ...]) -> list[ToolResultMessage]:
         results: list[ToolResultMessage] = []

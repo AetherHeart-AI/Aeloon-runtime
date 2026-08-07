@@ -180,6 +180,96 @@ async def test_compaction_summary_precedes_retained_tail_in_context(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_compaction_boundary_ignores_stale_usage_in_effective_stats(tmp_path: Path) -> None:
+    session = await JsonlSessionRepository(tmp_path).create(cwd=tmp_path)
+    retained = await session.append_message(UserMessage("recent"))
+    await session.append_message(
+        AssistantMessage(
+            (TextContent("old measured answer"),),
+            provider="deepseek",
+            model="deepseek-v4-flash",
+            usage=Usage(input=890, output=10, total_tokens=900),
+        )
+    )
+    await session.append_compaction(
+        summary="checkpoint",
+        tokens_before=900,
+        first_kept_entry_id=retained,
+    )
+
+    context = await session.build_context()
+    stale_stats = await session.stats(context_window=1_000)
+
+    assert context.compaction_boundary_ms is not None
+    assert isinstance(stale_stats["contextWindow"]["usedTokens"], int)
+    assert stale_stats["contextWindow"]["usedTokens"] < 900
+
+    await session.append_message(UserMessage("next"))
+    await session.append_message(
+        AssistantMessage(
+            (TextContent("fresh"),),
+            provider="deepseek",
+            model="deepseek-v4-flash",
+            usage=Usage(input=20, output=10, total_tokens=30),
+        )
+    )
+    fresh_stats = await session.stats(context_window=1_000)
+    assert fresh_stats["contextWindow"]["usedTokens"] == 30
+
+
+@pytest.mark.asyncio
+async def test_failed_assistant_is_durable_but_filtered_from_next_inference(
+    tmp_path: Path,
+) -> None:
+    session = await JsonlSessionRepository(tmp_path).create(cwd=tmp_path)
+    failed = AssistantMessage(
+        (),
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        stop_reason="error",
+        error_message="bad request",
+    )
+    provider = ScriptedProvider([failed, _assistant("recovered")])
+
+    class StaticManager:
+        async def model(self, _model_id):
+            return DEEPSEEK_V4_FLASH
+
+        def inference(self, _model):
+            return provider
+
+        async def close(self):
+            return None
+
+    agent = SessionAgent(
+        config=Config(
+            workspace=tmp_path,
+            data_dir=tmp_path,
+            agent={
+                "model": DEEPSEEK_V4_FLASH.id,
+                "compaction": {"enabled": False},
+            },
+        ).normalized(),
+        session=session,
+        provider_manager=StaticManager(),  # type: ignore[arg-type]
+    )
+
+    first = await agent.prompt("first", run_id="first")
+    second = await agent.prompt("second", run_id="second")
+
+    assert first.stop_reason == "error"
+    assert second.final_message.text == "recovered"
+    persisted = await session.find_entries("message")
+    assert any(
+        entry["message"].get("stopReason") == "error"
+        for entry in persisted
+        if entry["message"].get("role") == "assistant"
+    )
+    replayed = provider.requests[1][1].messages
+    assert [message.role for message in replayed] == ["user", "user"]
+
+
+@pytest.mark.asyncio
 async def test_repository_list_uses_separate_harness_sessions_directory(tmp_path: Path) -> None:
     legacy = tmp_path / "sessions"
     legacy.mkdir()

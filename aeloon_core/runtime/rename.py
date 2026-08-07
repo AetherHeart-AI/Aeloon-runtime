@@ -5,9 +5,9 @@ from __future__ import annotations
 import re
 from dataclasses import replace
 
-from aeloon_core.core.inference_runtime import collect_assistant
+from aeloon_core.core.events import RunEventDispatcher
+from aeloon_core.core.inference_runtime import InferenceRuntime
 from aeloon_core.core.types import (
-    InferenceContext,
     InferencePort,
     Model,
     StreamOptions,
@@ -79,22 +79,22 @@ async def rename_session(
         "Assistant outcome:\n"
         f"{assistant_text.strip()[:4_000]}"
     )
-    context = InferenceContext(
-        system_prompt=_SYSTEM_PROMPT,
+    async def on_retry(_data: dict[str, object]) -> None:
+        return None
+
+    response = await InferenceRuntime(inference, RunEventDispatcher()).request(
+        model=model,
         messages=(UserMessage(prompt),),
+        system_prompt=_SYSTEM_PROMPT,
         tools=(),
         session_id=f"{session.id}:rename",
-    )
-    response = await collect_assistant(
-        inference,
-        model,
-        context,
-        replace(
+        stream_options=replace(
             stream_options,
             max_tokens=80,
             temperature=0.2,
             thinking_level="off",
         ),
+        on_retry=on_retry,
     )
     if response.stop_reason in {"error", "aborted"}:
         return None

@@ -1129,11 +1129,12 @@ class RuntimeService:
         data = event.data
         if event.type == "message_update":
             stream = data.get("assistantMessageEvent") or {}
+            attempt = int(stream.get("attempt") or 0)
             kind = stream.get("type")
             index = int(stream.get("contentIndex") or stream.get("toolCallIndex") or 0)
             if kind in {"text_delta", "thinking_delta"}:
                 block_type = "text" if kind == "text_delta" else "thinking"
-                block_id = f"{block_type}-{index}"
+                block_id = self._attempt_block_id(f"{block_type}-{index}", attempt)
                 block = next((item for item in operation.blocks if item["id"] == block_id), None)
                 if block is None:
                     block = {
@@ -1142,6 +1143,7 @@ class RuntimeService:
                         "role": "narration" if block_type == "text" else None,
                         "content": "",
                         "status": "running",
+                        "_attempt": attempt,
                     }
                     operation.blocks.append(block)
                     await self._emit(
@@ -1153,7 +1155,8 @@ class RuntimeService:
                     "content.delta", session, operation, {"block_id": block_id, "delta": delta}
                 )
             elif kind == "toolcall_delta":
-                block_id = str(stream.get("toolCallId") or f"tool-{index}")
+                source_id = str(stream.get("toolCallId") or f"tool-{index}")
+                block_id = self._attempt_block_id(source_id, attempt)
                 block = next((item for item in operation.blocks if item["id"] == block_id), None)
                 if block is None:
                     block = {
@@ -1162,9 +1165,16 @@ class RuntimeService:
                         "name": str(stream.get("toolName") or "tool"),
                         "arguments": {},
                         "status": "streaming",
+                        "_attempt": attempt,
+                        "_source_id": source_id,
                     }
                     operation.blocks.append(block)
-                    await self._emit("tool.started", session, operation, {"block": block})
+                    await self._emit(
+                        "tool.started",
+                        session,
+                        operation,
+                        {"block": self._clean_block(block)},
+                    )
                 await self._emit(
                     "tool.updated",
                     session,
@@ -1174,8 +1184,17 @@ class RuntimeService:
         elif event.type == "message_end":
             message = data.get("message") or {}
             if message.get("role") == "assistant":
-                self._merge_complete_message(operation, message)
-                for block in operation.blocks:
+                attempt = int(data.get("attempt") or 0)
+                self._merge_complete_message(operation, message, attempt=attempt)
+                attempt_blocks = [
+                    block
+                    for block in operation.blocks
+                    if int(block.get("_attempt") or 0) == attempt
+                ]
+                failed = message.get("stopReason") in {"error", "aborted"}
+                for block in attempt_blocks:
+                    if failed:
+                        block["status"] = "failed"
                     name = "tool.updated" if block["type"] == "tool_call" else "content.completed"
                     await self._emit(
                         name,
@@ -1196,19 +1215,28 @@ class RuntimeService:
                     },
                 )
         elif event.type == "tool_execution_start":
-            block_id = str(data.get("toolCallId") or "tool")
-            block = next((item for item in operation.blocks if item["id"] == block_id), None)
+            source_id = str(data.get("toolCallId") or "tool")
+            block = self._find_tool_block(operation, source_id)
             if block is None:
+                block_id = source_id
                 block = {
                     "id": block_id,
                     "type": "tool_call",
                     "name": str(data.get("toolName") or "tool"),
                     "arguments": self._safe_mapping(data.get("args")),
                     "status": "running",
+                    "_attempt": self._latest_attempt(operation),
+                    "_source_id": source_id,
                 }
                 operation.blocks.append(block)
-                await self._emit("tool.started", session, operation, {"block": block})
+                await self._emit(
+                    "tool.started",
+                    session,
+                    operation,
+                    {"block": self._clean_block(block)},
+                )
             else:
+                block_id = str(block["id"])
                 block.update(
                     {"arguments": self._safe_mapping(data.get("args")), "status": "running"}
                 )
@@ -1219,7 +1247,9 @@ class RuntimeService:
                     {"block_id": block_id, "patch": self._clean_block(block)},
                 )
         elif event.type in {"tool_execution_update", "tool_execution_end"}:
-            block_id = str(data.get("toolCallId") or "tool")
+            source_id = str(data.get("toolCallId") or "tool")
+            block = self._find_tool_block(operation, source_id)
+            block_id = str(block["id"]) if block is not None else source_id
             raw = data.get("partialResult") if event.type.endswith("update") else data.get("result")
             result = self._tool_text(raw)
             patch = {
@@ -1240,13 +1270,12 @@ class RuntimeService:
             artifacts = [artifact.to_dict() for artifact in typed_artifacts]
             if artifacts:
                 patch["artifacts"] = artifacts
-            for block in operation.blocks:
-                if block["id"] == block_id:
-                    block.update(patch)
+            if block is not None:
+                block.update(patch)
             if artifacts:
                 await session.append_artifact_delivery(
                     run_id=operation.id,
-                    tool_call_id=block_id,
+                    tool_call_id=source_id,
                     artifacts=artifacts,
                 )
             await self._emit(
@@ -1276,6 +1305,13 @@ class RuntimeService:
                 session,
                 operation,
                 self._safe_mapping(data),
+            )
+        elif event.type == "compaction_end" and data.get("error"):
+            await self._emit(
+                "session.compacted",
+                session,
+                operation,
+                {**self._safe_mapping(data), "succeeded": False},
             )
 
     async def _emit(
@@ -1527,52 +1563,102 @@ class RuntimeService:
             result.append(current)
         return result
 
-    def _message_blocks(self, message: Mapping[str, Any]) -> list[dict[str, Any]]:
+    def _message_blocks(
+        self,
+        message: Mapping[str, Any],
+        *,
+        attempt: int = 0,
+    ) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
+        type_indices = {"text": 0, "thinking": 0}
         content = message.get("content") or []
         for index, raw in enumerate(content):
             if not isinstance(raw, Mapping):
                 continue
             kind = raw.get("type")
             if kind == "text":
+                source_id = f"text-{type_indices['text']}"
+                type_indices["text"] += 1
                 result.append(
                     {
-                        "id": f"text-{len(result)}",
+                        "id": self._attempt_block_id(source_id, attempt),
                         "type": "text",
                         "role": "final",
                         "content": str(raw.get("text") or ""),
                         "status": "completed",
+                        "_attempt": attempt,
                     }
                 )
             elif kind == "thinking":
+                source_id = f"thinking-{type_indices['thinking']}"
+                type_indices["thinking"] += 1
                 result.append(
                     {
-                        "id": f"thinking-{len(result)}",
+                        "id": self._attempt_block_id(source_id, attempt),
                         "type": "thinking",
                         "content": str(raw.get("thinking") or ""),
                         "status": "completed",
+                        "_attempt": attempt,
                     }
                 )
             elif kind == "toolCall":
+                source_id = str(raw.get("id") or f"tool-{index}")
                 result.append(
                     {
-                        "id": str(raw.get("id") or f"tool-{index}"),
+                        "id": self._attempt_block_id(source_id, attempt),
                         "type": "tool_call",
                         "name": str(raw.get("name") or "tool"),
                         "arguments": self._safe_mapping(raw.get("arguments")),
                         "status": "running",
+                        "_attempt": attempt,
+                        "_source_id": source_id,
                     }
                 )
+        error_message = str(message.get("errorMessage") or "").strip()
+        if message.get("stopReason") in {"error", "aborted"} and error_message:
+            result.append(
+                {
+                    "id": self._attempt_block_id("error-0", attempt),
+                    "type": "text",
+                    "role": "narration",
+                    "content": error_message,
+                    "status": "failed",
+                    "_attempt": attempt,
+                }
+            )
         return result
 
-    def _merge_complete_message(self, operation: Operation, message: Mapping[str, Any]) -> None:
-        complete = self._message_blocks(message)
+    def _merge_complete_message(
+        self,
+        operation: Operation,
+        message: Mapping[str, Any],
+        *,
+        attempt: int = 0,
+    ) -> None:
+        complete = self._message_blocks(message, attempt=attempt)
         for block in complete:
             existing = next((item for item in operation.blocks if item["id"] == block["id"]), None)
             if existing is None:
                 operation.blocks.append(block)
             else:
                 existing.update(block)
+
+    def _find_tool_block(self, operation: Operation, source_id: str) -> dict[str, Any] | None:
+        return next(
+            (
+                block
+                for block in reversed(operation.blocks)
+                if block.get("type") == "tool_call"
+                and (block.get("_source_id") == source_id or block.get("id") == source_id)
+            ),
+            None,
+        )
+
+    def _latest_attempt(self, operation: Operation) -> int:
+        return max((int(block.get("_attempt") or 0) for block in operation.blocks), default=0)
+
+    def _attempt_block_id(self, source_id: str, attempt: int) -> str:
+        return source_id if attempt <= 0 else f"attempt-{attempt}-{source_id}"
 
     def _pending_next_turn(self, entries: list[dict[str, Any]]) -> list[tuple[str, dict[str, Any]]]:
         pending: dict[str, dict[str, Any]] = {}
@@ -1703,7 +1789,11 @@ class RuntimeService:
                 raw[key].update(patch[key])
 
     def _clean_block(self, block: Mapping[str, Any]) -> dict[str, Any]:
-        return {key: self._json_safe(value) for key, value in block.items() if value is not None}
+        return {
+            key: self._json_safe(value)
+            for key, value in block.items()
+            if value is not None and not key.startswith("_")
+        }
 
     def _tool_text(self, raw: Any) -> str:
         if not isinstance(raw, Mapping):

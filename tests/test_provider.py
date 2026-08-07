@@ -17,7 +17,8 @@ from aeloon_core.core import (
     ToolCall,
     UserMessage,
 )
-from aeloon_core.core.inference_runtime import collect_assistant
+from aeloon_core.core.events import RunEventDispatcher
+from aeloon_core.core.inference_runtime import InferenceRuntime, collect_assistant
 from aeloon_core.runtime.providers import (
     DEEPSEEK_V4_FLASH,
     DeepSeekProvider,
@@ -305,3 +306,237 @@ async def test_openai_compatible_applies_timeout_to_request() -> None:
             StreamOptions(timeout_ms=25, max_retries=0),
         )
     await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_complete_attempt_retries_partial_sse_without_merging_attempts() -> None:
+    attempts = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=_sse({"choices": [{"delta": {"content": "partial"}}]}),
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_sse(
+                {"choices": [{"delta": {"content": "complete"}, "finish_reason": "stop"}]}
+            ),
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    model = Model("studio/model", "Model", "studio")
+    provider = OpenAICompatibleProvider(
+        provider_id="studio",
+        name="Studio",
+        endpoint="https://studio.example/v1",
+        client=client,
+    )
+    events = []
+    retries: list[dict[str, object]] = []
+    runtime = InferenceRuntime(provider, RunEventDispatcher(lambda event: events.append(event)))
+
+    message = await runtime.request(
+        model=model,
+        messages=(UserMessage("go"),),
+        system_prompt="",
+        tools=(),
+        session_id="session",
+        stream_options=StreamOptions(max_retries=1, base_delay_ms=0),
+        on_retry=lambda data: _record_retry(retries, data),
+    )
+    await client.aclose()
+
+    assert attempts == 2
+    assert message.text == "complete"
+    updates = [
+        event.data["assistantMessageEvent"]
+        for event in events
+        if event.type == "message_update"
+    ]
+    assert [(item["attempt"], item["delta"]) for item in updates] == [
+        (0, "partial"),
+        (1, "complete"),
+    ]
+    failed = [event for event in events if event.type == "message_end"]
+    assert failed[0].data["attempt"] == 0
+    assert failed[0].data["willRetry"] is True
+    assert [item["stage"] for item in retries] == ["start", "end"]
+
+
+async def _record_retry(
+    target: list[dict[str, object]],
+    data: dict[str, object],
+) -> None:
+    target.append(data)
+
+
+@pytest.mark.asyncio
+async def test_quota_429_is_not_retried_by_request_runtime() -> None:
+    attempts = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(429, text='{"error":{"code":"insufficient_quota"}}')
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    model = Model("studio/model", "Model", "studio")
+    provider = OpenAICompatibleProvider(
+        provider_id="studio",
+        name="Studio",
+        endpoint="https://studio.example/v1",
+        client=client,
+    )
+    message = await InferenceRuntime(provider, RunEventDispatcher()).request(
+        model=model,
+        messages=(UserMessage("go"),),
+        system_prompt="",
+        tools=(),
+        session_id="session",
+        stream_options=StreamOptions(max_retries=3, base_delay_ms=0),
+        on_retry=lambda data: _record_retry([], data),
+    )
+    await client.aclose()
+
+    assert attempts == 1
+    assert message.stop_reason == "error"
+    assert "insufficient_quota" in (message.error_message or "")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finish_reason", ["content_filter", "unexpected_reason"])
+async def test_unknown_finish_reason_discards_partial_tools(finish_reason: str) -> None:
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=_sse(
+                    {
+                        "choices": [
+                            {
+                                "delta": {
+                                    "content": "unsafe partial",
+                                    "tool_calls": [
+                                        {
+                                            "index": 0,
+                                            "id": "call",
+                                            "function": {"name": "write", "arguments": "{}"},
+                                        }
+                                    ],
+                                },
+                                "finish_reason": finish_reason,
+                            }
+                        ]
+                    }
+                ),
+            )
+        )
+    )
+    model = Model("studio/model", "Model", "studio")
+    provider = OpenAICompatibleProvider(
+        provider_id="studio",
+        name="Studio",
+        endpoint="https://studio.example/v1",
+        client=client,
+    )
+
+    message = await collect_assistant(
+        provider,
+        model,
+        InferenceContext("", (UserMessage("go"),), (), "session"),
+        StreamOptions(max_retries=0),
+    )
+    await client.aclose()
+
+    assert message.stop_reason == "error"
+    assert message.content == ()
+    assert finish_reason in (message.error_message or "")
+
+
+@pytest.mark.asyncio
+async def test_request_runtime_retries_a_midstream_transport_failure() -> None:
+    class BrokenStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+            raise httpx.ReadError("stream reset")
+
+    attempts = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                stream=BrokenStream(),
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_sse({"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}),
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    model = Model("studio/model", "Model", "studio")
+    provider = OpenAICompatibleProvider(
+        provider_id="studio",
+        name="Studio",
+        endpoint="https://studio.example/v1",
+        client=client,
+    )
+    message = await InferenceRuntime(provider, RunEventDispatcher()).request(
+        model=model,
+        messages=(UserMessage("go"),),
+        system_prompt="",
+        tools=(),
+        session_id="session",
+        stream_options=StreamOptions(max_retries=1, base_delay_ms=0),
+        on_retry=lambda data: _record_retry([], data),
+    )
+    await client.aclose()
+
+    assert attempts == 2
+    assert message.text == "ok"
+
+
+@pytest.mark.asyncio
+async def test_request_runtime_reports_retry_exhaustion_once() -> None:
+    attempts = 0
+    retry_events: list[dict[str, object]] = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(503, text="service unavailable")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    model = Model("studio/model", "Model", "studio")
+    provider = OpenAICompatibleProvider(
+        provider_id="studio",
+        name="Studio",
+        endpoint="https://studio.example/v1",
+        client=client,
+    )
+    message = await InferenceRuntime(provider, RunEventDispatcher()).request(
+        model=model,
+        messages=(UserMessage("go"),),
+        system_prompt="",
+        tools=(),
+        session_id="session",
+        stream_options=StreamOptions(max_retries=2, base_delay_ms=0),
+        on_retry=lambda data: _record_retry(retry_events, data),
+    )
+    await client.aclose()
+
+    assert attempts == 3
+    assert message.stop_reason == "error"
+    assert [event["stage"] for event in retry_events] == ["start", "start", "end"]
+    assert retry_events[-1]["attempt"] == 2
