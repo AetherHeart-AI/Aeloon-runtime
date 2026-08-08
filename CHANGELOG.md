@@ -5,12 +5,6 @@ release is cut, those entries should move to a versioned section with an ISO dat
 
 ## Unreleased
 
-### Changed
-
-- Browser Use passed end-to-end testing, but registering its 22 tools caused tool-catalog
-  explosion. The capability remains available while desktop startup now leaves it disabled by
-  default.
-
 ## 0.0.4 - 2026-08-07
 
 ### Added

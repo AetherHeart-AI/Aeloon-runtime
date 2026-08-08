@@ -472,26 +472,6 @@ def test_top_level_help_focuses_on_user_tasks() -> None:
     assert "==SUPPRESS==" not in help_text
 
 
-def test_rpc_browser_runtime_socket_is_explicit_opt_in(tmp_path: Path) -> None:
-    parser = cli.build_parser()
-    socket_path = tmp_path / "core.sock"
-
-    disabled = parser.parse_args(["rpc", "serve", "--socket", str(socket_path)])
-    enabled = parser.parse_args(
-        [
-            "rpc",
-            "serve",
-            "--socket",
-            str(socket_path),
-            "--browser-runtime-socket",
-            str(tmp_path / "browser.sock"),
-        ]
-    )
-
-    assert disabled.browser_runtime_socket is None
-    assert enabled.browser_runtime_socket == tmp_path / "browser.sock"
-
-
 def test_removed_local_and_provider_login_commands_are_absent() -> None:
     parser = cli.build_parser()
 

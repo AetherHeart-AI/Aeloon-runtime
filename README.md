@@ -167,9 +167,9 @@ session = await runtime.create_session(workspace="/path/to/repository")
 
 Runtime owns sessions, context construction, persistence, provider selection, and operation
 scheduling. The Electron workbench accesses the runtime through the private, incompatible
-`aeloon-rpc-v1` Unix-socket adapter. Browser Use is disabled unless Core starts with an explicit
-Browser Runtime socket. When configured, all 22 Browser Use tools are part of every agent tool
-catalog and execute through `browser-runtime-v1`.
+`aeloon-rpc-v1` Unix-socket adapter. When Core starts with a Browser Runtime socket, all 22
+Browser Use tools are part of every agent tool catalog and execute through
+`browser-runtime-v1`.
 
 ## Security
 
