@@ -5,7 +5,7 @@ data. There is no automatic protocol, Session, or configuration migration path.
 
 The supported desktop integration is now:
 
-- `aeloon rpc serve --socket <path> --browser-runtime-socket <path>` for the Bun Workbench;
+- `aeloon rpc serve --socket <path> [--browser-runtime-socket <path>]` for the Bun Workbench;
 - `aeloon-rpc-v1` for Workbench-to-Core requests and events;
 - `browser-runtime-v1` for Core Browser Use execution;
 - one UI thread UUID used directly as the Core Session and Browser scope ID.
