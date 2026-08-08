@@ -18,15 +18,6 @@ from rich.markdown import Markdown
 from rich.table import Table
 
 from aeloon_core.bootstrap import CloudAccountGateway, create_runtime_service
-from aeloon_core.bridge.daemon import (
-    bridge_request,
-    daemon_status,
-    default_socket_path,
-    ensure_daemon,
-    run_daemon,
-    stop_daemon,
-)
-from aeloon_core.bridge.protocol import BridgeError, load_schema
 from aeloon_core.config import (
     CloudProviderConfig,
     Config,
@@ -41,6 +32,8 @@ from aeloon_core.core import (
     RunEvent,
     message_to_dict,
 )
+from aeloon_core.rpc.protocol import RpcError
+from aeloon_core.rpc.server import run_rpc_server
 from aeloon_core.runtime import (
     JsonlSessionRepository,
     SessionError,
@@ -99,10 +92,8 @@ _KNOWN_COMMANDS = {
     "config",
     "provider",
     "system",
-    # Backward-compatible command names. These remain callable but are not
-    # emphasized in the top-level help.
     "session",
-    "bridge",
+    "rpc",
     "cloud",
 }
 
@@ -178,7 +169,6 @@ def _add_account_arguments(command: argparse.ArgumentParser, *, login: bool = Fa
         command.add_argument("username", nargs="?", help="Account username or email.")
     command.add_argument("--config", type=Path, help=argparse.SUPPRESS)
     command.add_argument("--data-dir", type=Path, help=argparse.SUPPRESS)
-    command.add_argument("--socket", type=Path, help=argparse.SUPPRESS)
     command.add_argument(
         "--json", action="store_const", const="json", dest="output", help="Print JSON output."
     )
@@ -208,7 +198,6 @@ def _add_provider_arguments(command: argparse.ArgumentParser) -> None:
 def _add_provider_runtime_arguments(command: argparse.ArgumentParser) -> None:
     command.add_argument("--config", type=Path, help=argparse.SUPPRESS)
     command.add_argument("--data-dir", type=Path, help=argparse.SUPPRESS)
-    command.add_argument("--socket", type=Path, help=argparse.SUPPRESS)
     command.add_argument(
         "--json", action="store_const", const="json", dest="output", help="Print JSON output."
     )
@@ -220,24 +209,14 @@ def _add_provider_runtime_arguments(command: argparse.ArgumentParser) -> None:
     )
 
 
-def _add_bridge_commands(parent: argparse.ArgumentParser) -> None:
-    commands = parent.add_subparsers(dest="bridge_command", required=True, metavar="COMMAND")
-    descriptions = {
-        "serve": "Run the Bridge daemon in the foreground.",
-        "ensure": "Start the Bridge daemon when it is not running.",
-        "status": "Show Bridge daemon status.",
-        "stop": "Stop the Bridge daemon.",
-    }
-    for name in ("serve", "ensure", "status", "stop"):
-        command = commands.add_parser(name, help=descriptions[name])
-        command.add_argument("--config", type=Path)
-        command.add_argument("--data-dir", type=Path)
-        command.add_argument("--socket", type=Path)
-        if name in {"serve", "ensure"}:
-            command.add_argument("--max-concurrent-operations", type=int, default=4)
-        if name in {"ensure", "status", "stop"}:
-            command.add_argument("--output", choices=("text", "json"), default="text")
-    commands.add_parser("schema", help="Print the Bridge v3 JSON schema.")
+def _add_rpc_commands(parent: argparse.ArgumentParser) -> None:
+    commands = parent.add_subparsers(dest="rpc_command", required=True, metavar="COMMAND")
+    serve = commands.add_parser("serve", help="Run the Electron-owned Core RPC process.")
+    serve.add_argument("--config", type=Path)
+    serve.add_argument("--data-dir", type=Path)
+    serve.add_argument("--socket", type=Path, required=True)
+    serve.add_argument("--browser-runtime-socket", type=Path, required=True)
+    serve.add_argument("--max-concurrent-operations", type=int, default=4)
 
 
 def _hide_suppressed_subcommands(commands: Any) -> None:
@@ -303,7 +282,6 @@ def build_parser() -> argparse.ArgumentParser:
     model_use.add_argument("model_id", help="Provider-qualified model id from `aeloon models`.")
     model_use.add_argument("--config", type=Path, help=argparse.SUPPRESS)
     model_use.add_argument("--data-dir", type=Path, help=argparse.SUPPRESS)
-    model_use.add_argument("--socket", type=Path, help=argparse.SUPPRESS)
     model_use.add_argument("--json", action="store_true", help="Print JSON output.")
 
     setup = commands.add_parser("setup", help=argparse.SUPPRESS)
@@ -349,13 +327,11 @@ def build_parser() -> argparse.ArgumentParser:
     config_set.add_argument("value")
     config_set.add_argument("--config", type=Path)
 
-    bridge = commands.add_parser("bridge", help=argparse.SUPPRESS)
-    _add_bridge_commands(bridge)
+    rpc = commands.add_parser("rpc", help=argparse.SUPPRESS)
+    _add_rpc_commands(rpc)
 
     system = commands.add_parser("system", help=argparse.SUPPRESS)
     system_commands = system.add_subparsers(dest="system_command", required=True, metavar="COMMAND")
-    system_bridge = system_commands.add_parser("bridge", help="Manage the local Bridge daemon.")
-    _add_bridge_commands(system_bridge)
     system_skill = system_commands.add_parser(
         "skill", help="Run one trusted bundled Skill entry point."
     )
@@ -381,7 +357,6 @@ def build_parser() -> argparse.ArgumentParser:
         )
         command.add_argument("--config", type=Path)
         command.add_argument("--data-dir", type=Path)
-        command.add_argument("--socket", type=Path)
         command.add_argument("--output", choices=("text", "json"), default="text")
 
     provider = commands.add_parser("provider", help="Manage inference Providers.")
@@ -994,42 +969,39 @@ async def model_use_command(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     if args.data_dir is not None:
         config = config.model_copy(update={"data_dir": args.data_dir}).normalized()
-    socket_path = args.socket or default_socket_path(config.data_dir)
-    daemon = await ensure_daemon(
+    runtime = create_runtime_service(
         config_path=args.config,
         data_dir=args.data_dir,
-        socket_path=socket_path,
-        required_methods=("catalog.get", "settings.get", "settings.update"),
     )
-    resolved_socket = Path(str(daemon["socket_path"]))
-    catalog = await bridge_request(resolved_socket, "catalog.get", {})
-    available = [
-        str(item.get("id"))
-        for item in catalog.get("models") or []
-        if isinstance(item, dict)
-        and item.get("id")
-        and not (
-            item.get("provider_id") == "deepseek"
-            and not getattr(config.providers["deepseek"], "api_key", None)
-        )
-    ]
-    requested = args.model_id.strip()
     try:
-        candidate = resolve_model_id(requested, available)
-    except KeyError:
-        raise RunError(
-            "model_not_found",
-            f"Model is not available: {requested}",
-        ) from None
-    settings = await bridge_request(resolved_socket, "settings.get", {})
-    result = await bridge_request(
-        resolved_socket,
-        "settings.update",
-        {
-            "revision": settings["revision"],
-            "patch": {"default_model_id": candidate},
-        },
-    )
+        catalog = await runtime.catalog_get({})
+        available = [
+            str(item.get("id"))
+            for item in catalog.get("models") or []
+            if isinstance(item, dict)
+            and item.get("id")
+            and not (
+                item.get("provider_id") == "deepseek"
+                and not getattr(config.providers["deepseek"], "api_key", None)
+            )
+        ]
+        requested = args.model_id.strip()
+        try:
+            candidate = resolve_model_id(requested, available)
+        except KeyError:
+            raise RunError(
+                "model_not_found",
+                f"Model is not available: {requested}",
+            ) from None
+        settings = await runtime.settings_get({})
+        result = await runtime.settings_update(
+            {
+                "revision": settings["revision"],
+                "patch": {"default_model_id": candidate},
+            }
+        )
+    finally:
+        await runtime.close()
     if args.json:
         print(_json(result))
     else:
@@ -1108,16 +1080,10 @@ async def doctor_command(args: argparse.Namespace) -> int:
         await manager.close()
         await account.close()
 
-    socket_path = default_socket_path(config.data_dir)
-    bridge = await daemon_status(socket_path)
-    bridge_status = str(bridge.get("status") or "stopped")
     add(
-        "bridge",
-        "ok" if bridge_status == "running" else "warning",
-        bridge_status,
-        "The Bridge starts automatically when account or UI features need it."
-        if bridge_status != "running"
-        else "",
+        "desktop-runtime",
+        "ok",
+        "Core is started and supervised by Electron when the desktop app runs",
     )
     if args.json:
         print(
@@ -1190,39 +1156,38 @@ async def setup_command(args: argparse.Namespace) -> int:
         print('Try: aeloon "inspect this repository"')
         return 0
 
-    # Persist the workspace before the daemon reads the configuration, then use
+    # Persist the workspace before the login flow reads the configuration, then use
     # the same account path as `aeloon login` so credentials remain in the vault.
     save_config(config, path)
     login_args = argparse.Namespace(
         config=path,
         data_dir=None,
-        socket=None,
         output="text",
         username=args.username,
         cloud_command="login",
     )
     await cloud_command(login_args)
     configured = load_config(path)
-    socket_path = default_socket_path(configured.data_dir)
-    daemon = await ensure_daemon(config_path=path, socket_path=socket_path)
-    catalog = await bridge_request(Path(str(daemon["socket_path"])), "catalog.get", {})
-    cloud_models = [
-        item
-        for item in catalog.get("models") or []
-        if isinstance(item, dict) and item.get("provider_id") == "aeloon-cloud"
-    ]
-    selected = args.model or (str(cloud_models[0]["id"]) if cloud_models else "")
-    if not selected or selected not in {str(item.get("id")) for item in cloud_models}:
-        raise ValueError("No matching Aeloon Cloud model is available for this account")
-    settings = await bridge_request(Path(str(daemon["socket_path"])), "settings.get", {})
-    await bridge_request(
-        Path(str(daemon["socket_path"])),
-        "settings.update",
-        {
-            "revision": settings["revision"],
-            "patch": {"default_model_id": selected},
-        },
-    )
+    runtime = create_runtime_service(config_path=path, data_dir=configured.data_dir)
+    try:
+        catalog = await runtime.catalog_get({})
+        cloud_models = [
+            item
+            for item in catalog.get("models") or []
+            if isinstance(item, dict) and item.get("provider_id") == "aeloon-cloud"
+        ]
+        selected = args.model or (str(cloud_models[0]["id"]) if cloud_models else "")
+        if not selected or selected not in {str(item.get("id")) for item in cloud_models}:
+            raise ValueError("No matching Aeloon Cloud model is available for this account")
+        settings = await runtime.settings_get({})
+        await runtime.settings_update(
+            {
+                "revision": settings["revision"],
+                "patch": {"default_model_id": selected},
+            }
+        )
+    finally:
+        await runtime.close()
     print(f"Selected {selected}.")
     print('Try: aeloon "inspect this repository"')
     return 0
@@ -1334,71 +1299,38 @@ def config_command(args: argparse.Namespace) -> int:
     return 0
 
 
-async def bridge_command(args: argparse.Namespace) -> int:
-    if args.bridge_command == "schema":
-        print(json.dumps(load_schema(), ensure_ascii=False, separators=(",", ":")))
-        return 0
-    config = load_config(args.config)
-    if args.data_dir is not None:
-        config = config.model_copy(update={"data_dir": args.data_dir}).normalized()
-    socket_path = args.socket or default_socket_path(config.data_dir)
-    if args.bridge_command == "serve":
-        runtime = create_runtime_service(
-            config_path=args.config,
-            data_dir=args.data_dir,
-            max_concurrent_operations=args.max_concurrent_operations,
-        )
-        await run_daemon(
-            runtime,
-            socket_path=socket_path,
-        )
-        return 0
-    if args.bridge_command == "ensure":
-        result = await ensure_daemon(
-            config_path=args.config,
-            data_dir=args.data_dir,
-            socket_path=socket_path,
-            max_concurrent_operations=args.max_concurrent_operations,
-        )
-    elif args.bridge_command == "status":
-        result = await daemon_status(socket_path)
-    else:
-        result = await stop_daemon(socket_path)
-    if getattr(args, "output", "text") == "json":
-        print(_json(result))
-    else:
-        print(f"Aeloon Core bridge: {result.get('status', 'ok')} ({socket_path})")
+async def rpc_command(args: argparse.Namespace) -> int:
+    runtime = create_runtime_service(
+        config_path=args.config,
+        data_dir=args.data_dir,
+        max_concurrent_operations=args.max_concurrent_operations,
+        browser_runtime_socket=args.browser_runtime_socket,
+    )
+    await run_rpc_server(runtime, socket_path=args.socket)
     return 0
 
 
 async def cloud_command(args: argparse.Namespace) -> int:
-    config = load_config(args.config)
-    if args.data_dir is not None:
-        config = config.model_copy(update={"data_dir": args.data_dir}).normalized()
-    socket_path = args.socket or default_socket_path(config.data_dir)
-
     params: dict[str, Any] = {}
-    method = f"cloud.account.{args.cloud_command}"
-    timeout = 3.0
     if args.cloud_command == "login":
         username = (args.username or _read_cloud_username()).strip()
         if not username:
             raise ValueError("Aeloon Cloud username is required")
         password = _read_cloud_password()
         params = {"username": username, "password": password}
-        timeout = 60.0
-
-    daemon = await ensure_daemon(
+    runtime = create_runtime_service(
         config_path=args.config,
         data_dir=args.data_dir,
-        socket_path=socket_path,
     )
-    result = await bridge_request(
-        Path(str(daemon["socket_path"])),
-        method,
-        params,
-        timeout=timeout,
-    )
+    try:
+        handlers = {
+            "status": runtime.account_status,
+            "login": runtime.account_login,
+            "logout": runtime.account_logout,
+        }
+        result = await handlers[args.cloud_command](params)
+    finally:
+        await runtime.close()
     _print_cloud_result(args.cloud_command, result, output=args.output)
     return 0
 
@@ -1439,16 +1371,10 @@ def _print_cloud_result(command: str, result: dict[str, Any], *, output: str) ->
 
 
 async def provider_command(args: argparse.Namespace) -> int:
-    config = load_config(args.config)
-    if args.data_dir is not None:
-        config = config.model_copy(update={"data_dir": args.data_dir}).normalized()
-    socket_path = args.socket or default_socket_path(config.data_dir)
-
     command = args.provider_command
     params: dict[str, Any] = {}
-    timeout = 3.0
     if command == "list":
-        method = "provider.list"
+        method = "list"
     elif command == "add":
         params = {
             "provider_id": args.provider_id,
@@ -1461,19 +1387,24 @@ async def provider_command(args: argparse.Namespace) -> int:
             params["proxy"] = args.proxy
         if args.headers:
             params["headers"] = _parse_headers(args.headers)
-        method = "provider.add"
-        timeout = None
+        method = "add"
     else:
         params = {"provider_id": args.provider_id}
-        method = "provider.remove"
+        method = "remove"
 
-    daemon = await ensure_daemon(
+    runtime = create_runtime_service(
         config_path=args.config,
         data_dir=args.data_dir,
-        socket_path=socket_path,
-        required_methods=(method,),
     )
-    result = await bridge_request(Path(str(daemon["socket_path"])), method, params, timeout=timeout)
+    try:
+        handlers = {
+            "list": runtime.provider_list,
+            "add": runtime.provider_add,
+            "remove": runtime.provider_remove,
+        }
+        result = await handlers[method](params)
+    finally:
+        await runtime.close()
     _print_provider_result(
         command,
         result,
@@ -1610,11 +1541,9 @@ async def async_main(argv: list[str] | None = None) -> int:
         return completion_command(args)
     if args.command == "session":
         return await session_command(args)
-    if args.command == "bridge":
-        return await bridge_command(args)
+    if args.command == "rpc":
+        return await rpc_command(args)
     if args.command == "system":
-        if args.system_command == "bridge":
-            return await bridge_command(args)
         return run_bundled_skill(
             args.skill_id,
             args.skill_action,
@@ -1645,8 +1574,7 @@ def _json_errors_for(argv: list[str]) -> bool:
     for index, value in enumerate(argv[:-1]):
         if value == "--output" and argv[index + 1] in {"json", "stream-json"}:
             return True
-    # Preserve the historical JSON error contract for explicit legacy entry points.
-    return bool(argv and argv[0] in {"run", "session", "config", "bridge", "cloud", "provider"})
+    return bool(argv and argv[0] in {"run", "session", "config", "rpc", "cloud", "provider"})
 
 
 def _print_cli_error(code: str, message: str, *, as_json: bool) -> None:
@@ -1672,7 +1600,7 @@ def main(argv: list[str] | None = None) -> int:
     json_errors = _json_errors_for(raw)
     try:
         return asyncio.run(async_main(raw))
-    except (BridgeError, RunError, SessionError) as exc:
+    except (RpcError, RunError, SessionError) as exc:
         _print_cli_error(exc.code, str(exc), as_json=json_errors)
         return 2
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:

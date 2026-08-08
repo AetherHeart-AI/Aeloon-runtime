@@ -57,7 +57,7 @@ def test_architecture_dependencies_point_inward() -> None:
     forbidden_by_module = {
         "core": (
             "aeloon_core.bootstrap",
-            "aeloon_core.bridge",
+            "aeloon_core.rpc",
             "aeloon_core.cloud",
             "aeloon_core.config",
             "aeloon_core.runtime",
@@ -65,20 +65,20 @@ def test_architecture_dependencies_point_inward() -> None:
         ),
         "tool": (
             "aeloon_core.bootstrap",
-            "aeloon_core.bridge",
+            "aeloon_core.rpc",
             "aeloon_core.cloud",
             "aeloon_core.config",
             "aeloon_core.runtime",
         ),
-        "runtime": ("aeloon_core.bridge", "aeloon_core.cloud"),
-        "bridge": (
+        "runtime": ("aeloon_core.rpc", "aeloon_core.cloud"),
+        "rpc": (
             "aeloon_core.bootstrap",
             "aeloon_core.cloud",
             "aeloon_core.core",
             "aeloon_core.tool",
         ),
         "cloud": (
-            "aeloon_core.bridge",
+            "aeloon_core.rpc",
             "aeloon_core.config",
             "aeloon_core.core",
             "aeloon_core.runtime",
@@ -120,8 +120,8 @@ def test_core_contains_only_vendor_neutral_stateless_contracts() -> None:
     ]
 
 
-def test_bridge_adapter_depends_on_runtime_not_core() -> None:
-    adapter = (PACKAGE / "bridge" / "adapter.py").read_text(encoding="utf-8")
+def test_rpc_adapter_depends_on_runtime_not_core() -> None:
+    adapter = (PACKAGE / "rpc" / "adapter.py").read_text(encoding="utf-8")
     assert "aeloon_core.runtime" in adapter
     assert "aeloon_core.core" not in adapter
     assert "aeloon_core.cloud" not in adapter
@@ -148,14 +148,26 @@ def test_runtime_components_and_object_oriented_tool_layer_exist() -> None:
         assert f"class {class_name}" in tool_source
 
 
-def test_runtime_has_no_wire_dispatch_or_bridge_errors() -> None:
+def test_runtime_has_no_wire_dispatch_or_rpc_errors() -> None:
     service = (PACKAGE / "runtime" / "service.py").read_text(encoding="utf-8")
     tree = ast.parse(service)
-    assert "BridgeError" not in service
+    assert "RpcError" not in service
     assert not any(
         isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "dispatch"
         for node in ast.walk(tree)
     )
+
+
+def test_core_browser_layer_has_no_electron_or_ui_dependency() -> None:
+    imports: set[str] = set()
+    for path in (PACKAGE / "browser").rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                imports.add(node.module)
+            elif isinstance(node, ast.Import):
+                imports.update(alias.name for alias in node.names)
+    assert not {name for name in imports if "electron" in name or "aeloon_ui" in name}
 
 
 def test_artifact_delivery_is_runtime_owned() -> None:

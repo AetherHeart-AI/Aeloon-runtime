@@ -238,7 +238,7 @@ class Session:
         )
 
     async def append_session_config(self, config: dict[str, Any]) -> str:
-        """Persist Bridge session overrides without adding model context."""
+        """Persist runtime session overrides without adding model context."""
 
         return await self._append_entry("session_config", config=config)
 

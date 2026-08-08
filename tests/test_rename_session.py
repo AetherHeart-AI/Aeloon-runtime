@@ -4,9 +4,9 @@ from pathlib import Path
 
 import pytest
 
-from aeloon_core.bridge import BridgeRpcAdapter
 from aeloon_core.config import Config, save_config
 from aeloon_core.core import AssistantMessage, TextContent
+from aeloon_core.rpc import AeloonRpcAdapter
 from aeloon_core.runtime import ProviderManager, RuntimeService
 from aeloon_core.runtime.providers.testing import ScriptedProvider
 from aeloon_core.runtime.rename import normalize_session_title
@@ -56,11 +56,12 @@ async def test_first_completed_turn_generates_one_semantic_session_title(tmp_pat
             driver_factories={"deepseek": lambda *_args: provider_factory()},
         ),
     )
-    bridge = BridgeRpcAdapter(runtime)
-    metadata = await bridge.dispatch(
-        "session.create", {"workspace": str(tmp_path), "title": "New chat"}
+    rpc = AeloonRpcAdapter(runtime)
+    metadata = await rpc.dispatch(
+        "session.create",
+        {"session_id": "rename-thread", "workspace": str(tmp_path), "title": "New chat"},
     )
-    started = await bridge.dispatch(
+    started = await rpc.dispatch(
         "turn.start",
         {
             "session_id": metadata["session_id"],
@@ -71,7 +72,7 @@ async def test_first_completed_turn_generates_one_semantic_session_title(tmp_pat
     assert operation.task is not None
     await operation.task
 
-    snapshot = await bridge.dispatch("session.get", {"session_id": metadata["session_id"]})
+    snapshot = await rpc.dispatch("session.get", {"session_id": metadata["session_id"]})
     assert snapshot["metadata"]["title"] == "修复图片附件识别"
     assert len(providers[0].requests) == 2
     rename_context = providers[0].requests[1][1]
@@ -81,7 +82,7 @@ async def test_first_completed_turn_generates_one_semantic_session_title(tmp_pat
         entry.get("message", {}).get("content") != "修复图片附件识别"
         for entry in await (await runtime.repository.open(metadata["session_id"])).get_entries()
     )
-    renamed_events = [event for event in bridge._events if event["name"] == "session.renamed"]
+    renamed_events = [event for event in rpc._events if event["name"] == "session.renamed"]
     assert renamed_events[-1]["payload"] == {
         "title": "修复图片附件识别",
         "source": "automatic",
@@ -89,21 +90,23 @@ async def test_first_completed_turn_generates_one_semantic_session_title(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_manual_session_rename_emits_bridge_event(tmp_path: Path) -> None:
+async def test_manual_session_rename_emits_rpc_event(tmp_path: Path) -> None:
     config_path = tmp_path / "config.json"
     save_config(Config(workspace=tmp_path, data_dir=tmp_path / "data"), config_path)
     runtime = RuntimeService(config_path=config_path)
-    bridge = BridgeRpcAdapter(runtime)
-    metadata = await bridge.dispatch("session.create", {"workspace": str(tmp_path)})
+    rpc = AeloonRpcAdapter(runtime)
+    metadata = await rpc.dispatch(
+        "session.create", {"session_id": "manual-rename-thread", "workspace": str(tmp_path)}
+    )
 
-    result = await bridge.dispatch(
+    result = await rpc.dispatch(
         "session.rename",
         {"session_id": metadata["session_id"], "title": "Manual title"},
     )
 
     assert result["title"] == "Manual title"
-    assert bridge._events[-1]["name"] == "session.renamed"
-    assert bridge._events[-1]["payload"] == {
+    assert rpc._events[-1]["name"] == "session.renamed"
+    assert rpc._events[-1]["payload"] == {
         "title": "Manual title",
         "source": "manual",
     }

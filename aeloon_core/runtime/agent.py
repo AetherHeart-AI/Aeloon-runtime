@@ -8,6 +8,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import Any
 
+from aeloon_core.browser.protocol import BrowserContext
 from aeloon_core.config import Config
 from aeloon_core.core import (
     AgentMessage,
@@ -129,6 +130,7 @@ class SessionAgent:
         session: Session | None,
         provider_manager: ProviderManager,
         active_tool_names: tuple[str, ...] | None = None,
+        browser_context: BrowserContext | None = None,
     ) -> None:
         self.config = config
         self.session = session
@@ -145,6 +147,7 @@ class SessionAgent:
             self.config.workspace,
             shell_path=self.config.tools.shell_path,
             auto_resize_images=self.config.tools.auto_resize_images,
+            browser_context=browser_context,
         )
 
     def subscribe(self, observer: RunObserver) -> Callable[[], None]:

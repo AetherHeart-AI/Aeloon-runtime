@@ -1,13 +1,13 @@
-"""Stable Bridge v3 protocol metadata and errors."""
+"""Strict aeloon-rpc-v1 protocol metadata and errors."""
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
 from typing import Any
 
-PROTOCOL_NAME = "aeloon-core-bridge"
-PROTOCOL_VERSION = 3
+PROTOCOL_NAME = "aeloon-rpc-v1"
+PROTOCOL_VERSION = 1
+MAX_FRAME_BYTES = 12 * 1024 * 1024
+
 METHODS = (
     "system.handshake",
     "system.health",
@@ -38,6 +38,7 @@ METHODS = (
     "cloud.account.login",
     "cloud.account.logout",
 )
+
 EVENTS = (
     "operation.queued",
     "operation.started",
@@ -64,23 +65,6 @@ EVENTS = (
     "log.entry",
     "system.shutdown",
 )
-CAPABILITIES = (
-    "daemon",
-    "sessions",
-    "turn-queue",
-    "ordered-events",
-    "event-replay",
-    "session-snapshots",
-    "attachments",
-    "revisioned-settings",
-    "dynamic-catalog",
-    "cloud-account",
-    "unified-providers",
-    "runtime-skills",
-    "skill-slash-commands",
-    "progressive-skill-loading",
-    "structured-artifacts",
-)
 
 RPC_CODES = {
     "protocol_incompatible": -32010,
@@ -91,15 +75,14 @@ RPC_CODES = {
     "invalid_state": -32023,
     "invalid_attachment": -32024,
     "revision_conflict": -32025,
-    "daemon_config_conflict": -32026,
     "authentication_failed": -32027,
     "internal_error": -32603,
     "method_not_found": -32601,
 }
 
 
-class BridgeError(RuntimeError):
-    """Sanitized public Bridge failure."""
+class RpcError(RuntimeError):
+    """Sanitized failure crossing the Core process boundary."""
 
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
@@ -113,17 +96,11 @@ class BridgeError(RuntimeError):
         }
 
 
-def load_schema() -> dict[str, Any]:
-    path = Path(__file__).with_name("bridge-protocol-v3.json")
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
 __all__ = [
-    "CAPABILITIES",
     "EVENTS",
+    "MAX_FRAME_BYTES",
     "METHODS",
     "PROTOCOL_NAME",
     "PROTOCOL_VERSION",
-    "BridgeError",
-    "load_schema",
+    "RpcError",
 ]

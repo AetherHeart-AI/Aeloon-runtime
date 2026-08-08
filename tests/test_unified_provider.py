@@ -7,7 +7,6 @@ from typing import Any
 import httpx
 import pytest
 
-from aeloon_core.bridge import BridgeRpcAdapter
 from aeloon_core.config import (
     Config,
     CustomProviderConfig,
@@ -16,6 +15,7 @@ from aeloon_core.config import (
 )
 from aeloon_core.core import InferenceContext, Model, StreamOptions, UserMessage
 from aeloon_core.core.inference_runtime import collect_assistant
+from aeloon_core.rpc import AeloonRpcAdapter
 from aeloon_core.runtime import (
     ProviderManager,
     RuntimeService,
@@ -296,7 +296,7 @@ async def test_custom_provider_routes_qualified_model_to_unprefixed_api_model() 
 
 
 @pytest.mark.asyncio
-async def test_bridge_adds_and_removes_provider_without_exposing_secret(
+async def test_rpc_adds_and_removes_provider_without_exposing_secret(
     tmp_path: Path,
 ) -> None:
     config_path = tmp_path / "config.json"
@@ -339,7 +339,7 @@ async def test_bridge_adds_and_removes_provider_without_exposing_secret(
         return ProviderManager(config, driver_factories={"custom": custom})
 
     runtime = RuntimeService(config_path=config_path, provider_manager_factory=factory)
-    service = BridgeRpcAdapter(runtime)
+    service = AeloonRpcAdapter(runtime)
 
     added = await service.dispatch(
         "provider.add",
@@ -378,7 +378,7 @@ async def test_bridge_adds_and_removes_provider_without_exposing_secret(
 
 
 @pytest.mark.asyncio
-async def test_bridge_discovers_models_and_persists_resolved_v1_endpoint(tmp_path: Path) -> None:
+async def test_rpc_discovers_models_and_persists_resolved_v1_endpoint(tmp_path: Path) -> None:
     config_path = tmp_path / "config.json"
     save_config(Config(workspace=tmp_path, data_dir=tmp_path / "data"), config_path)
     requests: list[httpx.Request] = []
@@ -421,7 +421,7 @@ async def test_bridge_discovers_models_and_persists_resolved_v1_endpoint(tmp_pat
         config_path=config_path,
         provider_manager_factory=factory,
     )
-    service = BridgeRpcAdapter(runtime)
+    service = AeloonRpcAdapter(runtime)
     added = await service.dispatch(
         "provider.add",
         {"provider_id": "desktop", "endpoint": "http://127.0.0.1:11434"},
@@ -435,7 +435,7 @@ async def test_bridge_discovers_models_and_persists_resolved_v1_endpoint(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_bridge_refreshes_provider_models_without_using_configured_cache(
+async def test_rpc_refreshes_provider_models_without_using_configured_cache(
     tmp_path: Path,
 ) -> None:
     config_path = tmp_path / "config.json"
@@ -487,7 +487,7 @@ async def test_bridge_refreshes_provider_models_without_using_configured_cache(
         return ProviderManager(snapshot, driver_factories={"custom": custom})
 
     runtime = RuntimeService(config_path=config_path, provider_manager_factory=factory)
-    service = BridgeRpcAdapter(runtime)
+    service = AeloonRpcAdapter(runtime)
     refreshed = await service.dispatch(
         "provider.refresh",
         {"provider_id": "studio", "force": True, "revision": 1},

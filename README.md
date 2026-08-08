@@ -115,7 +115,7 @@ remains optional and is used only to render DOCX/PPTX files for visual QA.
 
 Skill discovery is progressive: Runtime reads only each `SKILL.md` frontmatter for the catalog and
 system-prompt index. The full instructions are read only when the model chooses an enabled skill or
-when a prompt starts with an explicit command such as `/review inspect this patch`. Bridge clients
+when a prompt starts with an explicit command such as `/review inspect this patch`. Workbench clients
 select enabled skills through `settings.update.resources.enabled_skill_ids`; they continue to send
 the user's text as a normal prompt, and runtime resolves the slash command.
 
@@ -126,7 +126,7 @@ client saves an explicit list.
 
 Runtime also injects the intrinsic `present_files` delivery tool. Skills use it after verifying
 final office, PDF, image, Markdown, or HTML files. Runtime validates the paths, persists their
-display metadata outside model context, and exposes them to Bridge clients as structured
+display metadata outside model context, and exposes them to Workbench clients as structured
 artifacts; stateless core tools and message types remain format-agnostic.
 
 ## Python API
@@ -166,7 +166,10 @@ session = await runtime.create_session(workspace="/path/to/repository")
 ```
 
 Runtime owns sessions, context construction, persistence, provider selection, and operation
-scheduling. Bridge clients access the same runtime through Bridge v3.
+scheduling. The Electron workbench accesses the runtime through the private, incompatible
+`aeloon-rpc-v1` Unix-socket adapter. When Core starts with a Browser Runtime socket, all 22
+Browser Use tools are part of every agent tool catalog and execute through
+`browser-runtime-v1`.
 
 ## Security
 
@@ -199,7 +202,7 @@ uv run --isolated --frozen --no-default-groups \
 ```
 
 The executable is written to `dist/aeloon`. It includes Python, Node.js, office Skill runtime
-dependencies, the Bridge schema, and bundled skills, so the target Mac does not need Python,
+dependencies, and bundled skills, so the target Mac does not need Python,
 Node.js, npm, or `uv`. Install it somewhere on your `PATH`:
 
 ```bash
@@ -224,7 +227,7 @@ updates the matching GitHub Release with the archive and its SHA-256 checksum.
 
 The same PyInstaller command builds a native single-file executable on an ARM64 Ubuntu host.
 GitHub Actions builds it on an `ubuntu-22.04-arm` runner, verifies the glibc 2.35 compatibility
-baseline, ELF architecture, and daemon lifecycle, and uploads
+baseline, ELF architecture, and process lifecycle, and uploads
 `aeloon-ubuntu-arm64-glibc2.35.tar.gz` plus its SHA-256 checksum. The binary targets Ubuntu 22.04
 or newer. Tag builds also add these files to the matching GitHub Release.
 

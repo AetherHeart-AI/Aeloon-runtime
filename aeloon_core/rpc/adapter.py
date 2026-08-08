@@ -1,4 +1,4 @@
-"""Bridge v3 RPC adapter over the runtime service."""
+"""aeloon-rpc-v1 adapter over the transport-free runtime service."""
 
 from __future__ import annotations
 
@@ -12,13 +12,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from aeloon_core.bridge.protocol import (
-    CAPABILITIES,
+from aeloon_core.rpc.protocol import (
     EVENTS,
     METHODS,
     PROTOCOL_NAME,
-    PROTOCOL_VERSION,
-    BridgeError,
+    RpcError,
 )
 from aeloon_core.runtime.service import (
     ATTACHMENT_LIMIT,
@@ -32,14 +30,14 @@ from aeloon_core.runtime.types import RuntimeEvent, RuntimeFailure, TurnInput
 from aeloon_core.version import __version__
 
 EVENT_LIMIT = 5_000
-BridgeEventListener = Callable[[dict[str, Any]], Awaitable[None] | None]
+RpcEventListener = Callable[[dict[str, Any]], Awaitable[None] | None]
 
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-class BridgeRpcAdapter:
+class AeloonRpcAdapter:
     """Own wire dispatch, public errors, event sequencing, and replay."""
 
     def __init__(self, runtime: RuntimeService) -> None:
@@ -50,7 +48,7 @@ class BridgeRpcAdapter:
         self.shutdown_signal = asyncio.Event()
         self._events: deque[dict[str, Any]] = deque(maxlen=EVENT_LIMIT)
         self._seq = 0
-        self._listeners: set[BridgeEventListener] = set()
+        self._listeners: set[RpcEventListener] = set()
         self._remove_runtime_listener = runtime.add_event_listener(self._runtime_event)
 
     @property
@@ -61,7 +59,7 @@ class BridgeRpcAdapter:
     def data_dir(self) -> Path:
         return self.runtime.data_dir
 
-    def add_event_listener(self, listener: BridgeEventListener) -> Callable[[], None]:
+    def add_event_listener(self, listener: RpcEventListener) -> Callable[[], None]:
         self._listeners.add(listener)
 
         def remove() -> None:
@@ -109,16 +107,19 @@ class BridgeRpcAdapter:
         }
         handler = routes.get(method)
         if handler is None:
-            raise BridgeError("method_not_found", f"Unknown Bridge method: {method}")
+            raise RpcError("method_not_found", f"Unknown RPC method: {method}")
         try:
             if method == "turn.start":
-                return await handler(value, attachment_roots=attachment_roots)
+                return await handler(
+                    value,
+                    attachment_roots=attachment_roots,
+                )
             return await handler(value)
-        except BridgeError:
+        except RpcError:
             raise
         except SessionError as exc:
             code = "session_not_found" if exc.code == "not_found" else "invalid_state"
-            raise BridgeError(code, self._sanitize(str(exc))) from None
+            raise RpcError(code, self._sanitize(str(exc))) from None
         except RuntimeFailure as exc:
             allowed = {
                 "busy",
@@ -130,28 +131,29 @@ class BridgeRpcAdapter:
                 "authentication_failed",
             }
             code = exc.code if exc.code in allowed else "internal_error"
-            raise BridgeError(code, str(exc)) from None
+            raise RpcError(code, str(exc)) from None
         except (KeyError, TypeError, ValueError) as exc:
-            raise BridgeError("invalid_argument", self._sanitize(str(exc))) from None
+            raise RpcError("invalid_argument", self._sanitize(str(exc))) from None
         except Exception:
-            raise BridgeError(
+            raise RpcError(
                 "internal_error",
                 "Aeloon Core could not complete the request",
             ) from None
 
-    async def handshake(self, params: Mapping[str, Any]) -> dict[str, Any]:
-        versions = params.get("protocol_versions", [PROTOCOL_VERSION])
-        if versions and PROTOCOL_VERSION not in versions:
-            raise BridgeError("protocol_incompatible", "Aeloon Core requires Bridge protocol v3")
+    async def handshake(
+        self,
+        params: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if params.get("protocol") != PROTOCOL_NAME:
+            raise RpcError("protocol_incompatible", "Aeloon Core requires aeloon-rpc-v1")
         roots = params.get("attachment_roots") or []
         if not isinstance(roots, list) or any(not isinstance(root, str) for root in roots):
-            raise BridgeError("invalid_argument", "attachment_roots must be a list of paths")
+            raise RpcError("invalid_argument", "attachment_roots must be a list of paths")
         return {
             "protocol": PROTOCOL_NAME,
-            "protocol_version": PROTOCOL_VERSION,
             "core_version": __version__,
             "server_instance_id": self.server_instance_id,
-            "capabilities": list(CAPABILITIES),
+            "browser_runtime": self.runtime.browser_runtime is not None,
             "methods": list(METHODS),
             "events": list(EVENTS),
             "attachment_roots": [
@@ -173,7 +175,14 @@ class BridgeRpcAdapter:
         workspace = self._required_string(params, "workspace")
         raw_title = params.get("title")
         title = str(raw_title).strip() if raw_title is not None else None
-        return (await self.runtime.create_session(workspace=workspace, title=title)).to_dict()
+        session_id = self._required_string(params, "session_id")
+        return (
+            await self.runtime.create_session(
+                workspace=workspace,
+                session_id=session_id,
+                title=title,
+            )
+        ).to_dict()
 
     async def _session_list(self, params: Mapping[str, Any]) -> dict[str, Any]:
         workspace = str(params["workspace"]) if params.get("workspace") else None
@@ -243,6 +252,10 @@ class BridgeRpcAdapter:
         asyncio.get_running_loop().call_later(0.05, self.shutdown_signal.set)
         return {"status": "stopping"}
 
+    def request_shutdown(self) -> None:
+        self.shutdown_requested.set()
+        self.shutdown_signal.set()
+
     async def events_subscribe(self, params: Mapping[str, Any]) -> dict[str, Any]:
         session_ids = params.get("session_ids") or []
         after_seq = int(params.get("after_seq") or 0)
@@ -250,7 +263,7 @@ class BridgeRpcAdapter:
             not isinstance(item, str) for item in session_ids
         )
         if invalid_session_ids:
-            raise BridgeError("invalid_argument", "session_ids must be a list")
+            raise RpcError("invalid_argument", "session_ids must be a list")
         first_seq = self._events[0]["seq"] if self._events else self._seq + 1
         replay_complete = after_seq >= first_seq - 1
         replay = (
@@ -307,18 +320,18 @@ class BridgeRpcAdapter:
 
     def _turn_input(self, raw: Any) -> TurnInput:
         if not isinstance(raw, Mapping):
-            raise BridgeError("invalid_argument", "turn.start.input must be an object")
+            raise RpcError("invalid_argument", "turn.start.input must be an object")
         kind = str(raw.get("kind") or "prompt")
         if kind == "prompt":
             text = self._required_string(raw, "text")
             if len(text) > PROMPT_LIMIT:
-                raise BridgeError(
+                raise RpcError(
                     "invalid_argument",
                     f"Prompt must contain 1 to {PROMPT_LIMIT:,} characters",
                 )
             attachments = raw.get("attachments") or []
             if not isinstance(attachments, list):
-                raise BridgeError("invalid_attachment", "attachments must be a list")
+                raise RpcError("invalid_attachment", "attachments must be a list")
             return TurnInput(
                 kind="prompt",
                 text=text,
@@ -342,13 +355,13 @@ class BridgeRpcAdapter:
             if not isinstance(arguments, list) or any(
                 not isinstance(item, str) for item in arguments
             ):
-                raise BridgeError("invalid_argument", "template arguments must be strings")
+                raise RpcError("invalid_argument", "template arguments must be strings")
             return TurnInput(
                 kind="prompt_template",
                 name=self._required_string(raw, "name"),
                 arguments=tuple(arguments),
             )
-        raise BridgeError(
+        raise RpcError(
             "invalid_argument",
             "input.kind must be prompt, skill, or prompt_template",
         )
@@ -357,8 +370,8 @@ class BridgeRpcAdapter:
     def _required_string(params: Mapping[str, Any], key: str) -> str:
         value = params.get(key)
         if not isinstance(value, str) or not value.strip():
-            raise BridgeError("invalid_argument", f"{key} is required")
+            raise RpcError("invalid_argument", f"{key} is required")
         return value.strip()
 
 
-__all__ = ["BridgeRpcAdapter"]
+__all__ = ["AeloonRpcAdapter"]

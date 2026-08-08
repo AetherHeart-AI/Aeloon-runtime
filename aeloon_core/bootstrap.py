@@ -66,6 +66,7 @@ def create_runtime_service(
     data_dir: Path | str | None = None,
     max_concurrent_operations: int = 4,
     agent_factory: SessionAgentFactory | None = None,
+    browser_runtime_socket: Path | str | None = None,
 ) -> RuntimeService:
     config = load_config(config_path)
     if data_dir is not None:
@@ -95,6 +96,7 @@ def create_runtime_service(
         agent_factory=agent_factory,
         provider_manager_factory=manager_factory,
         account_gateway=account,
+        browser_runtime_socket=browser_runtime_socket,
     )
 
 

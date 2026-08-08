@@ -16,7 +16,7 @@ release is cut, those entries should move to a versioned section with an ISO dat
 - Official packages now include the Python, Node.js, PptxGenJS, PDF, DOCX, PaddlePaddle, and
   PaddleOCR execution dependencies required by the built-in office skills. OCR model weights are
   cached separately after first use, and LibreOffice remains an optional visual-QA dependency.
-- Extended the Bridge daemon startup window for large single-file packages so cold extraction on
+- Extended the desktop child-process startup window for large single-file packages so cold extraction on
   slower disks does not fail after five seconds.
 
 ## 0.0.3 - 2026-08-07
@@ -43,8 +43,8 @@ release is cut, those entries should move to a versioned section with an ISO dat
   Legacy `deepseek`, `local_providers`, and `cloud` keys now fail with a migration error.
 - Replaced CLI `local` commands with `aeloon provider add/list/remove` and required an explicit
   `ollama` or `openai-compatible` driver when adding an endpoint.
-- Upgraded Bridge to v3 with `provider.add/remove`, unified Provider/settings DTOs, and explicit
-  v2 handshake rejection. Append-only JSONL Session v3 remains readable and unchanged.
+- Unified the former desktop transport Provider/settings DTOs and made unsupported protocol
+  versions fail explicitly. Append-only JSONL Session data remained readable at that release.
 - Moved Skill metadata/content, prompt construction, summarization, compaction selection, and
   typed artifacts into Runtime. Cloud now owns only account, token, vault, and raw catalog access.
 - Removed old Python import re-exports and compatibility shims; package version is now `0.4.0`.
@@ -54,7 +54,7 @@ release is cut, those entries should move to a versioned section with an ISO dat
   development.
 - Moved compatibility guidance and internal architecture details into dedicated documents.
 - Reworded public project descriptions and core module documentation to focus on Aeloon behavior.
-- Added runtime-owned skill selection, `/skill` prompt resolution, metadata-rich Bridge catalog
+- Added runtime-owned skill selection, `/skill` prompt resolution, metadata-rich client catalog
   entries, and on-demand loading of full skill instructions.
 - Bundled office, presentation, document-writing, and reporting skills and provisioned missing
   presets into the Core data directory without overwriting user-owned skills.

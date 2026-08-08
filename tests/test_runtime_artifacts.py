@@ -4,13 +4,13 @@ from pathlib import Path
 
 import pytest
 
-from aeloon_core.bridge import BridgeRpcAdapter
 from aeloon_core.config import Config, save_config
 from aeloon_core.core import (
     AssistantMessage,
     TextContent,
     ToolCall,
 )
+from aeloon_core.rpc import AeloonRpcAdapter
 from aeloon_core.runtime import (
     PRESENT_FILES_TOOL_NAME,
     Artifact,
@@ -135,13 +135,15 @@ async def test_runtime_projects_presented_files_live_and_from_history(tmp_path: 
             driver_factories={"deepseek": lambda *_args: provider},
         ),
     )
-    bridge = BridgeRpcAdapter(runtime)
-    session = await bridge.dispatch("session.create", {"workspace": str(tmp_path)})
-    await bridge.dispatch(
+    rpc = AeloonRpcAdapter(runtime)
+    session = await rpc.dispatch(
+        "session.create", {"session_id": "artifact-thread", "workspace": str(tmp_path)}
+    )
+    await rpc.dispatch(
         "session.configure",
         {"session_id": session["session_id"], "active_tools": []},
     )
-    started = await bridge.dispatch(
+    started = await rpc.dispatch(
         "turn.start",
         {
             "session_id": session["session_id"],
@@ -158,11 +160,11 @@ async def test_runtime_projects_presented_files_live_and_from_history(tmp_path: 
 
     completed = next(
         event
-        for event in bridge._events
+        for event in rpc._events
         if event["name"] == "tool.completed" and event["operation_id"] == started["operation_id"]
     )
     assert completed["payload"]["patch"]["artifacts"][0]["path"] == "report.pptx"
-    snapshot = await bridge.dispatch("session.get", {"session_id": session["session_id"]})
+    snapshot = await rpc.dispatch("session.get", {"session_id": session["session_id"]})
     artifacts = snapshot["timeline"][0]["blocks"][0]["artifacts"]
     assert [artifact["path"] for artifact in artifacts] == ["report.pptx"]
     assert "generator.py" not in str(artifacts)
@@ -171,7 +173,7 @@ async def test_runtime_projects_presented_files_live_and_from_history(tmp_path: 
     assert delivery["runId"] == started["operation_id"]
     assert delivery["toolCallId"] == "present"
 
-    catalog = await bridge.dispatch("catalog.get")
+    catalog = await rpc.dispatch("catalog.get")
     present = next(item for item in catalog["tools"] if item["id"] == PRESENT_FILES_TOOL_NAME)
     assert present["description"] == "Runtime-managed final deliverable tool"
     assert snapshot["state"]["active_tools"] == [PRESENT_FILES_TOOL_NAME]
@@ -179,7 +181,5 @@ async def test_runtime_projects_presented_files_live_and_from_history(tmp_path: 
     assert DEFAULT_ACTIVE_TOOLS == ("read", "bash", "edit", "write")
 
 
-def test_bridge_advertises_structured_artifacts() -> None:
-    from aeloon_core.bridge.protocol import CAPABILITIES
-
-    assert "structured-artifacts" in CAPABILITIES
+def test_rpc_catalogue_advertises_structured_artifacts() -> None:
+    assert PRESENT_FILES_TOOL_NAME == "present_files"

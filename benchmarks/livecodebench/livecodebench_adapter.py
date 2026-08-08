@@ -1,4 +1,4 @@
-"""Bridge benchmark adapters to an official LiveCodeBench checkout.
+"""Benchmark adapters to an official LiveCodeBench checkout.
 
 This module is intentionally executed with the Python environment belonging to
 the LiveCodeBench checkout.  Keeping the adapter in a separate process avoids

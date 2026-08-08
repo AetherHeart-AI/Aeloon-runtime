@@ -8,7 +8,6 @@ from typing import Any
 import httpx
 import pytest
 
-from aeloon_core.bridge import BridgeRpcAdapter
 from aeloon_core.cloud import (
     CloudAccountService,
     CloudConfig,
@@ -18,6 +17,7 @@ from aeloon_core.cloud import (
 from aeloon_core.config import Config, save_config
 from aeloon_core.core import InferenceContext, Model, StreamOptions, UserMessage
 from aeloon_core.core.inference_runtime import collect_assistant
+from aeloon_core.rpc import AeloonRpcAdapter
 from aeloon_core.runtime import RuntimeService
 from aeloon_core.runtime.providers import CloudProvider
 
@@ -102,7 +102,7 @@ async def test_account_owns_refresh_token_and_raw_catalog(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_bridge_exposes_account_without_credentials_and_adds_cloud_models(
+async def test_rpc_exposes_account_without_credentials_and_adds_cloud_models(
     tmp_path: Path,
 ) -> None:
     cloud, _, _ = account(tmp_path)
@@ -112,7 +112,7 @@ async def test_bridge_exposes_account_without_credentials_and_adds_cloud_models(
         config_path=config_path,
         account_gateway=cloud,  # type: ignore[arg-type]
     )
-    service = BridgeRpcAdapter(runtime)
+    service = AeloonRpcAdapter(runtime)
 
     logged_in = await service.dispatch(
         "cloud.account.login", {"username": "alice", "password": "secret"}
@@ -125,7 +125,9 @@ async def test_bridge_exposes_account_without_credentials_and_adds_cloud_models(
     assert cloud_model["id"] == "aeloon-cloud/reasoner"
     assert cloud_model["supports_image"] is True
 
-    session = await service.dispatch("session.create", {"workspace": str(tmp_path)})
+    session = await service.dispatch(
+        "session.create", {"session_id": "cloud-thread", "workspace": str(tmp_path)}
+    )
     configured = await service.dispatch(
         "session.configure", {"session_id": session["session_id"], "model_id": cloud_model["id"]}
     )
