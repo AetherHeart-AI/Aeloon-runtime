@@ -1081,12 +1081,6 @@ class RuntimeService:
     async def _should_auto_rename(self, session: Session, operation: Operation) -> bool:
         if operation.input.get("kind") != "prompt":
             return False
-        entries = await session.get_entries()
-        run_ids = [
-            str(entry.get("runId") or "") for entry in entries if entry.get("type") == "run_start"
-        ]
-        if run_ids != [operation.id]:
-            return False
         title = await session.get_name() or session.metadata.metadata.get("title")
         return is_generic_session_title(str(title or ""))
 

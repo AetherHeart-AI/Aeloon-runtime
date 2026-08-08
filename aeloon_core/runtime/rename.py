@@ -54,6 +54,15 @@ def normalize_session_title(value: str, *, maximum: int = 60) -> str | None:
     return "".join(characters[: maximum - 1]).rstrip() + "…"
 
 
+def fallback_session_title(user_prompt: str, *, maximum: int = 60) -> str | None:
+    """Derive a stable title when the optional naming request cannot complete."""
+
+    title = normalize_session_title(user_prompt, maximum=maximum)
+    if title is None or is_generic_session_title(title):
+        return None
+    return title
+
+
 async def rename_session(
     *,
     session: Session,
@@ -79,27 +88,35 @@ async def rename_session(
         "Assistant outcome:\n"
         f"{assistant_text.strip()[:4_000]}"
     )
+
     async def on_retry(_data: dict[str, object]) -> None:
         return None
 
-    response = await InferenceRuntime(inference, RunEventDispatcher()).request(
-        model=model,
-        messages=(UserMessage(prompt),),
-        system_prompt=_SYSTEM_PROMPT,
-        tools=(),
-        session_id=f"{session.id}:rename",
-        stream_options=replace(
-            stream_options,
-            max_tokens=80,
-            temperature=0.2,
-            thinking_level="off",
-        ),
-        on_retry=on_retry,
-    )
-    if response.stop_reason in {"error", "aborted"}:
-        return None
-    title = normalize_session_title(response.text)
+    title: str | None = None
+    try:
+        response = await InferenceRuntime(inference, RunEventDispatcher()).request(
+            model=model,
+            messages=(UserMessage(prompt),),
+            system_prompt=_SYSTEM_PROMPT,
+            tools=(),
+            session_id=f"{session.id}:rename",
+            stream_options=replace(
+                stream_options,
+                max_tokens=80,
+                temperature=0.2,
+                thinking_level="off",
+            ),
+            on_retry=on_retry,
+        )
+        if response.stop_reason not in {"error", "aborted"}:
+            title = normalize_session_title(response.text)
+    except Exception:
+        # Naming must remain available when the separate best-effort inference
+        # request fails before it can return a normal error response.
+        pass
     if title is None or is_generic_session_title(title):
+        title = fallback_session_title(user_prompt)
+    if title is None:
         return None
 
     # A manual rename may have landed while the model was generating the title.
@@ -112,6 +129,7 @@ async def rename_session(
 
 __all__ = [
     "GENERIC_SESSION_TITLES",
+    "fallback_session_title",
     "is_generic_session_title",
     "normalize_session_title",
     "rename_session",
