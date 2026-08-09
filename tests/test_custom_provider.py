@@ -224,3 +224,119 @@ async def test_custom_discovery_failure_sanitizes_secrets() -> None:
     assert "local-secret" not in str(captured.value)
     assert "***" in str(captured.value)
     assert "local-secret" not in str(captured.value.cause)
+
+
+@pytest.mark.asyncio
+async def test_llamacpp_backend_reads_models_and_props_fields() -> None:
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.url.path)
+        if request.url.path == "/models":
+            return httpx.Response(200, json={"models": [{"model": "gemma.gguf"}]})
+        if request.url.path == "/props":
+            return httpx.Response(
+                200,
+                json={
+                    "default_generation_settings": {"n_ctx": 32_768},
+                    "modalities": ["text", "image"],
+                    "chat_template_caps": {"tools": True},
+                },
+            )
+        raise AssertionError(request.url)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = CustomProvider(
+        provider_id="llama",
+        name="llama.cpp",
+        endpoint="http://127.0.0.1:8080",
+        backend="llamacpp",
+        client=client,
+    )
+
+    models = await provider.discover_models()
+    await client.aclose()
+
+    assert requests == ["/models", "/props"]
+    assert provider.endpoint == "http://127.0.0.1:8080/v1"
+    assert models[0].id == "llama/gemma.gguf"
+    assert models[0].context_window == 32_768
+    assert models[0].input == ("text", "image")
+
+
+@pytest.mark.asyncio
+async def test_ollama_backend_reads_native_tags_and_show_fields() -> None:
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.url.path)
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": [{"name": "gemma3:latest"}]})
+        if request.url.path == "/api/show":
+            assert json.loads(request.content)["model"] == "gemma3:latest"
+            return httpx.Response(
+                200,
+                json={
+                    "capabilities": ["completion", "vision", "thinking"],
+                    "model_info": {"gemma3.context_length": 131_072},
+                },
+            )
+        raise AssertionError(request.url)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = CustomProvider(
+        provider_id="desktop",
+        name="Ollama",
+        endpoint="http://127.0.0.1:11434",
+        backend="ollama",
+        client=client,
+    )
+
+    models = await provider.discover_models()
+    await client.aclose()
+
+    assert requests == ["/api/tags", "/api/show"]
+    assert provider.endpoint == "http://127.0.0.1:11434/v1"
+    assert models[0].id == "desktop/gemma3:latest"
+    assert models[0].context_window == 131_072
+    assert models[0].reasoning is True
+    assert models[0].input == ("text", "image")
+
+
+@pytest.mark.asyncio
+async def test_vllm_backend_reads_model_card_max_model_len() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            assert request.url.path == "/v1/models"
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": "served-model",
+                            "owned_by": "vllm",
+                            "root": "org/model",
+                            "parent": None,
+                            "max_model_len": 65_536,
+                            "supports_image": False,
+                        }
+                    ]
+                },
+            )
+        raise AssertionError(request.url)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = CustomProvider(
+        provider_id="gpu",
+        name="vLLM",
+        endpoint="http://127.0.0.1:8000/v1",
+        backend="vllm",
+        client=client,
+    )
+
+    models = await provider.discover_models()
+    await client.aclose()
+
+    assert models[0].id == "gpu/served-model"
+    assert models[0].context_window == 65_536
+    assert models[0].input == ("text",)

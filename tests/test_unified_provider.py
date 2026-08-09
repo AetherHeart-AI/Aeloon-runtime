@@ -345,11 +345,12 @@ async def test_rpc_adds_and_removes_provider_without_exposing_secret(
         "provider.add",
         {
             "provider_id": "studio",
-            "driver": "openai-compatible",
+            "driver": "custom",
+            "backend": "openai",
             "name": "Studio API",
             "endpoint": "http://127.0.0.1:9000/v1/",
             "api_key": "local-secret",
-            "models": ["ignored-legacy-model"],
+            "models": ["coder", "vision"],
         },
     )
     catalog = await service.dispatch("catalog.get")

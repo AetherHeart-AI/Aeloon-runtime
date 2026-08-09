@@ -184,6 +184,18 @@ def _add_provider_arguments(command: argparse.ArgumentParser) -> None:
     command.add_argument("provider_id", help="Short name used in provider/model ids.")
     command.add_argument("--name", help="Human-readable provider name.")
     command.add_argument("--endpoint", required=True, help="Custom API base URL.")
+    command.add_argument(
+        "--backend",
+        choices=("openai", "llamacpp", "ollama", "vllm"),
+        default="openai",
+        help="Backend metadata dialect; inference remains OpenAI-compatible.",
+    )
+    command.add_argument(
+        "--model",
+        action="append",
+        dest="models",
+        help="Optional discovered-model allowlist; repeat for multiple models.",
+    )
     command.add_argument("--api-key", help="Optional API key.")
     command.add_argument("--proxy", help="Optional HTTP proxy.")
     command.add_argument(
@@ -1380,9 +1392,13 @@ async def provider_command(args: argparse.Namespace) -> int:
     elif command == "add":
         params = {
             "provider_id": args.provider_id,
+            "driver": "custom",
+            "backend": args.backend,
             "name": args.name or args.provider_id,
             "endpoint": args.endpoint,
         }
+        if args.models:
+            params["models"] = args.models
         if args.api_key:
             params["api_key"] = args.api_key
         if args.proxy:
@@ -1445,7 +1461,8 @@ def _print_provider_result(
         return
     if command == "add":
         provider = result["provider"]
-        print(f"Added provider {provider['id']} [{provider['driver']}] ({provider['endpoint']}).")
+        backend = provider.get("backend") or provider["driver"]
+        print(f"Added provider {provider['id']} [{backend}] ({provider['endpoint']}).")
         if provider.get("model_ids"):
             print("The first model in `aeloon-core models` is used automatically.")
             print(f"Optional pin: aeloon-core models use {provider['model_ids'][0]}")

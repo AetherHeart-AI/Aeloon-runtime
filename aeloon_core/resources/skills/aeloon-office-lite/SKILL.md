@@ -8,7 +8,7 @@ description: 快速、稳定地读取、创建、渲染和验证本地 PDF、Pow
 优先追求稳定和速度。使用统一入口：
 
 ```bash
-aeloon system skill aeloon-office-lite ACTION ...
+aeloon-core system skill aeloon-office-lite ACTION ...
 ```
 
 ## 工作流
@@ -22,11 +22,11 @@ aeloon system skill aeloon-office-lite ACTION ...
 ## 常用命令
 
 ```bash
-aeloon system skill aeloon-office-lite preflight
-aeloon system skill aeloon-office-lite read input.pdf --output extracted.md
-aeloon system skill aeloon-office-lite write content.json output.docx
-aeloon system skill aeloon-office-lite validate output.docx
-aeloon system skill aeloon-office-lite render output.pptx --output-dir rendered
+aeloon-core system skill aeloon-office-lite preflight
+aeloon-core system skill aeloon-office-lite read input.pdf --output extracted.md
+aeloon-core system skill aeloon-office-lite write content.json output.docx
+aeloon-core system skill aeloon-office-lite validate output.docx
+aeloon-core system skill aeloon-office-lite render output.pptx --output-dir rendered
 ```
 
 支持读写 `.pdf`、`.docx`、`.pptx`、`.xlsx`，并支持只读 `.xlsm`。对于 `.doc`、`.ppt`、`.xls`、`.wps`、`.dps`、`.et`，要求用户先用 Office 或 WPS 另存为现代格式。只接受本地路径；不要覆盖输入文件或已有输出，除非用户明确允许并传入 `--overwrite`。

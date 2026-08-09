@@ -1,4 +1,4 @@
-"""aeloon-rpc-v1 adapter over the transport-free runtime service."""
+"""aeloon-rpc-v2 adapter over the transport-free runtime service."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ from aeloon_core.runtime.service import (
 )
 from aeloon_core.runtime.session import SessionError
 from aeloon_core.runtime.types import RuntimeEvent, RuntimeFailure, TurnInput
-from aeloon_core.version import __version__
+from aeloon_core.version import __version__, core_commit
 
 EVENT_LIMIT = 5_000
 RpcEventListener = Callable[[dict[str, Any]], Awaitable[None] | None]
@@ -126,6 +126,7 @@ class AeloonRpcAdapter:
                 "invalid_state",
                 "invalid_argument",
                 "invalid_attachment",
+                "attachment_processing_failed",
                 "revision_conflict",
                 "operation_not_found",
                 "authentication_failed",
@@ -145,13 +146,14 @@ class AeloonRpcAdapter:
         params: Mapping[str, Any],
     ) -> dict[str, Any]:
         if params.get("protocol") != PROTOCOL_NAME:
-            raise RpcError("protocol_incompatible", "Aeloon Core requires aeloon-rpc-v1")
+            raise RpcError("protocol_incompatible", "Aeloon Core requires aeloon-rpc-v2")
         roots = params.get("attachment_roots") or []
         if not isinstance(roots, list) or any(not isinstance(root, str) for root in roots):
             raise RpcError("invalid_argument", "attachment_roots must be a list of paths")
         return {
             "protocol": PROTOCOL_NAME,
             "core_version": __version__,
+            "core_commit": core_commit(),
             "server_instance_id": self.server_instance_id,
             "browser_runtime": self.runtime.browser_runtime is not None,
             "methods": list(METHODS),

@@ -1,11 +1,11 @@
-"""Strict aeloon-rpc-v1 protocol metadata and errors."""
+"""Strict aeloon-rpc-v2 protocol metadata and errors."""
 
 from __future__ import annotations
 
 from typing import Any
 
-PROTOCOL_NAME = "aeloon-rpc-v1"
-PROTOCOL_VERSION = 1
+PROTOCOL_NAME = "aeloon-rpc-v2"
+PROTOCOL_VERSION = 2
 MAX_FRAME_BYTES = 12 * 1024 * 1024
 
 METHODS = (
@@ -74,6 +74,7 @@ RPC_CODES = {
     "busy": -32022,
     "invalid_state": -32023,
     "invalid_attachment": -32024,
+    "attachment_processing_failed": -32028,
     "revision_conflict": -32025,
     "authentication_failed": -32027,
     "internal_error": -32603,

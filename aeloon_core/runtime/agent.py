@@ -27,6 +27,7 @@ from aeloon_core.core import (
     run_agent,
 )
 from aeloon_core.core.compaction import ContextPolicy, ContextUpdate
+from aeloon_core.runtime.attachments import AttachmentAccessCallback, ResolvedAttachment
 from aeloon_core.runtime.compaction import (
     CompactionResult,
     CompactionSettings,
@@ -131,6 +132,8 @@ class SessionAgent:
         provider_manager: ProviderManager,
         active_tool_names: tuple[str, ...] | None = None,
         browser_context: BrowserContext | None = None,
+        attachments: tuple[ResolvedAttachment, ...] = (),
+        on_attachment_access: AttachmentAccessCallback | None = None,
     ) -> None:
         self.config = config
         self.session = session
@@ -148,6 +151,8 @@ class SessionAgent:
             shell_path=self.config.tools.shell_path,
             auto_resize_images=self.config.tools.auto_resize_images,
             browser_context=browser_context,
+            attachments=attachments,
+            on_attachment_access=on_attachment_access,
         )
 
     def subscribe(self, observer: RunObserver) -> Callable[[], None]:

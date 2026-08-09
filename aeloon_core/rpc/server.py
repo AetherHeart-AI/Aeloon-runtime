@@ -1,4 +1,4 @@
-"""Electron-owned length-framed aeloon-rpc-v1 server."""
+"""Electron-owned length-framed aeloon-rpc-v2 server."""
 
 from __future__ import annotations
 

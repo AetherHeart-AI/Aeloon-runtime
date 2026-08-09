@@ -48,18 +48,24 @@ def runtime_service(tmp_path: Path, *, browser: bool = False) -> RuntimeService:
 
 
 @pytest.mark.asyncio
-async def test_rpc_v1_rejects_every_legacy_handshake(tmp_path: Path) -> None:
+async def test_rpc_v2_rejects_every_legacy_handshake(tmp_path: Path) -> None:
     adapter = AeloonRpcAdapter(runtime_service(tmp_path))
     try:
         with pytest.raises(RpcError) as incompatible:
             await adapter.dispatch("system.handshake", {"protocol_versions": [3]})
         assert incompatible.value.code == "protocol_incompatible"
 
+        with pytest.raises(RpcError) as legacy:
+            await adapter.dispatch("system.handshake", {"protocol": "aeloon-rpc-v1"})
+        assert legacy.value.code == "protocol_incompatible"
+
         handshake = await adapter.dispatch(
             "system.handshake",
-            {"protocol": "aeloon-rpc-v1", "attachment_roots": [str(tmp_path)]},
+            {"protocol": "aeloon-rpc-v2", "attachment_roots": [str(tmp_path)]},
         )
-        assert handshake["protocol"] == "aeloon-rpc-v1"
+        assert handshake["protocol"] == "aeloon-rpc-v2"
+        assert handshake["core_version"] == "0.0.10"
+        assert len(handshake["core_commit"]) == 40
         assert "protocol_version" not in handshake
         assert "capabilities" not in handshake
     finally:
@@ -87,7 +93,7 @@ async def test_browser_tools_are_process_scoped_and_always_in_catalogue(tmp_path
     adapter = AeloonRpcAdapter(runtime_service(tmp_path, browser=True))
     try:
         handshake = await adapter.dispatch(
-            "system.handshake", {"protocol": "aeloon-rpc-v1"}
+            "system.handshake", {"protocol": "aeloon-rpc-v2"}
         )
         assert handshake["browser_runtime"] is True
         catalog = await adapter.dispatch("catalog.get", {"workspace": str(tmp_path)})
@@ -112,9 +118,9 @@ async def test_length_framed_rpc_round_trip_and_shutdown(tmp_path: Path) -> None
         result = await rpc_request(
             socket_path,
             "system.handshake",
-            {"protocol": "aeloon-rpc-v1"},
+            {"protocol": "aeloon-rpc-v2"},
         )
-        assert result["protocol"] == "aeloon-rpc-v1"
+        assert result["protocol"] == "aeloon-rpc-v2"
         await rpc_request(socket_path, "system.shutdown")
         await asyncio.wait_for(task, 2)
     finally:

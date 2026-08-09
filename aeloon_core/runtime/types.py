@@ -88,6 +88,7 @@ class OperationSnapshot:
     turn_id: str
     queue_position: int
     skill_id: str | None = None
+    attachment_ids: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         value = {
@@ -97,6 +98,7 @@ class OperationSnapshot:
         }
         if self.skill_id is not None:
             value["skill_id"] = self.skill_id
+        value["attachment_ids"] = list(self.attachment_ids)
         return value
 
 

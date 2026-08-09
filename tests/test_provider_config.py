@@ -68,7 +68,9 @@ def test_current_custom_driver_names_are_normalized_and_rewritten(tmp_path) -> N
 
     assert isinstance(config.providers["desktop"], CustomProviderConfig)
     assert config.providers["desktop"].endpoint == "http://127.0.0.1:11434/v1"
+    assert config.providers["desktop"].backend == "ollama"
     assert isinstance(config.providers["studio"], CustomProviderConfig)
+    assert config.providers["studio"].backend == "openai"
     assert config.providers["studio"].api_key == "studio-secret"
     assert config.providers["studio"].models[0].supports_image is True
 
@@ -76,6 +78,26 @@ def test_current_custom_driver_names_are_normalized_and_rewritten(tmp_path) -> N
     persisted = json.loads(path.read_text(encoding="utf-8"))
     assert persisted["providers"]["desktop"]["driver"] == "custom"
     assert persisted["providers"]["studio"]["driver"] == "custom"
+    assert persisted["providers"]["desktop"]["backend"] == "ollama"
+
+
+def test_custom_provider_without_backend_is_inferred_for_existing_configs() -> None:
+    raw = Config().model_dump(mode="json")
+    raw["providers"]["ollama"] = {
+        "driver": "custom",
+        "name": "Ollama",
+        "endpoint": "http://127.0.0.1:11434/v1",
+    }
+    raw["providers"]["studio"] = {
+        "driver": "custom",
+        "name": "Studio",
+        "endpoint": "https://studio.example/v1",
+    }
+
+    config = Config.model_validate(raw)
+
+    assert config.providers["ollama"].backend == "ollama"
+    assert config.providers["studio"].backend == "openai"
 
 
 def test_public_config_redacts_every_provider_secret_and_sensitive_header() -> None:

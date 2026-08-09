@@ -51,6 +51,7 @@ class CustomProviderConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     driver: Literal["custom"] = "custom"
+    backend: Literal["openai", "llamacpp", "ollama", "vllm"] = "openai"
     name: str
     enabled: bool = True
     endpoint: str
@@ -216,20 +217,32 @@ class Config(BaseModel):
                 normalized_providers: dict[str, Any] = {}
                 changed = False
                 for provider_id, provider in providers.items():
-                    if not isinstance(provider, dict) or provider.get("driver") not in {
-                        "ollama",
-                        "openai-compatible",
-                    }:
+                    if not isinstance(provider, dict):
                         normalized_providers[provider_id] = provider
                         continue
                     migrated = dict(provider)
-                    legacy_driver = migrated["driver"]
-                    migrated["driver"] = "custom"
+                    legacy_driver = migrated.get("driver")
+                    if legacy_driver in {"ollama", "openai-compatible"}:
+                        migrated["driver"] = "custom"
+                        migrated.setdefault(
+                            "backend", "ollama" if legacy_driver == "ollama" else "openai"
+                        )
+                        changed = True
+                    elif legacy_driver == "custom" and "backend" not in migrated:
+                        endpoint = str(migrated.get("endpoint") or "")
+                        migrated["backend"] = (
+                            "ollama"
+                            if provider_id.lower() == "ollama" or ":11434" in endpoint
+                            else "openai"
+                        )
+                        changed = True
+                    else:
+                        normalized_providers[provider_id] = provider
+                        continue
                     if legacy_driver == "ollama":
                         migrated.setdefault("name", "Ollama")
                         migrated.setdefault("endpoint", "http://127.0.0.1:11434/v1")
                     normalized_providers[provider_id] = migrated
-                    changed = True
                 if changed:
                     normalized["providers"] = normalized_providers
                     return normalized

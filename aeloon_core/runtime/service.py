@@ -7,7 +7,6 @@ import asyncio
 import base64
 import inspect
 import re
-import shutil
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
@@ -46,6 +45,13 @@ from aeloon_core.runtime.artifacts import (
     PRESENT_FILES_TOOL_NAME,
     artifacts_from_tool_result,
 )
+from aeloon_core.runtime.attachments import (
+    OFFICE_SUFFIXES,
+    AttachmentStore,
+    OfficeLiteService,
+    ResolvedAttachment,
+    missing_pdf_pages,
+)
 from aeloon_core.runtime.builtin_skills import provision_builtin_skills
 from aeloon_core.runtime.coordinator import (
     Operation,
@@ -78,6 +84,7 @@ from aeloon_core.runtime.types import (
     SessionSnapshot,
     TurnInput,
 )
+from aeloon_core.version import __version__, core_commit
 
 PROMPT_LIMIT = 100_000
 ATTACHMENT_LIMIT = 8
@@ -122,7 +129,15 @@ class RuntimeService:
         provision_builtin_skills(self.data_dir)
         self.repository = JsonlSessionRepository(self.data_dir)
         self.attachment_dir = self.data_dir / "session-attachments"
-        self.attachment_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.attachment_store = AttachmentStore(
+            self.attachment_dir,
+            image_limit=IMAGE_LIMIT,
+            file_limit=FILE_LIMIT,
+        )
+        self.attachment_store.cleanup_orphans(
+            {path.stem for path in self.repository.directory.glob("*.jsonl") if path.is_file()}
+        )
+        self.office_lite = OfficeLiteService()
         self.started_at = _now()
         self._revision = 1
         self._agent_factory = agent_factory
@@ -201,6 +216,7 @@ class RuntimeService:
             turn_id=str(value["turn_id"]),
             queue_position=int(value["queue_position"]),
             skill_id=str(value["skill_id"]) if value.get("skill_id") else None,
+            attachment_ids=tuple(str(item) for item in value.get("attachment_ids") or []),
         )
 
     async def cancel_turn(self, operation_id: str) -> None:
@@ -292,9 +308,7 @@ class RuntimeService:
             raise RuntimeFailure("busy", "Cannot delete a session with active operations")
         await self.repository.delete(session.id)
         self._runtimes.pop(session.id, None)
-        attachments = self.attachment_dir / session.id
-        if attachments.exists():
-            await asyncio.to_thread(shutil.rmtree, attachments)
+        await self.attachment_store.delete_session(session.id)
         return {"session_id": session.id, "deleted": True}
 
     async def session_rename(self, params: Mapping[str, Any]) -> dict[str, Any]:
@@ -407,8 +421,9 @@ class RuntimeService:
         session = await self._session(params)
         input_value = self._turn_input(params.get("input"))
         input_value = await self._resolve_skill_command(session, input_value)
+        newly_resolved: tuple[ResolvedAttachment, ...] = ()
         if input_value["kind"] == "prompt":
-            input_value["attachments"] = await self._copy_attachments(
+            input_value["attachments"], newly_resolved = await self._resolve_attachments(
                 session.id,
                 input_value.get("attachments") or [],
                 attachment_roots,
@@ -432,25 +447,40 @@ class RuntimeService:
                 else None
             ),
         )
-        overrides = self._session_overrides(await session.get_entries())
-        await session.append_run_start(
-            run_id=operation.id,
-            input=self._public_input(input_value),
-            model_id=str(overrides.get("model_id", self.config.agent.model)),
-            thinking_level=str(overrides.get("thinking_level", self.config.agent.thinking_level)),
-        )
+        try:
+            overrides = self._session_overrides(await session.get_entries())
+            await session.append_run_start(
+                run_id=operation.id,
+                input=self._public_input(input_value),
+                model_id=str(overrides.get("model_id", self.config.agent.model)),
+                thinking_level=str(
+                    overrides.get("thinking_level", self.config.agent.thinking_level)
+                ),
+            )
+        except Exception:
+            await self.attachment_store.remove(
+                session.id, [attachment.id for attachment in newly_resolved]
+            )
+            raise
         runtime.operations[operation.id] = operation
         queued = sum(1 for item in runtime.operations.values() if item.status == "queued")
         queued_payload: dict[str, Any] = {"kind": "turn", "queue_position": queued}
         if input_value.get("skill_id"):
             queued_payload["skill_id"] = input_value["skill_id"]
         await self._emit("operation.queued", session, operation, queued_payload)
+        for attachment in newly_resolved:
+            await self._attachment_log("resolved", session, operation, attachment)
         await self._emit_queue(session, runtime)
         operation.task = asyncio.create_task(self._execute_turn(session, runtime, operation))
         result = {
             "operation_id": operation.id,
             "turn_id": operation.id,
             "queue_position": queued,
+            "attachment_ids": [
+                str(attachment["id"])
+                for attachment in input_value.get("attachments") or []
+                if attachment.get("id")
+            ],
         }
         if input_value.get("skill_id"):
             result["skill_id"] = input_value["skill_id"]
@@ -798,12 +828,19 @@ class RuntimeService:
         provider_id = validate_provider_id(self._required_string(params, "provider_id"))
         if provider_id in {"deepseek", "aeloon-cloud"}:
             raise RuntimeFailure("invalid_argument", f"Provider id is reserved: {provider_id}")
+        driver = str(params.get("driver") or "custom")
+        if driver != "custom":
+            raise RuntimeFailure("invalid_argument", "Custom Provider driver must be custom")
+        backend = str(params.get("backend") or "openai")
+        if backend not in {"openai", "llamacpp", "ollama", "vllm"}:
+            raise RuntimeFailure("invalid_argument", f"Unsupported Provider backend: {backend}")
         endpoint = self._http_endpoint(self._required_string(params, "endpoint"))
         name = str(params.get("name") or provider_id).strip() or provider_id
         api_key = str(params["api_key"]) if params.get("api_key") else None
         proxy = str(params["proxy"]) if params.get("proxy") else None
         headers = self._string_mapping(params.get("headers"))
         provider = CustomProviderConfig(
+            backend=backend,  # type: ignore[arg-type]
             name=name,
             endpoint=endpoint,
             api_key=api_key,
@@ -824,6 +861,26 @@ class RuntimeService:
             ) from None
         finally:
             await manager.close()
+        requested_models = params.get("models") or []
+        if not isinstance(requested_models, list) or any(
+            not isinstance(model, str) or not model.strip() for model in requested_models
+        ):
+            raise RuntimeFailure("invalid_argument", "models must be a list of model ids")
+        if requested_models:
+            allowlist = list(
+                dict.fromkeys(
+                    model.strip().removeprefix(f"{provider_id}/")
+                    for model in requested_models
+                )
+            )
+            available = {split_model_id(model.id)[1]: model for model in discovered}
+            missing = sorted(set(allowlist).difference(available))
+            if missing:
+                raise RuntimeFailure(
+                    "invalid_argument",
+                    f"Provider did not return requested model(s): {', '.join(missing)}",
+                )
+            discovered = [available[model_id] for model_id in allowlist]
         models = [
             ProviderModelConfig(
                 id=split_model_id(model.id)[1],
@@ -903,10 +960,21 @@ class RuntimeService:
                 await self._emit("operation.started", session, operation, {"kind": "turn"})
                 await self._emit_queue(session, runtime)
                 config_snapshot = self.coordinator.snapshot(self.config)
+                resolved_attachments = await self.attachment_store.load(session.id)
+
+                async def on_attachment_access(
+                    action: str, attachment: ResolvedAttachment
+                ) -> None:
+                    await self._attachment_log(
+                        f"tool_{action}", session, operation, attachment
+                    )
+
                 agent = await self._new_agent(
                     config_snapshot,
                     session,
                     browser_context=operation.browser_context,
+                    attachments=resolved_attachments,
+                    on_attachment_access=on_attachment_access,
                 )
                 operation.agent = agent
                 await agent.prepare()
@@ -917,7 +985,13 @@ class RuntimeService:
                     await agent.next_turn(str(item.get("text") or ""))
                 if pending:
                     await session.append_next_turn_consumed([entry_id for entry_id, _ in pending])
-                result = await self._invoke_input(agent, operation.input, run_id=operation.id)
+                result = await self._invoke_input(
+                    agent,
+                    operation.input,
+                    run_id=operation.id,
+                    session=session,
+                    operation=operation,
+                )
                 operation.usage = result.usage.to_dict()
                 status = (
                     "cancelled"
@@ -982,8 +1056,12 @@ class RuntimeService:
             if not terminal_written:
                 safe = self._sanitize(str(exc))
                 await session.append_run_end(run_id=operation.id, status="failed", error=safe)
+                code = exc.code if isinstance(exc, RuntimeFailure) else "internal_error"
                 await self._emit(
-                    "operation.failed", session, operation, {"kind": "turn", "error": safe}
+                    "operation.failed",
+                    session,
+                    operation,
+                    {"kind": "turn", "error": safe, "code": code},
                 )
         finally:
             if operation.agent is not None:
@@ -1039,6 +1117,11 @@ class RuntimeService:
         session: Session,
         *,
         browser_context: BrowserContext | None = None,
+        attachments: tuple[ResolvedAttachment, ...] = (),
+        on_attachment_access: Callable[
+            [str, ResolvedAttachment], Awaitable[None] | None
+        ]
+        | None = None,
     ) -> SessionAgent:
         effective = config.model_copy(update={"workspace": Path(session.metadata.cwd)}).normalized()
         overrides = self._session_overrides(await session.get_entries())
@@ -1076,6 +1159,8 @@ class RuntimeService:
             provider_manager=manager,
             active_tool_names=(tuple(active_tools) if active_tools is not None else None),
             browser_context=browser_context,
+            attachments=attachments,
+            on_attachment_access=on_attachment_access,
         )
 
     async def _should_auto_rename(self, session: Session, operation: Operation) -> bool:
@@ -1190,6 +1275,8 @@ class RuntimeService:
         value: Mapping[str, Any],
         *,
         run_id: str,
+        session: Session,
+        operation: Operation,
     ) -> Any:
         kind = value["kind"]
         if kind == "skill":
@@ -1214,27 +1301,98 @@ class RuntimeService:
             elif attachment["type"] == "browser_annotation":
                 browser_annotations.append(dict(attachment["annotation"]))
             elif attachment["type"] == "image":
-                data = await asyncio.to_thread(Path(attachment["managed_path"]).read_bytes)
+                if agent.model is None or "image" not in agent.model.input:
+                    raise RuntimeFailure(
+                        "attachment_processing_failed",
+                        f"The selected model cannot read image attachment {attachment['display_name']}",
+                    )
+                path = Path(attachment["canonical_path"])
+                data = await asyncio.to_thread(path.read_bytes)
                 images.append(
                     ImageContent(
                         base64.b64encode(data).decode(), attachment.get("mime_type") or "image/png"
                     )
                 )
+                await self._attachment_log(
+                    "image_loaded", session, operation, self._resolved_attachment(attachment)
+                )
             elif attachment["type"] == "file":
-                path = Path(attachment["managed_path"])
-                try:
-                    content = (await asyncio.to_thread(path.read_text, encoding="utf-8"))[
-                        :TOOL_OUTPUT_LIMIT
-                    ]
-                    supplements.append(f"[File: {attachment['name']}]\n{content}")
-                except UnicodeError:
-                    supplements.append(f"[Binary file attached: {attachment['name']}]")
+                path = Path(attachment["canonical_path"])
+                resolved = self._resolved_attachment(attachment)
+                if path.suffix.lower() in OFFICE_SUFFIXES:
+                    try:
+                        markdown, metadata = await self.office_lite.read(path)
+                    except Exception as exc:
+                        raise RuntimeFailure(
+                            "attachment_processing_failed",
+                            f"Could not read Office attachment {resolved.display_name}: {exc}",
+                            cause=exc,
+                        ) from None
+                    supplements.append(
+                        f"[Attachment id={resolved.id} display_name={resolved.display_name}]\n"
+                        f"{markdown}"
+                    )
+                    await self._attachment_log(
+                        "office_read",
+                        session,
+                        operation,
+                        resolved,
+                        {"metadata": metadata},
+                    )
+                    missing_pages = (
+                        missing_pdf_pages(metadata) if path.suffix.lower() == ".pdf" else ()
+                    )
+                    if missing_pages:
+                        if agent.model is None or "image" not in agent.model.input:
+                            raise RuntimeFailure(
+                                "attachment_processing_failed",
+                                f"PDF {resolved.display_name} contains scanned pages but the "
+                                "selected model does not support vision",
+                            )
+                        try:
+                            rendered = await self.office_lite.render(path, dpi=120)
+                            selected = tuple(
+                                rendered[page - 1]
+                                for page in missing_pages
+                                if 0 < page <= len(rendered)
+                            )
+                        except Exception as exc:
+                            raise RuntimeFailure(
+                                "attachment_processing_failed",
+                                f"Could not render scanned PDF {resolved.display_name}: {exc}",
+                                cause=exc,
+                            ) from None
+                        if len(selected) != len(missing_pages):
+                            raise RuntimeFailure(
+                                "attachment_processing_failed",
+                                f"Could not render every scanned page in {resolved.display_name}",
+                            )
+                        images.extend(selected)
+                        await self._attachment_log(
+                            "vision_rendered",
+                            session,
+                            operation,
+                            resolved,
+                            {"pages": list(missing_pages), "dpi": 120},
+                        )
+                else:
+                    supplements.append(
+                        f"[Attachment id={resolved.id} display_name={resolved.display_name} "
+                        f"mime_type={resolved.mime_type}]\n"
+                        "Use attachment_read with this attachment ID if its text is needed. "
+                        "Never derive a workspace path from the display name."
+                    )
         if browser_annotations:
             supplements.append(browser_annotations_prompt(browser_annotations, message_id=run_id))
         if value.get("skill_id"):
             instructions = str(value.get("_skill_instructions") or "")
             if supplements:
                 instructions = "\n\n".join(item for item in (instructions, *supplements) if item)
+            if len(instructions) > PROMPT_LIMIT:
+                raise RuntimeFailure(
+                    "attachment_processing_failed",
+                    f"Skill instructions plus attachment content exceed {PROMPT_LIMIT:,} characters",
+                )
             return await agent.skill(
                 str(value["skill_id"]),
                 instructions or None,
@@ -1243,6 +1401,11 @@ class RuntimeService:
             )
         if supplements:
             text = "\n\n".join([text, *supplements])
+        if len(text) > PROMPT_LIMIT:
+            raise RuntimeFailure(
+                "attachment_processing_failed",
+                f"Prompt plus extracted attachment content exceeds {PROMPT_LIMIT:,} characters",
+            )
         return await agent.prompt(text, images=tuple(images), run_id=run_id)
 
     async def _run_event(
@@ -1510,16 +1673,14 @@ class RuntimeService:
     def _prompt_input(self, raw: Any) -> dict[str, Any]:
         return self.input_resolver.prompt(raw)
 
-    async def _copy_attachments(
+    async def _resolve_attachments(
         self,
         session_id: str,
         attachments: list[Any],
         roots: tuple[Path, ...],
-    ) -> list[dict[str, Any]]:
-        destination = self.attachment_dir / session_id
-        destination.mkdir(parents=True, exist_ok=True, mode=0o700)
-        resolved_roots = tuple(root.expanduser().resolve(strict=False) for root in roots)
-        result: list[dict[str, Any]] = []
+    ) -> tuple[list[dict[str, Any]], tuple[ResolvedAttachment, ...]]:
+        prepared: list[dict[str, Any] | None] = []
+        file_values: list[Mapping[str, Any]] = []
         annotation_count = 0
         for raw in attachments:
             if not isinstance(raw, Mapping):
@@ -1530,65 +1691,45 @@ class RuntimeService:
                 if annotation_count > MAX_ANNOTATIONS:
                     raise RuntimeFailure("invalid_attachment", "Too many browser annotations")
                 annotation = sanitize_browser_annotation(raw.get("annotation"))
-                result.append(
+                prepared.append(
                     {
                         "id": str(raw.get("id") or annotation["id"])[:128],
                         "type": kind,
-                        "name": str(raw.get("name") or f"Annotation {annotation['ordinal']}")[:255],
+                        "display_name": str(
+                            raw.get("display_name")
+                            or raw.get("name")
+                            or f"Annotation {annotation['ordinal']}"
+                        )[:255],
                         "annotation": annotation,
                     }
                 )
                 continue
             if kind == "assistant_selection":
                 text = str(raw.get("text") or "")[:PROMPT_LIMIT]
-                result.append(
+                prepared.append(
                     {
                         "id": str(raw.get("id") or uuid.uuid4().hex),
                         "type": kind,
-                        "name": str(raw.get("name") or "Assistant selection")[:255],
+                        "display_name": str(
+                            raw.get("display_name")
+                            or raw.get("name")
+                            or "Assistant selection"
+                        )[:255],
                         "text": text,
                     }
                 )
                 continue
             if kind not in {"image", "file"}:
                 raise RuntimeFailure("invalid_attachment", f"Unsupported attachment type: {kind}")
-            source_raw = raw.get("path")
-            if not isinstance(source_raw, str):
-                raise RuntimeFailure("invalid_attachment", "File attachment path is required")
-            try:
-                source = Path(source_raw).expanduser().resolve(strict=True)
-            except OSError:
-                raise RuntimeFailure(
-                    "invalid_attachment", "Attachment source does not exist"
-                ) from None
-            if not source.is_file() or not any(
-                source.is_relative_to(root) for root in resolved_roots
-            ):
-                raise RuntimeFailure(
-                    "invalid_attachment", "Attachment is outside the declared roots"
-                )
-            size = source.stat().st_size
-            maximum = IMAGE_LIMIT if kind == "image" else FILE_LIMIT
-            if size > maximum:
-                raise RuntimeFailure(
-                    "invalid_attachment",
-                    f"Attachment exceeds the {maximum // (1024 * 1024)} MiB limit",
-                )
-            name = Path(str(raw.get("name") or source.name)).name[:255]
-            target = destination / f"{uuid.uuid4().hex}{source.suffix[:20]}"
-            await asyncio.to_thread(shutil.copy2, source, target)
-            target.chmod(0o600)
-            result.append(
-                {
-                    "id": str(raw.get("id") or uuid.uuid4().hex),
-                    "type": kind,
-                    "name": name,
-                    "mime_type": str(raw.get("mime_type") or "application/octet-stream"),
-                    "size_bytes": size,
-                    "managed_path": str(target),
-                }
-            )
-        return result
+            file_values.append(raw)
+            prepared.append(None)
+        resolved = await self.attachment_store.resolve_batch(session_id, file_values, roots)
+        resolved_values = iter(resolved)
+        result = [
+            item if item is not None else next(resolved_values).runtime_dict()
+            for item in prepared
+        ]
+        return result, resolved
 
     def _public_input(self, value: Mapping[str, Any]) -> dict[str, Any]:
         result = {key: item for key, item in value.items() if not key.startswith("_")}
@@ -1598,7 +1739,7 @@ class RuntimeService:
                 for key in (
                     "id",
                     "type",
-                    "name",
+                    "display_name",
                     "mime_type",
                     "size_bytes",
                     "text",
@@ -1609,6 +1750,43 @@ class RuntimeService:
             for item in value.get("attachments") or []
         ]
         return result
+
+    @staticmethod
+    def _resolved_attachment(value: Mapping[str, Any]) -> ResolvedAttachment:
+        kind = str(value.get("type") or "")
+        if kind not in {"file", "image"}:
+            raise RuntimeFailure("invalid_attachment", "Attachment is not a stored file")
+        return ResolvedAttachment(
+            id=str(value["id"]),
+            type=kind,  # type: ignore[arg-type]
+            display_name=str(value["display_name"]),
+            mime_type=str(value["mime_type"]),
+            size_bytes=int(value["size_bytes"]),
+            canonical_path=Path(str(value["canonical_path"])),
+        )
+
+    async def _attachment_log(
+        self,
+        action: str,
+        session: Session,
+        operation: Operation | None,
+        attachment: ResolvedAttachment,
+        extra: Mapping[str, Any] | None = None,
+    ) -> None:
+        await self._emit(
+            "log.entry",
+            session,
+            operation,
+            {
+                "category": "attachment",
+                "action": action,
+                "core_version": __version__,
+                "core_commit": core_commit(),
+                "attachment_id": attachment.id,
+                "canonical_path": str(attachment.canonical_path),
+                **dict(extra or {}),
+            },
+        )
 
     def _operation_dto(self, operation: Operation) -> dict[str, Any]:
         return {

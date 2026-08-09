@@ -39,6 +39,8 @@ def test_only_office_lite_is_bundled_and_valid() -> None:
     assert set(metadata) == {"name", "description"}
     assert metadata["name"] == "aeloon-office-lite"
     assert "present_files" in body
+    assert "aeloon-core system skill" in body
+    assert "aeloon system skill" not in body
     assert "https://pypi.tuna.tsinghua.edu.cn/simple" in body
     interface = yaml.safe_load((skill_dir / "agents" / "openai.yaml").read_text(encoding="utf-8"))[
         "interface"
@@ -123,5 +125,7 @@ def test_wheel_packaging_uses_only_lite_python_office_dependencies() -> None:
     ):
         assert removed not in manifest.lower()
     assert "https://pypi.tuna.tsinghua.edu.cn/simple" in manifest
+    assert '[project.scripts]\naeloon-core = "aeloon_core.__main__:main"' in manifest
+    assert '\naeloon = "' not in manifest
     assert not list(RESOURCE_ROOT.rglob("package.json"))
     assert not list(RESOURCE_ROOT.rglob("*.js"))

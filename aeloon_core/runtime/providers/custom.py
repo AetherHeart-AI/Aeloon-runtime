@@ -34,13 +34,22 @@ class CustomProvider(OpenAICompatibleProvider):
 
     driver = "custom"
 
+    def __init__(self, *, backend: str = "openai", endpoint: str, **kwargs: Any) -> None:
+        if backend not in {"openai", "llamacpp", "ollama", "vllm"}:
+            raise ValueError(f"Unsupported custom Provider backend: {backend}")
+        self.backend = backend
+        self.discovery_endpoint = endpoint.rstrip("/")
+        super().__init__(endpoint=_inference_endpoint(backend, endpoint), **kwargs)
+
     async def _discover_models(self) -> list[Model]:
         headers = dict(self.headers)
         if self.api_key:
             headers["authorization"] = f"Bearer {self.api_key}"
         client = await self._get_client()
+        if self.backend == "ollama":
+            return await self._discover_ollama(client, headers)
         last_error: Exception | None = None
-        for endpoint in _endpoint_candidates(self.endpoint):
+        for endpoint in _endpoint_candidates(self.discovery_endpoint):
             try:
                 response = await client.get(
                     f"{endpoint}/models",
@@ -49,6 +58,8 @@ class CustomProvider(OpenAICompatibleProvider):
                 )
                 response.raise_for_status()
                 payload = response.json()
+                if self.backend == "llamacpp":
+                    payload = await self._llamacpp_payload(client, endpoint, payload, headers)
             except (httpx.HTTPError, ValueError) as exc:
                 last_error = exc
                 continue
@@ -56,7 +67,7 @@ class CustomProvider(OpenAICompatibleProvider):
             if not discovered:
                 last_error = ValueError("the model list contained no usable models")
                 continue
-            self.endpoint = endpoint
+            self.endpoint = _inference_endpoint(self.backend, endpoint)
             return await self._resolve_image_capabilities(discovered, headers)
         detail = f": {self._sanitize(str(last_error))}" if last_error is not None else ""
         sanitized_cause = (
@@ -67,6 +78,112 @@ class CustomProvider(OpenAICompatibleProvider):
             f"Could not load models from {self.name}{detail}",
             cause=sanitized_cause,
         )
+
+    async def _discover_ollama(
+        self,
+        client: httpx.AsyncClient,
+        headers: Mapping[str, str],
+    ) -> list[Model]:
+        root = _without_v1(self.discovery_endpoint)
+        try:
+            response = await client.get(
+                f"{root}/api/tags", headers=headers, timeout=MODEL_DISCOVERY_TIMEOUT
+            )
+            response.raise_for_status()
+            payload = response.json()
+            raw_models = payload.get("models") if isinstance(payload, Mapping) else None
+            if not isinstance(raw_models, list):
+                raise ValueError("the Ollama model list was invalid")
+            values: list[dict[str, Any]] = []
+            for raw in raw_models:
+                if not isinstance(raw, Mapping):
+                    continue
+                model_id = str(raw.get("model") or raw.get("name") or "").strip()
+                if not model_id:
+                    continue
+                detail_response = await client.post(
+                    f"{root}/api/show",
+                    headers=headers,
+                    json={"model": model_id, "verbose": False},
+                    timeout=MODEL_DISCOVERY_TIMEOUT,
+                )
+                detail_response.raise_for_status()
+                detail = detail_response.json()
+                detail_value = detail if isinstance(detail, Mapping) else {}
+                capabilities = detail_value.get("capabilities")
+                model_info = detail_value.get("model_info")
+                values.append(
+                    {
+                        **dict(raw),
+                        "id": model_id,
+                        "capabilities": capabilities,
+                        "context_window": _ollama_context_window(model_info),
+                        "reasoning": _sequence_mentions(capabilities, ("thinking", "reasoning")),
+                    }
+                )
+        except (httpx.HTTPError, ValueError) as exc:
+            sanitized = self._sanitize(str(exc))
+            raise InferenceError(
+                "model_discovery",
+                f"Could not load models from {self.name}: {sanitized}",
+                cause=ValueError(sanitized),
+            ) from None
+        discovered = _models_from_payload({"models": values}, self.id)
+        if not discovered:
+            raise InferenceError(
+                "model_discovery", f"Could not load models from {self.name}: no usable models"
+            )
+        self.endpoint = f"{root}/v1"
+        return await self._resolve_image_capabilities(discovered, headers)
+
+    async def _llamacpp_payload(
+        self,
+        client: httpx.AsyncClient,
+        endpoint: str,
+        payload: Any,
+        headers: Mapping[str, str],
+    ) -> Any:
+        if not isinstance(payload, Mapping):
+            return payload
+        raw_values = payload.get("data")
+        if not isinstance(raw_values, list):
+            raw_values = payload.get("models")
+        if not isinstance(raw_values, list):
+            return payload
+        root = _without_v1(endpoint)
+        values: list[Any] = []
+        for raw in raw_values:
+            if not isinstance(raw, Mapping):
+                values.append(raw)
+                continue
+            model_id = str(raw.get("id") or raw.get("model") or raw.get("name") or "")
+            try:
+                response = await client.get(
+                    f"{root}/props",
+                    headers=headers,
+                    params={"model": model_id} if model_id else None,
+                    timeout=MODEL_DISCOVERY_TIMEOUT,
+                )
+                response.raise_for_status()
+                props = response.json()
+            except (httpx.HTTPError, ValueError):
+                props = {}
+            settings = (
+                props.get("default_generation_settings") if isinstance(props, Mapping) else {}
+            )
+            values.append(
+                {
+                    **dict(raw),
+                    "context_window": (
+                        settings.get("n_ctx") if isinstance(settings, Mapping) else None
+                    ),
+                    "modalities": props.get("modalities") if isinstance(props, Mapping) else None,
+                    "chat_template_caps": (
+                        props.get("chat_template_caps") if isinstance(props, Mapping) else None
+                    ),
+                }
+            )
+        return {"data": values}
 
     async def _resolve_image_capabilities(
         self,
@@ -131,6 +248,20 @@ def _endpoint_candidates(endpoint: str) -> tuple[str, ...]:
     return (base, f"{base}/v1")
 
 
+def _without_v1(endpoint: str) -> str:
+    base = endpoint.rstrip("/")
+    return base[:-3] if base.endswith("/v1") else base
+
+
+def _inference_endpoint(backend: str, endpoint: str) -> str:
+    base = endpoint.rstrip("/")
+    if base.endswith("/v1"):
+        return base
+    if backend in {"openai", "llamacpp", "ollama", "vllm"}:
+        return f"{base}/v1"
+    return base
+
+
 def _models_from_payload(payload: Any, provider_id: str) -> list[_DiscoveredModel]:
     if not isinstance(payload, Mapping):
         return []
@@ -179,6 +310,10 @@ def _models_from_payload(payload: Any, provider_id: str) -> list[_DiscoveredMode
             "supports_reasoning",
             "supportsReasoning",
         )
+        if reasoning is None:
+            reasoning = _sequence_mentions(
+                value.get("capabilities"), ("thinking", "reasoning")
+            )
         cost = value.get("cost")
         model = Model(
             id=model_id,
@@ -310,6 +445,24 @@ def _positive_int(value: Any, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return parsed if parsed > 0 else default
+
+
+def _ollama_context_window(value: Any) -> int | None:
+    if not isinstance(value, Mapping):
+        return None
+    for key, item in value.items():
+        if str(key).endswith(".context_length"):
+            parsed = _positive_int(item, 0)
+            if parsed:
+                return parsed
+    return None
+
+
+def _sequence_mentions(value: Any, terms: Sequence[str]) -> bool | None:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return None
+    normalized = [str(item).strip().lower() for item in value]
+    return any(any(term in item for term in terms) for item in normalized)
 
 
 __all__ = ["CustomProvider"]

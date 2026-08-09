@@ -195,6 +195,11 @@ class ProviderManager:
                     "id": provider_id,
                     "name": configured.name,
                     "driver": configured.driver,
+                    **(
+                        {"backend": configured.backend}
+                        if isinstance(configured, CustomProviderConfig)
+                        else {}
+                    ),
                     "kind": "cloud" if configured.driver == "cloud" else "local",
                     "endpoint": configured.endpoint,
                     "enabled": configured.enabled,
@@ -343,6 +348,7 @@ def _create_custom(
         provider_id=provider_id,
         name=configured.name,
         endpoint=configured.endpoint,
+        backend=configured.backend,
         models=_configured_models(provider_id, configured),
         enabled=configured.enabled,
         api_key=configured.api_key,
