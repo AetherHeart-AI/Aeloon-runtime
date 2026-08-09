@@ -8,27 +8,26 @@ from importlib.resources import files
 from pathlib import Path
 
 _SKILL_ENTRIES = {
-    "document-reader": "document-reader/scripts/cli.py",
-    "word-docx": "word-docx/scripts/cli.py",
-    "powerpoint-pptx": "powerpoint-pptx/scripts/cli.py",
+    "aeloon-office-lite": "aeloon-office-lite/scripts/cli.py",
 }
 
 _SKILL_ACTIONS = {
-    "document-reader": ("preflight", "prepare-ocr", "ingest", "render-pdf"),
-    "word-docx": ("build", "edit", "validate", "render"),
-    "powerpoint-pptx": ("build", "inspect-template", "apply-template", "validate", "render"),
+    "aeloon-office-lite": ("preflight", "read", "write", "render", "validate"),
 }
 
 _RETIRED_SKILLS = {
-    "office": "document-reader, word-docx, or powerpoint-pptx",
-    "ppt": "powerpoint-pptx",
-    "document-writing": "word-docx",
-    "reports": "word-docx",
-    "markitdown": "document-reader",
-    "pdf": "document-reader",
-    "paddleocr-doc-parsing": "document-reader",
-    "pptx-generator": "powerpoint-pptx",
-    "document-format-skills": "word-docx",
+    "document-reader": "aeloon-office-lite",
+    "word-docx": "aeloon-office-lite",
+    "powerpoint-pptx": "aeloon-office-lite",
+    "office": "aeloon-office-lite",
+    "ppt": "aeloon-office-lite",
+    "document-writing": "aeloon-office-lite",
+    "reports": "aeloon-office-lite",
+    "markitdown": "aeloon-office-lite",
+    "pdf": "aeloon-office-lite",
+    "paddleocr-doc-parsing": "aeloon-office-lite",
+    "pptx-generator": "aeloon-office-lite",
+    "document-format-skills": "aeloon-office-lite",
 }
 
 def bundled_skill_root() -> Path:

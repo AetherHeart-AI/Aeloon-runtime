@@ -36,9 +36,9 @@ def test_runtime_bootstrap_copies_and_discovers_builtin_skills(tmp_path: Path) -
     resources = loader.reload()
     assert {skill.name for skill in resources.skills} == set(BUILTIN_SKILL_IDS)
     assert all(not hasattr(skill, "content") for skill in resources.skills)
-    loaded = loader.load_skill("powerpoint-pptx")
-    assert "PowerPoint" in loaded.content
+    loaded = loader.load_skill("aeloon-office-lite")
+    assert "Office Lite" in loaded.content
     assert all(
         "present_files" in loader.load_skill(skill_id).content for skill_id in BUILTIN_SKILL_IDS
     )
-    assert "source.manifest.json" in loader.load_skill("document-reader").content
+    assert "清华" in loaded.content

@@ -47,11 +47,11 @@ uses one operation-scoped `ProviderManager`, so the main run, compaction, branch
 automatic title reuse one inference instance. Closing the agent closes the whole manager.
 
 The built-in Office boundary is intentionally narrow. Runtime provisions exactly
-`document-reader`, `word-docx`, and `powerpoint-pptx` and dispatches each skill to one Python entry
-point with the action as its first argument. The main process includes only digital-document
-dependencies. Heavy OCR is isolated behind a locked `uv` environment and explicit cache manifest;
-external engines never enter automatic routing without a recorded license acceptance. Optional
-LibreOffice rendering is a validation enhancement, not a condition that may be silently assumed.
+`aeloon-office-lite` and dispatches its `preflight`, `read`, `write`, `render`, and `validate`
+actions to one Python entry point. The main process includes only lightweight document libraries.
+Scanned PDFs are rendered for the model's visual capability instead of starting an OCR runtime.
+Optional LibreOffice rendering is a validation enhancement, not a condition that may be silently
+assumed.
 
 `ProviderManager` constructs Providers lazily from a fixed driver factory mapping. It resolves
 qualified and unqualified model IDs, isolates transient model-discovery failures by Provider, and

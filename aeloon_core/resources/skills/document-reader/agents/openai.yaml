@@ -1,4 +1,0 @@
-interface:
-  display_name: "Document Reader"
-  short_description: "本地读取 PDF、Office、表格与扫描文档并核验质量"
-  default_prompt: "使用 $document-reader 在本地解析这份文档，并检查提取质量与证据。"

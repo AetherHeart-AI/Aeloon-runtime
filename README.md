@@ -103,19 +103,19 @@ Global resources live in `~/.aeloon-core`; workspace resources live in
 and the working directory are appended in a deterministic order. Workspace resources override
 same-named global resources and are reloaded at every turn boundary.
 
-Runtime bundles exactly three Python-driven Office skills: `document-reader` for local document
-ingestion and PDF layout inspection, `word-docx` for editable Word documents, and
-`powerpoint-pptx` for editable presentations. On first startup after installation, missing built-in
-skills are copied from package resources into `<data_dir>/skills` (normally
+Runtime bundles one Python-driven Office skill: `aeloon-office-lite` for fast, simple reading,
+creation, validation, and visual rendering of local PDF, DOCX, PPTX, and XLSX files. On first
+startup after installation, the missing built-in skill is copied from package resources into
+`<data_dir>/skills` (normally
 `~/.aeloon-core/skills`). Existing same-named files and directories are preserved, so local
 customizations and retired user-owned skill copies are never overwritten or removed.
 
-The main package contains the digital-document engines. Docling with RapidOCR runs only from its
-locked, separately prepared `uv` environment and model cache; the `document-reader preflight`
-action reports whether that cache is ready, while `prepare-ocr` installs and warms it for later
-offline use.
-LibreOffice remains optional and is used to render DOCX/PPTX files for visual QA. A missing renderer
-is reported explicitly and never treated as completed visual verification.
+The main package contains only lightweight Python document libraries. Text-bearing files are read
+directly; scanned PDFs are rendered into page images for a vision-capable model instead of
+downloading an OCR runtime. LibreOffice remains optional and is used only to render DOCX/PPTX/XLSX
+files for visual QA. A missing renderer is reported explicitly and never treated as completed
+visual verification. Python installation hints default to the Tsinghua PyPI mirror for Chinese
+users.
 
 Skill discovery is progressive: Runtime reads only each `SKILL.md` frontmatter for the catalog and
 system-prompt index. The full instructions are read only when the model chooses an enabled skill or
@@ -202,10 +202,9 @@ this repository to an exact commit, builds a wheel, and installs the wheel plus 
 production dependencies into the desktop application's bundled Python runtime. Core does not
 publish a separate PyInstaller executable or desktop archive.
 
-The desktop application starts Core with `python -m aeloon_core`, and the Agent, built-in Skills
-and terminal use that same bundled interpreter. The optional Docling/RapidOCR environment remains
-isolated because of its size and native dependency constraints, but it is created by the desktop
-runtime's Python and uv rather than downloading another Python distribution.
+The desktop application starts Core with `python -m aeloon_core`, and the Agent, built-in Skills,
+and terminal use that same bundled interpreter. Office Lite uses those bundled lightweight Python
+libraries directly and does not create a second Python or OCR environment.
 
 For local package validation:
 

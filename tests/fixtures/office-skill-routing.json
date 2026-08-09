@@ -1,14 +1,15 @@
 {
   "schema": "office-skill-routing-cases/v1",
   "cases": [
-    {"prompt": "读取这个三页扫描 PDF，提取中文表格并给出证据", "expected": "document-reader"},
-    {"prompt": "Render this local PDF into page images so I can inspect the layout", "expected": "document-reader"},
-    {"prompt": "从 Markdown 生成带封面、目录和页码的 Word DOCX", "expected": "word-docx"},
-    {"prompt": "在现有 DOCX 中保留格式替换合同条款并添加修订", "expected": "word-docx"},
-    {"prompt": "制作一份可编辑的季度汇报 PowerPoint 幻灯片", "expected": "powerpoint-pptx"},
-    {"prompt": "Inspect this PPTX template and update only its chart data", "expected": "powerpoint-pptx"},
+    {"prompt": "读取这个三页扫描 PDF，并用视觉能力检查内容", "expected": "aeloon-office-lite"},
+    {"prompt": "Render this local PDF into page images so I can inspect the layout", "expected": "aeloon-office-lite"},
+    {"prompt": "从简单内容创建 Word DOCX", "expected": "aeloon-office-lite"},
+    {"prompt": "制作一份简单可编辑的 PowerPoint 幻灯片", "expected": "aeloon-office-lite"},
+    {"prompt": "把销售数据写入一个新的 XLSX 工作簿", "expected": "aeloon-office-lite"},
+    {"prompt": "读取 Excel 表格并提取前 100 行", "expected": "aeloon-office-lite"},
     {"prompt": "合并两个 PDF 并加密输出", "expected": null},
-    {"prompt": "把销售数据写入一个新的 XLSX 工作簿", "expected": null},
+    {"prompt": "保留复杂模板和动画重做 PPTX", "expected": null},
+    {"prompt": "在 DOCX 中添加修订和批注", "expected": null},
     {"prompt": "只写一份演讲稿，不要创建 Word 或幻灯片", "expected": null},
     {"prompt": "修复 Python 单元测试中的并发错误", "expected": null}
   ]

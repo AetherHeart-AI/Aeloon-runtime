@@ -1,0 +1,4 @@
+interface:
+  display_name: "Aeloon Office Lite"
+  short_description: "快速稳定地读写 PDF、PPTX、DOCX 和 XLSX"
+  default_prompt: "使用 $aeloon-office-lite 快速读取、创建或验证这份 Office 文件。"
