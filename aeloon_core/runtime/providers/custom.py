@@ -39,6 +39,21 @@ class CustomProvider(OpenAICompatibleProvider):
             raise ValueError(f"Unsupported custom Provider backend: {backend}")
         self.backend = backend
         self.discovery_endpoint = endpoint.rstrip("/")
+        if backend == "llamacpp":
+            kwargs.setdefault("prepare_payload", _prepare_llamacpp_inference_payload)
+            kwargs.setdefault(
+                "thinking_level_map",
+                {
+                    "off": "none",
+                    "minimal": "minimal",
+                    "low": "low",
+                    "medium": "medium",
+                    "high": "high",
+                    "max": "max",
+                },
+            )
+            kwargs.setdefault("requires_reasoning_content", True)
+            kwargs.setdefault("parse_reasoning_tags", True)
         super().__init__(endpoint=_inference_endpoint(backend, endpoint), **kwargs)
 
     async def _discover_models(self) -> list[Model]:
@@ -262,6 +277,18 @@ def _inference_endpoint(backend: str, endpoint: str) -> str:
     return base
 
 
+def _prepare_llamacpp_inference_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    value = dict(payload)
+    value["reasoning_format"] = "deepseek"
+    effort = value.get("reasoning_effort")
+    if isinstance(effort, str):
+        template_kwargs = value.get("chat_template_kwargs")
+        merged = dict(template_kwargs) if isinstance(template_kwargs, Mapping) else {}
+        merged.setdefault("enable_thinking", effort != "none")
+        value["chat_template_kwargs"] = merged
+    return value
+
+
 def _models_from_payload(payload: Any, provider_id: str) -> list[_DiscoveredModel]:
     if not isinstance(payload, Mapping):
         return []
@@ -282,13 +309,17 @@ def _models_from_payload(payload: Any, provider_id: str) -> list[_DiscoveredMode
             value = raw
         else:
             continue
-        raw_id = str(
-            value.get("id")
-            or value.get("model")
-            or value.get("model_key")
-            or value.get("name")
-            or ""
-        ).strip().lstrip("/")
+        raw_id = (
+            str(
+                value.get("id")
+                or value.get("model")
+                or value.get("model_key")
+                or value.get("name")
+                or ""
+            )
+            .strip()
+            .lstrip("/")
+        )
         if not raw_id:
             continue
         local_id = raw_id.removeprefix(prefix)
@@ -311,17 +342,12 @@ def _models_from_payload(payload: Any, provider_id: str) -> list[_DiscoveredMode
             "supportsReasoning",
         )
         if reasoning is None:
-            reasoning = _sequence_mentions(
-                value.get("capabilities"), ("thinking", "reasoning")
-            )
+            reasoning = _sequence_mentions(value.get("capabilities"), ("thinking", "reasoning"))
         cost = value.get("cost")
         model = Model(
             id=model_id,
             name=str(
-                value.get("display_name")
-                or value.get("displayName")
-                or value.get("name")
-                or raw_id
+                value.get("display_name") or value.get("displayName") or value.get("name") or raw_id
             ),
             provider=provider_id,
             reasoning=bool(reasoning),

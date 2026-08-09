@@ -6,8 +6,22 @@ import json
 import httpx
 import pytest
 
-from aeloon_core.core import InferenceError
+from aeloon_core.core import (
+    AssistantMessage,
+    InferenceContext,
+    InferenceError,
+    Model,
+    StreamOptions,
+    ThinkingContent,
+    UserMessage,
+)
 from aeloon_core.runtime.providers import CustomProvider
+
+
+def _sse(*chunks: dict[str, object]) -> bytes:
+    lines = [f"data: {json.dumps(chunk)}\n\n" for chunk in chunks]
+    lines.append("data: [DONE]\n\n")
+    return "".join(lines).encode()
 
 
 @pytest.mark.asyncio
@@ -129,9 +143,7 @@ async def test_custom_discovery_reads_common_metadata_and_probes_only_unknown_mo
     assert by_id["studio/architecture-image"].name == "Architecture Image"
     assert by_id["studio/unknown-image"].context_window == 64_000
     assert by_id["studio/unknown-image"].max_tokens == 64_000
-    assert {
-        model.id for model in models if "image" in model.input
-    } == {
+    assert {model.id for model in models if "image" in model.input} == {
         "studio/plain-string",
         "studio/direct-image",
         "studio/architecture-image",
@@ -262,6 +274,114 @@ async def test_llamacpp_backend_reads_models_and_props_fields() -> None:
     assert models[0].id == "llama/gemma.gguf"
     assert models[0].context_window == 32_768
     assert models[0].input == ("text", "image")
+
+
+@pytest.mark.asyncio
+async def test_llamacpp_backend_forces_and_preserves_structured_reasoning() -> None:
+    requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_sse(
+                {"choices": [{"delta": {"reasoning": "plan "}}]},
+                {"choices": [{"delta": {"thinking": {"content": "carefully"}}}]},
+                {"choices": [{"delta": {"content": "answer"}, "finish_reason": "stop"}]},
+            ),
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    model = Model(id="local/model.gguf", name="model.gguf", provider="local")
+    provider = CustomProvider(
+        provider_id="local",
+        name="llama.cpp",
+        endpoint="http://127.0.0.1:8080",
+        backend="llamacpp",
+        models=(model,),
+        client=client,
+    )
+    history = AssistantMessage(
+        content=(ThinkingContent("previous plan"),),
+        provider="local",
+        model=model.id,
+    )
+    events = [
+        event
+        async for event in provider.stream(
+            model,
+            InferenceContext("", (history, UserMessage("go")), (), "session"),
+            StreamOptions(thinking_level="high"),
+        )
+    ]
+    await client.aclose()
+
+    assert [event.type for event in events] == [
+        "start",
+        "thinking_delta",
+        "thinking_delta",
+        "text_delta",
+        "done",
+    ]
+    assert requests[0]["reasoning_format"] == "deepseek"
+    assert requests[0]["reasoning_effort"] == "high"
+    assert requests[0]["chat_template_kwargs"] == {"enable_thinking": True}
+    assert requests[0]["messages"][0]["reasoning_content"] == "previous plan"  # type: ignore[index]
+    final = events[-1].message
+    assert final is not None
+    assert final.content[0] == ThinkingContent("plan carefully")
+    assert final.text == "answer"
+
+
+@pytest.mark.asyncio
+async def test_llamacpp_backend_splits_legacy_think_tags_across_chunks() -> None:
+    requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_sse(
+                {"choices": [{"delta": {"content": "<thi"}}]},
+                {"choices": [{"delta": {"content": "nk>plan</thi"}}]},
+                {"choices": [{"delta": {"content": "nk>answer"}, "finish_reason": "stop"}]},
+            ),
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    model = Model(id="local/model.gguf", name="model.gguf", provider="local")
+    provider = CustomProvider(
+        provider_id="local",
+        name="llama.cpp",
+        endpoint="http://127.0.0.1:8080",
+        backend="llamacpp",
+        models=(model,),
+        client=client,
+    )
+    events = [
+        event
+        async for event in provider.stream(
+            model,
+            InferenceContext("", (UserMessage("go"),), (), "session"),
+            StreamOptions(thinking_level="off"),
+        )
+    ]
+    await client.aclose()
+
+    assert [event.type for event in events] == [
+        "start",
+        "thinking_delta",
+        "text_delta",
+        "done",
+    ]
+    assert requests[0]["reasoning_effort"] == "none"
+    assert requests[0]["chat_template_kwargs"] == {"enable_thinking": False}
+    final = events[-1].message
+    assert final is not None
+    assert final.content[0] == ThinkingContent("plan")
+    assert final.text == "answer"
 
 
 @pytest.mark.asyncio

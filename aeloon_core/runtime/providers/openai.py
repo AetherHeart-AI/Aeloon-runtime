@@ -7,7 +7,7 @@ import inspect
 import json
 import math
 import uuid
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -63,6 +63,7 @@ class OpenAICompatibleProvider(BaseProvider):
         prepare_payload: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         thinking_level_map: Mapping[str, str | None] | None = None,
         requires_reasoning_content: bool = False,
+        parse_reasoning_tags: bool = False,
     ) -> None:
         super().__init__(
             provider_id=provider_id,
@@ -80,6 +81,7 @@ class OpenAICompatibleProvider(BaseProvider):
         self.prepare_payload = prepare_payload
         self.thinking_level_map = dict(thinking_level_map or {})
         self.requires_reasoning_content = requires_reasoning_content
+        self.parse_reasoning_tags = parse_reasoning_tags
         self._client = client
         self._owns_client = client is None
 
@@ -245,6 +247,7 @@ class OpenAICompatibleProvider(BaseProvider):
         finish_reason: str | None = None
         usage = Usage()
         saw_chunk = False
+        inline_reasoning = _InlineReasoningParser() if self.parse_reasoning_tags else None
         yield AssistantStreamEvent("start")
         try:
             async for line in response.aiter_lines():
@@ -285,10 +288,22 @@ class OpenAICompatibleProvider(BaseProvider):
                 delta = choice.get("delta") or {}
                 content = delta.get("content")
                 if isinstance(content, str) and content:
-                    text_parts[0] = text_parts.get(0, "") + content
-                    yield AssistantStreamEvent("text_delta", delta=content, content_index=0)
-                reasoning = delta.get("reasoning_content")
-                if isinstance(reasoning, str) and reasoning:
+                    parts = (
+                        inline_reasoning.feed(content)
+                        if inline_reasoning is not None
+                        else (("text", content),)
+                    )
+                    for kind, part in parts:
+                        if kind == "thinking":
+                            thinking_parts[0] = thinking_parts.get(0, "") + part
+                            yield AssistantStreamEvent(
+                                "thinking_delta", delta=part, content_index=0
+                            )
+                        else:
+                            text_parts[0] = text_parts.get(0, "") + part
+                            yield AssistantStreamEvent("text_delta", delta=part, content_index=0)
+                reasoning = _reasoning_delta(delta)
+                if reasoning:
                     thinking_parts[0] = thinking_parts.get(0, "") + reasoning
                     yield AssistantStreamEvent("thinking_delta", delta=reasoning, content_index=0)
                 for raw_call in delta.get("tool_calls") or []:
@@ -308,6 +323,14 @@ class OpenAICompatibleProvider(BaseProvider):
                     )
                 if choice.get("finish_reason"):
                     finish_reason = str(choice["finish_reason"])
+            if inline_reasoning is not None:
+                for kind, part in inline_reasoning.finish():
+                    if kind == "thinking":
+                        thinking_parts[0] = thinking_parts.get(0, "") + part
+                        yield AssistantStreamEvent("thinking_delta", delta=part, content_index=0)
+                    else:
+                        text_parts[0] = text_parts.get(0, "") + part
+                        yield AssistantStreamEvent("text_delta", delta=part, content_index=0)
         except asyncio.CancelledError:
             raise
         except InferenceError:
@@ -368,9 +391,7 @@ class OpenAICompatibleProvider(BaseProvider):
                     arguments=_parse_tool_arguments(state["arguments"]),
                 )
             )
-        stop_reason = {"tool_calls": "toolUse", "length": "length", "stop": "stop"}[
-            finish_reason
-        ]
+        stop_reason = {"tool_calls": "toolUse", "length": "length", "stop": "stop"}[finish_reason]
         message = AssistantMessage(
             content=tuple(assistant_content),
             provider=model.provider,
@@ -449,6 +470,78 @@ class OpenAICompatibleProvider(BaseProvider):
             if secret:
                 value = value.replace(secret, "***")
         return value
+
+
+class _InlineReasoningParser:
+    """Split legacy ``<think>`` content without assuming chunk boundaries."""
+
+    def __init__(self) -> None:
+        self._buffer = ""
+        self._thinking = False
+
+    def feed(self, value: str) -> tuple[tuple[str, str], ...]:
+        self._buffer += value
+        result: list[tuple[str, str]] = []
+        while self._buffer:
+            marker = "</think>" if self._thinking else "<think>"
+            index = self._buffer.find(marker)
+            if index >= 0:
+                self._append(result, self._buffer[:index])
+                self._buffer = self._buffer[index + len(marker) :]
+                self._thinking = not self._thinking
+                continue
+            held = _partial_marker_suffix(self._buffer, marker)
+            boundary = len(self._buffer) - held
+            self._append(result, self._buffer[:boundary])
+            self._buffer = self._buffer[boundary:]
+            break
+        return tuple(result)
+
+    def finish(self) -> tuple[tuple[str, str], ...]:
+        result: list[tuple[str, str]] = []
+        self._append(result, self._buffer)
+        self._buffer = ""
+        return tuple(result)
+
+    def _append(self, result: list[tuple[str, str]], value: str) -> None:
+        if value:
+            result.append(("thinking" if self._thinking else "text", value))
+
+
+def _partial_marker_suffix(value: str, marker: str) -> int:
+    maximum = min(len(value), len(marker) - 1)
+    for length in range(maximum, 0, -1):
+        if value.endswith(marker[:length]):
+            return length
+    return 0
+
+
+def _reasoning_delta(delta: Mapping[str, Any]) -> str:
+    for key in (
+        "reasoning_content",
+        "reasoning",
+        "thinking",
+        "thinking_content",
+        "reasoning_details",
+    ):
+        value = _reasoning_text(delta.get(key))
+        if value:
+            return value
+    return ""
+
+
+def _reasoning_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, Mapping):
+        for key in ("text", "content", "delta"):
+            nested = _reasoning_text(value.get(key))
+            if nested:
+                return nested
+        return ""
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return "".join(_reasoning_text(item) for item in value)
+    return ""
 
 
 def _openai_payload(
@@ -545,9 +638,7 @@ def _openai_messages(
                         *[
                             {
                                 "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:{image.mime_type};base64,{image.data}"
-                                },
+                                "image_url": {"url": f"data:{image.mime_type};base64,{image.data}"},
                             }
                             for image in images
                         ],

@@ -64,7 +64,7 @@ async def test_rpc_v2_rejects_every_legacy_handshake(tmp_path: Path) -> None:
             {"protocol": "aeloon-rpc-v2", "attachment_roots": [str(tmp_path)]},
         )
         assert handshake["protocol"] == "aeloon-rpc-v2"
-        assert handshake["core_version"] == "0.0.10"
+        assert handshake["core_version"] == "0.0.11"
         assert len(handshake["core_commit"]) == 40
         assert "protocol_version" not in handshake
         assert "capabilities" not in handshake
@@ -92,9 +92,7 @@ async def test_ui_thread_id_is_the_core_session_id(tmp_path: Path) -> None:
 async def test_browser_tools_are_process_scoped_and_always_in_catalogue(tmp_path: Path) -> None:
     adapter = AeloonRpcAdapter(runtime_service(tmp_path, browser=True))
     try:
-        handshake = await adapter.dispatch(
-            "system.handshake", {"protocol": "aeloon-rpc-v2"}
-        )
+        handshake = await adapter.dispatch("system.handshake", {"protocol": "aeloon-rpc-v2"})
         assert handshake["browser_runtime"] is True
         catalog = await adapter.dispatch("catalog.get", {"workspace": str(tmp_path)})
         names = {item["name"] for item in catalog["tools"]}

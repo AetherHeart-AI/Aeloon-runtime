@@ -5,6 +5,15 @@ release is cut, those entries should move to a versioned section with an ISO dat
 
 ## Unreleased
 
+## 0.0.11 - 2026-08-09
+
+### Fixed
+
+- Made llama.cpp reasoning deterministic by requesting the structured DeepSeek reasoning format,
+  forwarding per-turn thinking intent, and preserving reasoning in assistant history.
+- Added streaming compatibility for `reasoning`, `thinking`, and related reasoning fields, with a
+  chunk-safe fallback for legacy `<think>` content.
+
 ## 0.0.6 - 2026-08-09
 
 ### Changed
