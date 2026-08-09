@@ -83,6 +83,38 @@ async def test_ui_thread_id_is_the_core_session_id(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_attachments_use_the_workbench_path_without_session_copy(tmp_path: Path) -> None:
+    runtime = runtime_service(tmp_path)
+    source = tmp_path / "attachments" / "attachment-id" / "content.pdf"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"%PDF-1.7")
+
+    resolved = await runtime._resolve_attachments(
+        [{"type": "file", "name": "report.pdf", "path": str(source)}],
+        (tmp_path / "attachments",),
+    )
+
+    assert resolved[0]["path"] == str(source.resolve())
+    assert not (runtime.data_dir / "session-attachments").exists()
+    assert source.read_bytes() == b"%PDF-1.7"
+
+    class CapturingAgent:
+        text = ""
+
+        async def prompt(self, text: str, **_kwargs):
+            self.text = text
+
+    agent = CapturingAgent()
+    await runtime._invoke_input(
+        agent,
+        {"kind": "prompt", "text": "inspect", "attachments": resolved},
+        run_id="run",
+    )
+    assert f"[File: report.pdf]\nAttachment path: {source.resolve()}" in agent.text
+    assert "Binary file attached" not in agent.text
+
+
+@pytest.mark.asyncio
 async def test_browser_tools_are_process_scoped_and_always_in_catalogue(tmp_path: Path) -> None:
     adapter = AeloonRpcAdapter(runtime_service(tmp_path, browser=True))
     try:

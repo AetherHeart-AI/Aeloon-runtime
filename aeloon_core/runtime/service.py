@@ -121,8 +121,10 @@ class RuntimeService:
         )
         provision_builtin_skills(self.data_dir)
         self.repository = JsonlSessionRepository(self.data_dir)
+        # Attachment files are owned by the Workbench. Core reads the absolute
+        # source path supplied by the client instead of making a second copy in
+        # the session data directory.
         self.attachment_dir = self.data_dir / "session-attachments"
-        self.attachment_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.started_at = _now()
         self._revision = 1
         self._agent_factory = agent_factory
@@ -408,8 +410,7 @@ class RuntimeService:
         input_value = self._turn_input(params.get("input"))
         input_value = await self._resolve_skill_command(session, input_value)
         if input_value["kind"] == "prompt":
-            input_value["attachments"] = await self._copy_attachments(
-                session.id,
+            input_value["attachments"] = await self._resolve_attachments(
                 input_value.get("attachments") or [],
                 attachment_roots,
             )
@@ -1214,21 +1215,30 @@ class RuntimeService:
             elif attachment["type"] == "browser_annotation":
                 browser_annotations.append(dict(attachment["annotation"]))
             elif attachment["type"] == "image":
-                data = await asyncio.to_thread(Path(attachment["managed_path"]).read_bytes)
+                data = await asyncio.to_thread(Path(attachment["path"]).read_bytes)
                 images.append(
                     ImageContent(
                         base64.b64encode(data).decode(), attachment.get("mime_type") or "image/png"
                     )
                 )
             elif attachment["type"] == "file":
-                path = Path(attachment["managed_path"])
+                path = Path(attachment["path"])
+                if path.suffix.lower() in {
+                    ".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".xlsm",
+                }:
+                    supplements.append(
+                        f"[File: {attachment['name']}]\nAttachment path: {path}"
+                    )
+                    continue
                 try:
                     content = (await asyncio.to_thread(path.read_text, encoding="utf-8"))[
                         :TOOL_OUTPUT_LIMIT
                     ]
                     supplements.append(f"[File: {attachment['name']}]\n{content}")
-                except UnicodeError:
-                    supplements.append(f"[Binary file attached: {attachment['name']}]")
+                except (OSError, UnicodeError):
+                    supplements.append(
+                        f"[File: {attachment['name']}]\nAttachment path: {path}"
+                    )
         if browser_annotations:
             supplements.append(browser_annotations_prompt(browser_annotations, message_id=run_id))
         if value.get("skill_id"):
@@ -1510,14 +1520,11 @@ class RuntimeService:
     def _prompt_input(self, raw: Any) -> dict[str, Any]:
         return self.input_resolver.prompt(raw)
 
-    async def _copy_attachments(
+    async def _resolve_attachments(
         self,
-        session_id: str,
         attachments: list[Any],
         roots: tuple[Path, ...],
     ) -> list[dict[str, Any]]:
-        destination = self.attachment_dir / session_id
-        destination.mkdir(parents=True, exist_ok=True, mode=0o700)
         resolved_roots = tuple(root.expanduser().resolve(strict=False) for root in roots)
         result: list[dict[str, Any]] = []
         annotation_count = 0
@@ -1575,9 +1582,6 @@ class RuntimeService:
                     f"Attachment exceeds the {maximum // (1024 * 1024)} MiB limit",
                 )
             name = Path(str(raw.get("name") or source.name)).name[:255]
-            target = destination / f"{uuid.uuid4().hex}{source.suffix[:20]}"
-            await asyncio.to_thread(shutil.copy2, source, target)
-            target.chmod(0o600)
             result.append(
                 {
                     "id": str(raw.get("id") or uuid.uuid4().hex),
@@ -1585,7 +1589,7 @@ class RuntimeService:
                     "name": name,
                     "mime_type": str(raw.get("mime_type") or "application/octet-stream"),
                     "size_bytes": size,
-                    "managed_path": str(target),
+                    "path": str(source),
                 }
             )
         return result
