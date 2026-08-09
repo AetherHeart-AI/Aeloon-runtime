@@ -1,0 +1,38 @@
+name: Document Reader Chinese OCR benchmark
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  chinese-ocr:
+    name: Three-page online and offline quality gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv and Python 3.12
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+          python-version: "3.12"
+
+      - name: Install deterministic Chinese font
+        run: sudo apt-get update && sudo apt-get install --yes fonts-noto-cjk
+
+      - name: Run locked RapidOCR online and offline benchmark
+        env:
+          AELOON_RUN_OCR_BENCHMARK: "1"
+          AELOON_OCR_BENCHMARK_CACHE: ${{ runner.temp }}/aeloon-document-reader-cache
+          UV_HTTP_TIMEOUT: "300"
+        run: >-
+          uv run --frozen pytest -q
+          -m "integration and benchmark"
+          tests/test_document_reader_ocr_integration.py

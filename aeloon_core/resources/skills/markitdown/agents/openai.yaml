@@ -1,4 +1,0 @@
-interface:
-  display_name: "Office 文档读取"
-  short_description: "Convert local Office and WPS-compatible files to Markdown"
-  default_prompt: "使用 $markitdown 在本地读取这份 Office 文档并核对转换结果。"

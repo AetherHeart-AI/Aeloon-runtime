@@ -103,15 +103,19 @@ Global resources live in `~/.aeloon-core`; workspace resources live in
 and the working directory are appended in a deterministic order. Workspace resources override
 same-named global resources and are reloaded at every turn boundary.
 
-Runtime bundles the `office`, `ppt`, `document-writing`, and `reports` workflow presets together
-with the `markitdown`, `pdf`, `paddleocr-doc-parsing`, `pptx-generator`, and
-`document-format-skills` execution presets. On first startup after installation, any missing
-presets are copied from the package resources into `<data_dir>/skills` (normally
+Runtime bundles exactly three Python-driven Office skills: `document-reader` for local document
+ingestion and PDF layout inspection, `word-docx` for editable Word documents, and
+`powerpoint-pptx` for editable presentations. On first startup after installation, missing built-in
+skills are copied from package resources into `<data_dir>/skills` (normally
 `~/.aeloon-core/skills`). Existing same-named files and directories are preserved, so local
-customizations are not overwritten. Official packages include the Python, Node.js, PptxGenJS,
-PDF, DOCX, and local OCR execution dependencies used by these built-in skills. OCR model weights
-are downloaded once to the Aeloon data directory and can be prewarmed for offline use. LibreOffice
-remains optional and is used only to render DOCX/PPTX files for visual QA.
+customizations and retired user-owned skill copies are never overwritten or removed.
+
+The main package contains the digital-document engines. Docling with RapidOCR runs only from its
+locked, separately prepared `uv` environment and model cache; the `document-reader preflight`
+action reports whether that cache is ready, while `prepare-ocr` installs and warms it for later
+offline use.
+LibreOffice remains optional and is used to render DOCX/PPTX files for visual QA. A missing renderer
+is reported explicitly and never treated as completed visual verification.
 
 Skill discovery is progressive: Runtime reads only each `SKILL.md` frontmatter for the catalog and
 system-prompt index. The full instructions are read only when the model chooses an enabled skill or
@@ -201,9 +205,10 @@ uv run --isolated --frozen --no-default-groups \
   pyinstaller --clean --noconfirm aeloon.spec
 ```
 
-The executable is written to `dist/aeloon`. It includes Python, Node.js, office Skill runtime
-dependencies, and bundled skills, so the target Mac does not need Python,
-Node.js, npm, or `uv`. Install it somewhere on your `PATH`:
+The executable is written to `dist/aeloon`. It includes Python, the digital-document runtime
+dependencies, and the three bundled Office skills. The target Mac does not need Python or Node.js;
+`uv` is required only when preparing or refreshing the optional Docling/RapidOCR environment.
+Install it somewhere on your `PATH`:
 
 ```bash
 mkdir -p ~/.local/bin
@@ -211,25 +216,28 @@ install -m 755 dist/aeloon ~/.local/bin/aeloon
 aeloon --version
 ```
 
-Tagged releases also attach a wheel and source distribution. Installing the official wheel with
-`uv tool install ./aeloon_core-<version>-py3-none-any.whl` installs the declared Python, Node.js,
-PDF, DOCX, and PaddleOCR dependencies, while the wheel itself carries the pinned PptxGenJS assets.
+The release workflow builds a wheel and source distribution to validate package metadata, but
+publishes only the platform archives and their checksums. A locally built wheel installed with
+`uv tool install ./aeloon_core-<version>-py3-none-any.whl` includes the declared PDF, DOCX, PPTX,
+Markdown, and image dependencies. It does not install Node.js, PaddlePaddle, or OCR model weights.
 
 This build targets Apple Silicon Macs and uses an ad-hoc signature. It is intended for local use;
 public distribution requires Developer ID signing and notarization. A PyInstaller binary must be
 built on the oldest macOS version it needs to support.
 
 GitHub Actions also builds and verifies the binary on every pull request and push to `main`. Each
-run uploads a 30-day workflow artifact. Pushing a tag such as `v0.4.0` additionally creates or
-updates the matching GitHub Release with the archive and its SHA-256 checksum.
+run uploads a 30-day workflow artifact. Pushing a version-matched tag such as `v0.0.5`
+additionally creates or updates the matching GitHub Release with
+`Aeloon-core-mac-arm64-v0.0.5.tar.gz` and its SHA-256 checksum.
 
 ### Ubuntu ARM64 binary
 
 The same PyInstaller command builds a native single-file executable on an ARM64 Ubuntu host.
 GitHub Actions builds it on an `ubuntu-22.04-arm` runner, verifies the glibc 2.35 compatibility
 baseline, ELF architecture, and process lifecycle, and uploads
-`aeloon-ubuntu-arm64-glibc2.35.tar.gz` plus its SHA-256 checksum. The binary targets Ubuntu 22.04
-or newer. Tag builds also add these files to the matching GitHub Release.
+`Aeloon-core-ubuntu-arm64-v0.0.5.tar.gz` plus its SHA-256 checksum. The filename omits the libc
+baseline, but the binary continues to target Ubuntu 22.04 or newer with glibc 2.35. Tag builds also
+add these files to the matching GitHub Release.
 
 ## Documentation
 

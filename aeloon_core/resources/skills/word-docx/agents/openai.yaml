@@ -1,0 +1,4 @@
+interface:
+  display_name: "Word DOCX"
+  short_description: "创建、编辑、修订并完整验证专业 Word 文档"
+  default_prompt: "使用 $word-docx 创建或编辑这份 Word 文档并完成验证。"

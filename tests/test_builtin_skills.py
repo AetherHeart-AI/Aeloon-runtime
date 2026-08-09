@@ -15,7 +15,7 @@ def test_provision_builtin_skills_is_idempotent_and_preserves_existing(tmp_path:
 
     copied = provision_builtin_skills(tmp_path)
 
-    assert copied == tuple(skill_id for skill_id in BUILTIN_SKILL_IDS if skill_id != "office")
+    assert copied == BUILTIN_SKILL_IDS
     assert custom.read_text(encoding="utf-8") == "custom office skill\n"
     assert provision_builtin_skills(tmp_path) == ()
     assert all(
@@ -24,7 +24,6 @@ def test_provision_builtin_skills_is_idempotent_and_preserves_existing(tmp_path:
     assert all(
         (tmp_path / "skills" / skill_id / "agents" / "openai.yaml").is_file()
         for skill_id in BUILTIN_SKILL_IDS
-        if skill_id != "office"
     )
 
 
@@ -37,9 +36,9 @@ def test_runtime_bootstrap_copies_and_discovers_builtin_skills(tmp_path: Path) -
     resources = loader.reload()
     assert {skill.name for skill in resources.skills} == set(BUILTIN_SKILL_IDS)
     assert all(not hasattr(skill, "content") for skill in resources.skills)
-    loaded = loader.load_skill("ppt")
-    assert "定义演示策略" in loaded.content
+    loaded = loader.load_skill("powerpoint-pptx")
+    assert "PowerPoint" in loaded.content
     assert all(
         "present_files" in loader.load_skill(skill_id).content for skill_id in BUILTIN_SKILL_IDS
     )
-    assert "paddleocr-doc-parsing" in loader.load_skill("office").content
+    assert "source.manifest.json" in loader.load_skill("document-reader").content

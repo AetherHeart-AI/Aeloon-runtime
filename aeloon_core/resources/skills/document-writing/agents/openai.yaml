@@ -1,4 +1,0 @@
-interface:
-  display_name: "专业文档写作"
-  short_description: "Draft and revise structured professional documents"
-  default_prompt: "使用 $document-writing 起草并审阅这份专业文档。"

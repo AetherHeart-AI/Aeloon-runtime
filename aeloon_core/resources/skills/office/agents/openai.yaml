@@ -1,4 +1,0 @@
-interface:
-  display_name: "Office 办公协作"
-  short_description: "Coordinate polished multi-format office deliverables"
-  default_prompt: "使用 $office 统筹这项跨格式办公任务并完成一致性检查。"

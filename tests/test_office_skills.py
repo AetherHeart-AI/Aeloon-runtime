@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import importlib.util
-import json
+import re
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -14,30 +12,34 @@ from aeloon_core.runtime import skill_runtime
 from aeloon_core.runtime.builtin_skills import BUILTIN_SKILL_IDS
 
 RESOURCE_ROOT = Path(__file__).parents[1] / "aeloon_core" / "resources" / "skills"
-OFFICE_SKILL_IDS = (
+OFFICE_SKILL_IDS = ("document-reader", "word-docx", "powerpoint-pptx")
+RETIRED_SKILL_IDS = (
+    "office",
+    "ppt",
+    "document-writing",
+    "reports",
     "markitdown",
     "pdf",
     "paddleocr-doc-parsing",
     "pptx-generator",
     "document-format-skills",
 )
+RETIRED_REPLACEMENTS = {
+    "office": "document-reader, word-docx, or powerpoint-pptx",
+    "ppt": "powerpoint-pptx",
+    "document-writing": "word-docx",
+    "reports": "word-docx",
+    "markitdown": "document-reader",
+    "pdf": "document-reader",
+    "paddleocr-doc-parsing": "document-reader",
+    "pptx-generator": "powerpoint-pptx",
+    "document-format-skills": "word-docx",
+}
 
 
-def load_script(skill_id: str, script_name: str):
-    path = RESOURCE_ROOT / skill_id / "scripts" / script_name
-    spec = importlib.util.spec_from_file_location(f"test_{skill_id}_{path.stem}", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    try:
-        spec.loader.exec_module(module)
-    finally:
-        sys.modules.pop(spec.name, None)
-    return module
-
-
-def test_office_execution_skills_are_bundled_and_valid() -> None:
-    assert set(OFFICE_SKILL_IDS).issubset(BUILTIN_SKILL_IDS)
+def test_only_new_office_skills_are_bundled_and_valid() -> None:
+    assert BUILTIN_SKILL_IDS == OFFICE_SKILL_IDS
+    assert {path.parent.name for path in RESOURCE_ROOT.glob("*/SKILL.md")} == set(OFFICE_SKILL_IDS)
     for skill_id in OFFICE_SKILL_IDS:
         skill_dir = RESOURCE_ROOT / skill_id
         skill_text = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
@@ -53,29 +55,48 @@ def test_office_execution_skills_are_bundled_and_valid() -> None:
         assert f"${skill_id}" in interface["default_prompt"]
 
 
-def test_office_router_names_every_execution_skill() -> None:
-    office = (RESOURCE_ROOT / "office" / "SKILL.md").read_text(encoding="utf-8")
-    assert all(skill_id in office for skill_id in OFFICE_SKILL_IDS)
-    assert ".wps/.dps/.et" in office
+def test_old_skill_resources_are_removed() -> None:
+    assert all(not (RESOURCE_ROOT / skill_id).exists() for skill_id in RETIRED_SKILL_IDS)
 
 
-def test_bundled_office_scripts_compile() -> None:
-    for skill_id in (*OFFICE_SKILL_IDS, "office"):
-        for script in (RESOURCE_ROOT / skill_id / "scripts").glob("*.py"):
+def test_bundled_skill_scripts_compile() -> None:
+    for skill_id in OFFICE_SKILL_IDS:
+        for script in (RESOURCE_ROOT / skill_id).rglob("*.py"):
             compile(script.read_text(encoding="utf-8"), str(script), "exec")
 
 
-def test_bundled_skill_runtime_dispatches_python_script(
+def test_bundled_skill_runtime_prepends_action(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    script = tmp_path / "pdf" / "scripts" / "render_pdf.py"
+    script = tmp_path / "document-reader" / "scripts" / "cli.py"
     script.parent.mkdir(parents=True)
-    script.write_text("raise SystemExit(7)\n", encoding="utf-8")
+    script.write_text(
+        "import sys\n"
+        "assert sys.argv[1:] == ['ingest', '--check']\n"
+        "raise SystemExit(7)\n",
+        encoding="utf-8",
+    )
     monkeypatch.setattr(skill_runtime, "bundled_skill_root", lambda: tmp_path)
     original_argv = list(sys.argv)
 
-    assert skill_runtime.run_bundled_skill("pdf", "render", ["--check"]) == 7
+    assert skill_runtime.run_bundled_skill("document-reader", "ingest", ["--check"]) == 7
     assert sys.argv == original_argv
+
+
+def test_bundled_skill_runtime_reports_unknown_actions() -> None:
+    with pytest.raises(ValueError, match="expected one of: preflight, prepare-ocr, ingest"):
+        skill_runtime.run_bundled_skill("document-reader", "unknown", [])
+    with pytest.raises(ValueError, match="unknown bundled Skill 'missing'"):
+        skill_runtime.run_bundled_skill("missing", "run", [])
+
+
+@pytest.mark.parametrize(("skill_id", "replacement"), RETIRED_REPLACEMENTS.items())
+def test_every_retired_skill_reports_its_replacement(skill_id: str, replacement: str) -> None:
+    with pytest.raises(
+        ValueError,
+        match=f"has been retired; use {re.escape(replacement)}",
+    ):
+        skill_runtime.run_bundled_skill(skill_id, "run", [])
 
 
 @pytest.mark.asyncio
@@ -90,176 +111,31 @@ async def test_cli_dispatches_bundled_skill_arguments(
 
     monkeypatch.setattr(cli, "run_bundled_skill", fake_runner)
     code = await cli.async_main(
-        ["system", "skill", "pdf", "render", "--check", "--dpi", "96"]
+        ["system", "skill", "document-reader", "render-pdf", "--check", "--dpi", "96"]
     )
 
     assert code == 9
-    assert calls == [("pdf", "render", ["--check", "--dpi", "96"])]
+    assert calls == [("document-reader", "render-pdf", ["--check", "--dpi", "96"])]
 
 
-def test_packaging_includes_skill_scripts_and_runtime_dependencies() -> None:
+def test_packaging_uses_only_python_office_dependencies() -> None:
     manifest = (RESOURCE_ROOT.parents[2] / "pyproject.toml").read_text(encoding="utf-8")
     spec = (RESOURCE_ROOT.parents[2] / "aeloon.spec").read_text(encoding="utf-8")
-    package_lock = (
-        RESOURCE_ROOT / "pptx-generator" / "runtime" / "package-lock.json"
-    ).read_text(encoding="utf-8")
 
     for dependency in (
         "markitdown",
-        "nodejs-wheel",
-        "paddleocr",
-        "paddlepaddle",
+        "markdown-it-py",
+        "lxml",
         "pypdfium2",
         "python-docx",
+        "python-pptx",
     ):
         assert dependency in manifest
+    for removed in ("nodejs-wheel", "paddleocr", "paddlepaddle", "reportlab"):
+        assert removed not in manifest.lower()
+        assert removed not in spec.lower()
+    assert '"magika"' in spec
     assert "include_py_files=True" in spec
-    assert '"nodejs-wheel-binaries"' in spec
-    assert '"pptxgenjs": "4.0.1"' in package_lock
-
-
-def test_office_preflight_can_require_available_python(monkeypatch) -> None:
-    preflight = load_script("office", "preflight.py")
-    checks = {
-        "python": preflight.Check(True, "test"),
-        "markitdown": preflight.Check(False, "missing", "install it"),
-    }
-    monkeypatch.setattr(preflight, "collect_checks", lambda: checks)
-    monkeypatch.setattr(
-        preflight,
-        "COMPONENTS",
-        {"python-only": ("python",), "reader": ("markitdown",)},
-    )
-    assert preflight.main(["--require", "python-only"]) == 0
-    assert preflight.main(["--require", "reader"]) == 2
-
-
-def test_markitdown_converter_rejects_remote_and_native_wps(tmp_path: Path) -> None:
-    converter = load_script("markitdown", "convert.py")
-    with pytest.raises(ValueError, match="URI"):
-        converter._local_file("https://example.com/report.docx")
-    wps = tmp_path / "report.wps"
-    wps.write_bytes(b"placeholder")
-    with pytest.raises(ValueError, match="native WPS"):
-        converter._local_file(str(wps))
-
-
-def test_markitdown_converter_uses_local_api(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    converter = load_script("markitdown", "convert.py")
-    calls = []
-
-    class FakeMarkItDown:
-        def convert_local(self, source):
-            calls.append(source)
-            return SimpleNamespace(markdown="# 本地内容")
-
-    monkeypatch.setitem(sys.modules, "markitdown", SimpleNamespace(MarkItDown=FakeMarkItDown))
-    source = tmp_path / "report.docx"
-    source.write_bytes(b"docx")
-    assert converter.convert_file(source) == "# 本地内容"
-    assert calls == [source]
-
-
-def test_paddleocr_wrapper_is_local_only() -> None:
-    script = RESOURCE_ROOT / "paddleocr-doc-parsing" / "scripts" / "local_parse.py"
-    text = script.read_text(encoding="utf-8")
-    assert "PADDLEOCR_ACCESS_TOKEN" not in text
-    assert "paddleocr api" not in text
-    assert "requests" not in text
-    parser = load_script("paddleocr-doc-parsing", "local_parse.py")
-    with pytest.raises(ValueError, match="local files"):
-        parser.local_input("https://example.com/scan.pdf")
-    with parser.deny_network(True):
-        with pytest.raises(RuntimeError, match="network access is disabled"):
-            parser.socket.create_connection(("example.com", 443))
-
-
-def test_paddleocr_wrapper_writes_local_results(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    parser = load_script("paddleocr-doc-parsing", "local_parse.py")
-
-    class FakeImage:
-        def save(self, path: Path) -> None:
-            path.write_bytes(b"image")
-
-    class FakeResult:
-        def __init__(self, page: int) -> None:
-            self.page = page
-            self.markdown = {
-                "markdown_text": f"## 第 {page} 页",
-                "markdown_images": {f"assets/page-{page}.png": FakeImage()},
-            }
-
-        def save_to_json(self, save_path: str) -> None:
-            Path(save_path, "result.json").write_text("{}", encoding="utf-8")
-
-        def save_to_markdown(self, save_path: str) -> None:
-            Path(save_path, "result.md").write_text(
-                self.markdown["markdown_text"], encoding="utf-8"
-            )
-
-    class FakePipeline:
-        init_kwargs = None
-
-        def __init__(self, **kwargs) -> None:
-            type(self).init_kwargs = kwargs
-
-        def predict(self, *, input: str):
-            assert input.endswith("scan.pdf")
-            return [FakeResult(1), FakeResult(2)]
-
-        def concatenate_markdown_pages(self, pages):
-            return "\n\n".join(page["markdown_text"] for page in pages)
-
-    monkeypatch.setattr(parser, "import_pipeline", lambda: FakePipeline)
-    monkeypatch.setattr(parser.os, "environ", {})
-    source = tmp_path / "scan.pdf"
-    source.write_bytes(b"pdf")
-    output_dir = tmp_path / "output"
-    args = SimpleNamespace(
-        input=str(source),
-        output_dir=str(output_dir),
-        model_cache=str(tmp_path / "models"),
-        device="cpu",
-        offline=True,
-        use_doc_orientation=True,
-        use_doc_unwarping=True,
-        use_textline_orientation=True,
-    )
-
-    output, pages = parser.parse_document(args)
-
-    assert pages == 2
-    assert output.read_text(encoding="utf-8") == "## 第 1 页\n\n## 第 2 页"
-    assert (output_dir / "assets" / "page-1.png").read_bytes() == b"image"
-    assert (output_dir / "assets" / "page-2.png").read_bytes() == b"image"
-    manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["offline"] is True
-    assert parser.os.environ["HF_HUB_OFFLINE"] == "1"
-    assert parser.os.environ["PADDLE_PDX_CACHE_HOME"] == str(tmp_path / "models")
-    assert FakePipeline.init_kwargs["device"] == "cpu"
-
-
-def test_paddleocr_wrapper_rejects_asset_path_escape(tmp_path: Path) -> None:
-    parser = load_script("paddleocr-doc-parsing", "local_parse.py")
-    with pytest.raises(RuntimeError, match="outside the output directory"):
-        parser.safe_asset_path(tmp_path, "../outside.png")
-
-
-def test_third_party_license_families_are_preserved() -> None:
-    assert "MIT License" in (
-        RESOURCE_ROOT / "markitdown" / "LICENSE.txt"
-    ).read_text(encoding="utf-8")
-    assert "Apache License" in (
-        RESOURCE_ROOT / "pdf" / "LICENSE.txt"
-    ).read_text(encoding="utf-8")
-    assert "Apache License" in (
-        RESOURCE_ROOT / "paddleocr-doc-parsing" / "LICENSE.txt"
-    ).read_text(encoding="utf-8")
-    for skill_id in ("pptx-generator", "document-format-skills"):
-        assert "MIT License" in (RESOURCE_ROOT / skill_id / "LICENSE.txt").read_text(
-            encoding="utf-8"
-        )
+    assert not list(RESOURCE_ROOT.rglob("package.json"))
+    assert not list(RESOURCE_ROOT.rglob("*.js"))
+    assert not list(RESOURCE_ROOT.rglob("*.cjs"))

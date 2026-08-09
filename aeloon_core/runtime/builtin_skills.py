@@ -10,15 +10,9 @@ from importlib.resources.abc import Traversable
 from pathlib import Path
 
 BUILTIN_SKILL_IDS = (
-    "office",
-    "ppt",
-    "document-writing",
-    "reports",
-    "markitdown",
-    "pdf",
-    "paddleocr-doc-parsing",
-    "pptx-generator",
-    "document-format-skills",
+    "document-reader",
+    "word-docx",
+    "powerpoint-pptx",
 )
 
 

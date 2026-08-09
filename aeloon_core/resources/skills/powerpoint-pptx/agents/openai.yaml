@@ -1,0 +1,4 @@
+interface:
+  display_name: "PowerPoint PPTX"
+  short_description: "使用纯 Python 创建、编辑并验证可编辑 PowerPoint 演示文稿"
+  default_prompt: "使用 $powerpoint-pptx 制作并验证这份可编辑 PowerPoint。"

@@ -1,4 +1,0 @@
-interface:
-  display_name: "中文 DOCX 排版"
-  short_description: "Create and format editable Chinese Word documents"
-  default_prompt: "使用 $document-format-skills 生成并检查这份中文 DOCX。"

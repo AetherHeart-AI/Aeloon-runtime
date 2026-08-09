@@ -5,6 +5,34 @@ release is cut, those entries should move to a versioned section with an ISO dat
 
 ## Unreleased
 
+## 0.0.5 - 2026-08-09
+
+### Added
+
+- Added the Python-driven `document-reader`, `word-docx`, and `powerpoint-pptx` built-in skills.
+  They provide document ingestion with evidence sidecars, editable DOCX/PPTX build and targeted
+  editing, structural validation, and optional LibreOffice-backed visual verification.
+- Added a locked, opt-in Docling/RapidOCR runtime with explicit preparation, cache manifests, and
+  offline cache-miss behavior. External Marker and PyMuPDF4LLM engines require a recorded license
+  acceptance and are never selected by default.
+- Added Word tracked replacements and comments through the versioned `word-edit-spec/v1.1`, plus
+  an independently gated Chinese scanned-PDF OCR quality benchmark.
+
+### Changed
+
+- Replaced the nine former Office skills with three focused single-entry Python skills. Existing
+  copies in user data directories are preserved, but the retired built-in IDs now return migration
+  guidance instead of running compatibility implementations.
+- Removed the bundled Node.js/PptxGenJS, PaddlePaddle/PaddleOCR, ReportLab, and related packaging
+  branches. LibreOffice and the system `uv` executable remain optional and all missing validation
+  or download capabilities are reported explicitly.
+
+### Removed
+
+- Removed built-in PDF creation, merging, splitting, rotation, form filling, and encryption. These
+  requests now require a reviewed custom PDF skill or a dedicated PDF tool; document ingestion and
+  PDF rendering remain supported by `document-reader`.
+
 ## 0.0.4 - 2026-08-07
 
 ### Added

@@ -34,18 +34,31 @@ jobs:
           enable-cache: false
           python-version: "3.12"
 
+      - name: Resolve package version and asset name
+        id: release_meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(uv run --no-project --python 3.12 python - <<'PY'
+          import tomllib
+          from pathlib import Path
+
+          print(tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"])
+          PY
+          )"
+          test -n "$version"
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            test "$GITHUB_REF_NAME" = "v$version"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "asset_base=Aeloon-core-ubuntu-arm64-v$version" >> "$GITHUB_OUTPUT"
+
       - name: Verify glibc compatibility baseline
         shell: bash
         run: |
           set -euo pipefail
           test "$(uname -m)" = "aarch64"
           test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.35"
-
-      - name: Prepare bundled PptxGenJS runtime
-        run: >-
-          npm ci
-          --prefix aeloon_core/resources/skills/pptx-generator/runtime
-          --omit=dev --ignore-scripts
 
       - name: Build single-file executable
         run: >-
@@ -55,94 +68,151 @@ jobs:
 
       - name: Verify executable and bundled resources
         shell: bash
+        env:
+          EXPECTED_VERSION: ${{ steps.release_meta.outputs.version }}
         run: |
           set -euo pipefail
           file dist/aeloon | grep -E "ELF 64-bit LSB.*ARM aarch64"
           ldd dist/aeloon
-          dist/aeloon --version
+          test "$(dist/aeloon --version)" = "aeloon $EXPECTED_VERSION"
           dist/aeloon --help >/dev/null
-          dist/aeloon bridge schema | python3 -m json.tool >/dev/null
+          dist/aeloon rpc serve --help >/dev/null
 
       - name: Verify standalone daemon lifecycle
         shell: bash
+        env:
+          EXPECTED_VERSION: ${{ steps.release_meta.outputs.version }}
         run: |
           set -euo pipefail
           smoke_root="$(mktemp -d /tmp/aeloon-smoke.XXXXXX)"
           mkdir -p "$smoke_root/home"
           config_path="$smoke_root/config.json"
           data_path="$smoke_root/data"
-          socket_path="$smoke_root/bridge.sock"
+          socket_path="$smoke_root/core.sock"
+          browser_socket_path="$smoke_root/browser.sock"
           binary_path="$GITHUB_WORKSPACE/dist/aeloon"
+          daemon_pid=""
 
           stop_daemon() {
-            env -i HOME="$smoke_root/home" PATH=/usr/bin:/bin TMPDIR=/tmp \
-              "$binary_path" bridge stop \
-              --config "$config_path" \
-              --data-dir "$data_path" \
-              --socket "$socket_path" >/dev/null 2>&1 || true
+            if [[ -n "$daemon_pid" ]]; then
+              kill "$daemon_pid" >/dev/null 2>&1 || true
+              wait "$daemon_pid" >/dev/null 2>&1 || true
+            fi
           }
           trap stop_daemon EXIT
 
           env -i HOME="$smoke_root/home" PATH=/usr/bin:/bin TMPDIR=/tmp \
-            "$binary_path" bridge ensure \
+            "$binary_path" rpc serve \
             --config "$config_path" \
             --data-dir "$data_path" \
-            --socket "$socket_path"
-          env -i HOME="$smoke_root/home" PATH=/usr/bin:/bin TMPDIR=/tmp \
-            "$binary_path" bridge status \
-            --config "$config_path" \
-            --data-dir "$data_path" \
-            --socket "$socket_path"
+            --socket "$socket_path" \
+            --browser-runtime-socket "$browser_socket_path" \
+            >"$smoke_root/rpc.log" 2>&1 &
+          daemon_pid=$!
 
-          for skill_id in \
-            office ppt document-writing reports markitdown pdf \
-            paddleocr-doc-parsing pptx-generator document-format-skills; do
+          for _ in {1..300}; do
+            if [[ -S "$socket_path" ]]; then
+              break
+            fi
+            if ! kill -0 "$daemon_pid" >/dev/null 2>&1; then
+              cat "$smoke_root/rpc.log"
+              exit 1
+            fi
+            sleep 0.1
+          done
+          test -S "$socket_path"
+
+          AELOON_SMOKE_SOCKET="$socket_path" python3 - <<'PY'
+          import json
+          import os
+          import socket
+          import struct
+
+
+          def receive_exact(client: socket.socket, size: int) -> bytes:
+              value = bytearray()
+              while len(value) < size:
+                  chunk = client.recv(size - len(value))
+                  if not chunk:
+                      raise RuntimeError("RPC socket closed before the frame completed")
+                  value.extend(chunk)
+              return bytes(value)
+
+
+          def request(client: socket.socket, request_id: int, method: str, params: dict) -> dict:
+              payload = json.dumps(
+                  {"id": request_id, "method": method, "params": params},
+                  separators=(",", ":"),
+              ).encode()
+              client.sendall(struct.pack("!I", len(payload)) + payload)
+              length = struct.unpack("!I", receive_exact(client, 4))[0]
+              response = json.loads(receive_exact(client, length))
+              if response.get("error"):
+                  raise RuntimeError(response["error"])
+              if response.get("id") != request_id:
+                  raise RuntimeError("RPC response id mismatch")
+              return response["result"]
+
+
+          with socket.socket(socket.AF_UNIX) as client:
+              client.connect(os.environ["AELOON_SMOKE_SOCKET"])
+              handshake = request(
+                  client,
+                  1,
+                  "system.handshake",
+                  {"protocol": "aeloon-rpc-v1"},
+              )
+              if handshake["protocol"] != "aeloon-rpc-v1":
+                  raise RuntimeError("RPC protocol mismatch")
+              if handshake["core_version"] != os.environ["EXPECTED_VERSION"]:
+                  raise RuntimeError("RPC core version mismatch")
+              shutdown = request(client, 2, "system.shutdown", {})
+              if shutdown["status"] != "stopping":
+                  raise RuntimeError("RPC shutdown was not accepted")
+          PY
+
+          for skill_id in document-reader word-docx powerpoint-pptx; do
             test -f "$data_path/skills/$skill_id/SKILL.md"
-          done
-          for skill_id in \
-            markitdown pdf paddleocr-doc-parsing pptx-generator document-format-skills; do
             test -f "$data_path/skills/$skill_id/LICENSE.txt"
+            test -f "$data_path/skills/$skill_id/scripts/cli.py"
+            test -f "$data_path/skills/$skill_id/agents/openai.yaml"
           done
-          test -f "$data_path/skills/office/scripts/preflight.py"
-          test -f "$data_path/skills/markitdown/scripts/convert.py"
-          test -f "$data_path/skills/pdf/scripts/render_pdf.py"
-          test -f "$data_path/skills/paddleocr-doc-parsing/scripts/local_parse.py"
-          test -f "$data_path/skills/pptx-generator/scripts/render_slides.py"
-          test -f "$data_path/skills/document-format-skills/scripts/process.py"
-          test -f "$data_path/skills/pptx-generator/runtime/check.cjs"
-          test -f "$data_path/skills/pptx-generator/runtime/node_modules/pptxgenjs/package.json"
 
           env -i HOME="$smoke_root/home" PATH=/usr/bin:/bin TMPDIR=/tmp \
-            "$binary_path" system skill office preflight \
-            --require markitdown --require pdf --require pptx --require docx
+            "$binary_path" system skill document-reader ingest --help
           env -i HOME="$smoke_root/home" PATH=/usr/bin:/bin TMPDIR=/tmp \
-            "$binary_path" system skill pdf render --check
+            "$binary_path" system skill word-docx build --help
           env -i HOME="$smoke_root/home" PATH=/usr/bin:/bin TMPDIR=/tmp \
-            "$binary_path" system skill paddleocr-doc-parsing parse --check
-          env -i HOME="$smoke_root/home" PATH=/usr/bin:/bin TMPDIR=/tmp \
-            "$binary_path" system skill pptx-generator node \
-            "$data_path/skills/pptx-generator/runtime/check.cjs"
-          stop_daemon
+            "$binary_path" system skill powerpoint-pptx build --help
+
+          watchdog_pid=""
+          ( sleep 10; kill "$daemon_pid" >/dev/null 2>&1 || true ) &
+          watchdog_pid=$!
+          wait "$daemon_pid"
+          daemon_pid=""
+          kill "$watchdog_pid" >/dev/null 2>&1 || true
+          wait "$watchdog_pid" >/dev/null 2>&1 || true
           trap - EXIT
           test ! -e "$socket_path"
 
       - name: Create release archive and checksum
         shell: bash
+        env:
+          ASSET_BASE: ${{ steps.release_meta.outputs.asset_base }}
         run: |
           set -euo pipefail
           mkdir -p release
-          tar -czf release/aeloon-ubuntu-arm64-glibc2.35.tar.gz -C dist aeloon
+          tar -czf "release/$ASSET_BASE.tar.gz" -C dist aeloon
           cd release
-          sha256sum aeloon-ubuntu-arm64-glibc2.35.tar.gz \
-            > aeloon-ubuntu-arm64-glibc2.35.sha256
+          sha256sum "$ASSET_BASE.tar.gz" > "$ASSET_BASE.sha256"
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: aeloon-ubuntu-arm64-glibc2.35-${{ github.sha }}
           path: |
-            release/aeloon-ubuntu-arm64-glibc2.35.tar.gz
-            release/aeloon-ubuntu-arm64-glibc2.35.sha256
+            release/${{ steps.release_meta.outputs.asset_base }}.tar.gz
+            release/${{ steps.release_meta.outputs.asset_base }}.sha256
           if-no-files-found: error
           retention-days: 30
 
@@ -170,6 +240,7 @@ jobs:
           set -euo pipefail
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" release/* --clobber
-          elif ! gh release create "$GITHUB_REF_NAME" release/* --generate-notes; then
+          elif ! gh release create "$GITHUB_REF_NAME" release/* \
+            --title "Aeloon Core $GITHUB_REF_NAME" --generate-notes; then
             gh release upload "$GITHUB_REF_NAME" release/* --clobber
           fi

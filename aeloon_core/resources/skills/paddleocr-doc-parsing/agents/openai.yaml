@@ -1,4 +1,0 @@
-interface:
-  display_name: "本地文档 OCR"
-  short_description: "Parse scanned Chinese documents locally with PaddleOCR"
-  default_prompt: "使用 $paddleocr-doc-parsing 在本地解析这份扫描文档并核验结构。"

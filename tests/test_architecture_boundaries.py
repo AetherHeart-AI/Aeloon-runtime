@@ -25,18 +25,9 @@ def test_runtime_has_no_application_javascript_and_removed_subsystems_are_absent
         PACKAGE / "rename_session.py",
     )
     assert all(not path.exists() for path in forbidden_paths)
-    pptx_runtime = PACKAGE / "resources" / "skills" / "pptx-generator" / "runtime"
-    assert not [
-        path for path in PACKAGE.rglob("*.js") if not path.is_relative_to(pptx_runtime)
-    ]
-    assert not [
-        path for path in PACKAGE.rglob("*.ts") if not path.is_relative_to(pptx_runtime)
-    ]
-    assert not [
-        path
-        for path in PACKAGE.rglob("package.json")
-        if not path.is_relative_to(pptx_runtime)
-    ]
+    assert not list(PACKAGE.rglob("*.js"))
+    assert not list(PACKAGE.rglob("*.ts"))
+    assert not list(PACKAGE.rglob("package.json"))
     assert not list(PACKAGE.rglob("bun.lock"))
 
 

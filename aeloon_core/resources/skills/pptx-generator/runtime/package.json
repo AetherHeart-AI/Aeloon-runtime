@@ -1,8 +1,0 @@
-{
-  "name": "aeloon-bundled-pptx-runtime",
-  "private": true,
-  "version": "0.0.4",
-  "dependencies": {
-    "pptxgenjs": "4.0.1"
-  }
-}

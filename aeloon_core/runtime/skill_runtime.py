@@ -1,36 +1,38 @@
-"""Run trusted bundled Skill entry points with Aeloon's packaged runtimes."""
+"""Run trusted bundled Python Skill entry points."""
 
 from __future__ import annotations
 
-import os
 import runpy
 import sys
 from importlib.resources import files
 from pathlib import Path
 
-_SCRIPT_COMMANDS = {
-    ("office", "preflight"): "office/scripts/preflight.py",
-    ("markitdown", "convert"): "markitdown/scripts/convert.py",
-    ("pdf", "render"): "pdf/scripts/render_pdf.py",
-    ("paddleocr-doc-parsing", "parse"): (
-        "paddleocr-doc-parsing/scripts/local_parse.py"
-    ),
-    ("pptx-generator", "render"): "pptx-generator/scripts/render_slides.py",
-    ("document-format-skills", "from-text"): (
-        "document-format-skills/scripts/from_text.py"
-    ),
-    ("document-format-skills", "process"): (
-        "document-format-skills/scripts/process.py"
-    ),
+_SKILL_ENTRIES = {
+    "document-reader": "document-reader/scripts/cli.py",
+    "word-docx": "word-docx/scripts/cli.py",
+    "powerpoint-pptx": "powerpoint-pptx/scripts/cli.py",
 }
 
+_SKILL_ACTIONS = {
+    "document-reader": ("preflight", "prepare-ocr", "ingest", "render-pdf"),
+    "word-docx": ("build", "edit", "validate", "render"),
+    "powerpoint-pptx": ("build", "inspect-template", "apply-template", "validate", "render"),
+}
+
+_RETIRED_SKILLS = {
+    "office": "document-reader, word-docx, or powerpoint-pptx",
+    "ppt": "powerpoint-pptx",
+    "document-writing": "word-docx",
+    "reports": "word-docx",
+    "markitdown": "document-reader",
+    "pdf": "document-reader",
+    "paddleocr-doc-parsing": "document-reader",
+    "pptx-generator": "powerpoint-pptx",
+    "document-format-skills": "word-docx",
+}
 
 def bundled_skill_root() -> Path:
     return Path(str(files("aeloon_core.resources").joinpath("skills"))).resolve()
-
-
-def bundled_pptx_node_modules() -> Path:
-    return bundled_skill_root() / "pptx-generator" / "runtime" / "node_modules"
 
 
 def _exit_code(value: object) -> int:
@@ -57,53 +59,29 @@ def _run_python_script(relative_path: str, arguments: list[str]) -> int:
     return 0
 
 
-def _run_pptx_javascript(arguments: list[str]) -> int:
-    if not arguments:
-        raise ValueError("pptx-generator node requires a local JavaScript file")
-    source = Path(arguments[0]).expanduser().resolve(strict=False)
-    if not source.is_file() or source.suffix.lower() not in {".js", ".cjs", ".mjs"}:
-        raise ValueError("pptx-generator node requires an existing local JavaScript file")
-    node_modules = bundled_pptx_node_modules()
-    if not (node_modules / "pptxgenjs" / "package.json").is_file():
-        raise RuntimeError("bundled PptxGenJS runtime is missing")
-
-    try:
-        from nodejs_wheel import node
-    except ImportError as exc:
-        raise RuntimeError("bundled Node.js runtime is missing") from exc
-
-    previous_node_path = os.environ.get("NODE_PATH")
-    os.environ["NODE_PATH"] = str(node_modules)
-    try:
-        completed = node(
-            [str(source), *arguments[1:]],
-            return_completed_process=True,
-        )
-    finally:
-        if previous_node_path is None:
-            os.environ.pop("NODE_PATH", None)
-        else:
-            os.environ["NODE_PATH"] = previous_node_path
-    return int(completed.returncode)
-
-
 def run_bundled_skill(skill_id: str, action: str, arguments: list[str]) -> int:
-    if (skill_id, action) == ("pptx-generator", "node"):
-        return _run_pptx_javascript(arguments)
-    relative_path = _SCRIPT_COMMANDS.get((skill_id, action))
-    if relative_path is None:
-        available = ", ".join(
-            f"{item_skill}/{item_action}"
-            for item_skill, item_action in sorted(
-                [*_SCRIPT_COMMANDS, ("pptx-generator", "node")]
-            )
+    replacement = _RETIRED_SKILLS.get(skill_id)
+    if replacement is not None:
+        raise ValueError(
+            f"bundled Skill '{skill_id}' has been retired; use {replacement} instead"
         )
-        raise ValueError(f"unknown bundled Skill action; expected one of: {available}")
-    return _run_python_script(relative_path, arguments)
+
+    relative_path = _SKILL_ENTRIES.get(skill_id)
+    if relative_path is None:
+        available = ", ".join(sorted(_SKILL_ENTRIES))
+        raise ValueError(f"unknown bundled Skill '{skill_id}'; expected one of: {available}")
+
+    valid_actions = _SKILL_ACTIONS[skill_id]
+    if action not in valid_actions:
+        available = ", ".join(valid_actions)
+        raise ValueError(
+            f"unknown action '{action}' for bundled Skill '{skill_id}'; "
+            f"expected one of: {available}"
+        )
+    return _run_python_script(relative_path, [action, *arguments])
 
 
 __all__ = [
-    "bundled_pptx_node_modules",
     "bundled_skill_root",
     "run_bundled_skill",
 ]

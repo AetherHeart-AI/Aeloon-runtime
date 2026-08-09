@@ -14,15 +14,15 @@ hiddenimports = []
 
 for package in (
     "docx",
+    "lxml",
+    "magika",
+    "markdown_it",
     "markitdown",
-    "nodejs_wheel",
-    "paddle",
-    "paddleocr",
-    "paddlex",
+    "PIL",
     "pdfplumber",
     "pypdf",
     "pypdfium2",
-    "reportlab",
+    "pptx",
 ):
     package_datas, package_binaries, package_hiddenimports = collect_all(package)
     datas += package_datas
@@ -30,16 +30,16 @@ for package in (
     hiddenimports += package_hiddenimports
 
 for distribution in (
+    "lxml",
+    "magika",
+    "markdown-it-py",
     "markitdown",
-    "nodejs-wheel",
-    "nodejs-wheel-binaries",
-    "paddleocr",
-    "paddlepaddle",
+    "pillow",
     "pdfplumber",
     "pypdf",
     "pypdfium2",
     "python-docx",
-    "reportlab",
+    "python-pptx",
 ):
     datas += copy_metadata(distribution, recursive=True)
 

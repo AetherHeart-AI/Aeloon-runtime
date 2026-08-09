@@ -1,4 +1,0 @@
-interface:
-  display_name: "业务报表与报告"
-  short_description: "Build verifiable business reports and reporting tables"
-  default_prompt: "使用 $reports 制作一份口径清晰且可核验的业务报告。"

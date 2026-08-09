@@ -1,4 +1,0 @@
-interface:
-  display_name: "PPT 演示文稿"
-  short_description: "Plan and refine clear professional presentations"
-  default_prompt: "使用 $ppt 规划并制作这份专业演示文稿。"
