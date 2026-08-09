@@ -5,6 +5,13 @@ release is cut, those entries should move to a versioned section with an ISO dat
 
 ## Unreleased
 
+## 0.0.12 - 2026-08-09
+
+### Changed
+
+- Bumped the packaged Core identity for the unified v0.0.12 desktop release; runtime behavior is
+  unchanged from Core 0.0.11.
+
 ## 0.0.11 - 2026-08-09
 
 ### Fixed
