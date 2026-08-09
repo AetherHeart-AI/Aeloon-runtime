@@ -38,7 +38,10 @@ jobs:
           test -n "$wheel"
           uv venv --python 3.12 wheel-smoke
           uv pip install --python wheel-smoke/bin/python "$wheel"
-          test "$(wheel-smoke/bin/python -m aeloon_core --version)" = "aeloon 0.0.6"
+          test "$(wheel-smoke/bin/python -m aeloon_core --version)" = "aeloon-core 0.0.7"
+          test -x wheel-smoke/bin/aeloon-core
+          test ! -e wheel-smoke/bin/aeloon
+          test "$(wheel-smoke/bin/aeloon-core --version)" = "aeloon-core 0.0.7"
           wheel-smoke/bin/python -m aeloon_core rpc serve --help >/dev/null
           test -f "aeloon_core/resources/skills/aeloon-office-lite/SKILL.md"
           test -f "aeloon_core/resources/skills/aeloon-office-lite/scripts/cli.py"
