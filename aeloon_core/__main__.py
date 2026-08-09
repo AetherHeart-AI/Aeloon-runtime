@@ -229,18 +229,18 @@ def _hide_suppressed_subcommands(commands: Any) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="aeloon",
+        prog="aeloon-core",
         description="A coding agent for the current workspace.",
         epilog=(
             "examples:\n"
-            '  aeloon "fix the failing tests"\n'
-            '  aeloon resume "continue with the implementation"\n'
-            "  aeloon provider add studio --endpoint http://127.0.0.1:8000\n"
-            "  aeloon login\n"
-            "  aeloon doctor\n\n"
+            '  aeloon-core "fix the failing tests"\n'
+            '  aeloon-core resume "continue with the implementation"\n'
+            "  aeloon-core provider add studio --endpoint http://127.0.0.1:8000\n"
+            "  aeloon-core login\n"
+            "  aeloon-core doctor\n\n"
             "task options: -C PATH, -m MODEL, --json, -v, --ephemeral\n"
-            "Use `aeloon -- TASK` when TASK starts with a command name.\n"
-            "Run `aeloon COMMAND --help` for command-specific options."
+            "Use `aeloon-core -- TASK` when TASK starts with a command name.\n"
+            "Run `aeloon-core COMMAND --help` for command-specific options."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -279,7 +279,9 @@ def build_parser() -> argparse.ArgumentParser:
     models.set_defaults(models_command="list")
     model_commands = models.add_subparsers(dest="models_command", metavar="COMMAND")
     model_use = model_commands.add_parser("use", help="Set the default model.")
-    model_use.add_argument("model_id", help="Provider-qualified model id from `aeloon models`.")
+    model_use.add_argument(
+        "model_id", help="Provider-qualified model id from `aeloon-core models`."
+    )
     model_use.add_argument("--config", type=Path, help=argparse.SUPPRESS)
     model_use.add_argument("--data-dir", type=Path, help=argparse.SUPPRESS)
     model_use.add_argument("--json", action="store_true", help="Print JSON output.")
@@ -380,7 +382,7 @@ def build_parser() -> argparse.ArgumentParser:
         _add_provider_runtime_arguments(command)
     _hide_suppressed_subcommands(commands)
     # Set this after child parsers are created so their own usage remains concise.
-    parser.usage = "aeloon [TASK...] | aeloon COMMAND ..."
+    parser.usage = "aeloon-core [TASK...] | aeloon-core COMMAND ..."
     return parser
 
 
@@ -912,7 +914,7 @@ async def models_command(args: argparse.Namespace) -> int:
         print(_json(payload))
         return 0
     if not payload:
-        print("No models are connected. Run `aeloon provider add ...` or `aeloon login`.")
+        print("No models are connected. Run `aeloon-core provider add ...` or `aeloon-core login`.")
         return 0
     _print_table(
         ("", "MODEL", "PROVIDER", "CONTEXT"),
@@ -928,7 +930,8 @@ async def models_command(args: argparse.Namespace) -> int:
     )
     if payload[0]["automatic"]:
         print(
-            "* automatically used when no default is set; pin one with `aeloon models use MODEL`."
+            "* automatically used when no default is set; pin one with "
+            "`aeloon-core models use MODEL`."
         )
     return 0
 
@@ -1026,7 +1029,7 @@ async def doctor_command(args: argparse.Namespace) -> int:
             "config",
             "warning",
             "Using built-in defaults",
-            "Connect an API with `aeloon provider add ...` or run `aeloon login`.",
+            "Connect an API with `aeloon-core provider add ...` or run `aeloon-core login`.",
         )
     if config.workspace.is_dir():
         add("workspace", "ok", str(config.workspace))
@@ -1048,7 +1051,7 @@ async def doctor_command(args: argparse.Namespace) -> int:
                     "model",
                     "warning",
                     f"No default is set; runs automatically use {available[0].id}",
-                    "Pin it with `aeloon models use MODEL` if desired.",
+                    "Pin it with `aeloon-core models use MODEL` if desired.",
                 )
                 add("credential", "ok", "Credentials are configured")
             else:
@@ -1056,13 +1059,13 @@ async def doctor_command(args: argparse.Namespace) -> int:
                     "model",
                     "error",
                     "No connected model is available",
-                    "Connect with `aeloon provider add ...` or `aeloon login`.",
+                    "Connect with `aeloon-core provider add ...` or `aeloon-core login`.",
                 )
         else:
             try:
                 model = await manager.model(config.agent.model)
             except (KeyError, RuntimeError, PermissionError) as exc:
-                add("model", "error", str(exc), "Run `aeloon models` to choose another model.")
+                add("model", "error", str(exc), "Run `aeloon-core models` to choose another model.")
             else:
                 add("model", "ok", f"{model.id} ({model.name})")
                 if model.provider == "deepseek" and not getattr(
@@ -1072,7 +1075,8 @@ async def doctor_command(args: argparse.Namespace) -> int:
                         "credential",
                         "error",
                         "DeepSeek API key is not configured",
-                        "Add an API with `aeloon provider add ...` or log in with `aeloon login`.",
+                        "Add an API with `aeloon-core provider add ...` or log in with "
+                        "`aeloon-core login`.",
                     )
                 else:
                     add("credential", "ok", "Credentials are configured")
@@ -1153,11 +1157,11 @@ async def setup_command(args: argparse.Namespace) -> int:
         ).normalized()
         save_config(config, path)
         print(f"Configured {model_id} in {path}.")
-        print('Try: aeloon "inspect this repository"')
+        print('Try: aeloon-core "inspect this repository"')
         return 0
 
     # Persist the workspace before the login flow reads the configuration, then use
-    # the same account path as `aeloon login` so credentials remain in the vault.
+    # the same account path as `aeloon-core login` so credentials remain in the vault.
     save_config(config, path)
     login_args = argparse.Namespace(
         config=path,
@@ -1189,7 +1193,7 @@ async def setup_command(args: argparse.Namespace) -> int:
     finally:
         await runtime.close()
     print(f"Selected {selected}.")
-    print('Try: aeloon "inspect this repository"')
+    print('Try: aeloon-core "inspect this repository"')
     return 0
 
 
@@ -1211,18 +1215,16 @@ def completion_command(args: argparse.Namespace) -> int:
     commands = "resume history login logout whoami models setup doctor config provider system"
     scripts = {
         "bash": (
-            "_aeloon_complete() {\n"
+            "_aeloon_core_complete() {\n"
             "  provider current\n"
             '  current="${COMP_WORDS[COMP_CWORD]}"\n'
             f'  COMPREPLY=($(compgen -W "{commands}" -- "$current"))\n'
             "}\n"
-            "complete -F _aeloon_complete aeloon aeloon-core"
+            "complete -F _aeloon_core_complete aeloon-core"
         ),
-        "zsh": (
-            f"#compdef aeloon aeloon-core\n_arguments '1:command:({commands})' '*::argument:->args'"
-        ),
+        "zsh": (f"#compdef aeloon-core\n_arguments '1:command:({commands})' '*::argument:->args'"),
         "fish": "\n".join(
-            f"complete -c aeloon -f -n '__fish_use_subcommand' -a {command}"
+            f"complete -c aeloon-core -f -n '__fish_use_subcommand' -a {command}"
             for command in commands.split()
         ),
     }
@@ -1445,8 +1447,8 @@ def _print_provider_result(
         provider = result["provider"]
         print(f"Added provider {provider['id']} [{provider['driver']}] ({provider['endpoint']}).")
         if provider.get("model_ids"):
-            print("The first model in `aeloon models` is used automatically.")
-            print(f"Optional pin: aeloon models use {provider['model_ids'][0]}")
+            print("The first model in `aeloon-core models` is used automatically.")
+            print(f"Optional pin: aeloon-core models use {provider['model_ids'][0]}")
         return
     print(f"Removed provider {result['provider_id']}.")
 
@@ -1583,13 +1585,15 @@ def _print_cli_error(code: str, message: str, *, as_json: bool) -> None:
         return
     print(f"Error: {message}", file=sys.stderr)
     suggestions = {
-        "auth": "Run `aeloon provider add ...` or `aeloon login` to configure a model source.",
+        "auth": (
+            "Run `aeloon-core provider add ...` or `aeloon-core login` to configure a model source."
+        ),
         "model_not_configured": (
-            "Add an API with `aeloon provider add ...` or sign in with `aeloon login`, "
+            "Add an API with `aeloon-core provider add ...` or sign in with `aeloon-core login`, "
             "then Aeloon will use the first available model automatically."
         ),
-        "model_not_found": "Run `aeloon models` to see available models.",
-        "not_found": "Run `aeloon history` to see saved tasks.",
+        "model_not_found": "Run `aeloon-core models` to see available models.",
+        "not_found": "Run `aeloon-core history` to see saved tasks.",
     }
     if code in suggestions:
         print(suggestions[code], file=sys.stderr)

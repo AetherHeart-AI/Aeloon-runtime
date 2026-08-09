@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -456,14 +457,14 @@ def test_run_without_any_connected_model_explains_setup(tmp_path: Path, capsys) 
     )
     error = capsys.readouterr().err
     assert "No connected model is available" in error
-    assert "aeloon provider add" in error
+    assert "aeloon-core provider add" in error
     assert "first available model automatically" in error
 
 
 def test_top_level_help_focuses_on_user_tasks() -> None:
     help_text = cli.build_parser().format_help()
 
-    assert 'aeloon "fix the failing tests"' in help_text
+    assert 'aeloon-core "fix the failing tests"' in help_text
     assert "resume" in help_text
     assert "history" in help_text
     assert "doctor" in help_text
@@ -508,7 +509,7 @@ def test_new_commands_use_actionable_errors_while_legacy_run_keeps_json(
     )
     human = capsys.readouterr().err
     assert human.startswith("Error: No saved task")
-    assert "aeloon history" in human
+    assert "aeloon-core history" in human
 
     assert cli.main(["run"]) == 2
     legacy = json.loads(capsys.readouterr().err)
@@ -667,7 +668,7 @@ async def test_models_and_doctor_offer_human_and_machine_views(tmp_path: Path, c
     assert diagnosis["ok"] is False
     model = next(item for item in diagnosis["checks"] if item["name"] == "model")
     assert model["status"] == "error"
-    assert "aeloon provider add" in model["fix"]
+    assert "aeloon-core provider add" in model["fix"]
 
 
 @pytest.mark.asyncio
@@ -823,5 +824,15 @@ async def test_setup_configures_deepseek_without_exposing_key(
 def test_completion_command_emits_shell_script(capsys) -> None:
     assert cli.main(["completion", "zsh"]) == 0
     rendered = capsys.readouterr().out
-    assert rendered.startswith("#compdef aeloon aeloon-core")
+    assert rendered.startswith("#compdef aeloon-core")
     assert "resume history login logout" in rendered
+
+
+def test_package_exposes_only_the_aeloon_core_command() -> None:
+    metadata = tomllib.loads(
+        (Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8")
+    )
+
+    assert metadata["project"]["scripts"] == {
+        "aeloon-core": "aeloon_core.__main__:main",
+    }

@@ -17,10 +17,10 @@ Install the project and connect a local endpoint:
 ```bash
 uv sync
 
-uv run aeloon provider add studio \
+uv run aeloon-core provider add studio \
   --endpoint http://127.0.0.1:8000
 
-uv run aeloon "Inspect this repository and explain its entry points"
+uv run aeloon-core "Inspect this repository and explain its entry points"
 ```
 
 Pass `--api-key` when the endpoint requires one. The key is stored in the mode-`0600` config file.
@@ -31,9 +31,9 @@ Capability probe failures leave that model available as text-only and do not blo
 To use Aeloon Cloud instead:
 
 ```bash
-uv run aeloon login
-uv run aeloon models
-uv run aeloon "Fix the failing tests"
+uv run aeloon-core login
+uv run aeloon-core models
+uv run aeloon-core "Fix the failing tests"
 ```
 
 ## Common workflows
@@ -42,35 +42,35 @@ The task is the default command:
 
 ```bash
 # Start a saved task in the current workspace
-uv run aeloon "fix the failing tests"
+uv run aeloon-core "fix the failing tests"
 
 # Continue the newest task for this workspace
-uv run aeloon resume "continue with the implementation"
+uv run aeloon-core resume "continue with the implementation"
 
 # Read a task from a file or standard input
-uv run aeloon --file task.md
-printf 'review this change' | uv run aeloon
+uv run aeloon-core --file task.md
+printf 'review this change' | uv run aeloon-core
 
 # Select a workspace or model for one run
-uv run aeloon -C ../project -m studio/qwen3-coder "review the repository"
+uv run aeloon-core -C ../project -m studio/qwen3-coder "review the repository"
 
 # Run without saving, return JSON, or show tool activity
-uv run aeloon --ephemeral "answer without saving a session"
-uv run aeloon --json "return one machine-readable result"
-uv run aeloon -v "show concise tool activity"
-uv run aeloon -vv "also show lifecycle events"
+uv run aeloon-core --ephemeral "answer without saving a session"
+uv run aeloon-core --json "return one machine-readable result"
+uv run aeloon-core -v "show concise tool activity"
+uv run aeloon-core -vv "also show lifecycle events"
 ```
 
 Useful management commands:
 
 ```bash
-uv run aeloon provider list
-uv run aeloon models
-uv run aeloon models use studio/qwen3-coder
-uv run aeloon history
-uv run aeloon doctor
-uv run aeloon whoami
-uv run aeloon logout
+uv run aeloon-core provider list
+uv run aeloon-core models
+uv run aeloon-core models use studio/qwen3-coder
+uv run aeloon-core history
+uv run aeloon-core doctor
+uv run aeloon-core whoami
+uv run aeloon-core logout
 ```
 
 Fresh installations have no pinned default model. Aeloon uses the first available model until
@@ -81,9 +81,9 @@ selection for one run without changing the saved default.
 Shell completion is available without an additional runtime dependency:
 
 ```bash
-uv run aeloon completion zsh > ~/.zfunc/_aeloon
-uv run aeloon completion bash > ~/.local/share/bash-completion/completions/aeloon
-uv run aeloon completion fish > ~/.config/fish/completions/aeloon.fish
+uv run aeloon-core completion zsh > ~/.zfunc/_aeloon-core
+uv run aeloon-core completion bash > ~/.local/share/bash-completion/completions/aeloon-core
+uv run aeloon-core completion fish > ~/.config/fish/completions/aeloon-core.fish
 ```
 
 ## Project resources
