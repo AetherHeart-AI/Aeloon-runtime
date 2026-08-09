@@ -36,7 +36,7 @@ jobs:
           uv build --wheel --out-dir dist
           wheel="$(find dist -maxdepth 1 -name '*.whl' -print -quit)"
           test -n "$wheel"
-          expected_version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          expected_version="$(uv run --frozen python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
           uv venv --python 3.12 wheel-smoke
           uv pip install --python wheel-smoke/bin/python "$wheel"
           test "$(wheel-smoke/bin/python -m aeloon_core --version)" = "aeloon-core ${expected_version}"
