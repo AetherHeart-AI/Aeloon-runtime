@@ -118,9 +118,8 @@ async def test_cli_dispatches_bundled_skill_arguments(
     assert calls == [("document-reader", "render-pdf", ["--check", "--dpi", "96"])]
 
 
-def test_packaging_uses_only_python_office_dependencies() -> None:
+def test_wheel_packaging_uses_only_python_office_dependencies() -> None:
     manifest = (RESOURCE_ROOT.parents[2] / "pyproject.toml").read_text(encoding="utf-8")
-    spec = (RESOURCE_ROOT.parents[2] / "aeloon.spec").read_text(encoding="utf-8")
 
     for dependency in (
         "markitdown",
@@ -133,9 +132,9 @@ def test_packaging_uses_only_python_office_dependencies() -> None:
         assert dependency in manifest
     for removed in ("nodejs-wheel", "paddleocr", "paddlepaddle", "reportlab"):
         assert removed not in manifest.lower()
-        assert removed not in spec.lower()
-    assert '"magika"' in spec
-    assert "include_py_files=True" in spec
+    assert "pyinstaller" not in manifest.lower()
+    assert not (RESOURCE_ROOT.parents[2] / "aeloon.spec").exists()
+    assert 'packages = ["aeloon_core"]' in manifest
     assert not list(RESOURCE_ROOT.rglob("package.json"))
     assert not list(RESOURCE_ROOT.rglob("*.js"))
     assert not list(RESOURCE_ROOT.rglob("*.cjs"))

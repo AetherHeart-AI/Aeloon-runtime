@@ -176,6 +176,10 @@ def test_prepare_ocr_retries_resumable_model_downloads(
     downloader.parent.mkdir(parents=True)
     downloader.write_text("", encoding="utf-8")
     (downloader.parent / "python").write_text("", encoding="utf-8")
+    bundled_python = tmp_path / "bundled" / "python3"
+    bundled_python.parent.mkdir()
+    bundled_python.write_text("", encoding="utf-8")
+    monkeypatch.setenv("AELOON_RUNTIME_PYTHON", str(bundled_python))
     calls: list[tuple[list[str], dict[str, str]]] = []
     download_attempts = 0
 
@@ -208,6 +212,11 @@ def test_prepare_ocr_retries_resumable_model_downloads(
 
     assert state["complete"] is True
     assert download_attempts == 2
+    sync_command, sync_environment = calls[0]
+    assert sync_command[:4] == ["/usr/bin/uv", "sync", "--frozen", "--no-dev"]
+    assert "--no-python-downloads" in sync_command
+    assert sync_environment["UV_PYTHON"] == str(bundled_python)
+    assert sync_environment["UV_PYTHON_DOWNLOADS"] == "never"
     download_environments = [
         environment for command, environment in calls if command[0] == str(downloader)
     ]

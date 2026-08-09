@@ -269,14 +269,28 @@ def prepare_ocr(cache_dir: Path) -> dict[str, Any]:
         {
             "UV_PROJECT_ENVIRONMENT": str(cache_dir / "venv"),
             "UV_CACHE_DIR": str(cache_dir / "uv"),
+            "UV_PYTHON_DOWNLOADS": "never",
             "HF_HOME": str(cache_dir / "huggingface"),
             "DOCLING_ARTIFACTS_PATH": str(cache_dir / "models"),
         }
     )
+    bundled_python = os.environ.get("AELOON_RUNTIME_PYTHON", "").strip()
+    if bundled_python:
+        if not Path(bundled_python).is_file():
+            raise ReaderError(f"Aeloon bundled Python is missing: {bundled_python}")
+        environment["UV_PYTHON"] = bundled_python
     environment.setdefault("HF_HUB_DISABLE_XET", "1")
     environment.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "300")
     sync = subprocess.run(
-        [uv, "sync", "--frozen", "--no-dev", "--project", str(RUNTIME_PROJECT)],
+        [
+            uv,
+            "sync",
+            "--frozen",
+            "--no-dev",
+            "--no-python-downloads",
+            "--project",
+            str(RUNTIME_PROJECT),
+        ],
         capture_output=True,
         text=True,
         env=environment,

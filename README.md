@@ -195,49 +195,26 @@ git diff --check
 The default test suite is offline and uses local fixtures. Optional live tests require credentials
 in an explicit test config and are not part of default CI.
 
-### macOS Apple Silicon binary
+### Desktop distribution
 
-Build a single-file `arm64` command-line executable with Python 3.12 and PyInstaller:
+Aeloon Core is distributed as part of the Aeloon desktop installer. The UI release workflow locks
+this repository to an exact commit, builds a wheel, and installs the wheel plus its frozen
+production dependencies into the desktop application's bundled Python runtime. Core does not
+publish a separate PyInstaller executable or desktop archive.
+
+The desktop application starts Core with `python -m aeloon_core`, and the Agent, built-in Skills
+and terminal use that same bundled interpreter. The optional Docling/RapidOCR environment remains
+isolated because of its size and native dependency constraints, but it is created by the desktop
+runtime's Python and uv rather than downloading another Python distribution.
+
+For local package validation:
 
 ```bash
-uv run --isolated --frozen --no-default-groups \
-  --group package --python 3.12 \
-  pyinstaller --clean --noconfirm aeloon.spec
+uv build --wheel --out-dir dist
+uv venv wheel-smoke
+uv pip install --python wheel-smoke/bin/python dist/aeloon_core-*.whl
+wheel-smoke/bin/python -m aeloon_core --version
 ```
-
-The executable is written to `dist/aeloon`. It includes Python, the digital-document runtime
-dependencies, and the three bundled Office skills. The target Mac does not need Python or Node.js;
-`uv` is required only when preparing or refreshing the optional Docling/RapidOCR environment.
-Install it somewhere on your `PATH`:
-
-```bash
-mkdir -p ~/.local/bin
-install -m 755 dist/aeloon ~/.local/bin/aeloon
-aeloon --version
-```
-
-The release workflow builds a wheel and source distribution to validate package metadata, but
-publishes only the platform archives and their checksums. A locally built wheel installed with
-`uv tool install ./aeloon_core-<version>-py3-none-any.whl` includes the declared PDF, DOCX, PPTX,
-Markdown, and image dependencies. It does not install Node.js, PaddlePaddle, or OCR model weights.
-
-This build targets Apple Silicon Macs and uses an ad-hoc signature. It is intended for local use;
-public distribution requires Developer ID signing and notarization. A PyInstaller binary must be
-built on the oldest macOS version it needs to support.
-
-GitHub Actions also builds and verifies the binary on every pull request and push to `main`. Each
-run uploads a 30-day workflow artifact. Pushing a version-matched tag such as `v0.0.5`
-additionally creates or updates the matching GitHub Release with
-`Aeloon-core-mac-arm64-v0.0.5.tar.gz` and its SHA-256 checksum.
-
-### Ubuntu ARM64 binary
-
-The same PyInstaller command builds a native single-file executable on an ARM64 Ubuntu host.
-GitHub Actions builds it on an `ubuntu-22.04-arm` runner, verifies the glibc 2.35 compatibility
-baseline, ELF architecture, and process lifecycle, and uploads
-`Aeloon-core-ubuntu-arm64-v0.0.5.tar.gz` plus its SHA-256 checksum. The filename omits the libc
-baseline, but the binary continues to target Ubuntu 22.04 or newer with glibc 2.35. Tag builds also
-add these files to the matching GitHub Release.
 
 ## Documentation
 
