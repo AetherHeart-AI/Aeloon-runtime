@@ -5,6 +5,15 @@ release is cut, those entries should move to a versioned section with an ISO dat
 
 ## Unreleased
 
+## 0.0.6 - 2026-08-09
+
+### Changed
+
+- Removed the standalone PyInstaller desktop artifacts and release workflows. Core is now built and
+  tested as a wheel for inclusion in the unified Aeloon UI desktop installer.
+- Required the locked OCR environment to inherit the Aeloon-managed Python runtime and disabled uv
+  Python downloads, keeping heavyweight Skill isolation without introducing a second interpreter.
+
 ## 0.0.5 - 2026-08-09
 
 ### Added
