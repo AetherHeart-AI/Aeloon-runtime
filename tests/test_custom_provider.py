@@ -25,6 +25,46 @@ def _sse(*chunks: dict[str, object]) -> bytes:
 
 
 @pytest.mark.asyncio
+async def test_custom_discovery_derives_safe_output_limits_from_context_window() -> None:
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": f"context-{context_window}",
+                            "context_window": context_window,
+                            "max_tokens": context_window,
+                            "supports_image": False,
+                        }
+                        for context_window in (4_096, 8_192, 32_768, 128_000)
+                    ]
+                },
+            )
+        )
+    )
+    provider = CustomProvider(
+        provider_id="studio",
+        name="Studio",
+        endpoint="https://studio.example/v1",
+        client=client,
+    )
+
+    models = await provider.discover_models()
+    await client.aclose()
+
+    assert {
+        model.context_window: model.max_output_tokens for model in models
+    } == {
+        4_096: 1_024,
+        8_192: 2_048,
+        32_768: 8_192,
+        128_000: 8_192,
+    }
+
+
+@pytest.mark.asyncio
 async def test_custom_discovery_reads_llamacpp_meta_allow_image_without_probe() -> None:
     requests: list[httpx.Request] = []
 
@@ -142,7 +182,7 @@ async def test_custom_discovery_reads_common_metadata_and_probes_only_unknown_mo
     ]
     assert by_id["studio/architecture-image"].name == "Architecture Image"
     assert by_id["studio/unknown-image"].context_window == 64_000
-    assert by_id["studio/unknown-image"].max_tokens == 64_000
+    assert by_id["studio/unknown-image"].max_output_tokens == 8_192
     assert {model.id for model in models if "image" in model.input} == {
         "studio/plain-string",
         "studio/direct-image",

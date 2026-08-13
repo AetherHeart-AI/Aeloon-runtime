@@ -25,8 +25,21 @@ class ProviderModelConfig(BaseModel):
     reasoning: bool = False
     supports_image: bool = False
     context_window: int = Field(default=128_000, ge=1)
-    max_tokens: int = Field(default=32_768, ge=1)
+    max_output_tokens: int = Field(
+        default_factory=lambda data: max(
+            1, min(8_192, int(data.get("context_window", 128_000) * 0.25))
+        ),
+        ge=1,
+    )
     cost: dict[str, float] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def discard_legacy_max_tokens(cls, value: Any) -> Any:
+        if isinstance(value, dict) and "max_tokens" in value:
+            value = dict(value)
+            value.pop("max_tokens")
+        return value
 
 
 class DeepSeekProviderConfig(BaseModel):

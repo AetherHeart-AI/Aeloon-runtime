@@ -16,6 +16,8 @@ from aeloon_core.runtime.providers.openai import OpenAICompatibleProvider
 MODEL_DISCOVERY_TIMEOUT = 15
 CAPABILITY_PROBE_TIMEOUT = 15
 CAPABILITY_PROBE_CONCURRENCY = 4
+DEFAULT_OUTPUT_CEILING = 8_192
+DEFAULT_OUTPUT_FRACTION = 0.25
 _PROBE_IMAGE = (
     "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAATUlEQVR42u3PQQ0AAAgEILV/"
     "5zOFDzdoQCepz6aeExAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ"
@@ -337,9 +339,9 @@ def _models_from_payload(payload: Any, provider_id: str) -> list[_DiscoveredMode
             _first(value, "context_window", "contextWindow", "max_model_len"),
             128_000,
         )
-        max_tokens = min(
-            _positive_int(_first(value, "max_tokens", "maxTokens"), 32_768),
-            context_window,
+        max_output_tokens = max(
+            1,
+            min(DEFAULT_OUTPUT_CEILING, int(context_window * DEFAULT_OUTPUT_FRACTION)),
         )
         reasoning = _first_bool(
             value,
@@ -356,7 +358,7 @@ def _models_from_payload(payload: Any, provider_id: str) -> list[_DiscoveredMode
             provider=provider_id,
             reasoning=bool(reasoning),
             context_window=context_window,
-            max_tokens=max_tokens,
+            max_output_tokens=max_output_tokens,
             cost=dict(cost) if isinstance(cost, Mapping) else {},
         )
         models.append(_DiscoveredModel(model, _image_capability(value)))

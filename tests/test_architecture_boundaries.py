@@ -106,7 +106,7 @@ def test_core_contains_only_vendor_neutral_stateless_contracts() -> None:
         "reasoning",
         "input",
         "context_window",
-        "max_tokens",
+        "max_output_tokens",
         "cost",
     ]
 

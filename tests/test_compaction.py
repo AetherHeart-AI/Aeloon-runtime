@@ -207,7 +207,7 @@ async def test_ollama_overflow_forces_compaction_below_keep_recent(tmp_path: Pat
         "Local",
         "ollama",
         context_window=128_000,
-        max_tokens=32_768,
+        max_output_tokens=32_768,
     )
     await session.append_message(UserMessage("analyze the document"))
     for index in range(3):
@@ -656,7 +656,7 @@ async def test_rolling_summary_chunks_oversized_input_and_uses_unique_sessions()
         "Test",
         "test",
         context_window=2_000,
-        max_tokens=1_000,
+        max_output_tokens=1_000,
     )
     messages = tuple(UserMessage(f"turn {index} " + "x" * 20_000) for index in range(3))
     preparation = CompactionPreparation(

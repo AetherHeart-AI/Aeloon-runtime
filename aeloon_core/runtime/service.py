@@ -544,7 +544,7 @@ class RuntimeService:
                     "thinking_levels": ["off", "minimal", "low", "medium", "high", "max"],
                     "supports_image": "image" in model.input,
                     "context_window": model.context_window,
-                    "max_tokens": model.max_tokens,
+                    "max_output_tokens": model.max_output_tokens,
                 }
                 for model in models.values()
             ],
@@ -780,14 +780,19 @@ class RuntimeService:
             await manager.close()
 
         if isinstance(configured, (CustomProviderConfig, DeepSeekProviderConfig)):
+            configured_output_limits = {
+                model.id: model.max_output_tokens for model in configured.models
+            }
             models = [
                 ProviderModelConfig(
-                    id=split_model_id(model.id)[1],
+                    id=(local_id := split_model_id(model.id)[1]),
                     name=model.name,
                     reasoning=model.reasoning,
                     supports_image="image" in model.input,
                     context_window=model.context_window,
-                    max_tokens=model.max_tokens,
+                    max_output_tokens=configured_output_limits.get(
+                        local_id, model.max_output_tokens
+                    ),
                     cost=model.cost,
                 )
                 for model in discovered
@@ -839,6 +844,15 @@ class RuntimeService:
         api_key = str(params["api_key"]) if params.get("api_key") else None
         proxy = str(params["proxy"]) if params.get("proxy") else None
         headers = self._string_mapping(params.get("headers"))
+        requested_max_output_tokens = params.get("max_output_tokens")
+        if requested_max_output_tokens is not None and (
+            isinstance(requested_max_output_tokens, bool)
+            or not isinstance(requested_max_output_tokens, int)
+            or requested_max_output_tokens < 1
+        ):
+            raise RuntimeFailure(
+                "invalid_argument", "max_output_tokens must be a positive integer"
+            )
         provider = CustomProviderConfig(
             backend=backend,  # type: ignore[arg-type]
             name=name,
@@ -888,7 +902,11 @@ class RuntimeService:
                 reasoning=model.reasoning,
                 supports_image="image" in model.input,
                 context_window=model.context_window,
-                max_tokens=model.max_tokens,
+                max_output_tokens=(
+                    requested_max_output_tokens
+                    if requested_max_output_tokens is not None
+                    else model.max_output_tokens
+                ),
                 cost=model.cost,
             )
             for model in discovered

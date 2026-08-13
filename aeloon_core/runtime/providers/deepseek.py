@@ -19,7 +19,7 @@ DEEPSEEK_V4_FLASH = Model(
     provider=DEEPSEEK_PROVIDER_ID,
     reasoning=True,
     context_window=1_000_000,
-    max_tokens=384_000,
+    max_output_tokens=384_000,
     cost={"input": 0.14, "output": 0.28, "cacheRead": 0.0028, "cacheWrite": 0.0},
 )
 DEEPSEEK_V4_PRO = replace(

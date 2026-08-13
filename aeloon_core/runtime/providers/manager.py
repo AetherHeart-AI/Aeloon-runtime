@@ -94,7 +94,7 @@ def model_from_config(
         reasoning=configured.reasoning,
         input=("text", "image") if configured.supports_image else ("text",),
         context_window=configured.context_window,
-        max_tokens=min(configured.max_tokens, configured.context_window),
+        max_output_tokens=min(configured.max_output_tokens, configured.context_window),
         cost=dict(configured.cost),
     )
 

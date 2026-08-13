@@ -10,6 +10,7 @@ from aeloon_core.config import (
     ConfigMigrationError,
     CustomProviderConfig,
     DeepSeekProviderConfig,
+    ProviderModelConfig,
     load_config,
     public_config,
     save_config,
@@ -98,6 +99,36 @@ def test_custom_provider_without_backend_is_inferred_for_existing_configs() -> N
 
     assert config.providers["ollama"].backend == "ollama"
     assert config.providers["studio"].backend == "openai"
+
+
+def test_legacy_provider_model_max_tokens_is_dropped_and_recomputed(tmp_path) -> None:
+    path = tmp_path / "config.json"
+    raw = Config().model_dump(mode="json")
+    raw["providers"]["studio"] = {
+        "driver": "custom",
+        "name": "Studio",
+        "endpoint": "https://studio.example/v1",
+        "models": [
+            {
+                "id": "legacy",
+                "context_window": 8_192,
+                "max_tokens": 8_192,
+            }
+        ],
+    }
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    config = load_config(path)
+
+    studio = config.providers["studio"]
+    assert isinstance(studio, CustomProviderConfig)
+    assert studio.models == [
+        ProviderModelConfig(
+            id="legacy",
+            context_window=8_192,
+            max_output_tokens=2_048,
+        )
+    ]
 
 
 def test_public_config_redacts_every_provider_secret_and_sensitive_header() -> None:

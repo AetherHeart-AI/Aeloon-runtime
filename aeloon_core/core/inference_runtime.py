@@ -336,7 +336,7 @@ def model_to_dict(model: Model) -> dict[str, Any]:
         "reasoning": model.reasoning,
         "input": list(model.input),
         "contextWindow": model.context_window,
-        "maxTokens": model.max_tokens,
+        "maxOutputTokens": model.max_output_tokens,
     }
 
 

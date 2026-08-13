@@ -195,7 +195,13 @@ def test_openai_tool_images_follow_the_complete_tool_result_batch() -> None:
         tools=(),
         session_id="session-1",
     )
-    model = Model("vision", "Vision", "test", input=("text", "image"))
+    model = Model(
+        "vision",
+        "Vision",
+        "test",
+        input=("text", "image"),
+        max_output_tokens=2_048,
+    )
     payload = _openai_payload(
         model,
         context,
@@ -213,6 +219,7 @@ def test_openai_tool_images_follow_the_complete_tool_result_batch() -> None:
     assert payload["messages"][-1]["content"][1]["image_url"]["url"].startswith(
         "data:image/png;base64,"
     )
+    assert payload["max_tokens"] == 2_048
 
 
 def test_non_image_model_receives_no_base64_tool_observation() -> None:

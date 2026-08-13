@@ -86,7 +86,7 @@ class CloudProvider(BaseProvider):
                 if value.get("supports_image") or value.get("supportsImage")
                 else ("text",),
                 context_window=context_window,
-                max_tokens=min(
+                max_output_tokens=min(
                     _positive_int(
                         value.get("max_tokens") or value.get("maxTokens"),
                         32_768,

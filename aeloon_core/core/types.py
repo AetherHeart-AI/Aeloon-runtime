@@ -342,7 +342,7 @@ class Model:
     reasoning: bool = False
     input: tuple[str, ...] = ("text",)
     context_window: int = 128_000
-    max_tokens: int = 32_768
+    max_output_tokens: int = 32_768
     cost: dict[str, float] = field(default_factory=dict)
 
 

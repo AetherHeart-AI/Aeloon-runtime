@@ -35,6 +35,9 @@ from aeloon_core.core.types import (
 from aeloon_core.runtime.providers.base import BaseProvider
 from aeloon_core.runtime.providers.model_filters import is_agent_capable_model
 
+DEFAULT_OUTPUT_CEILING = 8_192
+DEFAULT_OUTPUT_FRACTION = 0.25
+
 
 def _request_model_id(model: Model) -> str:
     prefix = f"{model.provider}/"
@@ -446,9 +449,12 @@ class OpenAICompatibleProvider(BaseProvider):
                     reasoning=bool(value.get("reasoning", False)),
                     input=("text", "image") if value.get("supports_image") else ("text",),
                     context_window=context_window,
-                    max_tokens=min(
-                        max(1, int(value.get("max_tokens") or 32_768)),
-                        context_window,
+                    max_output_tokens=max(
+                        1,
+                        min(
+                            DEFAULT_OUTPUT_CEILING,
+                            int(context_window * DEFAULT_OUTPUT_FRACTION),
+                        ),
                     ),
                     cost=dict(value.get("cost") or {}),
                 )
@@ -584,7 +590,7 @@ def _openai_payload(
             }
             for tool in context.tools
         ]
-    payload["max_tokens"] = options.max_tokens or model.max_tokens
+    payload["max_tokens"] = options.max_tokens or model.max_output_tokens
     if options.temperature is not None:
         payload["temperature"] = options.temperature
     mapped_thinking = thinking_level_map.get(options.thinking_level)

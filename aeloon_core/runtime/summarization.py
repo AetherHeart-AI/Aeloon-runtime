@@ -299,7 +299,7 @@ async def _rolling_summary(
         1,
         min(
             int(reserve_tokens * 0.8),
-            model.max_tokens,
+            model.max_output_tokens,
             max(1, int(model.context_window * 0.25)),
         ),
     )

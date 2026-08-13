@@ -351,6 +351,7 @@ async def test_rpc_adds_and_removes_provider_without_exposing_secret(
             "endpoint": "http://127.0.0.1:9000/v1/",
             "api_key": "local-secret",
             "models": ["coder", "vision"],
+            "max_output_tokens": 4_096,
         },
     )
     catalog = await service.dispatch("catalog.get")
@@ -367,6 +368,10 @@ async def test_rpc_adds_and_removes_provider_without_exposing_secret(
     persisted = json.loads(config_path.read_text(encoding="utf-8"))
     assert persisted["providers"]["studio"]["api_key"] == "local-secret"
     assert persisted["providers"]["studio"]["driver"] == "custom"
+    assert {
+        model["max_output_tokens"]
+        for model in persisted["providers"]["studio"]["models"]
+    } == {4_096}
     assert [request.url.path for request in requests] == [
         "/v1/models",
         "/v1/chat/completions",
@@ -448,7 +453,10 @@ async def test_rpc_refreshes_provider_models_without_using_configured_cache(
             "studio": CustomProviderConfig(
                 name="Studio",
                 endpoint="http://127.0.0.1:9000/v1",
-                models=[ProviderModelConfig(id="cached")],
+                models=[
+                    ProviderModelConfig(id="fresh", max_output_tokens=1_234),
+                    ProviderModelConfig(id="cached"),
+                ],
             ),
         },
     )
@@ -466,7 +474,13 @@ async def test_rpc_refreshes_provider_models_without_using_configured_cache(
                         "name": "Fresh Model",
                         "supports_image": False,
                         "context_window": 96_000,
-                    }
+                    },
+                    {
+                        "id": "new",
+                        "name": "New Model",
+                        "supports_image": False,
+                        "context_window": 4_096,
+                    },
                 ]
             },
         )
@@ -494,15 +508,19 @@ async def test_rpc_refreshes_provider_models_without_using_configured_cache(
         {"provider_id": "studio", "force": True, "revision": 1},
     )
 
-    assert refreshed["provider"]["model_ids"] == ["studio/fresh"]
+    assert refreshed["provider"]["model_ids"] == ["studio/fresh", "studio/new"]
     assert refreshed["revision"] == 2
     assert [request.url.path for request in requests] == ["/v1/models"]
     persisted = json.loads(config_path.read_text(encoding="utf-8"))
-    assert [model["id"] for model in persisted["providers"]["studio"]["models"]] == [
-        "fresh"
-    ]
+    persisted_models = {
+        model["id"]: model for model in persisted["providers"]["studio"]["models"]
+    }
+    assert list(persisted_models) == ["fresh", "new"]
+    assert persisted_models["fresh"]["max_output_tokens"] == 1_234
+    assert persisted_models["new"]["max_output_tokens"] == 1_024
     catalog = await service.dispatch("catalog.get")
     assert any(model["id"] == "studio/fresh" for model in catalog["models"])
+    assert any(model["id"] == "studio/new" for model in catalog["models"])
     assert all(model["id"] != "studio/cached" for model in catalog["models"])
     await service.close()
     await client.aclose()
