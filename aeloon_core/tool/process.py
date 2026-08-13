@@ -11,14 +11,37 @@ from asyncio.subprocess import Process
 async def terminate_process_group(process: Process, *, grace_seconds: float = 1.0) -> None:
     """Stop a process and its ordinary descendants, then force-kill if needed."""
 
-    if process.returncode is not None:
-        return
     if os.name == "posix":
+        pgid = process.pid
         try:
-            os.killpg(process.pid, signal.SIGTERM)
+            os.killpg(pgid, signal.SIGTERM)
         except ProcessLookupError:
+            await process.wait()
             return
+        deadline = asyncio.get_running_loop().time() + max(0.0, grace_seconds)
+        while True:
+            try:
+                os.killpg(pgid, 0)
+            except ProcessLookupError:
+                await process.wait()
+                return
+            except PermissionError:
+                # A process in our own group should be reachable, but retain the
+                # conservative cleanup path if the platform reports otherwise.
+                pass
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(0.05, remaining))
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        await process.wait()
+        return
     else:
+        if process.returncode is not None:
+            return
         process.terminate()
     try:
         await asyncio.wait_for(process.wait(), grace_seconds)
@@ -27,13 +50,7 @@ async def terminate_process_group(process: Process, *, grace_seconds: float = 1.
         pass
     if process.returncode is not None:
         return
-    if os.name == "posix":
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            return
-    else:
-        process.kill()
+    process.kill()
     await process.wait()
 
 

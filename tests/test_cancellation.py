@@ -58,6 +58,31 @@ async def test_bash_cancel_stops_the_entire_process_group(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_bash_cancel_cleans_background_process_after_shell_exits(tmp_path: Path) -> None:
+    child_pid_file = tmp_path / "orphan.pid"
+    tool = BashTool(ToolContext.create(tmp_path), shell_path="/bin/bash")
+    task = asyncio.create_task(
+        tool.execute(
+            "bash",
+            {"command": f"sleep 30 & echo $! > {child_pid_file}"},
+            None,
+        )
+    )
+    for _ in range(100):
+        if child_pid_file.exists():
+            break
+        await asyncio.sleep(0.01)
+    assert child_pid_file.exists()
+    child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=2)
+    await asyncio.sleep(0.05)
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)
+
+
+@pytest.mark.asyncio
 async def test_bash_timeout_stops_the_entire_process_group(tmp_path: Path) -> None:
     child_pid_file = tmp_path / "timeout-child.pid"
     tool = BashTool(ToolContext.create(tmp_path), shell_path="/bin/bash")
