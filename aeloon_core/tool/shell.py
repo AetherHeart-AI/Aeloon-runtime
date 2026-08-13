@@ -11,6 +11,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from aeloon_core.blocking import run_blocking
 from aeloon_core.core.types import ToolResult, ToolUpdateCallback
 from aeloon_core.tool.base import ToolContext, WorkspaceTool, object_schema, truncate_tail
 from aeloon_core.tool.process import terminate_process_group
@@ -103,9 +104,9 @@ class BashTool(WorkspaceTool):
         full_output_path: str | None = None
         if truncated:
             directory = Path(tempfile.gettempdir()) / "aeloon-core"
-            directory.mkdir(parents=True, exist_ok=True)
+            await run_blocking(directory.mkdir, parents=True, exist_ok=True)
             full_path = directory / f"bash-{uuid.uuid4().hex}.log"
-            full_path.write_text(output, encoding="utf-8")
+            await run_blocking(full_path.write_text, output, encoding="utf-8")
             full_output_path = str(full_path)
         rendered = visible or "(no output)"
         if process.returncode:

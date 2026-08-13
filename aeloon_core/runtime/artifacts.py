@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from aeloon_core.blocking import run_blocking
 from aeloon_core.core.types import ToolResult, ToolUpdateCallback
 from aeloon_core.tool import BaseTool
 
@@ -100,7 +101,7 @@ class PresentFilesTool(BaseTool):
             raise ValueError(
                 f"paths must contain 1 to {MAX_PRESENTED_FILES} final deliverable files"
             )
-        artifacts = normalize_artifact_paths(self.root, paths)
+        artifacts = await run_blocking(normalize_artifact_paths, self.root, paths)
         rendered = "\n".join(f"- {artifact.path}" for artifact in artifacts)
         return ToolResult.text(
             f"Presented {len(artifacts)} final deliverable file(s):\n{rendered}",

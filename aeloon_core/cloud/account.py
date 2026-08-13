@@ -82,7 +82,7 @@ class CloudAccountService:
             if not force and self._access_token and self._access_expires_at:
                 if (self._access_expires_at - now).total_seconds() > 60:
                     return self._access_token
-            state = self._load_state()
+            state = await run_blocking(self._load_state)
             refresh_token = await run_blocking(self.vault.load)
             if state is None or not refresh_token:
                 raise CloudError(
