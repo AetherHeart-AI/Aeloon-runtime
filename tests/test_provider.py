@@ -33,6 +33,34 @@ def _sse(*chunks: dict[str, object]) -> bytes:
 
 
 @pytest.mark.asyncio
+async def test_openai_compatible_discovery_excludes_name_denylisted_models() -> None:
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {"id": "seedream-4.0"},
+                        {"id": "chat-model"},
+                    ]
+                },
+            )
+        )
+    )
+    provider = OpenAICompatibleProvider(
+        provider_id="studio",
+        name="Studio",
+        endpoint="https://studio.example/v1",
+        client=client,
+    )
+
+    models = await provider.discover_models()
+    await client.aclose()
+
+    assert [model.id for model in models] == ["studio/chat-model"]
+
+
+@pytest.mark.asyncio
 async def test_deepseek_stream_parses_reasoning_tool_fragments_usage_and_payload() -> None:
     requests: list[httpx.Request] = []
 

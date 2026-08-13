@@ -33,6 +33,7 @@ from aeloon_core.core.types import (
     UserMessage,
 )
 from aeloon_core.runtime.providers.base import BaseProvider
+from aeloon_core.runtime.providers.model_filters import is_agent_capable_model
 
 
 def _request_model_id(model: Model) -> str:
@@ -430,6 +431,9 @@ class OpenAICompatibleProvider(BaseProvider):
             prefix = f"{self.id}/"
             local_id = raw_id.removeprefix(prefix)
             model_id = f"{prefix}{local_id}"
+            display_name = str(value.get("name") or raw_id)
+            if not is_agent_capable_model(raw_id, display_name, value):
+                continue
             if model_id in seen:
                 continue
             seen.add(model_id)
@@ -437,7 +441,7 @@ class OpenAICompatibleProvider(BaseProvider):
             models.append(
                 Model(
                     id=model_id,
-                    name=str(value.get("name") or raw_id),
+                    name=display_name,
                     provider=self.id,
                     reasoning=bool(value.get("reasoning", False)),
                     input=("text", "image") if value.get("supports_image") else ("text",),

@@ -10,6 +10,7 @@ from typing import Any
 import httpx
 
 from aeloon_core.core import InferenceError, Model
+from aeloon_core.runtime.providers.model_filters import is_agent_capable_model
 from aeloon_core.runtime.providers.openai import OpenAICompatibleProvider
 
 MODEL_DISCOVERY_TIMEOUT = 15
@@ -324,6 +325,11 @@ def _models_from_payload(payload: Any, provider_id: str) -> list[_DiscoveredMode
             continue
         local_id = raw_id.removeprefix(prefix)
         model_id = f"{prefix}{local_id}"
+        display_name = str(
+            value.get("display_name") or value.get("displayName") or value.get("name") or raw_id
+        )
+        if not is_agent_capable_model(raw_id, display_name, value):
+            continue
         if model_id in seen:
             continue
         seen.add(model_id)
@@ -346,9 +352,7 @@ def _models_from_payload(payload: Any, provider_id: str) -> list[_DiscoveredMode
         cost = value.get("cost")
         model = Model(
             id=model_id,
-            name=str(
-                value.get("display_name") or value.get("displayName") or value.get("name") or raw_id
-            ),
+            name=display_name,
             provider=provider_id,
             reasoning=bool(reasoning),
             context_window=context_window,

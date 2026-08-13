@@ -158,6 +158,34 @@ async def test_custom_discovery_reads_common_metadata_and_probes_only_unknown_mo
 
 
 @pytest.mark.asyncio
+async def test_custom_discovery_excludes_name_denylisted_models() -> None:
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {"id": "seedream-4.0", "supports_image": False},
+                        {"id": "chat-model", "supports_image": False},
+                    ]
+                },
+            )
+        )
+    )
+    provider = CustomProvider(
+        provider_id="studio",
+        name="Studio",
+        endpoint="https://studio.example/v1",
+        client=client,
+    )
+
+    models = await provider.discover_models()
+    await client.aclose()
+
+    assert [model.id for model in models] == ["studio/chat-model"]
+
+
+@pytest.mark.asyncio
 async def test_custom_discovery_limits_probe_concurrency_to_four() -> None:
     active = 0
     maximum = 0
@@ -274,6 +302,40 @@ async def test_llamacpp_backend_reads_models_and_props_fields() -> None:
     assert models[0].id == "llama/gemma.gguf"
     assert models[0].context_window == 32_768
     assert models[0].input == ("text", "image")
+
+
+@pytest.mark.asyncio
+async def test_llamacpp_backend_excludes_models_without_tool_template_support() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/models":
+            return httpx.Response(
+                200,
+                json={"models": [{"model": "chat.gguf"}, {"model": "completion.gguf"}]},
+            )
+        if request.url.path == "/props":
+            supports_tools = request.url.params["model"] == "chat.gguf"
+            return httpx.Response(
+                200,
+                json={
+                    "modalities": ["text"],
+                    "chat_template_caps": {"tools": supports_tools},
+                },
+            )
+        raise AssertionError(request.url)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = CustomProvider(
+        provider_id="llama",
+        name="llama.cpp",
+        endpoint="http://127.0.0.1:8080",
+        backend="llamacpp",
+        client=client,
+    )
+
+    models = await provider.discover_models()
+    await client.aclose()
+
+    assert [model.id for model in models] == ["llama/chat.gguf"]
 
 
 @pytest.mark.asyncio
@@ -397,7 +459,7 @@ async def test_ollama_backend_reads_native_tags_and_show_fields() -> None:
             return httpx.Response(
                 200,
                 json={
-                    "capabilities": ["completion", "vision", "thinking"],
+                    "capabilities": ["completion", "vision", "thinking", "tools"],
                     "model_info": {"gemma3.context_length": 131_072},
                 },
             )
@@ -421,6 +483,40 @@ async def test_ollama_backend_reads_native_tags_and_show_fields() -> None:
     assert models[0].context_window == 131_072
     assert models[0].reasoning is True
     assert models[0].input == ("text", "image")
+
+
+@pytest.mark.asyncio
+async def test_ollama_backend_excludes_models_without_tools_capability() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tags":
+            return httpx.Response(
+                200,
+                json={
+                    "models": [
+                        {"name": "agent:latest"},
+                        {"name": "completion-only:latest"},
+                    ]
+                },
+            )
+        if request.url.path == "/api/show":
+            model_id = json.loads(request.content)["model"]
+            capabilities = ["completion", "tools"] if model_id == "agent:latest" else ["completion"]
+            return httpx.Response(200, json={"capabilities": capabilities})
+        raise AssertionError(request.url)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = CustomProvider(
+        provider_id="desktop",
+        name="Ollama",
+        endpoint="http://127.0.0.1:11434",
+        backend="ollama",
+        client=client,
+    )
+
+    models = await provider.discover_models()
+    await client.aclose()
+
+    assert [model.id for model in models] == ["desktop/agent:latest"]
 
 
 @pytest.mark.asyncio
