@@ -11,6 +11,13 @@ from aeloon_core.runtime.artifacts import (
 )
 from aeloon_core.runtime.coordinator import OperationCoordinator
 from aeloon_core.runtime.input import PreparedTurn, TurnInputResolver
+from aeloon_core.runtime.operation_status import (
+    IN_FLIGHT_STATUSES,
+    TERMINAL_STATUSES,
+    is_cancellable,
+    is_in_flight,
+    is_terminal,
+)
 from aeloon_core.runtime.projection import RuntimeProjection
 from aeloon_core.runtime.prompt import build_system_prompt, format_skills_for_system_prompt
 from aeloon_core.runtime.providers import (
@@ -68,6 +75,7 @@ __all__ = [
     "CustomProvider",
     "DeepSeekProvider",
     "JsonlSessionRepository",
+    "IN_FLIGHT_STATUSES",
     "LoadedSkill",
     "OperationSnapshot",
     "OperationCoordinator",
@@ -85,6 +93,7 @@ __all__ = [
     "RuntimeResources",
     "RuntimeService",
     "RuntimeToolSet",
+    "TERMINAL_STATUSES",
     "Session",
     "SessionContext",
     "SessionError",
@@ -94,6 +103,9 @@ __all__ = [
     "Skill",
     "TurnInput",
     "TurnInputResolver",
+    "is_cancellable",
+    "is_in_flight",
+    "is_terminal",
     "build_system_prompt",
     "format_skills_for_system_prompt",
     "normalize_model_id",

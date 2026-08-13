@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from aeloon_core.blocking import run_blocking
 from aeloon_core.cloud.client import CloudClient, CloudError, CloudTokenBundle
 from aeloon_core.cloud.config import CloudConfig
 from aeloon_core.cloud.vault import TokenVault, default_token_vault
@@ -82,7 +83,7 @@ class CloudAccountService:
                 if (self._access_expires_at - now).total_seconds() > 60:
                     return self._access_token
             state = self._load_state()
-            refresh_token = await asyncio.to_thread(self.vault.load)
+            refresh_token = await run_blocking(self.vault.load)
             if state is None or not refresh_token:
                 raise CloudError(
                     "Sign in to Aeloon Cloud before using cloud models",
@@ -151,9 +152,9 @@ class CloudAccountService:
         if user.get("username") == "user" and fallback_user:
             user = fallback_user
         if bundle.refresh_token:
-            await asyncio.to_thread(self.vault.save, bundle.refresh_token)
+            await run_blocking(self.vault.save, bundle.refresh_token)
         state = AccountState(user=user, base_url=self.client.base_url, device_id=self.device_id)
-        await asyncio.to_thread(self._save_state, state)
+        await run_blocking(self._save_state, state)
         self._access_token = bundle.access_token
         self._access_expires_at = bundle.expires_at
 

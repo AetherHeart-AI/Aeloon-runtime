@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from aeloon_core.blocking import run_blocking
 from aeloon_core.core.context_stats import cache_statistics, context_statistics
 from aeloon_core.core.types import (
     AgentMessage,
@@ -463,7 +464,7 @@ class Session:
     async def _persist(self, entry: dict[str, Any]) -> None:
         line = json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n"
         async with self._lock:
-            await asyncio.to_thread(_append_fsync, self.path, line)
+            await run_blocking(_append_fsync, self.path, line)
 
 
 class JsonlSessionRepository:
@@ -496,7 +497,7 @@ class JsonlSessionRepository:
             header["parentSession"] = parent_session_path
         if metadata:
             header["metadata"] = metadata
-        await asyncio.to_thread(
+        await run_blocking(
             _write_fsync,
             path,
             json.dumps(header, ensure_ascii=False, separators=(",", ":")) + "\n",
@@ -507,7 +508,7 @@ class JsonlSessionRepository:
         path = self._path(session_id)
         if not path.is_file():
             raise SessionError("not_found", f"Session {session_id} not found")
-        header, entries, leaf = await asyncio.to_thread(_read_session, path)
+        header, entries, leaf = await run_blocking(_read_session, path)
         if header["id"] != session_id:
             raise SessionError("invalid_session", f"Session header id differs from {session_id}")
         return Session(_metadata(header, path), entries, current_leaf_id=leaf)
@@ -519,7 +520,7 @@ class JsonlSessionRepository:
         result: list[SessionMetadata] = []
         for path in self.directory.glob("*.jsonl"):
             try:
-                header, _, _ = await asyncio.to_thread(_read_session, path, True)
+                header, _, _ = await run_blocking(_read_session, path, True)
             except SessionError:
                 continue
             metadata = _metadata(header, path)
@@ -531,7 +532,7 @@ class JsonlSessionRepository:
         path = self._path(session_id)
         if not path.exists():
             raise SessionError("not_found", f"Session {session_id} not found")
-        await asyncio.to_thread(path.unlink)
+        await run_blocking(path.unlink)
 
     async def fork(
         self,

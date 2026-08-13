@@ -64,7 +64,7 @@ async def test_rpc_v2_rejects_every_legacy_handshake(tmp_path: Path) -> None:
             {"protocol": "aeloon-rpc-v2", "attachment_roots": [str(tmp_path)]},
         )
         assert handshake["protocol"] == "aeloon-rpc-v2"
-        assert handshake["core_version"] == "0.0.12"
+        assert handshake["core_version"] == "0.0.13"
         assert len(handshake["core_commit"]) == 40
         assert "protocol_version" not in handshake
         assert "capabilities" not in handshake

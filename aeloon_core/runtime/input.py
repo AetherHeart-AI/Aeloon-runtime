@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import asyncio
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from aeloon_core.blocking import run_blocking
 from aeloon_core.config import Config
 from aeloon_core.runtime.resources import ResourceLoader
 from aeloon_core.runtime.session import Session
@@ -93,7 +93,7 @@ class TurnInputResolver:
         name = match.group(1)
         effective = config.model_copy(update={"workspace": Path(session.metadata.cwd)}).normalized()
         loader = resource_loader(effective)
-        resources = await asyncio.to_thread(loader.reload)
+        resources = await run_blocking(loader.reload)
         skill = next((item for item in loader.available_skills if item.name == name), None)
         if skill is None:
             return PreparedTurn(value)

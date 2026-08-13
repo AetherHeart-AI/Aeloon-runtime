@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from aeloon_core.blocking import run_blocking
 from aeloon_core.browser.annotations import (
     MAX_ANNOTATIONS,
     browser_annotations_prompt,
@@ -59,6 +60,7 @@ from aeloon_core.runtime.coordinator import (
     SessionRuntime,
 )
 from aeloon_core.runtime.input import TurnInputResolver
+from aeloon_core.runtime.operation_status import is_cancellable, is_in_flight, is_terminal
 from aeloon_core.runtime.ports import AccountGateway, NullAccountGateway
 from aeloon_core.runtime.projection import RuntimeProjection
 from aeloon_core.runtime.providers import (
@@ -264,7 +266,7 @@ class RuntimeService:
         active = []
         if runtime is not None:
             for operation in runtime.operations.values():
-                if operation.status in {"queued", "active"}:
+                if is_in_flight(operation.status):
                     active.append(self._operation_dto(operation))
         overrides = self._session_overrides(entries)
         restored_model = (await session.build_context()).model
@@ -296,7 +298,8 @@ class RuntimeService:
             },
             "stats": await session.stats(context_window=context_window),
             "timeline": self._project_timeline(
-                branch, active_ids={item["operation_id"] for item in active}
+                branch,
+                active_statuses={item["operation_id"]: item["status"] for item in active},
             ),
             "active_operations": active,
         }
@@ -304,7 +307,7 @@ class RuntimeService:
     async def session_delete(self, params: Mapping[str, Any]) -> dict[str, Any]:
         session = await self._session(params)
         runtime = self._runtimes.get(session.id)
-        if runtime and any(op.status in {"queued", "active"} for op in runtime.operations.values()):
+        if runtime and any(is_in_flight(op.status) for op in runtime.operations.values()):
             raise RuntimeFailure("busy", "Cannot delete a session with active operations")
         await self.repository.delete(session.id)
         self._runtimes.pop(session.id, None)
@@ -488,13 +491,26 @@ class RuntimeService:
 
     async def turn_cancel(self, params: Mapping[str, Any]) -> dict[str, Any]:
         operation = self._operation(params)
-        if operation.status == "queued" and operation.task is not None:
-            operation.task.cancel()
-        elif operation.status == "active" and operation.agent is not None:
-            await operation.agent.abort()
-        else:
+        if is_terminal(operation.status):
+            return {
+                "operation_id": operation.id,
+                "cancelled": False,
+                "status": operation.status,
+            }
+        if not is_cancellable(operation.status):
             raise RuntimeFailure("invalid_state", "Operation is no longer cancellable")
-        return {"operation_id": operation.id, "cancelled": True}
+        if operation.status != "cancelling":
+            operation.cancel_requested = True
+            operation.status = "cancelling"
+            session = await self.repository.open(operation.session_id)
+            await self._emit("operation.cancelling", session, operation, {"kind": operation.kind})
+            if operation.task is not None and (
+                operation.agent is None or getattr(operation.agent, "controller", None) is None
+            ):
+                operation.task.cancel()
+            elif operation.agent is not None:
+                await operation.agent.abort()
+        return {"operation_id": operation.id, "cancelled": True, "status": operation.status}
 
     async def turn_steer(self, params: Mapping[str, Any]) -> dict[str, Any]:
         operation = self._active_operation(params)
@@ -523,7 +539,7 @@ class RuntimeService:
         loader = self._resource_loader(
             self.config.model_copy(update={"workspace": workspace}).normalized()
         )
-        resources = await asyncio.to_thread(loader.reload)
+        resources = await run_blocking(loader.reload)
         enabled_skill_ids = {skill.name for skill in resources.skills}
         selected_skill_ids = self._selected_skill_ids(loader)
         manager = self._provider_manager()
@@ -606,7 +622,7 @@ class RuntimeService:
         loader = self._resource_loader(
             config.model_copy(update={"workspace": workspace}).normalized()
         )
-        await asyncio.to_thread(loader.reload)
+        await run_blocking(loader.reload)
         return {
             "revision": self._revision,
             "config_path": str(self.config_path),
@@ -682,7 +698,7 @@ class RuntimeService:
                         }
                     ).normalized()
                 loader = self._resource_loader(validation_config)
-                await asyncio.to_thread(loader.reload)
+                await run_blocking(loader.reload)
                 known_skill_ids = {skill.name for skill in loader.available_skills}
                 requested_skill_ids = set(persisted_config.resources.enabled_skills or ())
                 unknown_skill_ids = requested_skill_ids - known_skill_ids
@@ -691,7 +707,7 @@ class RuntimeService:
                         "invalid_argument",
                         "Unknown skill ids: " + ", ".join(sorted(unknown_skill_ids)),
                     )
-            await asyncio.to_thread(save_config, persisted_config, self.config_path)
+            await run_blocking(save_config, persisted_config, self.config_path)
             next_config = load_config(self.config_path)
             if self._data_dir_override is not None:
                 next_config = next_config.model_copy(
@@ -815,7 +831,7 @@ class RuntimeService:
                     refreshed_ids = {model.id for model in discovered}
                     if current_default not in refreshed_ids:
                         raw["agent"]["model"] = discovered[0].id if discovered else ""
-                await asyncio.to_thread(
+                await run_blocking(
                     save_config, Config.model_validate(raw).normalized(), self.config_path
                 )
                 self._reload_config()
@@ -924,7 +940,7 @@ class RuntimeService:
                 raise RuntimeFailure("invalid_argument", f"Provider already exists: {provider_id}")
             raw = load_config(self.config_path).model_dump(mode="json")
             raw["providers"][provider_id] = provider.model_dump(mode="json")
-            await asyncio.to_thread(
+            await run_blocking(
                 save_config, Config.model_validate(raw).normalized(), self.config_path
             )
             self._reload_config()
@@ -955,7 +971,7 @@ class RuntimeService:
                     raw["agent"]["model"] = ""
             except ValueError:
                 pass
-            await asyncio.to_thread(
+            await run_blocking(
                 save_config, Config.model_validate(raw).normalized(), self.config_path
             )
             self._reload_config()
@@ -971,8 +987,11 @@ class RuntimeService:
     ) -> None:
         started = time.monotonic()
         terminal_written = False
+        terminal_event: tuple[str, dict[str, Any]] | None = None
         try:
             async with runtime.lock, self._semaphore:
+                if operation.cancel_requested:
+                    raise asyncio.CancelledError
                 operation.status = "active"
                 runtime.active = operation
                 await self._emit("operation.started", session, operation, {"kind": "turn"})
@@ -1013,7 +1032,7 @@ class RuntimeService:
                 operation.usage = result.usage.to_dict()
                 status = (
                     "cancelled"
-                    if result.stop_reason == "aborted"
+                    if operation.cancel_requested or result.stop_reason == "aborted"
                     else "failed"
                     if result.stop_reason == "error"
                     else "completed"
@@ -1033,7 +1052,10 @@ class RuntimeService:
                     payload["error"] = self._sanitize(
                         result.final_message.error_message or "Operation failed"
                     )
-                await self._emit(name, session, operation, payload)
+                if status == "cancelled":
+                    terminal_event = (name, payload)
+                else:
+                    await self._emit(name, session, operation, payload)
                 if status == "completed" and await self._should_auto_rename(session, operation):
                     try:
                         title = await rename_session(
@@ -1068,19 +1090,14 @@ class RuntimeService:
             operation.status = "cancelled"
             if not terminal_written:
                 await session.append_run_end(run_id=operation.id, status="cancelled")
-                await self._emit("operation.cancelled", session, operation, {"kind": "turn"})
+                terminal_event = ("operation.cancelled", {"kind": "turn"})
         except Exception as exc:
             operation.status = "failed"
             if not terminal_written:
                 safe = self._sanitize(str(exc))
                 await session.append_run_end(run_id=operation.id, status="failed", error=safe)
                 code = exc.code if isinstance(exc, RuntimeFailure) else "internal_error"
-                await self._emit(
-                    "operation.failed",
-                    session,
-                    operation,
-                    {"kind": "turn", "error": safe, "code": code},
-                )
+                await self._emit("operation.failed", session, operation, {"kind": "turn", "error": safe, "code": code})
         finally:
             if operation.agent is not None:
                 await operation.agent.close()
@@ -1089,6 +1106,8 @@ class RuntimeService:
             if runtime.active is operation:
                 runtime.active = None
             await self._emit_queue(session, runtime)
+            if terminal_event is not None:
+                await self._emit(terminal_event[0], session, operation, terminal_event[1])
 
     async def _session_operation(
         self,
@@ -1325,7 +1344,7 @@ class RuntimeService:
                         f"The selected model cannot read image attachment {attachment['display_name']}",
                     )
                 path = Path(attachment["canonical_path"])
-                data = await asyncio.to_thread(path.read_bytes)
+                data = await run_blocking(path.read_bytes)
                 images.append(
                     ImageContent(
                         base64.b64encode(data).decode(), attachment.get("mime_type") or "image/png"
@@ -1818,7 +1837,7 @@ class RuntimeService:
         }
 
     def _project_timeline(
-        self, entries: list[dict[str, Any]], *, active_ids: set[str]
+        self, entries: list[dict[str, Any]], *, active_statuses: dict[str, str]
     ) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
         current: dict[str, Any] | None = None
@@ -1827,13 +1846,13 @@ class RuntimeService:
             if kind == "run_start":
                 if current is not None:
                     current["status"] = (
-                        "interrupted" if current["turn_id"] not in active_ids else "active"
+                        "interrupted" if current["turn_id"] not in active_statuses else active_statuses[current["turn_id"]]
                     )
                     result.append(current)
                 current = {
                     "type": "turn",
                     "turn_id": str(entry.get("runId")),
-                    "status": "active" if str(entry.get("runId")) in active_ids else "interrupted",
+                    "status": active_statuses.get(str(entry.get("runId")), "interrupted"),
                     "input": self._public_input(entry.get("input") or {}),
                     "blocks": [],
                     "usage": {},

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
 from typing import Any
 
 from aeloon_core.core.types import ToolResult, ToolUpdateCallback
 from aeloon_core.tool.base import WorkspaceTool, object_schema, truncate_limited
+from aeloon_core.tool.process import terminate_process_group
 
 
 class RipgrepTool(WorkspaceTool):
@@ -21,8 +23,13 @@ class RipgrepTool(WorkspaceTool):
             cwd=str(self.context.cwd),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=os.name == "posix",
         )
-        stdout, stderr = await process.communicate()
+        try:
+            stdout, stderr = await process.communicate()
+        except asyncio.CancelledError:
+            await terminate_process_group(process)
+            raise
         output = stdout.decode("utf-8", errors="replace")
         if process.returncode not in {0, 1}:
             raise RuntimeError(stderr.decode("utf-8", errors="replace").strip() or "rg failed")

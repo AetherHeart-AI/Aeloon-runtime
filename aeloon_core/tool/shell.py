@@ -13,6 +13,7 @@ from typing import Any
 
 from aeloon_core.core.types import ToolResult, ToolUpdateCallback
 from aeloon_core.tool.base import ToolContext, WorkspaceTool, object_schema, truncate_tail
+from aeloon_core.tool.process import terminate_process_group
 
 
 class BashTool(WorkspaceTool):
@@ -60,6 +61,7 @@ class BashTool(WorkspaceTool):
             env=dict(os.environ),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=os.name == "posix",
         )
         chunks: list[str] = []
 
@@ -87,13 +89,11 @@ class BashTool(WorkspaceTool):
             else:
                 await asyncio.wait_for(process.wait(), float(timeout))
         except TimeoutError:
-            process.kill()
-            await process.wait()
+            await terminate_process_group(process)
             await asyncio.gather(*pumps)
             raise TimeoutError(f"Command timed out after {timeout} seconds") from None
         except asyncio.CancelledError:
-            process.kill()
-            await process.wait()
+            await terminate_process_group(process)
             raise
         finally:
             if not all(task.done() for task in pumps):

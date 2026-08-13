@@ -8,6 +8,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import Any
 
+from aeloon_core.blocking import run_blocking
 from aeloon_core.browser.protocol import BrowserContext
 from aeloon_core.config import Config
 from aeloon_core.core import (
@@ -170,7 +171,7 @@ class SessionAgent:
         self.model = await self.provider_manager.model(self.config.agent.model)
         self.inference = self.provider_manager.inference(self.model)
         self._resource_loader_instance = self._resource_loader()
-        self._resources = await asyncio.to_thread(self._resource_loader_instance.reload)
+        self._resources = await run_blocking(self._resource_loader_instance.reload)
 
     async def prompt(
         self,
@@ -257,7 +258,7 @@ class SessionAgent:
         await self.prepare()
         assert self._resources is not None and self._resource_loader_instance is not None
         try:
-            skill = await asyncio.to_thread(self._resource_loader_instance.load_skill, name)
+            skill = await run_blocking(self._resource_loader_instance.load_skill, name)
         except KeyError:
             raise ValueError(f"Unknown skill: {name}") from None
         prompt = (

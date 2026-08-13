@@ -27,6 +27,7 @@ class Operation:
     input: dict[str, Any]
     created_at: str = field(default_factory=_now)
     status: str = "queued"
+    cancel_requested: bool = False
     blocks: list[dict[str, Any]] = field(default_factory=list)
     usage: dict[str, Any] = field(default_factory=dict)
     task: asyncio.Task[None] | None = None

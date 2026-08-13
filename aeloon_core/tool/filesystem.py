@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import difflib
 import io
@@ -13,6 +12,7 @@ from typing import Any
 
 from PIL import Image
 
+from aeloon_core.blocking import run_blocking
 from aeloon_core.core.types import ImageContent, TextContent, ToolResult, ToolUpdateCallback
 from aeloon_core.tool.base import (
     DEFAULT_MAX_BYTES,
@@ -78,7 +78,7 @@ class ReadTool(WorkspaceTool):
             raise FileNotFoundError(f"Could not read file: {raw_path}")
         mime = _IMAGE_MIME.get(path.suffix.lower())
         if mime:
-            data, processed_mime, hints, size = await asyncio.to_thread(
+            data, processed_mime, hints, size = await run_blocking(
                 _read_image, path, mime, self.auto_resize_images
             )
             note = f"Read image file [{processed_mime}]"
@@ -89,8 +89,8 @@ class ReadTool(WorkspaceTool):
                 details={"path": str(path), "sizeBytes": size, "mimeType": processed_mime},
             )
 
-        text = await asyncio.to_thread(path.read_text, encoding="utf-8", errors="replace")
-        size = (await asyncio.to_thread(path.stat)).st_size
+        text = await run_blocking(path.read_text, encoding="utf-8", errors="replace")
+        size = (await run_blocking(path.stat)).st_size
         all_lines = text.splitlines() or [""]
         offset = int(arguments.get("offset") or 1)
         limit_value = arguments.get("limit")
@@ -154,9 +154,9 @@ class WriteTool(WorkspaceTool):
         content = str(arguments["content"])
         path = self.context.resolve(raw_path)
         async with self.context.mutation_lock(path):
-            await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
+            await run_blocking(path.parent.mkdir, parents=True, exist_ok=True)
             encoded = content.encode("utf-8")
-            await asyncio.to_thread(atomic_write_bytes, path, encoded)
+            await run_blocking(atomic_write_bytes, path, encoded)
         return ToolResult.text(
             f"Successfully wrote {len(encoded)} bytes to {raw_path}",
             details={"path": str(path), "sizeBytes": len(encoded)},
@@ -235,7 +235,7 @@ class EditTool(WorkspaceTool):
             )
         path = self.context.resolve(raw_path)
         async with self.context.mutation_lock(path):
-            raw = await asyncio.to_thread(path.read_bytes)
+            raw = await run_blocking(path.read_bytes)
             size_before = len(raw)
             bom = b"\xef\xbb\xbf" if raw.startswith(b"\xef\xbb\xbf") else b""
             decoded = raw[len(bom) :].decode("utf-8")
@@ -262,7 +262,7 @@ class EditTool(WorkspaceTool):
                 changed = changed[:start] + new + changed[end:]
             rendered = changed.replace("\n", line_ending)
             encoded = bom + rendered.encode("utf-8")
-            await asyncio.to_thread(atomic_write_bytes, path, encoded)
+            await run_blocking(atomic_write_bytes, path, encoded)
         diff = "".join(
             difflib.unified_diff(
                 original.splitlines(keepends=True),

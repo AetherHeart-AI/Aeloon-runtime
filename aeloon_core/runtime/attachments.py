@@ -17,6 +17,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Literal
 
+from aeloon_core.blocking import run_blocking
 from aeloon_core.core import ImageContent, ToolResult
 from aeloon_core.core.types import ToolUpdateCallback
 from aeloon_core.runtime.types import RuntimeFailure
@@ -86,24 +87,24 @@ class AttachmentStore:
     ) -> tuple[ResolvedAttachment, ...]:
         lock = self._locks.setdefault(session_id, asyncio.Lock())
         async with lock:
-            return await asyncio.to_thread(self._resolve_batch, session_id, values, roots)
+            return await run_blocking(self._resolve_batch, session_id, values, roots)
 
     async def load(self, session_id: str) -> tuple[ResolvedAttachment, ...]:
         lock = self._locks.setdefault(session_id, asyncio.Lock())
         async with lock:
-            return await asyncio.to_thread(self._load, session_id)
+            return await run_blocking(self._load, session_id)
 
     async def remove(self, session_id: str, attachment_ids: Sequence[str]) -> None:
         lock = self._locks.setdefault(session_id, asyncio.Lock())
         async with lock:
-            await asyncio.to_thread(self._remove, session_id, set(attachment_ids))
+            await run_blocking(self._remove, session_id, set(attachment_ids))
 
     async def delete_session(self, session_id: str) -> None:
         lock = self._locks.setdefault(session_id, asyncio.Lock())
         async with lock:
             directory = self._session_dir(session_id)
             if directory.exists():
-                await asyncio.to_thread(shutil.rmtree, directory)
+                await run_blocking(shutil.rmtree, directory)
         self._locks.pop(session_id, None)
 
     def cleanup_orphans(self, valid_session_ids: set[str]) -> tuple[str, ...]:
@@ -341,7 +342,7 @@ class OfficeLiteService:
         self._module: ModuleType | None = None
 
     async def read(self, path: Path) -> tuple[str, dict[str, Any]]:
-        return await asyncio.to_thread(self._load().read_document, path)
+        return await run_blocking(self._load().read_document, path)
 
     async def render(self, path: Path, *, dpi: int = 120) -> tuple[ImageContent, ...]:
         def execute() -> tuple[ImageContent, ...]:
@@ -354,7 +355,7 @@ class OfficeLiteService:
                     for output in outputs
                 )
 
-        return await asyncio.to_thread(execute)
+        return await run_blocking(execute)
 
     def _load(self) -> ModuleType:
         if self._module is not None:
@@ -454,7 +455,7 @@ class AttachmentReadTool(AttachmentMetadataTool):
                 is_error=True,
             )
         try:
-            content = await asyncio.to_thread(attachment.canonical_path.read_text, encoding="utf-8")
+            content = await run_blocking(attachment.canonical_path.read_text, encoding="utf-8")
         except UnicodeError:
             return ToolResult.text(
                 json.dumps(

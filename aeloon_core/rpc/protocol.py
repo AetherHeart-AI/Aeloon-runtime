@@ -42,6 +42,7 @@ METHODS = (
 EVENTS = (
     "operation.queued",
     "operation.started",
+    "operation.cancelling",
     "operation.completed",
     "operation.failed",
     "operation.cancelled",

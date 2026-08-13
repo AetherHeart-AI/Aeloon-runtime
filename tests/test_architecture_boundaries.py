@@ -87,7 +87,15 @@ def test_architecture_dependencies_point_inward() -> None:
                     imports.update(alias.name for alias in node.names)
         assert not {
             name for name in imports if any(name.startswith(prefix) for prefix in forbidden)
-        }, module
+            }, module
+
+
+def test_blocking_work_uses_the_shared_cancellation_helper() -> None:
+    helper = PACKAGE / "blocking.py"
+    for path in PACKAGE.rglob("*.py"):
+        if path == helper:
+            continue
+        assert "asyncio.to_thread" not in path.read_text(encoding="utf-8"), path
 
 
 def test_core_contains_only_vendor_neutral_stateless_contracts() -> None:
