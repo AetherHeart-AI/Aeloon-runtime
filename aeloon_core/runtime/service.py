@@ -1089,8 +1089,13 @@ class RuntimeService:
         except asyncio.CancelledError:
             operation.status = "cancelled"
             if not terminal_written:
-                await session.append_run_end(run_id=operation.id, status="cancelled")
-                terminal_event = ("operation.cancelled", {"kind": "turn"})
+                duration = round((time.monotonic() - started) * 1000)
+                await session.append_run_end(
+                    run_id=operation.id,
+                    status="cancelled",
+                    duration_ms=duration,
+                )
+                terminal_event = ("operation.cancelled", {"kind": "turn", "duration_ms": duration})
         except Exception as exc:
             operation.status = "failed"
             if not terminal_written:
