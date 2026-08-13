@@ -16,7 +16,13 @@ async def run_blocking(function: Callable[..., T], /, *args: Any, **kwargs: Any)
     try:
         return await asyncio.shield(worker)
     except asyncio.CancelledError:
-        await asyncio.shield(worker)
+        try:
+            await asyncio.shield(worker)
+        except BaseException:
+            # Cancellation is the caller's control signal. The worker's
+            # exception is intentionally not allowed to replace it while we
+            # finish joining the thread.
+            pass
         raise
 
 

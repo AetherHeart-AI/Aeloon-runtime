@@ -33,6 +33,28 @@ async def test_run_blocking_waits_for_worker_before_propagating_cancel() -> None
 
 
 @pytest.mark.asyncio
+async def test_run_blocking_preserves_cancel_when_worker_fails() -> None:
+    started = threading.Event()
+
+    def work() -> str:
+        import time
+
+        started.set()
+        time.sleep(0.05)
+        raise ValueError("worker failed")
+
+    task = asyncio.create_task(run_blocking(work))
+    for _ in range(100):
+        if started.is_set():
+            break
+        await asyncio.sleep(0.01)
+    assert started.is_set()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
 async def test_bash_cancel_stops_the_entire_process_group(tmp_path: Path) -> None:
     child_pid_file = tmp_path / "child.pid"
     tool = BashTool(ToolContext.create(tmp_path), shell_path="/bin/bash")
