@@ -45,6 +45,15 @@ def should_compact(context_tokens: int, context_window: int, policy: ContextPoli
     return policy.enabled and context_tokens > context_window - policy.reserve_tokens
 
 
+def effective_context_policy(policy: ContextPolicy, context_window: int) -> ContextPolicy:
+    """Clamp configured compaction limits to a model's usable context window."""
+
+    window = max(1, context_window)
+    reserve = max(1, min(policy.reserve_tokens, window // 4))
+    keep = max(1, min(policy.keep_recent_tokens, (window - reserve) // 2))
+    return ContextPolicy(enabled=policy.enabled, reserve_tokens=reserve, keep_recent_tokens=keep)
+
+
 _OVERFLOW_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
@@ -117,6 +126,7 @@ __all__ = [
     "ContextCompactor",
     "ContextPolicy",
     "ContextUpdate",
+    "effective_context_policy",
     "is_context_overflow",
     "should_compact",
 ]

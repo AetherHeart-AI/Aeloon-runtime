@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from aeloon_core.core.compaction import (
@@ -273,7 +273,7 @@ class _RunEngine:
             return final
         pending = await self.controller._drain_steering()
         first_turn = True
-        overflow_attempted = False
+        overflow_attempts = 0
         final: AssistantMessage | None = None
         while True:
             has_more_tools = True
@@ -287,12 +287,12 @@ class _RunEngine:
                 final = await self._stream_response(system_prompt)
                 if (
                     final.stop_reason in {"error", "length"}
-                    and not overflow_attempted
+                    and overflow_attempts < 2
                     and self.compactor is not None
                     and self.request.context_policy.enabled
                     and is_context_overflow(final, self.request.model.context_window)
                 ):
-                    overflow_attempted = True
+                    overflow_attempts += 1
                     await self.events.emit(
                         "message_end",
                         {
@@ -324,6 +324,22 @@ class _RunEngine:
                         await self._agent_end()
                         return final
                     continue
+                if (
+                    final.stop_reason in {"error", "length"}
+                    and overflow_attempts >= 2
+                    and is_context_overflow(final, self.request.model.context_window)
+                ):
+                    policy = self.request.context_policy
+                    final = replace(
+                        final,
+                        stop_reason="error",
+                        error_message=(
+                            "Context still exceeds the model window after 2 compaction attempts "
+                            f"(context window {self.request.model.context_window}, "
+                            "effective reserve "
+                            f"{policy.reserve_tokens}, effective keep {policy.keep_recent_tokens})."
+                        ),
+                    )
                 await self._append(
                     final,
                     message_started=True,

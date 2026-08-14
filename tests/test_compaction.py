@@ -20,7 +20,11 @@ from aeloon_core.core import (
     UserMessage,
     estimate_context_tokens,
 )
-from aeloon_core.core.compaction import is_context_overflow, should_compact
+from aeloon_core.core.compaction import (
+    effective_context_policy,
+    is_context_overflow,
+    should_compact,
+)
 from aeloon_core.runtime import JsonlSessionRepository
 from aeloon_core.runtime.agent import SessionAgent
 from aeloon_core.runtime.compaction import (
@@ -80,6 +84,26 @@ def _session_agent(
         session=session,
         provider_manager=StaticManager(),  # type: ignore[arg-type]
     )
+
+
+def test_compaction_policy_is_clamped_to_small_model_windows() -> None:
+    policy = effective_context_policy(
+        ContextPolicy(reserve_tokens=16_384, keep_recent_tokens=20_000),
+        32_000,
+    )
+
+    assert policy.reserve_tokens == 8_000
+    assert policy.keep_recent_tokens == 12_000
+
+
+def test_compaction_policy_preserves_smaller_configured_limits() -> None:
+    policy = effective_context_policy(
+        ContextPolicy(reserve_tokens=1_000, keep_recent_tokens=2_000),
+        128_000,
+    )
+
+    assert policy.reserve_tokens == 1_000
+    assert policy.keep_recent_tokens == 2_000
 
 
 @pytest.mark.asyncio
@@ -197,6 +221,44 @@ async def test_context_overflow_compacts_once_then_retries(tmp_path: Path) -> No
     assert len(await session.find_entries("compaction")) == 1
     assert any(kind == "compaction_start" and data["reason"] == "overflow" for kind, data in events)
     assert any(kind == "compaction_end" and data["willRetry"] is True for kind, data in events)
+
+
+@pytest.mark.asyncio
+async def test_context_overflow_compacts_twice_then_returns_bounded_error(tmp_path: Path) -> None:
+    session = await JsonlSessionRepository(tmp_path).create(cwd=tmp_path)
+    for index in range(3):
+        await session.append_message(UserMessage(f"old user {index} " + "x" * 80))
+        await session.append_message(_assistant(f"old answer {index} " + "y" * 80))
+    overflow = AssistantMessage(
+        (),
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        stop_reason="error",
+        error_message="maximum context length exceeded",
+    )
+    provider = ScriptedProvider(
+        [
+            overflow,
+            _assistant("first checkpoint"),
+            _assistant("first turn prefix"),
+            overflow,
+            _assistant("second checkpoint"),
+            overflow,
+        ]
+    )
+    agent = _session_agent(
+        tmp_path,
+        session,
+        provider,
+        model=replace(DEEPSEEK_V4_FLASH, context_window=32_000),
+    )
+
+    result = await agent.prompt("continue", run_id="bounded-overflow")
+
+    assert result.stop_reason == "error"
+    assert "after 2 compaction attempts" in (result.final_message.error_message or "")
+    assert "effective reserve 8000" in (result.final_message.error_message or "")
+    assert len(await session.find_entries("compaction")) == 2
 
 
 @pytest.mark.asyncio

@@ -26,7 +26,7 @@ from aeloon_core.core import (
     message_from_dict,
     run_agent,
 )
-from aeloon_core.core.compaction import ContextPolicy, ContextUpdate
+from aeloon_core.core.compaction import ContextPolicy, ContextUpdate, effective_context_policy
 from aeloon_core.runtime.attachments import AttachmentAccessCallback, ResolvedAttachment
 from aeloon_core.runtime.compaction import (
     CompactionResult,
@@ -62,6 +62,7 @@ class SessionContextCompactor:
         self.options = options
         self.settings = settings
         self._cancellation = asyncio.Event()
+        self._overflow_compactions = 0
 
     def cancel(self) -> None:
         self._cancellation.set()
@@ -95,9 +96,18 @@ class SessionContextCompactor:
         reason: str,
         custom_instructions: str | None = None,
     ) -> tuple[CompactionResult, str]:
+        settings = self.settings
+        if reason == "overflow":
+            divisor = 2**self._overflow_compactions
+            settings = CompactionSettings(
+                enabled=settings.enabled,
+                reserve_tokens=settings.reserve_tokens,
+                keep_recent_tokens=max(1, settings.keep_recent_tokens // divisor),
+            )
+            self._overflow_compactions += 1
         preparation = await prepare_compaction(
             self.session,
-            self.settings,
+            settings,
             force=reason == "overflow",
         )
         if preparation is None:
@@ -107,7 +117,7 @@ class SessionContextCompactor:
             inference=self.inference,
             model=self.model,
             stream_options=self.options,
-            settings=self.settings,
+            settings=settings,
             custom_instructions=custom_instructions,
             cancellation_event=self._cancellation,
         )
@@ -185,6 +195,14 @@ class SessionAgent:
             self._configured_active_tools,
             context.active_tool_names if context is not None else None,
         )
+        context_policy = effective_context_policy(
+            ContextPolicy(
+                enabled=self.config.agent.compaction.enabled,
+                reserve_tokens=self.config.agent.compaction.reserve_tokens,
+                keep_recent_tokens=self.config.agent.compaction.keep_recent_tokens,
+            ),
+            self.model.context_window,
+        )
         request = RunRequest(
             run_id=run_id,
             inference=self.inference,
@@ -199,11 +217,7 @@ class SessionAgent:
             tools=self._tool_set.tools,
             active_tool_names=active_tool_names,
             stream_options=self._stream_options(),
-            context_policy=ContextPolicy(
-                enabled=self.config.agent.compaction.enabled,
-                reserve_tokens=self.config.agent.compaction.reserve_tokens,
-                keep_recent_tokens=self.config.agent.compaction.keep_recent_tokens,
-            ),
+            context_policy=context_policy,
             steering_mode=self.config.agent.steering_mode,
             follow_up_mode=self.config.agent.follow_up_mode,
             context_id=self.session.id if self.session is not None else run_id,
@@ -226,9 +240,9 @@ class SessionAgent:
                 model=self.model,
                 options=request.stream_options,
                 settings=CompactionSettings(
-                    enabled=self.config.agent.compaction.enabled,
-                    reserve_tokens=self.config.agent.compaction.reserve_tokens,
-                    keep_recent_tokens=self.config.agent.compaction.keep_recent_tokens,
+                    enabled=context_policy.enabled,
+                    reserve_tokens=context_policy.reserve_tokens,
+                    keep_recent_tokens=context_policy.keep_recent_tokens,
                 ),
             )
             if self.session is not None
@@ -305,15 +319,23 @@ class SessionAgent:
         assert self.inference is not None and self.model is not None
         if self.session is None:
             raise RuntimeError("Compaction requires a persistent session")
+        context_policy = effective_context_policy(
+            ContextPolicy(
+                enabled=True,
+                reserve_tokens=self.config.agent.compaction.reserve_tokens,
+                keep_recent_tokens=self.config.agent.compaction.keep_recent_tokens,
+            ),
+            self.model.context_window,
+        )
         compactor = SessionContextCompactor(
             session=self.session,
             inference=self.inference,
             model=self.model,
             options=self._stream_options(),
             settings=CompactionSettings(
-                enabled=True,
-                reserve_tokens=self.config.agent.compaction.reserve_tokens,
-                keep_recent_tokens=self.config.agent.compaction.keep_recent_tokens,
+                enabled=context_policy.enabled,
+                reserve_tokens=context_policy.reserve_tokens,
+                keep_recent_tokens=context_policy.keep_recent_tokens,
             ),
         )
         result, _ = await compactor.compact_session(
