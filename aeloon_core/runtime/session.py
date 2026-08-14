@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import uuid
+import weakref
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -180,6 +181,8 @@ class Session:
         self._by_id = {str(entry["id"]): entry for entry in entries}
         self._current_leaf_id = current_leaf_id
         self._lock = asyncio.Lock()
+        self._sync_task: asyncio.Task[None] | None = None
+        self._sync_dirty = False
         self._stats_cache_version = 0
         self._lifetime_stats = _lifetime_stats(entries)
         self._context_stats_cache: _ContextStatsCache | None = None
@@ -212,13 +215,19 @@ class Session:
         return await self._append_entry("message", message=message_to_dict(message))
 
     async def append_model_change(self, provider: str, model_id: str) -> str:
-        return await self._append_entry("model_change", provider=provider, modelId=model_id)
+        return await self._append_entry(
+            "model_change", durable=True, provider=provider, modelId=model_id
+        )
 
     async def append_thinking_level_change(self, level: str) -> str:
-        return await self._append_entry("thinking_level_change", thinkingLevel=level)
+        return await self._append_entry(
+            "thinking_level_change", durable=True, thinkingLevel=level
+        )
 
     async def append_active_tools_change(self, names: list[str] | tuple[str, ...]) -> str:
-        return await self._append_entry("active_tools_change", activeToolNames=list(names))
+        return await self._append_entry(
+            "active_tools_change", durable=True, activeToolNames=list(names)
+        )
 
     async def append_compaction(
         self,
@@ -315,7 +324,7 @@ class Session:
             payload["durationMs"] = duration_ms
         if error:
             payload["error"] = error
-        return await self._append_entry("run_end", **payload)
+        return await self._append_entry("run_end", durable=True, **payload)
 
     async def append_artifact_delivery(
         self,
@@ -336,7 +345,7 @@ class Session:
     async def append_session_config(self, config: dict[str, Any]) -> str:
         """Persist runtime session overrides without adding model context."""
 
-        return await self._append_entry("session_config", config=config)
+        return await self._append_entry("session_config", durable=True, config=config)
 
     async def append_next_turn_input(self, input: dict[str, Any]) -> str:
         """Persist input that should precede the next prompt."""
@@ -349,7 +358,7 @@ class Session:
     async def set_label(self, target_id: str, label: str | None) -> str:
         if target_id not in self._by_id:
             raise SessionError("not_found", f"Entry {target_id} not found")
-        return await self._append_entry("label", targetId=target_id, label=label)
+        return await self._append_entry("label", durable=True, targetId=target_id, label=label)
 
     async def get_label(self, target_id: str) -> str | None:
         label: str | None = None
@@ -360,7 +369,7 @@ class Session:
         return label
 
     async def set_name(self, name: str | None) -> str:
-        return await self._append_entry("session_info", name=name)
+        return await self._append_entry("session_info", durable=True, name=name)
 
     async def get_name(self) -> str | None:
         entries = [entry for entry in self._entries if entry.get("type") == "session_info"]
@@ -379,7 +388,7 @@ class Session:
             "timestamp": _iso_now(),
             "targetId": leaf_id,
         }
-        await self._persist(entry)
+        await self._persist(entry, durable=True)
         self._entries.append(entry)
         self._by_id[entry["id"]] = entry
         self._current_leaf_id = leaf_id
@@ -547,7 +556,9 @@ class Session:
             "cache": cache_statistics(usages),
         }
 
-    async def _append_entry(self, entry_type: str, **payload: Any) -> str:
+    async def _append_entry(
+        self, entry_type: str, *, durable: bool = False, **payload: Any
+    ) -> str:
         previous_leaf = self._current_leaf_id
         previous_version = self._stats_cache_version
         entry = {
@@ -557,7 +568,7 @@ class Session:
             "timestamp": _iso_now(),
             **payload,
         }
-        await self._persist(entry)
+        await self._persist(entry, durable=durable)
         self._entries.append(entry)
         self._by_id[entry["id"]] = entry
         self._current_leaf_id = entry["id"]
@@ -583,10 +594,36 @@ class Session:
                 return entry_id
         return uuid.uuid4().hex
 
-    async def _persist(self, entry: dict[str, Any]) -> None:
+    async def _persist(self, entry: dict[str, Any], *, durable: bool = False) -> None:
         line = json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n"
         async with self._lock:
-            await run_blocking(_append_fsync, self.path, line)
+            await run_blocking(_append, self.path, line)
+            self._sync_dirty = True
+            if durable:
+                await self._flush_locked()
+            elif self._sync_task is None or self._sync_task.done():
+                self._sync_task = asyncio.create_task(self._delayed_flush())
+
+    async def durable_flush(self) -> None:
+        async with self._lock:
+            task = self._sync_task
+            if task is not None and task is not asyncio.current_task() and not task.done():
+                task.cancel()
+            await self._flush_locked()
+
+    async def _delayed_flush(self) -> None:
+        try:
+            await asyncio.sleep(0.025)
+            async with self._lock:
+                await self._flush_locked()
+        except asyncio.CancelledError:
+            return
+
+    async def _flush_locked(self) -> None:
+        if not self._sync_dirty:
+            return
+        await run_blocking(_fsync_path, self.path)
+        self._sync_dirty = False
 
 
 class JsonlSessionRepository:
@@ -595,6 +632,7 @@ class JsonlSessionRepository:
     def __init__(self, data_dir: Path | str) -> None:
         self.directory = Path(data_dir).expanduser().resolve(strict=False) / "harness-sessions"
         self.directory.mkdir(parents=True, exist_ok=True)
+        self._sessions: weakref.WeakSet[Session] = weakref.WeakSet()
 
     async def create(
         self,
@@ -624,7 +662,9 @@ class JsonlSessionRepository:
             path,
             json.dumps(header, ensure_ascii=False, separators=(",", ":")) + "\n",
         )
-        return Session(_metadata(header, path), [], current_leaf_id=None)
+        session = Session(_metadata(header, path), [], current_leaf_id=None)
+        self._sessions.add(session)
+        return session
 
     async def open(self, session_id: str) -> Session:
         path = self._path(session_id)
@@ -633,7 +673,12 @@ class JsonlSessionRepository:
         header, entries, leaf = await run_blocking(_read_session, path)
         if header["id"] != session_id:
             raise SessionError("invalid_session", f"Session header id differs from {session_id}")
-        return Session(_metadata(header, path), entries, current_leaf_id=leaf)
+        session = Session(_metadata(header, path), entries, current_leaf_id=leaf)
+        self._sessions.add(session)
+        return session
+
+    async def flush_all(self) -> None:
+        await asyncio.gather(*(session.durable_flush() for session in tuple(self._sessions)))
 
     async def list(self, *, cwd: Path | str | None = None) -> list[SessionMetadata]:
         expected_cwd = (
@@ -654,6 +699,13 @@ class JsonlSessionRepository:
         path = self._path(session_id)
         if not path.exists():
             raise SessionError("not_found", f"Session {session_id} not found")
+        await asyncio.gather(
+            *(
+                session.durable_flush()
+                for session in tuple(self._sessions)
+                if session.id == session_id
+            )
+        )
         await run_blocking(path.unlink)
 
     async def fork(
@@ -747,10 +799,14 @@ def _read_session(
     return header, entries, leaf
 
 
-def _append_fsync(path: Path, text: str) -> None:
+def _append(path: Path, text: str) -> None:
     with path.open("a", encoding="utf-8") as handle:
         handle.write(text)
         handle.flush()
+
+
+def _fsync_path(path: Path) -> None:
+    with path.open("rb") as handle:
         os.fsync(handle.fileno())
 
 

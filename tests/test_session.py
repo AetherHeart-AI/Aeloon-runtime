@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -167,6 +168,30 @@ async def test_jsonl_v3_is_message_durable_and_recovers_truncated_tail(tmp_path:
     context = await reopened.build_context()
     assert [message.role for message in context.messages] == ["user", "assistant"]
     assert context.messages[-1].text == "world"
+
+
+@pytest.mark.asyncio
+async def test_jsonl_appends_coalesce_syncs_and_terminal_entries_force_flush(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = JsonlSessionRepository(tmp_path)
+    session = await repository.create(cwd=tmp_path, session_id="batched-sync")
+    syncs = 0
+
+    def record_sync(_path: Path) -> None:
+        nonlocal syncs
+        syncs += 1
+
+    monkeypatch.setattr("aeloon_core.runtime.session._fsync_path", record_sync)
+    for index in range(100):
+        await session.append_message(UserMessage(str(index)))
+    await asyncio.sleep(0.05)
+    assert syncs == 1
+
+    await session.append_run_end(run_id="run", status="completed")
+    assert syncs == 2
+    reopened = await repository.open("batched-sync")
+    assert len(await reopened.get_entries()) == 101
 
 
 @pytest.mark.asyncio

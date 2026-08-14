@@ -702,6 +702,7 @@ class RuntimeService:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        await self.repository.flush_all()
         await self.account.close()
 
     async def account_status(self, _params: Mapping[str, Any]) -> dict[str, Any]:
