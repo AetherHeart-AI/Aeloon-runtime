@@ -612,9 +612,12 @@ async def test_request_runtime_retries_a_midstream_transport_failure() -> None:
 
 
 @pytest.mark.asyncio
-async def test_request_runtime_reports_retry_exhaustion_once() -> None:
+async def test_request_runtime_owns_retries_and_disables_provider_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     attempts = 0
     retry_events: list[dict[str, object]] = []
+    provider_retry_limits: list[int | None] = []
 
     def handler(_request: httpx.Request) -> httpx.Response:
         nonlocal attempts
@@ -629,6 +632,14 @@ async def test_request_runtime_reports_retry_exhaustion_once() -> None:
         endpoint="https://studio.example/v1",
         client=client,
     )
+    original_stream = provider.stream
+
+    async def recording_stream(model, context, options):
+        provider_retry_limits.append(options.max_retries)
+        async for event in original_stream(model, context, options):
+            yield event
+
+    monkeypatch.setattr(provider, "stream", recording_stream)
     message = await InferenceRuntime(provider, RunEventDispatcher()).request(
         model=model,
         messages=(UserMessage("go"),),
@@ -641,6 +652,7 @@ async def test_request_runtime_reports_retry_exhaustion_once() -> None:
     await client.aclose()
 
     assert attempts == 3
+    assert provider_retry_limits == [0, 0, 0]
     assert message.stop_reason == "error"
     assert [event["stage"] for event in retry_events] == ["start", "start", "end"]
     assert retry_events[-1]["attempt"] == 2
