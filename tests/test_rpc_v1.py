@@ -6,7 +6,6 @@ from pathlib import Path
 
 import pytest
 
-from aeloon_core.browser import BROWSER_TOOL_NAMES
 from aeloon_core.config import Config, save_config
 from aeloon_core.rpc import AeloonRpcAdapter, RpcError
 from aeloon_core.rpc.server import AeloonRpcServer, rpc_request
@@ -25,7 +24,7 @@ class EmptyProvider(BaseProvider):
         raise AssertionError("Inference is not expected in RPC boundary tests")
 
 
-def runtime_service(tmp_path: Path, *, browser: bool = False) -> RuntimeService:
+def runtime_service(tmp_path: Path) -> RuntimeService:
     config_path = tmp_path / "config.json"
     save_config(
         Config(
@@ -37,7 +36,6 @@ def runtime_service(tmp_path: Path, *, browser: bool = False) -> RuntimeService:
     )
     return RuntimeService(
         config_path=config_path,
-        browser_runtime_socket=(tmp_path / "browser.sock" if browser else None),
         provider_manager_factory=lambda config: ProviderManager(
             config,
             driver_factories={
@@ -68,6 +66,9 @@ async def test_rpc_v2_rejects_every_legacy_handshake(tmp_path: Path) -> None:
         assert len(handshake["core_commit"]) == 40
         assert "protocol_version" not in handshake
         assert "capabilities" not in handshake
+        assert "browser_runtime" not in handshake
+        catalog = await adapter.dispatch("catalog.get", {"workspace": str(tmp_path)})
+        assert not any(tool["name"].startswith("browser_") for tool in catalog["tools"])
     finally:
         await adapter.close()
 
@@ -84,20 +85,6 @@ async def test_ui_thread_id_is_the_core_session_id(tmp_path: Path) -> None:
         assert created["session_id"] == thread_id
         fetched = await adapter.dispatch("session.get", {"session_id": thread_id})
         assert fetched["metadata"]["session_id"] == thread_id
-    finally:
-        await adapter.close()
-
-
-@pytest.mark.asyncio
-async def test_browser_tools_are_process_scoped_and_always_in_catalogue(tmp_path: Path) -> None:
-    adapter = AeloonRpcAdapter(runtime_service(tmp_path, browser=True))
-    try:
-        handshake = await adapter.dispatch("system.handshake", {"protocol": "aeloon-rpc-v2"})
-        assert handshake["browser_runtime"] is True
-        catalog = await adapter.dispatch("catalog.get", {"workspace": str(tmp_path)})
-        names = {item["name"] for item in catalog["tools"]}
-        assert set(BROWSER_TOOL_NAMES).issubset(names)
-        assert len(BROWSER_TOOL_NAMES) == 22
     finally:
         await adapter.close()
 

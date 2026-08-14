@@ -10,11 +10,9 @@ flowchart LR
     Runtime --> Agent["stateless agent core"]
     Runtime --> Tools["runtime tool set"]
     Tools --> Agent
-    Tools --> BrowserPort["browser-runtime-v1 client"]
-    BrowserPort --> BrowserRuntime["Electron Browser Runtime"]
 ```
 
-The fixed dependency directions are `rpc → runtime → core`, `runtime → tool/core/browser`, and
+The fixed dependency directions are `rpc → runtime → core`, `runtime → tool/core`, and
 `tool → core`. Bootstrap is the composition root. Core never imports Electron, Bun, React, UI,
 `httpx`, Pillow, or a concrete vendor implementation.
 
@@ -39,7 +37,7 @@ global write registry. Writes and edits replace their target atomically.
 Runtime's `RuntimeToolSet` explicitly adds `PresentFilesTool`. This composition is intentionally
 small and does not introduce a plugin registry.
 
-## Runtime: state and first-class Browser Use
+## Runtime: state and resources
 
 Runtime owns Sessions, Skills, prompt templates, prompt construction, artifacts, compaction
 selection and persistence, Provider configuration, and all resource lifecycles. `SessionAgent`
@@ -65,17 +63,6 @@ mutating an operation that is already running.
 Concrete implementations live in `aeloon_core.runtime.providers`: Custom OpenAI-compatible APIs,
 DeepSeek, Aeloon Cloud, and the testing-only `ScriptedProvider`.
 
-Browser Use is a fixed runtime feature, not a plugin. Core owns the 22 tool definitions, schemas,
-workspace upload checks, scheduling, cancellation, result envelopes, and multimodal image
-observations. When a Browser Runtime endpoint is configured at process startup, these tools are
-always in the model catalog and cannot be removed by persistent tool preferences. Electron owns
-only the actual browser and CDP execution behind `browser-runtime-v1`. A disconnected endpoint
-returns the stable `BrowserRuntimeUnavailable` error; it does not remove the tools or fall back to
-shell networking.
-
-The UI thread UUID is used unchanged as both the Core Session ID and Browser scope ID. This keeps
-affinity explicit and removes transport-specific identity mappings.
-
 ## Local RPC and Cloud
 
 `aeloon-rpc-v1` is a small private transport adapter over Runtime. It uses length-prefixed JSON on
@@ -87,5 +74,5 @@ Cloud owns login, refresh tokens, the vault, and raw model-catalog access. It do
 models or inference implementations. Bootstrap adapts `CloudAccountService` to `AccountGateway`
 and injects it into Runtime's Provider manager factory.
 
-Sessions remain append-only JSONL. Socket paths, Browser operation IDs, and transport state are
-operation-local and are never serialized into Session data.
+Sessions remain append-only JSONL. Socket paths and transport state are operation-local and are
+never serialized into Session data.

@@ -7,7 +7,6 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from aeloon_core.browser.protocol import BrowserContext
 from aeloon_core.config import Config
 from aeloon_core.core import Model
 from aeloon_core.runtime.agent import SessionAgent
@@ -33,7 +32,6 @@ class Operation:
     task: asyncio.Task[None] | None = None
     agent: SessionAgent | None = None
     model: Model | None = None
-    browser_context: BrowserContext | None = field(default=None, repr=False)
 
 
 @dataclass(slots=True)

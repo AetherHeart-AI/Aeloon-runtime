@@ -15,13 +15,6 @@ from pathlib import Path
 from typing import Any
 
 from aeloon_core.blocking import run_blocking
-from aeloon_core.browser.annotations import (
-    MAX_ANNOTATIONS,
-    browser_annotations_prompt,
-    sanitize_browser_annotation,
-)
-from aeloon_core.browser.protocol import BrowserContext, BrowserRuntimeEndpoint
-from aeloon_core.browser.tools import BROWSER_TOOL_CATALOGUE
 from aeloon_core.config import (
     CloudProviderConfig,
     Config,
@@ -112,7 +105,6 @@ class RuntimeService:
         agent_factory: SessionAgentFactory | None = None,
         provider_manager_factory: ProviderManagerFactory | None = None,
         account_gateway: AccountGateway | None = None,
-        browser_runtime_socket: Path | str | None = None,
     ) -> None:
         self.config_path = resolve_config_path(config_path).resolve(strict=False)
         self._data_dir_override = (
@@ -123,11 +115,6 @@ class RuntimeService:
             config = config.model_copy(update={"data_dir": self._data_dir_override}).normalized()
         self.config = config
         self.data_dir = config.data_dir
-        self.browser_runtime = (
-            BrowserRuntimeEndpoint.create(browser_runtime_socket)
-            if browser_runtime_socket is not None
-            else None
-        )
         provision_builtin_skills(self.data_dir)
         self.repository = JsonlSessionRepository(self.data_dir)
         self.attachment_dir = self.data_dir / "session-attachments"
@@ -439,16 +426,6 @@ class RuntimeService:
             workspace=session.metadata.cwd,
             kind="turn",
             input=input_value,
-            browser_context=(
-                BrowserContext.create(
-                    endpoint=self.browser_runtime,
-                    session_id=session.id,
-                    operation_id=operation_id,
-                    workspace=session.metadata.cwd,
-                )
-                if self.browser_runtime is not None
-                else None
-            ),
         )
         try:
             overrides = self._session_overrides(await session.get_entries())
@@ -575,19 +552,7 @@ class RuntimeService:
                     ),
                 }
                 for name in sorted(tool_set.all_names)
-            ]
-            + (
-                [
-                    {
-                        "id": str(item["name"]),
-                        "name": str(item["name"]),
-                        "description": str(item.get("description") or ""),
-                    }
-                    for item in BROWSER_TOOL_CATALOGUE
-                ]
-                if self.browser_runtime is not None
-                else []
-            ),
+            ],
             "skills": [
                 {
                     "id": skill.name,
@@ -1009,7 +974,6 @@ class RuntimeService:
                 agent = await self._new_agent(
                     config_snapshot,
                     session,
-                    browser_context=operation.browser_context,
                     attachments=resolved_attachments,
                     on_attachment_access=on_attachment_access,
                 )
@@ -1158,7 +1122,6 @@ class RuntimeService:
         config: Config,
         session: Session,
         *,
-        browser_context: BrowserContext | None = None,
         attachments: tuple[ResolvedAttachment, ...] = (),
         on_attachment_access: Callable[
             [str, ResolvedAttachment], Awaitable[None] | None
@@ -1200,7 +1163,6 @@ class RuntimeService:
             session=session,
             provider_manager=manager,
             active_tool_names=(tuple(active_tools) if active_tools is not None else None),
-            browser_context=browser_context,
             attachments=attachments,
             on_attachment_access=on_attachment_access,
         )
@@ -1336,12 +1298,9 @@ class RuntimeService:
         text = str(value.get("text") or "")
         images: list[ImageContent] = []
         supplements: list[str] = []
-        browser_annotations: list[dict[str, Any]] = []
         for attachment in value.get("attachments") or []:
             if attachment["type"] == "assistant_selection":
                 supplements.append(f"[Assistant selection]\n{attachment.get('text', '')}")
-            elif attachment["type"] == "browser_annotation":
-                browser_annotations.append(dict(attachment["annotation"]))
             elif attachment["type"] == "image":
                 if agent.model is None or "image" not in agent.model.input:
                     raise RuntimeFailure(
@@ -1424,8 +1383,6 @@ class RuntimeService:
                         "Use attachment_read with this attachment ID if its text is needed. "
                         "Never derive a workspace path from the display name."
                     )
-        if browser_annotations:
-            supplements.append(browser_annotations_prompt(browser_annotations, message_id=run_id))
         if value.get("skill_id"):
             instructions = str(value.get("_skill_instructions") or "")
             if supplements:
@@ -1723,29 +1680,10 @@ class RuntimeService:
     ) -> tuple[list[dict[str, Any]], tuple[ResolvedAttachment, ...]]:
         prepared: list[dict[str, Any] | None] = []
         file_values: list[Mapping[str, Any]] = []
-        annotation_count = 0
         for raw in attachments:
             if not isinstance(raw, Mapping):
                 raise RuntimeFailure("invalid_attachment", "Attachment must be an object")
             kind = str(raw.get("type") or "")
-            if kind == "browser_annotation":
-                annotation_count += 1
-                if annotation_count > MAX_ANNOTATIONS:
-                    raise RuntimeFailure("invalid_attachment", "Too many browser annotations")
-                annotation = sanitize_browser_annotation(raw.get("annotation"))
-                prepared.append(
-                    {
-                        "id": str(raw.get("id") or annotation["id"])[:128],
-                        "type": kind,
-                        "display_name": str(
-                            raw.get("display_name")
-                            or raw.get("name")
-                            or f"Annotation {annotation['ordinal']}"
-                        )[:255],
-                        "annotation": annotation,
-                    }
-                )
-                continue
             if kind == "assistant_selection":
                 text = str(raw.get("text") or "")[:PROMPT_LIMIT]
                 prepared.append(
@@ -2198,13 +2136,11 @@ class RuntimeService:
         self,
         *,
         workspace: Path | None = None,
-        browser_context: BrowserContext | None = None,
     ) -> RuntimeToolSet:
         return RuntimeToolSet(
             workspace or self.config.workspace,
             shell_path=self.config.tools.shell_path,
             auto_resize_images=self.config.tools.auto_resize_images,
-            browser_context=browser_context,
         )
 
     @staticmethod

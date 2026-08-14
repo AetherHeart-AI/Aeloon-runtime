@@ -227,7 +227,6 @@ def _add_rpc_commands(parent: argparse.ArgumentParser) -> None:
     serve.add_argument("--config", type=Path)
     serve.add_argument("--data-dir", type=Path)
     serve.add_argument("--socket", type=Path, required=True)
-    serve.add_argument("--browser-runtime-socket", type=Path, required=True)
     serve.add_argument("--max-concurrent-operations", type=int, default=4)
 
 
@@ -1318,7 +1317,6 @@ async def rpc_command(args: argparse.Namespace) -> int:
         config_path=args.config,
         data_dir=args.data_dir,
         max_concurrent_operations=args.max_concurrent_operations,
-        browser_runtime_socket=args.browser_runtime_socket,
     )
     await run_rpc_server(runtime, socket_path=args.socket)
     return 0

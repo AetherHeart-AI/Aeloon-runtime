@@ -15,6 +15,7 @@ from aeloon_core.core import (
     TextContent,
     ThinkingContent,
     ToolCall,
+    ToolResultMessage,
     UserMessage,
 )
 from aeloon_core.core.events import RunEventDispatcher
@@ -24,6 +25,81 @@ from aeloon_core.runtime.providers import (
     DeepSeekProvider,
     OpenAICompatibleProvider,
 )
+from aeloon_core.runtime.providers.openai import _openai_payload
+
+
+def test_openai_tool_images_follow_the_complete_tool_result_batch() -> None:
+    context = InferenceContext(
+        system_prompt="system",
+        messages=(
+            ToolResultMessage("call-1", "inspect", (TextContent("first"),)),
+            ToolResultMessage(
+                "call-2",
+                "capture",
+                (TextContent("second"), ImageContent("aGVsbG8=", "image/png")),
+            ),
+        ),
+        tools=(),
+        session_id="session-1",
+    )
+    model = Model(
+        "vision",
+        "Vision",
+        "test",
+        input=("text", "image"),
+        max_output_tokens=2_048,
+    )
+
+    payload = _openai_payload(
+        model,
+        context,
+        StreamOptions(),
+        thinking_level_map={},
+        requires_reasoning_content=False,
+    )
+
+    assert [message["role"] for message in payload["messages"]] == [
+        "system",
+        "tool",
+        "tool",
+        "user",
+    ]
+    assert payload["messages"][-1]["content"][1]["image_url"]["url"].startswith(
+        "data:image/png;base64,"
+    )
+    assert "browser" not in payload["messages"][-1]["content"][0]["text"].lower()
+
+
+def test_non_image_model_receives_no_base64_tool_observation() -> None:
+    context = InferenceContext(
+        system_prompt="",
+        messages=(
+            ToolResultMessage(
+                "call-1",
+                "capture",
+                (TextContent("Image unavailable"), ImageContent("secret", "image/png")),
+            ),
+        ),
+        tools=(),
+        session_id="session-1",
+    )
+
+    payload = _openai_payload(
+        Model("text", "Text", "test"),
+        context,
+        StreamOptions(),
+        thinking_level_map={},
+        requires_reasoning_content=False,
+    )
+
+    assert payload["messages"] == [
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": "Image unavailable",
+        }
+    ]
+    assert "secret" not in json.dumps(payload)
 
 
 def _sse(*chunks: dict[str, object]) -> bytes:

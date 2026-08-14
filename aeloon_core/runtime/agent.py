@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any
 
 from aeloon_core.blocking import run_blocking
-from aeloon_core.browser.protocol import BrowserContext
 from aeloon_core.config import Config
 from aeloon_core.core import (
     AgentMessage,
@@ -132,7 +131,6 @@ class SessionAgent:
         session: Session | None,
         provider_manager: ProviderManager,
         active_tool_names: tuple[str, ...] | None = None,
-        browser_context: BrowserContext | None = None,
         attachments: tuple[ResolvedAttachment, ...] = (),
         on_attachment_access: AttachmentAccessCallback | None = None,
     ) -> None:
@@ -151,7 +149,6 @@ class SessionAgent:
             self.config.workspace,
             shell_path=self.config.tools.shell_path,
             auto_resize_images=self.config.tools.auto_resize_images,
-            browser_context=browser_context,
             attachments=attachments,
             on_attachment_access=on_attachment_access,
         )

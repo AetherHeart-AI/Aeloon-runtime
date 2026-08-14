@@ -157,18 +157,6 @@ def test_runtime_has_no_wire_dispatch_or_rpc_errors() -> None:
     )
 
 
-def test_core_browser_layer_has_no_electron_or_ui_dependency() -> None:
-    imports: set[str] = set()
-    for path in (PACKAGE / "browser").rglob("*.py"):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and node.module:
-                imports.add(node.module)
-            elif isinstance(node, ast.Import):
-                imports.update(alias.name for alias in node.names)
-    assert not {name for name in imports if "electron" in name or "aeloon_ui" in name}
-
-
 def test_artifact_delivery_is_runtime_owned() -> None:
     assert (PACKAGE / "runtime" / "artifacts.py").is_file()
     core_source = "\n".join(

@@ -484,6 +484,25 @@ def test_removed_local_and_provider_login_commands_are_absent() -> None:
         parser.parse_args(["provider", "login"])
 
 
+def test_rpc_serve_has_no_browser_runtime_interface(tmp_path: Path) -> None:
+    parser = cli.build_parser()
+    args = parser.parse_args(["rpc", "serve", "--socket", str(tmp_path / "core.sock")])
+
+    assert args.rpc_command == "serve"
+    assert not hasattr(args, "browser_runtime_socket")
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "rpc",
+                "serve",
+                "--socket",
+                str(tmp_path / "core.sock"),
+                "--browser-runtime-socket",
+                str(tmp_path / "browser.sock"),
+            ]
+        )
+
+
 def test_default_task_command_and_explicit_separator_are_normalized() -> None:
     assert cli._normalize_argv(["fix", "the", "tests"]) == ["run", "fix", "the", "tests"]
     assert cli._normalize_argv(["--json", "inspect"]) == ["run", "--json", "inspect"]

@@ -78,6 +78,23 @@ def test_attachment_store_cleans_only_sessions_missing_from_repository(tmp_path:
 
 
 @pytest.mark.asyncio
+async def test_browser_annotation_attachment_is_unsupported(tmp_path: Path) -> None:
+    runtime = RuntimeService(
+        config_path=tmp_path / "config.json",
+        data_dir=tmp_path / "data",
+    )
+    try:
+        with pytest.raises(RuntimeFailure, match="Unsupported attachment type: browser_annotation"):
+            await runtime._resolve_attachments(
+                "thread",
+                [{"type": "browser_annotation", "annotation": {}}],
+                (),
+            )
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
 async def test_attachment_tools_accept_only_ids_and_hide_paths(tmp_path: Path) -> None:
     source = tmp_path / "content.txt"
     source.write_text("hello by id", encoding="utf-8")

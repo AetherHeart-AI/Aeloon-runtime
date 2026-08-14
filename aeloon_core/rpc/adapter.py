@@ -155,7 +155,6 @@ class AeloonRpcAdapter:
             "core_version": __version__,
             "core_commit": core_commit(),
             "server_instance_id": self.server_instance_id,
-            "browser_runtime": self.runtime.browser_runtime is not None,
             "methods": list(METHODS),
             "events": list(EVENTS),
             "attachment_roots": [
