@@ -107,6 +107,50 @@ async def test_session_stats_handle_empty_context_and_unknown_window(tmp_path: P
 
 
 @pytest.mark.asyncio
+async def test_incremental_stats_match_full_recomputation(tmp_path: Path) -> None:
+    repository = JsonlSessionRepository(tmp_path)
+    session = await repository.create(cwd=tmp_path, session_id="incremental-stats")
+    await session.append_message(UserMessage("first"))
+    await session.append_message(_assistant("answer"))
+    assert await session.stats(context_window=1_000) == await session._stats_full(
+        context_window=1_000
+    )
+
+    await session.append_message(UserMessage("second"))
+    await session.append_message(_assistant("second answer"))
+    assert await session.stats(context_window=1_000) == await session._stats_full(
+        context_window=1_000
+    )
+
+    old_leaf = await session.get_leaf_id()
+    abandoned = await session.append_message(UserMessage("abandoned"))
+    await session.set_leaf_id(old_leaf)
+    await session.append_message(UserMessage("alternate"))
+    branched = await session.stats(context_window=1_000)
+    assert branched == await session._stats_full(context_window=1_000)
+    assert branched["messageCount"] == 6
+    assert all(
+        message.content != "abandoned" for message in (await session.build_context()).messages
+    )
+    assert abandoned != await session.get_leaf_id()
+
+    retained = await session.append_message(UserMessage("retained"))
+    await session.append_compaction(
+        summary="checkpoint",
+        tokens_before=100,
+        first_kept_entry_id=retained,
+    )
+    assert await session.stats(context_window=1_000) == await session._stats_full(
+        context_window=1_000
+    )
+
+    reopened = await repository.open("incremental-stats")
+    assert await reopened.stats(context_window=1_000) == await reopened._stats_full(
+        context_window=1_000
+    )
+
+
+@pytest.mark.asyncio
 async def test_jsonl_v3_is_message_durable_and_recovers_truncated_tail(tmp_path: Path) -> None:
     repository = JsonlSessionRepository(tmp_path)
     session = await repository.create(cwd=tmp_path, session_id="durable")

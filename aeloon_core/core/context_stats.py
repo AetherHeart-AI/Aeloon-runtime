@@ -83,25 +83,50 @@ def context_statistics(
         usage_after_ms=usage_after_ms,
         usage_after_index=usage_after_index,
     )
+    message_counts = {message_type: 0 for message_type in MESSAGE_TYPES}
+    estimated_tokens = {message_type: 0 for message_type in MESSAGE_TYPES}
+    for message in messages:
+        message_type = message_type_for_statistics(message)
+        message_counts[message_type] += 1
+        estimated_tokens[message_type] += estimate_tokens(message)
+    return context_statistics_from_aggregates(
+        used_tokens,
+        message_counts,
+        estimated_tokens,
+        context_window=context_window,
+    )
+
+
+def context_statistics_from_aggregates(
+    used_tokens: int,
+    message_counts: Mapping[str, int],
+    estimated_tokens: Mapping[str, int],
+    *,
+    context_window: int | None = None,
+) -> dict[str, Any]:
+    """Render context statistics from trusted incremental aggregates."""
+
     window_tokens = max(1, int(context_window)) if context_window is not None else None
     remaining_tokens = max(0, window_tokens - used_tokens) if window_tokens is not None else None
     usage_percent = _percent(used_tokens, window_tokens) if window_tokens is not None else None
 
-    message_counts = {message_type: 0 for message_type in MESSAGE_TYPES}
-    estimated_tokens = {message_type: 0 for message_type in MESSAGE_TYPES}
-    for message in messages:
-        message_type = _message_type(message)
-        message_counts[message_type] += 1
-        estimated_tokens[message_type] += estimate_tokens(message)
+    counts = {
+        message_type: int(message_counts.get(message_type, 0))
+        for message_type in MESSAGE_TYPES
+    }
+    estimates = {
+        message_type: int(estimated_tokens.get(message_type, 0))
+        for message_type in MESSAGE_TYPES
+    }
 
-    attributed_tokens = sum(estimated_tokens.values())
+    attributed_tokens = sum(estimates.values())
     if attributed_tokens <= used_tokens:
         # Inference totals also include the system prompt, tool schemas, and request
         # framing. Attribute that otherwise invisible portion to the system bucket.
-        estimated_tokens["system"] += used_tokens - attributed_tokens
+        estimates["system"] += used_tokens - attributed_tokens
     elif attributed_tokens:
-        estimated_tokens = _scale_tokens(estimated_tokens, used_tokens)
-    percentages = _percentage_distribution(estimated_tokens, used_tokens)
+        estimates = _scale_tokens(estimates, used_tokens)
+    percentages = _percentage_distribution(estimates, used_tokens)
 
     return {
         "contextWindow": {
@@ -112,8 +137,8 @@ def context_statistics(
         },
         "messageTypes": {
             message_type: {
-                "messageCount": message_counts[message_type],
-                "estimatedTokens": estimated_tokens[message_type],
+                "messageCount": counts[message_type],
+                "estimatedTokens": estimates[message_type],
                 "percentage": percentages[message_type],
             }
             for message_type in MESSAGE_TYPES
@@ -154,7 +179,7 @@ def cache_statistics(usages: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _message_type(message: AgentMessage) -> str:
+def message_type_for_statistics(message: AgentMessage) -> str:
     if isinstance(message, UserMessage):
         return "user"
     if isinstance(message, AssistantMessage):
@@ -192,6 +217,8 @@ __all__ = [
     "MESSAGE_TYPES",
     "cache_statistics",
     "context_statistics",
+    "context_statistics_from_aggregates",
     "estimate_context_tokens",
     "estimate_tokens",
+    "message_type_for_statistics",
 ]

@@ -12,9 +12,17 @@ from pathlib import Path
 from typing import Any
 
 from aeloon_core.blocking import run_blocking
-from aeloon_core.core.context_stats import cache_statistics, context_statistics
+from aeloon_core.core.context_stats import (
+    MESSAGE_TYPES,
+    cache_statistics,
+    context_statistics,
+    context_statistics_from_aggregates,
+    estimate_tokens,
+    message_type_for_statistics,
+)
 from aeloon_core.core.types import (
     AgentMessage,
+    AssistantMessage,
     RunError,
     Usage,
     UserMessage,
@@ -73,6 +81,90 @@ class SessionContext:
     compaction_boundary_index: int | None = None
 
 
+@dataclass(slots=True)
+class _LifetimeStats:
+    message_count: int = 0
+    total_tokens: int = 0
+    cost: float = 0.0
+    input_tokens: int = 0
+    cache_read: int = 0
+    cache_write: int = 0
+    request_count: int = 0
+    hit_request_count: int = 0
+
+    def add(self, entry: dict[str, Any]) -> None:
+        usage: dict[str, Any] | None = None
+        if entry.get("type") == "message":
+            self.message_count += 1
+            message = entry.get("message") or {}
+            if message.get("role") == "assistant":
+                usage = message.get("usage")
+        elif entry.get("type") in {"compaction", "branch_summary"}:
+            usage = entry.get("usage")
+        if not usage:
+            return
+        self.total_tokens += int(usage.get("totalTokens") or 0)
+        self.cost += float((usage.get("cost") or {}).get("total") or 0)
+        uncached = max(0, int(usage.get("input") or 0))
+        cache_read = max(0, int(usage.get("cacheRead") or 0))
+        cache_write = max(0, int(usage.get("cacheWrite") or 0))
+        self.input_tokens += uncached
+        self.cache_read += cache_read
+        self.cache_write += cache_write
+        if uncached or cache_read or cache_write:
+            self.request_count += 1
+            if cache_read:
+                self.hit_request_count += 1
+
+    def cache(self) -> dict[str, Any]:
+        cacheable = self.input_tokens + self.cache_read
+        return {
+            "inputTokens": self.input_tokens,
+            "readTokens": self.cache_read,
+            "writeTokens": self.cache_write,
+            "cacheableTokens": cacheable,
+            "hitTokenPercent": _percent(self.cache_read, cacheable),
+            "requestCount": self.request_count,
+            "hitRequestCount": self.hit_request_count,
+            "hitRequestPercent": _percent(self.hit_request_count, self.request_count),
+        }
+
+
+@dataclass(slots=True)
+class _ContextStatsCache:
+    version: int
+    leaf_id: str | None
+    message_counts: dict[str, int]
+    estimated_tokens: dict[str, int]
+    estimated_total: int
+    usage_anchor: int | None
+    trailing_tokens: int
+
+    @property
+    def used_tokens(self) -> int:
+        if self.usage_anchor is None:
+            return self.estimated_total
+        return self.usage_anchor + self.trailing_tokens
+
+    def append(self, message: AgentMessage, *, version: int, leaf_id: str) -> None:
+        estimated = estimate_tokens(message)
+        message_type = message_type_for_statistics(message)
+        self.message_counts[message_type] += 1
+        self.estimated_tokens[message_type] += estimated
+        self.estimated_total += estimated
+        if (
+            isinstance(message, AssistantMessage)
+            and message.stop_reason not in {"error", "aborted"}
+            and message.usage.total_tokens > 0
+        ):
+            self.usage_anchor = message.usage.total_tokens
+            self.trailing_tokens = 0
+        elif self.usage_anchor is not None:
+            self.trailing_tokens += estimated
+        self.version = version
+        self.leaf_id = leaf_id
+
+
 class Session:
     """Stateful session facade backed by one append-only JSONL file."""
 
@@ -88,6 +180,9 @@ class Session:
         self._by_id = {str(entry["id"]): entry for entry in entries}
         self._current_leaf_id = current_leaf_id
         self._lock = asyncio.Lock()
+        self._stats_cache_version = 0
+        self._lifetime_stats = _lifetime_stats(entries)
+        self._context_stats_cache: _ContextStatsCache | None = None
 
     @property
     def id(self) -> str:
@@ -288,6 +383,9 @@ class Session:
         self._entries.append(entry)
         self._by_id[entry["id"]] = entry
         self._current_leaf_id = leaf_id
+        self._stats_cache_version += 1
+        self._lifetime_stats.add(entry)
+        self._context_stats_cache = None
 
     async def get_branch(self, from_id: str | None = None) -> list[dict[str, Any]]:
         leaf_id = self._current_leaf_id if from_id is None else from_id
@@ -408,29 +506,38 @@ class Session:
 
     async def stats(self, *, context_window: int | None = None) -> dict[str, Any]:
         """Return lifetime totals plus statistics for the effective context branch."""
+        cache = self._context_stats_cache
+        if cache is None or cache.version != self._stats_cache_version:
+            context = await self.build_context()
+            cache = _context_stats_cache(
+                context,
+                version=self._stats_cache_version,
+                leaf_id=self._current_leaf_id,
+            )
+            self._context_stats_cache = cache
+        return {
+            "messageCount": self._lifetime_stats.message_count,
+            "totalTokens": self._lifetime_stats.total_tokens,
+            "costTotal": self._lifetime_stats.cost,
+            **context_statistics_from_aggregates(
+                cache.used_tokens,
+                cache.message_counts,
+                cache.estimated_tokens,
+                context_window=context_window,
+            ),
+            "cache": self._lifetime_stats.cache(),
+        }
 
-        message_count = 0
-        total_tokens = 0
-        cost = 0.0
-        usages: list[dict[str, Any]] = []
-        for entry in self._entries:
-            usage: dict[str, Any] | None = None
-            if entry.get("type") == "message":
-                message_count += 1
-                message = entry.get("message") or {}
-                if message.get("role") == "assistant":
-                    usage = message.get("usage")
-            elif entry.get("type") in {"compaction", "branch_summary"}:
-                usage = entry.get("usage")
-            if usage:
-                total_tokens += int(usage.get("totalTokens") or 0)
-                cost += float((usage.get("cost") or {}).get("total") or 0)
-                usages.append(usage)
+    async def _stats_full(self, *, context_window: int | None = None) -> dict[str, Any]:
+        """Correct full-scan oracle used by fallbacks and regression tests."""
+
+        lifetime = _lifetime_stats(self._entries)
+        usages = _entry_usages(self._entries)
         context = await self.build_context()
         return {
-            "messageCount": message_count,
-            "totalTokens": total_tokens,
-            "costTotal": cost,
+            "messageCount": lifetime.message_count,
+            "totalTokens": lifetime.total_tokens,
+            "costTotal": lifetime.cost,
             **context_statistics(
                 context.messages,
                 context_window=context_window,
@@ -441,6 +548,8 @@ class Session:
         }
 
     async def _append_entry(self, entry_type: str, **payload: Any) -> str:
+        previous_leaf = self._current_leaf_id
+        previous_version = self._stats_cache_version
         entry = {
             "type": entry_type,
             "id": self._entry_id(),
@@ -452,6 +561,19 @@ class Session:
         self._entries.append(entry)
         self._by_id[entry["id"]] = entry
         self._current_leaf_id = entry["id"]
+        self._stats_cache_version += 1
+        self._lifetime_stats.add(entry)
+        cache = self._context_stats_cache
+        message = _context_message(entry)
+        if (
+            message is not None
+            and cache is not None
+            and cache.version == previous_version
+            and cache.leaf_id == previous_leaf
+        ):
+            cache.append(message, version=self._stats_cache_version, leaf_id=entry["id"])
+        else:
+            self._context_stats_cache = None
         return str(entry["id"])
 
     def _entry_id(self) -> str:
@@ -630,6 +752,84 @@ def _append_fsync(path: Path, text: str) -> None:
         handle.write(text)
         handle.flush()
         os.fsync(handle.fileno())
+
+
+def _lifetime_stats(entries: list[dict[str, Any]]) -> _LifetimeStats:
+    result = _LifetimeStats()
+    for entry in entries:
+        result.add(entry)
+    return result
+
+
+def _entry_usages(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for entry in entries:
+        usage: dict[str, Any] | None = None
+        if entry.get("type") == "message":
+            message = entry.get("message") or {}
+            if message.get("role") == "assistant":
+                usage = message.get("usage")
+        elif entry.get("type") in {"compaction", "branch_summary"}:
+            usage = entry.get("usage")
+        if usage:
+            result.append(usage)
+    return result
+
+
+def _context_message(entry: dict[str, Any]) -> AgentMessage | None:
+    if entry.get("type") == "message":
+        return message_from_dict(entry["message"])
+    if entry.get("type") == "custom_message":
+        return UserMessage(str(entry.get("content") or ""))
+    return None
+
+
+def _context_stats_cache(
+    context: SessionContext,
+    *,
+    version: int,
+    leaf_id: str | None,
+) -> _ContextStatsCache:
+    counts = {message_type: 0 for message_type in MESSAGE_TYPES}
+    estimates = {message_type: 0 for message_type in MESSAGE_TYPES}
+    estimated_total = 0
+    usage_anchor: int | None = None
+    trailing_tokens = 0
+    for index, message in enumerate(context.messages):
+        estimated = estimate_tokens(message)
+        message_type = message_type_for_statistics(message)
+        counts[message_type] += 1
+        estimates[message_type] += estimated
+        estimated_total += estimated
+        after_boundary = (
+            index > context.compaction_boundary_index
+            if context.compaction_boundary_index is not None
+            else context.compaction_boundary_ms is None
+            or message.timestamp > context.compaction_boundary_ms
+        )
+        if (
+            isinstance(message, AssistantMessage)
+            and message.stop_reason not in {"error", "aborted"}
+            and message.usage.total_tokens > 0
+            and after_boundary
+        ):
+            usage_anchor = message.usage.total_tokens
+            trailing_tokens = 0
+        elif usage_anchor is not None:
+            trailing_tokens += estimated
+    return _ContextStatsCache(
+        version=version,
+        leaf_id=leaf_id,
+        message_counts=counts,
+        estimated_tokens=estimates,
+        estimated_total=estimated_total,
+        usage_anchor=usage_anchor,
+        trailing_tokens=trailing_tokens,
+    )
+
+
+def _percent(value: int, total: int) -> float:
+    return round(value * 100 / total, 2) if total > 0 else 0.0
 
 
 def _write_fsync(path: Path, text: str) -> None:
