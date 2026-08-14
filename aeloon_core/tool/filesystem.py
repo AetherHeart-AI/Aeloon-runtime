@@ -16,6 +16,7 @@ from aeloon_core.blocking import run_blocking
 from aeloon_core.core.types import ImageContent, TextContent, ToolResult, ToolUpdateCallback
 from aeloon_core.tool.base import (
     DEFAULT_MAX_BYTES,
+    DEFAULT_MAX_LINES,
     ToolContext,
     WorkspaceTool,
     atomic_write_bytes,
@@ -89,23 +90,19 @@ class ReadTool(WorkspaceTool):
                 details={"path": str(path), "sizeBytes": size, "mimeType": processed_mime},
             )
 
-        text = await run_blocking(path.read_text, encoding="utf-8", errors="replace")
-        size = (await run_blocking(path.stat)).st_size
-        all_lines = text.splitlines() or [""]
         offset = int(arguments.get("offset") or 1)
         limit_value = arguments.get("limit")
         limit = int(limit_value) if limit_value is not None else None
         start = max(0, offset - 1)
-        if start >= len(all_lines):
+        window = await run_blocking(_read_text_window, path, start, limit)
+        if start >= window["totalLines"]:
             raise ValueError(
-                f"Offset {offset} is beyond end of file ({len(all_lines)} lines total)"
+                f"Offset {offset} is beyond end of file ({window['totalLines']} lines total)"
             )
-        selected = all_lines[start : start + limit if limit is not None else None]
-        output, truncation = truncate_head("\n".join(selected))
+        output, truncation = truncate_head(window["text"])
         if truncation["firstLineExceedsLimit"]:
-            line_size = len(all_lines[start].encode("utf-8"))
             output = (
-                f"[Line {start + 1} is {format_size(line_size)}, exceeds "
+                f"[Line {start + 1} is {format_size(window['firstLineBytes'])}, exceeds "
                 f"{format_size(DEFAULT_MAX_BYTES)} limit. Use bash: sed -n "
                 f"'{start + 1}p' {raw_path} | head -c {DEFAULT_MAX_BYTES}]"
             )
@@ -119,9 +116,9 @@ class ReadTool(WorkspaceTool):
             output,
             details={
                 "path": str(path),
-                "sizeBytes": size,
+                "sizeBytes": window["sizeBytes"],
                 "selectedLines": int(truncation["outputLines"]),
-                "lineRange": {"start": start + 1, "total": len(all_lines)},
+                "lineRange": {"start": start + 1, "total": window["totalLines"]},
                 "truncation": truncation,
             },
         )
@@ -284,6 +281,83 @@ class EditTool(WorkspaceTool):
                 "sizeAfterBytes": len(encoded),
             },
         )
+
+
+def _read_text_window(path: Path, start: int, limit: int | None) -> dict[str, Any]:
+    """Scan a text file without retaining content outside the requested bounded window."""
+
+    selected: list[str] = []
+    selected_bytes = 0
+    total_lines = 0
+    first_line_bytes = 0
+    selection_stopped = False
+    size = path.stat().st_size
+
+    with path.open("rb") as stream:
+        while True:
+            chunk = stream.readline(DEFAULT_MAX_BYTES + 2)
+            if not chunk:
+                break
+
+            line_bytes = 0
+            retained = bytearray()
+            while True:
+                newline = chunk.endswith(b"\n")
+                content = chunk[:-1] if newline else chunk
+                line_bytes += len(content)
+                if len(retained) <= DEFAULT_MAX_BYTES:
+                    remaining = DEFAULT_MAX_BYTES + 1 - len(retained)
+                    retained.extend(content[:remaining])
+                if newline:
+                    break
+                chunk = stream.readline(DEFAULT_MAX_BYTES + 2)
+                if not chunk:
+                    break
+
+            line_index = total_lines
+            total_lines += 1
+            within_limit = limit is None or line_index < start + limit
+            if line_index >= start and within_limit and not selection_stopped:
+                if not selected:
+                    first_line_bytes = line_bytes
+                text = bytes(retained).decode("utf-8", errors="replace")
+                if text.endswith("\r"):
+                    text = text[:-1]
+                encoded_size = len((text + "\n").encode("utf-8"))
+                if (
+                    len(retained) > DEFAULT_MAX_BYTES
+                    or len(selected) >= DEFAULT_MAX_LINES
+                    or selected_bytes + encoded_size > DEFAULT_MAX_BYTES
+                ):
+                    selection_stopped = True
+                else:
+                    selected.append(text)
+                    selected_bytes += encoded_size
+
+            if not chunk:
+                break
+
+    if total_lines == 0:
+        total_lines = 1
+        if start == 0:
+            selected.append("")
+
+    # truncate_head remains the single source of truncation metadata. Add a sentinel
+    # line when the streaming scan stopped so it observes the same bounded condition.
+    text = "\n".join(selected)
+    if selection_stopped:
+        if not selected:
+            text = "x" * (DEFAULT_MAX_BYTES + 1)
+        elif len(selected) >= DEFAULT_MAX_LINES:
+            text += "\ntruncated"
+        else:
+            text += "\n" + ("x" * (DEFAULT_MAX_BYTES + 1))
+    return {
+        "text": text,
+        "sizeBytes": size,
+        "totalLines": total_lines,
+        "firstLineBytes": first_line_bytes,
+    }
 
 
 def _read_image(path: Path, mime: str, resize: bool) -> tuple[str, str, list[str], int]:

@@ -39,6 +39,25 @@ async def test_read_text_truncation_continuation_and_absolute_paths(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_read_text_streams_distant_window_and_bounds_long_lines(tmp_path: Path) -> None:
+    path = tmp_path / "large.txt"
+    path.write_bytes((b"prefix\n" * 100_000) + b"target\n")
+    tool = create_all_tools(tmp_path)["read"]
+
+    result = await tool.execute(
+        "call", {"path": "large.txt", "offset": 100_001, "limit": 1}, None
+    )
+    assert result.content[0].text == "target"
+    assert result.details["lineRange"] == {"start": 100_001, "total": 100_001}
+
+    huge = tmp_path / "huge-line.txt"
+    huge.write_bytes(b"x" * (2 * 1024 * 1024))
+    result = await tool.execute("call", {"path": "huge-line.txt"}, None)
+    assert "Line 1 is 2048.0KB" in result.content[0].text
+    assert len(result.content[0].text) < 500
+
+
+@pytest.mark.asyncio
 async def test_structured_file_tools_reject_workspace_escape(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     outside = tmp_path / "outside"
