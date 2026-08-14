@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import os
 import shutil
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from PIL import Image
 
 from aeloon_core.core import ImageContent
 from aeloon_core.tool import BuiltinToolSet
+from aeloon_core.tool.shell import prune_bash_logs
 
 DEFAULT_ACTIVE_TOOLS = BuiltinToolSet.default_active_names
 
@@ -232,7 +234,27 @@ async def test_bash_streams_updates_times_out_and_retains_large_output(tmp_path:
     assert large.details["truncated"] is True
     full_path = Path(large.details["fullOutputPath"])
     assert full_path.is_file()
-    assert len(full_path.read_text(encoding="utf-8")) == 60_000
+    assert len(full_path.read_text(encoding="utf-8").rstrip("\n")) == 60_000
+    assert full_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_prune_bash_logs_ignores_active_files_and_applies_age_and_size(tmp_path: Path) -> None:
+    old = tmp_path / "bash-old.log"
+    first = tmp_path / "bash-first.log"
+    second = tmp_path / "bash-second.log"
+    active = tmp_path / "bash-active.tmp"
+    for path in (old, first, second, active):
+        path.write_bytes(b"x" * 10)
+    os.utime(old, (1, 1))
+    os.utime(first, (90, 90))
+    os.utime(second, (95, 95))
+
+    prune_bash_logs(tmp_path, now=100, retention_seconds=50, cap_bytes=10)
+
+    assert not old.exists()
+    assert not first.exists()
+    assert second.exists()
+    assert active.exists()
 
 
 @pytest.mark.asyncio

@@ -79,6 +79,7 @@ from aeloon_core.runtime.types import (
     SessionSnapshot,
     TurnInput,
 )
+from aeloon_core.tool.shell import prune_bash_logs
 from aeloon_core.version import __version__, core_commit
 
 PROMPT_LIMIT = 100_000
@@ -115,6 +116,7 @@ class RuntimeService:
             config = config.model_copy(update={"data_dir": self._data_dir_override}).normalized()
         self.config = config
         self.data_dir = config.data_dir
+        prune_bash_logs()
         provision_builtin_skills(self.data_dir)
         self.repository = JsonlSessionRepository(self.data_dir)
         self.attachment_dir = self.data_dir / "session-attachments"
