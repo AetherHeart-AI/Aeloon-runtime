@@ -7,10 +7,8 @@ from pydantic import ValidationError
 
 from aeloon_core.config import (
     Config,
-    ConfigMigrationError,
     CustomProviderConfig,
     DeepSeekProviderConfig,
-    ProviderModelConfig,
     load_config,
     public_config,
     save_config,
@@ -31,31 +29,37 @@ def test_provider_config_requires_reserved_ids_and_exclusive_drivers() -> None:
 
     raw = Config().model_dump(mode="json")
     raw["providers"]["deepseek"] = {
-        "driver": "ollama",
+        "driver": "custom",
+        "backend": "ollama",
         "name": "Not DeepSeek",
+        "endpoint": "http://127.0.0.1:11434/v1",
     }
     with pytest.raises(ValidationError, match="must use driver deepseek"):
         Config.model_validate(raw)
 
 
-def test_legacy_provider_config_and_no_key_sentinel_are_rejected(tmp_path) -> None:
+def test_removed_provider_config_shapes_are_rejected(tmp_path) -> None:
     path = tmp_path / "config.json"
     path.write_text(json.dumps({"deepseek": {"api_key": "old"}}), encoding="utf-8")
 
-    with pytest.raises(ConfigMigrationError, match="deepseek.*MIGRATION.md"):
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         load_config(path)
-    with pytest.raises(ValidationError, match="no-key"):
-        DeepSeekProviderConfig(api_key="no-key")
 
 
-def test_current_custom_driver_names_are_normalized_and_rewritten(tmp_path) -> None:
+def test_current_custom_provider_shape_round_trips(tmp_path) -> None:
     path = tmp_path / "config.json"
     raw = Config().model_dump(mode="json")
     raw["providers"].update(
         {
-            "desktop": {"driver": "ollama"},
+            "desktop": {
+                "driver": "custom",
+                "backend": "ollama",
+                "name": "Ollama",
+                "endpoint": "http://127.0.0.1:11434/v1",
+            },
             "studio": {
-                "driver": "openai-compatible",
+                "driver": "custom",
+                "backend": "openai",
                 "name": "Studio",
                 "endpoint": "https://studio.example/v1",
                 "api_key": "studio-secret",
@@ -82,35 +86,28 @@ def test_current_custom_driver_names_are_normalized_and_rewritten(tmp_path) -> N
     assert persisted["providers"]["desktop"]["backend"] == "ollama"
 
 
-def test_custom_provider_without_backend_is_inferred_for_existing_configs() -> None:
+def test_custom_provider_requires_backend() -> None:
     raw = Config().model_dump(mode="json")
     raw["providers"]["ollama"] = {
         "driver": "custom",
         "name": "Ollama",
         "endpoint": "http://127.0.0.1:11434/v1",
     }
-    raw["providers"]["studio"] = {
-        "driver": "custom",
-        "name": "Studio",
-        "endpoint": "https://studio.example/v1",
-    }
-
-    config = Config.model_validate(raw)
-
-    assert config.providers["ollama"].backend == "ollama"
-    assert config.providers["studio"].backend == "openai"
+    with pytest.raises(ValidationError, match="backend"):
+        Config.model_validate(raw)
 
 
-def test_legacy_provider_model_max_tokens_is_dropped_and_recomputed(tmp_path) -> None:
+def test_removed_provider_model_max_tokens_is_rejected(tmp_path) -> None:
     path = tmp_path / "config.json"
     raw = Config().model_dump(mode="json")
     raw["providers"]["studio"] = {
         "driver": "custom",
+        "backend": "openai",
         "name": "Studio",
         "endpoint": "https://studio.example/v1",
         "models": [
             {
-                "id": "legacy",
+                "id": "removed-field",
                 "context_window": 8_192,
                 "max_tokens": 8_192,
             }
@@ -118,17 +115,8 @@ def test_legacy_provider_model_max_tokens_is_dropped_and_recomputed(tmp_path) ->
     }
     path.write_text(json.dumps(raw), encoding="utf-8")
 
-    config = load_config(path)
-
-    studio = config.providers["studio"]
-    assert isinstance(studio, CustomProviderConfig)
-    assert studio.models == [
-        ProviderModelConfig(
-            id="legacy",
-            context_window=8_192,
-            max_output_tokens=2_048,
-        )
-    ]
+    with pytest.raises(ValidationError, match="max_tokens"):
+        load_config(path)
 
 
 def test_public_config_redacts_every_provider_secret_and_sensitive_header() -> None:
@@ -137,6 +125,7 @@ def test_public_config_redacts_every_provider_secret_and_sensitive_header() -> N
         headers={"Proxy-Authorization": "proxy-secret", "X-Public": "visible"},
     )
     studio = CustomProviderConfig(
+        backend="openai",
         name="Studio",
         endpoint="https://studio.example/v1",
         api_key="studio-secret",

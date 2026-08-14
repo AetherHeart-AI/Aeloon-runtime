@@ -73,6 +73,7 @@ def _provider_config(
     enabled: bool = True,
 ) -> CustomProviderConfig:
     return CustomProviderConfig(
+        backend="openai",
         name=provider_id,
         endpoint=f"https://{provider_id}.example/v1",
         enabled=enabled,
@@ -111,11 +112,13 @@ def test_unqualified_model_id_uses_first_matching_provider() -> None:
 @pytest.mark.asyncio
 async def test_manager_resolves_unqualified_model_in_configuration_order() -> None:
     studio = CustomProviderConfig(
+        backend="openai",
         name="Studio",
         endpoint="http://127.0.0.1:8000/v1",
         models=[ProviderModelConfig(id="coder")],
     )
     backup = CustomProviderConfig(
+        backend="openai",
         name="Backup",
         endpoint="http://127.0.0.1:9000/v1",
         models=[ProviderModelConfig(id="coder")],
@@ -268,6 +271,7 @@ async def test_custom_provider_routes_qualified_model_to_unprefixed_api_model() 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     model_config = ProviderModelConfig(id="llama/3.3")
     config = CustomProviderConfig(
+        backend="ollama",
         name="Custom",
         endpoint="http://127.0.0.1:11434/v1",
         models=[model_config],
@@ -451,6 +455,7 @@ async def test_rpc_refreshes_provider_models_without_using_configured_cache(
         providers={
             **Config().providers,
             "studio": CustomProviderConfig(
+                backend="openai",
                 name="Studio",
                 endpoint="http://127.0.0.1:9000/v1",
                 models=[

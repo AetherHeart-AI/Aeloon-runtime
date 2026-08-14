@@ -202,7 +202,6 @@ class RuntimeService:
         )
         return OperationSnapshot(
             operation_id=str(value["operation_id"]),
-            turn_id=str(value["turn_id"]),
             queue_position=int(value["queue_position"]),
             skill_id=str(value["skill_id"]) if value.get("skill_id") else None,
             attachment_ids=tuple(str(item) for item in value.get("attachment_ids") or []),
@@ -454,7 +453,6 @@ class RuntimeService:
         operation.task = asyncio.create_task(self._execute_turn(session, runtime, operation))
         result = {
             "operation_id": operation.id,
-            "turn_id": operation.id,
             "queue_position": queued,
             "attachment_ids": [
                 str(attachment["id"])
@@ -1723,7 +1721,6 @@ class RuntimeService:
                     "mime_type",
                     "size_bytes",
                     "text",
-                    "annotation",
                 )
                 if key in item
             }

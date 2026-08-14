@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 import sys
 from pathlib import Path
 
@@ -13,20 +12,6 @@ from aeloon_core.runtime.builtin_skills import BUILTIN_SKILL_IDS
 
 RESOURCE_ROOT = Path(__file__).parents[1] / "aeloon_core" / "resources" / "skills"
 OFFICE_SKILL_IDS = ("aeloon-office-lite",)
-RETIRED_SKILL_IDS = (
-    "document-reader",
-    "word-docx",
-    "powerpoint-pptx",
-    "office",
-    "ppt",
-    "document-writing",
-    "reports",
-    "markitdown",
-    "pdf",
-    "paddleocr-doc-parsing",
-    "pptx-generator",
-    "document-format-skills",
-)
 
 
 def test_only_office_lite_is_bundled_and_valid() -> None:
@@ -69,19 +54,13 @@ def test_bundled_skill_runtime_prepends_action(
     assert sys.argv == original_argv
 
 
-def test_bundled_skill_runtime_reports_unknown_and_retired_actions() -> None:
+def test_bundled_skill_runtime_reports_unknown_ids_and_actions() -> None:
     with pytest.raises(
         ValueError, match="expected one of: preflight, read, write, render, validate"
     ):
         skill_runtime.run_bundled_skill("aeloon-office-lite", "unknown", [])
     with pytest.raises(ValueError, match="unknown bundled Skill 'missing'"):
         skill_runtime.run_bundled_skill("missing", "run", [])
-    for skill_id in RETIRED_SKILL_IDS:
-        with pytest.raises(
-            ValueError,
-            match=f"has been retired; use {re.escape('aeloon-office-lite')}",
-        ):
-            skill_runtime.run_bundled_skill(skill_id, "run", [])
 
 
 @pytest.mark.asyncio

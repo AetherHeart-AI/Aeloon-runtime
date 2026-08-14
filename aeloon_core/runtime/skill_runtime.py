@@ -15,21 +15,6 @@ _SKILL_ACTIONS = {
     "aeloon-office-lite": ("preflight", "read", "write", "render", "validate"),
 }
 
-_RETIRED_SKILLS = {
-    "document-reader": "aeloon-office-lite",
-    "word-docx": "aeloon-office-lite",
-    "powerpoint-pptx": "aeloon-office-lite",
-    "office": "aeloon-office-lite",
-    "ppt": "aeloon-office-lite",
-    "document-writing": "aeloon-office-lite",
-    "reports": "aeloon-office-lite",
-    "markitdown": "aeloon-office-lite",
-    "pdf": "aeloon-office-lite",
-    "paddleocr-doc-parsing": "aeloon-office-lite",
-    "pptx-generator": "aeloon-office-lite",
-    "document-format-skills": "aeloon-office-lite",
-}
-
 def bundled_skill_root() -> Path:
     return Path(str(files("aeloon_core.resources").joinpath("skills"))).resolve()
 
@@ -59,12 +44,6 @@ def _run_python_script(relative_path: str, arguments: list[str]) -> int:
 
 
 def run_bundled_skill(skill_id: str, action: str, arguments: list[str]) -> int:
-    replacement = _RETIRED_SKILLS.get(skill_id)
-    if replacement is not None:
-        raise ValueError(
-            f"bundled Skill '{skill_id}' has been retired; use {replacement} instead"
-        )
-
     relative_path = _SKILL_ENTRIES.get(skill_id)
     if relative_path is None:
         available = ", ".join(sorted(_SKILL_ENTRIES))

@@ -88,39 +88,28 @@ _NON_OVERFLOW_PATTERNS = tuple(
 
 
 def is_context_overflow(
-    value: str | AssistantMessage | None,
+    message: AssistantMessage,
     context_window: int | None = None,
 ) -> bool:
-    """Detect provider-reported and silent context overflow.
+    """Detect provider-reported and silent context overflow."""
 
-    String calls remain supported for compatibility. Passing the complete
-    assistant message additionally enables usage-based detection.
-    """
-
-    if isinstance(value, AssistantMessage):
-        message = value
-        error_message = message.error_message or ""
-        if message.stop_reason == "error" and error_message:
-            excluded = any(pattern.search(error_message) for pattern in _NON_OVERFLOW_PATTERNS)
-            matched = any(pattern.search(error_message) for pattern in _OVERFLOW_PATTERNS)
-            if not excluded and matched:
-                return True
-        if context_window and context_window > 0:
-            input_tokens = message.usage.input + message.usage.cache_read
-            if message.stop_reason == "stop" and input_tokens > context_window:
-                return True
-            if (
-                message.stop_reason == "length"
-                and message.usage.output == 0
-                and input_tokens >= context_window * 0.99
-            ):
-                return True
-        return False
-
-    error_message = value or ""
-    if any(pattern.search(error_message) for pattern in _NON_OVERFLOW_PATTERNS):
-        return False
-    return any(pattern.search(error_message) for pattern in _OVERFLOW_PATTERNS)
+    error_message = message.error_message or ""
+    if message.stop_reason == "error" and error_message:
+        excluded = any(pattern.search(error_message) for pattern in _NON_OVERFLOW_PATTERNS)
+        matched = any(pattern.search(error_message) for pattern in _OVERFLOW_PATTERNS)
+        if not excluded and matched:
+            return True
+    if context_window and context_window > 0:
+        input_tokens = message.usage.input + message.usage.cache_read
+        if message.stop_reason == "stop" and input_tokens > context_window:
+            return True
+        if (
+            message.stop_reason == "length"
+            and message.usage.output == 0
+            and input_tokens >= context_window * 0.99
+        ):
+            return True
+    return False
 
 
 __all__ = [

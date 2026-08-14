@@ -301,12 +301,11 @@ def test_text_renderer_renders_final_markdown_in_interactive_terminal(
 
 
 @pytest.mark.asyncio
-async def test_run_session_list_show_and_no_session(tmp_path: Path, monkeypatch, capsys) -> None:
+async def test_task_history_and_ephemeral_mode(tmp_path: Path, monkeypatch, capsys) -> None:
     data_dir = tmp_path / "data"
     monkeypatch.setattr(cli, "DeepSeekProvider", lambda **_kwargs: _provider("saved"))
     await cli.async_main(
         [
-            "run",
             "persist",
             "--workspace",
             str(tmp_path),
@@ -321,20 +320,19 @@ async def test_run_session_list_show_and_no_session(tmp_path: Path, monkeypatch,
     result = json.loads(capsys.readouterr().out)
     session_id = result["session_id"]
 
-    await cli.async_main(["session", "list", "--data-dir", str(data_dir)])
+    await cli.async_main(["history", "--all", "--data-dir", str(data_dir), "--json"])
     listed = json.loads(capsys.readouterr().out)
     assert [item["id"] for item in listed] == [session_id]
 
-    await cli.async_main(["session", "show", session_id, "--data-dir", str(data_dir)])
+    await cli.async_main(["history", session_id, "--data-dir", str(data_dir), "--json"])
     shown = json.loads(capsys.readouterr().out)
     assert shown["id"] == session_id
-    assert [message["role"] for message in shown["context"]] == ["user", "assistant"]
+    assert [message["role"] for message in shown["messages"]] == ["user", "assistant"]
 
     before = set((data_dir / "harness-sessions").glob("*.jsonl"))
     monkeypatch.setattr(cli, "DeepSeekProvider", lambda **_kwargs: _provider("ephemeral"))
     await cli.async_main(
         [
-            "run",
             "temporary",
             "--workspace",
             str(tmp_path),
@@ -504,15 +502,14 @@ def test_rpc_serve_has_no_browser_runtime_interface(tmp_path: Path) -> None:
 
 
 def test_default_task_command_and_explicit_separator_are_normalized() -> None:
-    assert cli._normalize_argv(["fix", "the", "tests"]) == ["run", "fix", "the", "tests"]
-    assert cli._normalize_argv(["--json", "inspect"]) == ["run", "--json", "inspect"]
-    assert cli._normalize_argv(["--", "models"]) == ["run", "models"]
+    task = cli._TASK_COMMAND
+    assert cli._normalize_argv(["fix", "the", "tests"]) == [task, "fix", "the", "tests"]
+    assert cli._normalize_argv(["--json", "inspect"]) == [task, "--json", "inspect"]
+    assert cli._normalize_argv(["--", "models"]) == [task, "models"]
     assert cli._normalize_argv(["resume", "continue"]) == ["resume", "continue"]
 
 
-def test_new_commands_use_actionable_errors_while_legacy_run_keeps_json(
-    tmp_path: Path, capsys
-) -> None:
+def test_commands_use_actionable_errors(tmp_path: Path, capsys) -> None:
     assert (
         cli.main(
             [
@@ -529,11 +526,6 @@ def test_new_commands_use_actionable_errors_while_legacy_run_keeps_json(
     human = capsys.readouterr().err
     assert human.startswith("Error: No saved task")
     assert "aeloon-core history" in human
-
-    assert cli.main(["run"]) == 2
-    legacy = json.loads(capsys.readouterr().err)
-    assert legacy["error"] == "invalid_argument"
-
 
 @pytest.mark.asyncio
 async def test_default_task_runs_without_run_verb(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -702,7 +694,8 @@ async def test_first_listed_model_is_automatic_default(
             providers=_providers(
                 {
                     "studio": {
-                        "driver": "openai-compatible",
+                        "driver": "custom",
+                        "backend": "openai",
                         "name": "Studio",
                         "endpoint": "http://127.0.0.1:8000/v1",
                         "models": [{"id": "first"}, {"id": "second"}],
@@ -758,13 +751,15 @@ async def test_explicit_short_model_uses_first_matching_provider(
             providers=_providers(
                 {
                     "studio": {
-                        "driver": "openai-compatible",
+                        "driver": "custom",
+                        "backend": "openai",
                         "name": "Studio",
                         "endpoint": "http://127.0.0.1:8000/v1",
                         "models": [{"id": "shared-model"}],
                     },
                     "backup": {
-                        "driver": "openai-compatible",
+                        "driver": "custom",
+                        "backend": "openai",
                         "name": "Backup",
                         "endpoint": "http://127.0.0.1:9000/v1",
                         "models": [{"id": "shared-model"}],
@@ -805,39 +800,6 @@ async def test_explicit_short_model_uses_first_matching_provider(
     result = json.loads(capsys.readouterr().out)
     assert result["final_content"] == "matched"
     assert provider.requests[0][0].id == "studio/shared-model"
-
-
-@pytest.mark.asyncio
-async def test_setup_configures_deepseek_without_exposing_key(
-    tmp_path: Path, monkeypatch, capsys
-) -> None:
-    config_path = tmp_path / "config.json"
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "ignored-environment-secret")
-    monkeypatch.setattr(cli.getpass, "getpass", lambda _prompt: "setup-secret")
-
-    assert (
-        await cli.async_main(
-            [
-                "setup",
-                "--provider",
-                "deepseek",
-                "--model",
-                "deepseek-v4-pro",
-                "--config",
-                str(config_path),
-                "-C",
-                str(tmp_path),
-            ]
-        )
-        == 0
-    )
-
-    output = capsys.readouterr().out
-    saved = json.loads(config_path.read_text(encoding="utf-8"))
-    assert "setup-secret" not in output
-    assert saved["providers"]["deepseek"]["api_key"] == "setup-secret"
-    assert saved["providers"]["deepseek"]["api_key"] != "ignored-environment-secret"
-    assert saved["agent"]["model"] == "deepseek/deepseek-v4-pro"
 
 
 def test_completion_command_emits_shell_script(capsys) -> None:

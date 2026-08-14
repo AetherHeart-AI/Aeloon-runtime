@@ -544,7 +544,15 @@ async def test_compaction_records_files_read_and_modified(tmp_path: Path) -> Non
     ],
 )
 def test_context_overflow_patterns_exclude_rate_limits(message: str, expected: bool) -> None:
-    assert is_context_overflow(message) is expected
+    assert is_context_overflow(
+        AssistantMessage(
+            (),
+            provider="test",
+            model="model",
+            stop_reason="error",
+            error_message=message,
+        )
+    ) is expected
 
 
 def test_context_overflow_detects_silent_and_length_zero_output() -> None:

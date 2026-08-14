@@ -77,24 +77,21 @@ CONFIG_PATHS: dict[str, tuple[str, ...]] = {
 }
 
 _TOOL_SUMMARY_MAX_CHARS = 240
+_TASK_COMMAND = "__task__"
 
 _KNOWN_COMMANDS = {
-    "run",
     "resume",
     "history",
     "login",
     "logout",
     "whoami",
     "models",
-    "setup",
     "doctor",
     "completion",
     "config",
     "provider",
     "system",
-    "session",
     "rpc",
-    "cloud",
 }
 
 
@@ -230,8 +227,8 @@ def _add_rpc_commands(parent: argparse.ArgumentParser) -> None:
     serve.add_argument("--max-concurrent-operations", type=int, default=4)
 
 
-def _hide_suppressed_subcommands(commands: Any) -> None:
-    """Keep compatibility commands parseable without cluttering top-level help."""
+def _hide_internal_subcommands(commands: Any) -> None:
+    """Hide implementation-only commands from top-level help."""
 
     commands._choices_actions = [
         action for action in commands._choices_actions if action.help != argparse.SUPPRESS
@@ -258,7 +255,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     commands = parser.add_subparsers(dest="command", metavar="COMMAND")
 
-    run = commands.add_parser("run", help=argparse.SUPPRESS)
+    run = commands.add_parser(_TASK_COMMAND, help=argparse.SUPPRESS)
     _add_run_arguments(run, allow_session=True)
 
     resume = commands.add_parser("resume", help="Continue the latest task in this workspace.")
@@ -297,13 +294,6 @@ def build_parser() -> argparse.ArgumentParser:
     model_use.add_argument("--data-dir", type=Path, help=argparse.SUPPRESS)
     model_use.add_argument("--json", action="store_true", help="Print JSON output.")
 
-    setup = commands.add_parser("setup", help=argparse.SUPPRESS)
-    setup.add_argument("--provider", choices=("cloud", "deepseek"))
-    setup.add_argument("--model")
-    setup.add_argument("--username")
-    setup.add_argument("-C", "--workspace", type=Path)
-    setup.add_argument("--config", type=Path, help=argparse.SUPPRESS)
-
     doctor = commands.add_parser("doctor", help="Check configuration and show suggested fixes.")
     doctor.add_argument("--config", type=Path, help=argparse.SUPPRESS)
     doctor.add_argument("--data-dir", type=Path, help=argparse.SUPPRESS)
@@ -311,17 +301,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     completion = commands.add_parser("completion", help=argparse.SUPPRESS)
     completion.add_argument("shell", choices=("bash", "zsh", "fish"))
-
-    session = commands.add_parser("session", help=argparse.SUPPRESS)
-    session_commands = session.add_subparsers(dest="session_command", required=True)
-    session_list = session_commands.add_parser("list", help="List saved sessions.")
-    session_list.add_argument("--config", type=Path)
-    session_list.add_argument("--data-dir", type=Path)
-    session_list.add_argument("--workspace", type=Path)
-    session_show = session_commands.add_parser("show", help="Show one saved session.")
-    session_show.add_argument("session_id")
-    session_show.add_argument("--config", type=Path)
-    session_show.add_argument("--data-dir", type=Path)
 
     config = commands.add_parser("config", help="Manage persistent configuration.")
     config_commands = config.add_subparsers(dest="config_command", required=True)
@@ -352,26 +331,6 @@ def build_parser() -> argparse.ArgumentParser:
     system_skill.add_argument("skill_action")
     system_skill.add_argument("skill_arguments", nargs=argparse.REMAINDER)
 
-    cloud = commands.add_parser("cloud", help=argparse.SUPPRESS)
-    cloud_commands = cloud.add_subparsers(dest="cloud_command", required=True)
-    cloud_login = cloud_commands.add_parser("login", help="Sign in to Aeloon Cloud.")
-    cloud_login.add_argument("username", nargs="?", help="Account username or email.")
-    for command_name in ("login", "status", "logout"):
-        command = (
-            cloud_login
-            if command_name == "login"
-            else cloud_commands.add_parser(
-                command_name,
-                help={
-                    "status": "Show the current Aeloon Cloud account.",
-                    "logout": "Sign out of Aeloon Cloud.",
-                }[command_name],
-            )
-        )
-        command.add_argument("--config", type=Path)
-        command.add_argument("--data-dir", type=Path)
-        command.add_argument("--output", choices=("text", "json"), default="text")
-
     provider = commands.add_parser("provider", help="Manage inference Providers.")
     provider_commands = provider.add_subparsers(dest="provider_command", required=True)
     provider_add = provider_commands.add_parser("add", help="Add an inference Provider.")
@@ -391,7 +350,7 @@ def build_parser() -> argparse.ArgumentParser:
                 }[command_name],
             )
         _add_provider_runtime_arguments(command)
-    _hide_suppressed_subcommands(commands)
+    _hide_internal_subcommands(commands)
     # Set this after child parsers are created so their own usage remains concise.
     parser.usage = "aeloon-core [TASK...] | aeloon-core COMMAND ..."
     return parser
@@ -1118,96 +1077,6 @@ async def doctor_command(args: argparse.Namespace) -> int:
     return 1 if any(item["status"] == "error" for item in checks) else 0
 
 
-async def setup_command(args: argparse.Namespace) -> int:
-    path = resolve_config_path(args.config)
-    config = load_config(path) if path.is_file() else Config().normalized()
-    if args.workspace is not None:
-        config = config.model_copy(update={"workspace": args.workspace}).normalized()
-    provider = args.provider
-    if provider is None:
-        if _stdin_is_interactive():
-            print("Choose a model provider:")
-            print("  1. Aeloon Cloud")
-            print("  2. DeepSeek API")
-            choice = input("Provider [1]: ").strip() or "1"
-            provider = "cloud" if choice == "1" else "deepseek" if choice == "2" else ""
-        if provider not in {"cloud", "deepseek"}:
-            raise ValueError("Choose `--provider cloud` or `--provider deepseek`")
-
-    if provider == "deepseek":
-        deepseek = config.providers["deepseek"]
-        assert isinstance(deepseek, DeepSeekProviderConfig)
-        api_key = deepseek.api_key
-        if not api_key:
-            try:
-                api_key = getpass.getpass("DeepSeek API key: ")
-            except EOFError:
-                raise ValueError("DeepSeek API key must be entered from a terminal") from None
-        if not api_key:
-            raise ValueError("DeepSeek API key is required")
-        model_id = args.model or (
-            config.agent.model
-            if config.agent.model.startswith("deepseek/")
-            else "deepseek/deepseek-v4-flash"
-        )
-        if model_id in {"deepseek-v4-flash", "deepseek-v4-pro"}:
-            model_id = f"deepseek/{model_id}"
-        if model_id not in {
-            "deepseek/deepseek-v4-flash",
-            "deepseek/deepseek-v4-pro",
-        }:
-            raise ValueError("DeepSeek setup model must be deepseek-v4-flash or deepseek-v4-pro")
-        config = config.model_copy(
-            update={
-                "providers": {
-                    **config.providers,
-                    "deepseek": deepseek.model_copy(update={"api_key": api_key}),
-                },
-                "agent": config.agent.model_copy(update={"model": model_id}),
-            }
-        ).normalized()
-        save_config(config, path)
-        print(f"Configured {model_id} in {path}.")
-        print('Try: aeloon-core "inspect this repository"')
-        return 0
-
-    # Persist the workspace before the login flow reads the configuration, then use
-    # the same account path as `aeloon-core login` so credentials remain in the vault.
-    save_config(config, path)
-    login_args = argparse.Namespace(
-        config=path,
-        data_dir=None,
-        output="text",
-        username=args.username,
-        cloud_command="login",
-    )
-    await cloud_command(login_args)
-    configured = load_config(path)
-    runtime = create_runtime_service(config_path=path, data_dir=configured.data_dir)
-    try:
-        catalog = await runtime.catalog_get({})
-        cloud_models = [
-            item
-            for item in catalog.get("models") or []
-            if isinstance(item, dict) and item.get("provider_id") == "aeloon-cloud"
-        ]
-        selected = args.model or (str(cloud_models[0]["id"]) if cloud_models else "")
-        if not selected or selected not in {str(item.get("id")) for item in cloud_models}:
-            raise ValueError("No matching Aeloon Cloud model is available for this account")
-        settings = await runtime.settings_get({})
-        await runtime.settings_update(
-            {
-                "revision": settings["revision"],
-                "patch": {"default_model_id": selected},
-            }
-        )
-    finally:
-        await runtime.close()
-    print(f"Selected {selected}.")
-    print('Try: aeloon-core "inspect this repository"')
-    return 0
-
-
 def _print_table(headers: tuple[str, ...], rows: list[tuple[str, ...]]) -> None:
     if _is_interactive_terminal():
         table = Table(show_header=True, header_style="bold", box=None)
@@ -1223,7 +1092,7 @@ def _print_table(headers: tuple[str, ...], rows: list[tuple[str, ...]]) -> None:
 
 
 def completion_command(args: argparse.Namespace) -> int:
-    commands = "resume history login logout whoami models setup doctor config provider system"
+    commands = "resume history login logout whoami models doctor config provider system"
     scripts = {
         "bash": (
             "_aeloon_core_complete() {\n"
@@ -1240,48 +1109,6 @@ def completion_command(args: argparse.Namespace) -> int:
         ),
     }
     print(scripts[args.shell])
-    return 0
-
-
-async def session_command(args: argparse.Namespace) -> int:
-    config = load_config(args.config)
-    data_dir = args.data_dir or config.data_dir
-    repository = JsonlSessionRepository(data_dir)
-    if args.session_command == "list":
-        metadata = await repository.list(cwd=args.workspace)
-        print(
-            _json(
-                [
-                    {
-                        "id": item.id,
-                        "created_at": item.created_at,
-                        "cwd": item.cwd,
-                        "path": str(item.path),
-                        "parent_session_path": item.parent_session_path,
-                        "metadata": item.metadata,
-                    }
-                    for item in metadata
-                ]
-            )
-        )
-        return 0
-    session = await repository.open(args.session_id)
-    context = await session.build_context()
-    print(
-        _json(
-            {
-                "id": session.id,
-                "created_at": session.metadata.created_at,
-                "cwd": session.metadata.cwd,
-                "path": str(session.path),
-                "leaf_id": await session.get_leaf_id(),
-                "name": await session.get_name(),
-                "entries": await session.get_entries(),
-                "context": [message_to_dict(message) for message in context.messages],
-                "stats": await session.stats(),
-            }
-        )
-    )
     return 0
 
 
@@ -1539,7 +1366,7 @@ async def async_main(argv: list[str] | None = None) -> int:
     if args.command is None:
         parser.print_help()
         return 0
-    if args.command == "run":
+    if args.command == _TASK_COMMAND:
         return await run_command(args)
     if args.command == "resume":
         return await resume_command(args)
@@ -1550,14 +1377,10 @@ async def async_main(argv: list[str] | None = None) -> int:
         return await cloud_command(args)
     if args.command == "models":
         return await models_command(args)
-    if args.command == "setup":
-        return await setup_command(args)
     if args.command == "doctor":
         return await doctor_command(args)
     if args.command == "completion":
         return completion_command(args)
-    if args.command == "session":
-        return await session_command(args)
     if args.command == "rpc":
         return await rpc_command(args)
     if args.command == "system":
@@ -1566,23 +1389,21 @@ async def async_main(argv: list[str] | None = None) -> int:
             args.skill_action,
             list(args.skill_arguments),
         )
-    if args.command == "cloud":
-        return await cloud_command(args)
     if args.command == "provider":
         return await provider_command(args)
     return config_command(args)
 
 
 def _normalize_argv(argv: list[str]) -> list[str]:
-    """Make the task itself the default command while retaining legacy verbs."""
+    """Route bare arguments to the task command."""
 
     if not argv:
-        return [] if _stdin_is_interactive() else ["run", "--stdin"]
+        return [] if _stdin_is_interactive() else [_TASK_COMMAND, "--stdin"]
     if argv[0] == "--":
-        return ["run", *argv[1:]]
+        return [_TASK_COMMAND, *argv[1:]]
     if argv[0] in {"-h", "--help", "--version"} or argv[0] in _KNOWN_COMMANDS:
         return argv
-    return ["run", *argv]
+    return [_TASK_COMMAND, *argv]
 
 
 def _json_errors_for(argv: list[str]) -> bool:
@@ -1591,7 +1412,7 @@ def _json_errors_for(argv: list[str]) -> bool:
     for index, value in enumerate(argv[:-1]):
         if value == "--output" and argv[index + 1] in {"json", "stream-json"}:
             return True
-    return bool(argv and argv[0] in {"run", "session", "config", "rpc", "cloud", "provider"})
+    return bool(argv and argv[0] in {"config", "rpc", "provider"})
 
 
 def _print_cli_error(code: str, message: str, *, as_json: bool) -> None:

@@ -85,7 +85,6 @@ class SessionSnapshot:
 @dataclass(frozen=True, slots=True)
 class OperationSnapshot:
     operation_id: str
-    turn_id: str
     queue_position: int
     skill_id: str | None = None
     attachment_ids: tuple[str, ...] = ()
@@ -93,7 +92,6 @@ class OperationSnapshot:
     def to_dict(self) -> dict[str, Any]:
         value = {
             "operation_id": self.operation_id,
-            "turn_id": self.turn_id,
             "queue_position": self.queue_position,
         }
         if self.skill_id is not None:

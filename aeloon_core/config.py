@@ -13,10 +13,6 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
-class ConfigMigrationError(ValueError):
-    """Raised when a pre-0.4 Provider configuration is detected."""
-
-
 class ProviderModelConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -32,15 +28,6 @@ class ProviderModelConfig(BaseModel):
         ge=1,
     )
     cost: dict[str, float] = Field(default_factory=dict)
-
-    @model_validator(mode="before")
-    @classmethod
-    def discard_legacy_max_tokens(cls, value: Any) -> Any:
-        if isinstance(value, dict) and "max_tokens" in value:
-            value = dict(value)
-            value.pop("max_tokens")
-        return value
-
 
 class DeepSeekProviderConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -64,7 +51,7 @@ class CustomProviderConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     driver: Literal["custom"] = "custom"
-    backend: Literal["openai", "llamacpp", "ollama", "vllm"] = "openai"
+    backend: Literal["openai", "llamacpp", "ollama", "vllm"]
     name: str
     enabled: bool = True
     endpoint: str
@@ -99,7 +86,6 @@ ProviderConfig = Annotated[
 ]
 
 _PROVIDER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-_LEGACY_PROVIDER_KEYS = {"deepseek", "local_providers", "cloud"}
 _SENSITIVE_HEADERS = {
     "api-key",
     "authorization",
@@ -115,8 +101,6 @@ def _normalize_api_key(value: Any) -> Any:
     if not isinstance(value, str):
         return value
     normalized = value.strip()
-    if normalized == "no-key":
-        raise ValueError("The legacy 'no-key' API-key sentinel is not supported")
     return normalized or None
 
 
@@ -186,8 +170,7 @@ class ResourceConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     roots: list[Path] = Field(default_factory=list)
-    # None preserves the historical behaviour: every discovered skill is enabled.
-    # Once the UI saves a selection, the explicit list becomes the source of truth.
+    # None selects every discovered skill; an explicit list is subtractive.
     enabled_skills: list[str] | None = None
     no_skills: bool = False
     no_prompt_templates: bool = False
@@ -212,54 +195,6 @@ class Config(BaseModel):
     agent: AgentConfig = Field(default_factory=AgentConfig)
     resources: ResourceConfig = Field(default_factory=ResourceConfig)
     tools: ToolConfig = Field(default_factory=ToolConfig)
-
-    @model_validator(mode="before")
-    @classmethod
-    def reject_legacy_provider_config(cls, value: Any) -> Any:
-        if isinstance(value, dict):
-            removed = sorted(_LEGACY_PROVIDER_KEYS.intersection(value))
-            if removed:
-                names = ", ".join(removed)
-                raise ConfigMigrationError(
-                    f"Legacy Provider configuration detected: {names}. Move these values into "
-                    "Config.providers using the 0.4 format documented in MIGRATION.md."
-                )
-            providers = value.get("providers")
-            if isinstance(providers, dict):
-                normalized = dict(value)
-                normalized_providers: dict[str, Any] = {}
-                changed = False
-                for provider_id, provider in providers.items():
-                    if not isinstance(provider, dict):
-                        normalized_providers[provider_id] = provider
-                        continue
-                    migrated = dict(provider)
-                    legacy_driver = migrated.get("driver")
-                    if legacy_driver in {"ollama", "openai-compatible"}:
-                        migrated["driver"] = "custom"
-                        migrated.setdefault(
-                            "backend", "ollama" if legacy_driver == "ollama" else "openai"
-                        )
-                        changed = True
-                    elif legacy_driver == "custom" and "backend" not in migrated:
-                        endpoint = str(migrated.get("endpoint") or "")
-                        migrated["backend"] = (
-                            "ollama"
-                            if provider_id.lower() == "ollama" or ":11434" in endpoint
-                            else "openai"
-                        )
-                        changed = True
-                    else:
-                        normalized_providers[provider_id] = provider
-                        continue
-                    if legacy_driver == "ollama":
-                        migrated.setdefault("name", "Ollama")
-                        migrated.setdefault("endpoint", "http://127.0.0.1:11434/v1")
-                    normalized_providers[provider_id] = migrated
-                if changed:
-                    normalized["providers"] = normalized_providers
-                    return normalized
-        return value
 
     @model_validator(mode="after")
     def validate_reserved_providers(self) -> Config:
@@ -354,14 +289,6 @@ def load_config(
     resolved = resolve_config_path(path)
     if resolved.is_file():
         raw = json.loads(resolved.read_text(encoding="utf-8"))
-        if isinstance(raw, dict):
-            removed = sorted(_LEGACY_PROVIDER_KEYS.intersection(raw))
-            if removed:
-                raise ConfigMigrationError(
-                    "Legacy Provider configuration detected: "
-                    f"{', '.join(removed)}. Move these values into Config.providers using "
-                    "the 0.4 format documented in MIGRATION.md."
-                )
         config = Config.model_validate(raw)
     else:
         config = Config()
@@ -409,7 +336,6 @@ __all__ = [
     "CompactionConfig",
     "Config",
     "CloudProviderConfig",
-    "ConfigMigrationError",
     "DeepSeekProviderConfig",
     "CustomProviderConfig",
     "ProviderConfig",
