@@ -39,6 +39,60 @@ async def test_read_text_truncation_continuation_and_absolute_paths(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_structured_file_tools_reject_workspace_escape(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    secret = outside / "secret.txt"
+    secret.write_text("secret", encoding="utf-8")
+    tools = create_all_tools(workspace)
+
+    for value in ("../outside/secret.txt", str(secret)):
+        with pytest.raises(PermissionError, match="outside the workspace"):
+            await tools["read"].execute("read", {"path": value}, None)
+    with pytest.raises(PermissionError, match="outside the workspace"):
+        await tools["write"].execute(
+            "write", {"path": "../outside/new.txt", "content": "blocked"}, None
+        )
+    with pytest.raises(PermissionError, match="outside the workspace"):
+        await tools["edit"].execute(
+            "edit",
+            {"path": str(secret), "edits": [{"oldText": "secret", "newText": "stolen"}]},
+            None,
+        )
+    assert secret.read_text(encoding="utf-8") == "secret"
+    assert not (outside / "new.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_structured_file_tools_reject_symlink_escape(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    (outside / "secret.txt").write_text("secret", encoding="utf-8")
+    (workspace / "escape").symlink_to(outside, target_is_directory=True)
+    tools = create_all_tools(workspace)
+
+    with pytest.raises(PermissionError, match="outside the workspace"):
+        await tools["read"].execute("read", {"path": "escape/secret.txt"}, None)
+    with pytest.raises(PermissionError, match="outside the workspace"):
+        await tools["write"].execute(
+            "write", {"path": "escape/new.txt", "content": "blocked"}, None
+        )
+    with pytest.raises(PermissionError, match="outside the workspace"):
+        await tools["ls"].execute("ls", {"path": "escape"}, None)
+    with pytest.raises(PermissionError, match="outside the workspace"):
+        await tools["grep"].execute(
+            "grep", {"pattern": "secret", "path": "escape"}, None
+        )
+    with pytest.raises(PermissionError, match="outside the workspace"):
+        await tools["find"].execute("find", {"pattern": "*.txt", "path": "escape"}, None)
+    assert not (outside / "new.txt").exists()
+
+
+@pytest.mark.asyncio
 async def test_read_returns_image_attachment_and_resizes_large_images(tmp_path: Path) -> None:
     path = tmp_path / "image.png"
     Image.new("RGB", (2_100, 20), "red").save(path)

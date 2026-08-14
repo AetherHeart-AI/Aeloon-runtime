@@ -82,7 +82,8 @@ class GrepTool(RipgrepTool):
             values.extend(["--glob", str(arguments["glob"])])
         if arguments.get("context") is not None:
             values.extend(["--context", str(int(arguments["context"]))])
-        values.extend([str(arguments["pattern"]), str(arguments.get("path") or ".")])
+        path = self.context.relative(str(arguments.get("path") or "."))
+        values.extend([str(arguments["pattern"]), path])
         output, _ = await self._run_rg(values)
         limit = max(1, int(arguments.get("limit") or 100))
         lines = output.splitlines()
@@ -120,7 +121,7 @@ class FindTool(RipgrepTool):
     async def execute(
         self, _call_id: str, arguments: dict[str, Any], _on_update: ToolUpdateCallback | None
     ) -> ToolResult:
-        base = str(arguments.get("path") or ".")
+        base = self.context.relative(str(arguments.get("path") or "."))
         output, _ = await self._run_rg(["--files", "--glob", str(arguments["pattern"]), base])
         limit = max(1, int(arguments.get("limit") or 1_000))
         lines = output.splitlines()

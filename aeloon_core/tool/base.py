@@ -29,7 +29,17 @@ class ToolContext:
 
     def resolve(self, value: str) -> Path:
         path = Path(value).expanduser()
-        return (path if path.is_absolute() else self.cwd / path).resolve(strict=False)
+        resolved = (path if path.is_absolute() else self.cwd / path).resolve(strict=False)
+        if not resolved.is_relative_to(self.cwd):
+            raise PermissionError(f"Path is outside the workspace: {value}")
+        return resolved
+
+    def relative(self, value: str) -> str:
+        """Validate a path and return its canonical workspace-relative spelling."""
+
+        resolved = self.resolve(value)
+        relative = resolved.relative_to(self.cwd)
+        return str(relative) if relative.parts else "."
 
     def mutation_lock(self, path: Path) -> asyncio.Lock:
         key = os.path.normcase(str(path))

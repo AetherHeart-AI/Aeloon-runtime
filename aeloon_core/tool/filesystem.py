@@ -49,7 +49,7 @@ class ReadTool(WorkspaceTool):
         {
             "path": {
                 "type": "string",
-                "description": "Path to the file to read (relative or absolute)",
+                "description": "File inside the workspace (relative or absolute)",
             },
             "offset": {
                 "type": "number",
@@ -140,7 +140,7 @@ class WriteTool(WorkspaceTool):
         {
             "path": {
                 "type": "string",
-                "description": "Path to the file to write (relative or absolute)",
+                "description": "File inside the workspace to write (relative or absolute)",
             },
             "content": {"type": "string", "description": "Content to write to the file"},
         },
@@ -188,7 +188,7 @@ class EditTool(WorkspaceTool):
         {
             "path": {
                 "type": "string",
-                "description": "Path to the file to edit (relative or absolute)",
+                "description": "File inside the workspace to edit (relative or absolute)",
             },
             "edits": {
                 "type": "array",
