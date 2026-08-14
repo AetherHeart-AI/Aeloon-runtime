@@ -71,7 +71,7 @@ async def test_rpc_v2_rejects_incompatible_handshakes(tmp_path: Path) -> None:
             {"protocol": "aeloon-rpc-v2", "attachment_roots": [str(tmp_path)]},
         )
         assert handshake["protocol"] == "aeloon-rpc-v2"
-        assert handshake["core_version"] == "0.0.13"
+        assert handshake["core_version"] == "0.0.15"
         assert len(handshake["core_commit"]) == 40
         assert handshake["limits"]["request_bytes"] == 12 * 1024 * 1024
         assert "protocol_version" not in handshake
