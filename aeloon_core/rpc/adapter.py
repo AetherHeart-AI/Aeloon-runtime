@@ -14,6 +14,8 @@ from typing import Any
 
 from aeloon_core.rpc.protocol import (
     EVENTS,
+    MAX_FRAME_BYTES,
+    METHOD_REGISTRY,
     METHODS,
     PROTOCOL_NAME,
     RpcError,
@@ -75,39 +77,15 @@ class AeloonRpcAdapter:
         attachment_roots: tuple[Path, ...] = (),
     ) -> Any:
         value = dict(params or {})
-        routes: dict[str, Callable[..., Awaitable[Any]]] = {
-            "system.handshake": self.handshake,
-            "system.health": self.health,
-            "system.shutdown": self.shutdown,
-            "events.subscribe": self.events_subscribe,
-            "session.create": self._session_create,
-            "session.list": self._session_list,
-            "session.get": self._session_get,
-            "session.delete": self.runtime.session_delete,
-            "session.rename": self.runtime.session_rename,
-            "session.configure": self.runtime.session_configure,
-            "session.tree": self.runtime.session_tree,
-            "session.navigate": self.runtime.session_navigate,
-            "session.compact": self.runtime.session_compact,
-            "session.next_turn": self.runtime.session_next_turn,
-            "turn.start": self._turn_start,
-            "turn.cancel": self._turn_cancel,
-            "turn.steer": self._turn_steer,
-            "turn.follow_up": self._turn_follow_up,
-            "catalog.get": self.runtime.catalog_get,
-            "provider.list": self.runtime.provider_list,
-            "provider.refresh": self.runtime.provider_refresh,
-            "provider.add": self.runtime.provider_add,
-            "provider.remove": self.runtime.provider_remove,
-            "settings.get": self.runtime.settings_get,
-            "settings.update": self.runtime.settings_update,
-            "cloud.account.status": self.runtime.account_status,
-            "cloud.account.login": self.runtime.account_login,
-            "cloud.account.logout": self.runtime.account_logout,
-        }
-        handler = routes.get(method)
-        if handler is None:
+        spec = METHOD_REGISTRY.get(method)
+        if spec is None:
             raise RpcError("method_not_found", f"Unknown RPC method: {method}")
+        owner: Any = self
+        handler_name = spec.handler
+        if handler_name.startswith("runtime."):
+            owner = self.runtime
+            handler_name = handler_name.removeprefix("runtime.")
+        handler: Callable[..., Awaitable[Any]] = getattr(owner, handler_name)
         try:
             if method == "turn.start":
                 return await handler(
@@ -167,7 +145,7 @@ class AeloonRpcAdapter:
                 "attachments": ATTACHMENT_LIMIT,
                 "image_bytes": IMAGE_LIMIT,
                 "file_bytes": FILE_LIMIT,
-                "request_bytes": 1024 * 1024,
+                "request_bytes": MAX_FRAME_BYTES,
                 "retained_events": EVENT_LIMIT,
             },
         }

@@ -108,7 +108,7 @@ creation, validation, and visual rendering of local PDF, DOCX, PPTX, and XLSX fi
 startup after installation, the missing built-in skill is copied from package resources into
 `<data_dir>/skills` (normally
 `~/.aeloon-core/skills`). Existing same-named files and directories are preserved, so local
-customizations and retired user-owned skill copies are never overwritten or removed.
+customizations are never overwritten or removed.
 
 The main package contains only lightweight Python document libraries. Text-bearing files are read
 directly; scanned PDFs are rendered into page images for a vision-capable model instead of
@@ -120,13 +120,13 @@ users.
 Skill discovery is progressive: Runtime reads only each `SKILL.md` frontmatter for the catalog and
 system-prompt index. The full instructions are read only when the model chooses an enabled skill or
 when a prompt starts with an explicit command such as `/review inspect this patch`. Workbench clients
-select enabled skills through `settings.update.resources.enabled_skill_ids`; they continue to send
+select enabled skills through `settings.update.resources.enabled_skill_ids`; they send
 the user's text as a normal prompt, and runtime resolves the slash command.
 
 `catalog.get.skills` includes each skill's command, source, location, selection and invocation
 status, plus `content_loading: "on_demand"`. `settings.get.resources.enabled_skill_ids` is the
-persisted selection. On existing configurations, all discovered skills remain selected until a
-client saves an explicit list.
+effective selection. A null persisted selection enables every discovered skill; an explicit list
+is subtractive.
 
 Runtime also injects the intrinsic `present_files` delivery tool. Skills use it after verifying
 final office, PDF, image, Markdown, or HTML files. Runtime validates the paths, persists their
@@ -170,8 +170,8 @@ session = await runtime.create_session(workspace="/path/to/repository")
 ```
 
 Runtime owns sessions, context construction, persistence, provider selection, and operation
-scheduling. The Electron workbench accesses the runtime through the private, incompatible
-`aeloon-rpc-v1` Unix-socket adapter.
+scheduling. The Electron workbench accesses the runtime through the private `aeloon-rpc-v2`
+Unix-socket adapter.
 
 ## Security
 
@@ -186,12 +186,17 @@ the model is allowed to access the filesystem, credentials, and processes.
 uv sync
 uv run pytest -q
 uv run ruff check .
+uv run python -m aeloon_core.rpc.manifest --check
 uv build
 git diff --check
 ```
 
 The default test suite is offline and uses local fixtures. Optional live tests require credentials
 in an explicit test config and are not part of default CI.
+
+The checked-in `aeloon-rpc-v2.manifest.json` is generated from Core's typed RPC registry. Run
+`uv run python -m aeloon_core.rpc.manifest --output aeloon_core/rpc/aeloon-rpc-v2.manifest.json`
+after changing a public method, result, or event payload; CI rejects stale output.
 
 ### Desktop distribution
 
@@ -216,6 +221,5 @@ wheel-smoke/bin/python -m aeloon_core --version
 ## Documentation
 
 - [Architecture](docs/architecture.md)
-- [Migration guide](MIGRATION.md)
 - [Changelog](CHANGELOG.md)
 - [Benchmark guide](benchmarks/README.md)

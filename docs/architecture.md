@@ -5,7 +5,7 @@ not dependencies of this repository.
 
 ```mermaid
 flowchart LR
-    Workbench["Bun Workbench"] --> RPC["aeloon-rpc-v1 adapter"]
+    Workbench["Bun Workbench"] --> RPC["aeloon-rpc-v2 adapter"]
     RPC --> Runtime["Core runtime"]
     Runtime --> Agent["stateless agent core"]
     Runtime --> Tools["runtime tool set"]
@@ -65,10 +65,14 @@ DeepSeek, Aeloon Cloud, and the testing-only `ScriptedProvider`.
 
 ## Local RPC and Cloud
 
-`aeloon-rpc-v1` is a small private transport adapter over Runtime. It uses length-prefixed JSON on
+`aeloon-rpc-v2` is a small private transport adapter over Runtime. It uses length-prefixed JSON on
 a restricted Unix socket and owns dispatch, cancellation, frame limits, timeouts, event delivery,
 and JSON DTOs. It has no legacy negotiation, token, certificate, capability grant, or background
 discovery. The adapter does not import UI or Electron code.
+
+Its typed method/event registry is the protocol source of truth. A deterministic build-only
+exporter produces the checked-in JSON Schema manifest consumed by Desktop; the production adapter
+does not import the exporter or run schema validation on response and streaming-event hot paths.
 
 Cloud owns login, refresh tokens, the vault, and raw model-catalog access. It does not create Core
 models or inference implementations. Bootstrap adapts `CloudAccountService` to `AccountGateway`
