@@ -1,17 +1,24 @@
 # Changelog
 
-## Unreleased
-
-- Added `web_search` and `web_fetch`. Search credentials are stored through the
-  secret settings channel and are redacted from public configuration and errors.
-- Compatibility note: after saving Web tool settings, downgrading to an older Core
-  that does not recognize `tools.web` will fail to load the shared config because
-  configuration schemas deliberately reject unknown fields.
-
 Significant changes to Aeloon Core are recorded here. New work is added under `Unreleased`; when a
 release is cut, those entries should move to a versioned section with an ISO date.
 
 ## Unreleased
+
+## 0.0.16 - 2026-08-15
+
+### Added
+
+- Added `web_search` and `web_fetch`, including configurable search providers, safe URL fetching,
+  bounded caching, and extracted readable page content.
+- Added secret Web tool settings over RPC. Credentials are redacted from public configuration and
+  errors while remaining available to the runtime.
+
+### Compatibility
+
+- After Web tool settings are saved, downgrading to an older Core that does not recognize
+  `tools.web` will fail to load the shared config because configuration schemas deliberately reject
+  unknown fields.
 
 ## 0.0.15 - 2026-08-14
 
