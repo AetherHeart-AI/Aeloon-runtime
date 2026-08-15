@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "httpx>=0.28",
+  "readability-lxml>=0.8.4,<1.0.0",
   "jsonschema>=4.26,<5",
   "openpyxl>=3.1,<4",
   "pillow>=11.0",

@@ -5,6 +5,7 @@ from aeloon_core.tool.builtin import BuiltinToolSet
 from aeloon_core.tool.filesystem import EditTool, ReadTool, WriteTool
 from aeloon_core.tool.search import FindTool, GrepTool, ListTool
 from aeloon_core.tool.shell import BashTool
+from aeloon_core.tool.web import WebFetchTool, WebSearchTool
 
 __all__ = [
     "BaseTool",
@@ -17,4 +18,6 @@ __all__ = [
     "ReadTool",
     "ToolContext",
     "WriteTool",
+    "WebFetchTool",
+    "WebSearchTool",
 ]

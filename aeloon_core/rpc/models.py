@@ -473,6 +473,19 @@ class ResourceSettings(TypedDict):
 class ToolSettings(TypedDict):
     shell_path: str | None
     auto_resize_images: bool
+    web: dict[str, Any]
+
+
+class ToolsSearchTestParams(TypedDict):
+    workspace: NotRequired[str]
+
+
+class ToolsSearchTestResult(TypedDict):
+    ok: bool
+    provider: str
+    result_count: int
+    latency_ms: int
+    message: NotRequired[str]
 
 
 class SettingsResult(TypedDict):

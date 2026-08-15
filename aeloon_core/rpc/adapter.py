@@ -292,6 +292,8 @@ class AeloonRpcAdapter:
             for name, header_value in getattr(provider, "headers", {}).items():
                 if name.lower() in {"authorization", "api-key", "x-api-key"}:
                     secrets.append(header_value)
+        if self.runtime.config.tools.web.search.api_key:
+            secrets.append(self.runtime.config.tools.web.search.api_key)
         for secret in secrets:
             if secret:
                 value = value.replace(secret, "***")

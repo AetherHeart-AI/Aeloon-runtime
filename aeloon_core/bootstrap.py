@@ -40,6 +40,9 @@ class CloudAccountGateway:
     async def access_token(self, *, force: bool = False) -> str:
         return await self._service.access_token(force=force)
 
+    async def search(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._service.search(payload)
+
     async def login(self, *, username: str, password: str) -> dict[str, Any]:
         return await self._service.login(username=username, password=password)
 

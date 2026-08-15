@@ -19,6 +19,7 @@ class AccountGateway(Protocol):
     async def models(self, *, force: bool = False) -> list[dict[str, Any]]: ...
 
     async def access_token(self, *, force: bool = False) -> str: ...
+    async def search(self, payload: dict[str, Any]) -> dict[str, Any]: ...
 
     async def login(self, *, username: str, password: str) -> dict[str, Any]: ...
 
@@ -48,6 +49,10 @@ class NullAccountGateway:
 
     async def access_token(self, *, force: bool = False) -> str:
         del force
+        raise RuntimeError("No account provider is configured")
+
+    async def search(self, payload: dict[str, Any]) -> dict[str, Any]:
+        del payload
         raise RuntimeError("No account provider is configured")
 
     def logout(self) -> dict[str, Any]:

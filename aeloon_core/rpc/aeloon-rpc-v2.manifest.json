@@ -2466,13 +2466,63 @@
             }
           ],
           "title": "Shell Path"
+        },
+        "web": {
+          "additionalProperties": true,
+          "title": "Web",
+          "type": "object"
         }
       },
       "required": [
         "shell_path",
-        "auto_resize_images"
+        "auto_resize_images",
+        "web"
       ],
       "title": "ToolSettings",
+      "type": "object"
+    },
+    "ToolsSearchTestParams": {
+      "additionalProperties": false,
+      "properties": {
+        "workspace": {
+          "title": "Workspace",
+          "type": "string"
+        }
+      },
+      "title": "ToolsSearchTestParams",
+      "type": "object"
+    },
+    "ToolsSearchTestResult": {
+      "additionalProperties": false,
+      "properties": {
+        "latency_ms": {
+          "title": "Latency Ms",
+          "type": "integer"
+        },
+        "message": {
+          "title": "Message",
+          "type": "string"
+        },
+        "ok": {
+          "title": "Ok",
+          "type": "boolean"
+        },
+        "provider": {
+          "title": "Provider",
+          "type": "string"
+        },
+        "result_count": {
+          "title": "Result Count",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "ok",
+        "provider",
+        "result_count",
+        "latency_ms"
+      ],
+      "title": "ToolsSearchTestResult",
       "type": "object"
     },
     "TurnAcceptedResult": {
@@ -2943,6 +2993,14 @@
       },
       "result": {
         "$ref": "#/$defs/ShutdownResult"
+      }
+    },
+    "tools.search.test": {
+      "params": {
+        "$ref": "#/$defs/ToolsSearchTestParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ToolsSearchTestResult"
       }
     },
     "turn.cancel": {

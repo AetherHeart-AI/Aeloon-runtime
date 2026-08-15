@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Added `web_search` and `web_fetch`. Search credentials are stored through the
+  secret settings channel and are redacted from public configuration and errors.
+- Compatibility note: after saving Web tool settings, downgrading to an older Core
+  that does not recognize `tools.web` will fail to load the shared config because
+  configuration schemas deliberately reject unknown fields.
+
 Significant changes to Aeloon Core are recorded here. New work is added under `Unreleased`; when a
 release is cut, those entries should move to a versioned section with an ISO date.
 
