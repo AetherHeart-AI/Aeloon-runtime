@@ -97,7 +97,6 @@ def test_wheel_packaging_uses_only_lite_python_office_dependencies() -> None:
         "markitdown",
         "markdown-it-py",
         "pdfplumber",
-        "lxml",
         "nodejs-wheel",
         "paddleocr",
         "paddlepaddle",

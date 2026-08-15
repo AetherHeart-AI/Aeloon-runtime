@@ -91,6 +91,29 @@ class CloudClient:
     async def models(self, access_token: str) -> dict[str, Any]:
         return self._payload_data(await self._get("/proxy/v1/models", access_token))
 
+    async def search(self, access_token: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        return self._payload_data(
+            await self._post_authed("/proxy/v1/search", payload, access_token)
+        )
+
+    async def _post_authed(
+        self, path: str, body: Mapping[str, Any], access_token: str
+    ) -> dict[str, Any]:
+        client = await self._http_client()
+        try:
+            response = await client.post(
+                f"{self.base_url}{path}",
+                json=dict(body),
+                headers={
+                    "content-type": "application/json",
+                    "authorization": f"Bearer {access_token}",
+                },
+                timeout=60.0,
+            )
+        except httpx.RequestError as exc:
+            raise CloudError(f"Unable to reach Aeloon Cloud: {exc}") from exc
+        return self._response(response)
+
     async def _get(self, path: str, access_token: str) -> dict[str, Any]:
         client = await self._http_client()
         try:

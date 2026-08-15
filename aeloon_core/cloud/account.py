@@ -115,6 +115,16 @@ class CloudAccountService:
         self._catalog_at = time.monotonic()
         return self._models_from_payload(payload)
 
+    async def search(self, payload: dict[str, Any]) -> dict[str, Any]:
+        token = await self.access_token()
+        try:
+            return await self.client.search(token, payload)
+        except CloudError as exc:
+            if not exc.is_auth_failure:
+                raise
+            token = await self.access_token(force=True)
+            return await self.client.search(token, payload)
+
     def status(self) -> dict[str, Any]:
         state = self._load_state()
         try:

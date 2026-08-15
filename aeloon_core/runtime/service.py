@@ -526,6 +526,11 @@ class RuntimeService:
         finally:
             await manager.close()
         tool_set = self._tool_set(workspace=workspace)
+        tool_descriptions = {
+            PRESENT_FILES_TOOL_NAME: "Runtime-managed final deliverable tool",
+            "web_search": "Search the public web for current information",
+            "web_fetch": "Fetch readable content from a public web page",
+        }
         return {
             "providers": providers,
             "models": [
@@ -545,11 +550,7 @@ class RuntimeService:
                 {
                     "id": name,
                     "name": name,
-                    "description": (
-                        "Runtime-managed final deliverable tool"
-                        if name == PRESENT_FILES_TOOL_NAME
-                        else "Runtime-managed local tool"
-                    ),
+                    "description": tool_descriptions.get(name, "Runtime-managed local tool"),
                 }
                 for name in sorted(tool_set.all_names)
             ],
@@ -602,7 +603,7 @@ class RuntimeService:
                 "load_prompt_templates": not config.resources.no_prompt_templates,
                 "load_context_files": not config.resources.no_context_files,
             },
-            "tools": config.tools.model_dump(mode="json"),
+            "tools": self._public_tool_config(config.tools),
             "providers": {
                 provider_id: self._public_provider_config(provider)
                 for provider_id, provider in config.providers.items()
@@ -631,23 +632,29 @@ class RuntimeService:
             for action in actions:
                 if not isinstance(action, Mapping):
                     raise RuntimeFailure("invalid_argument", "Unsupported secret action")
+                path = str(action.get("path") or "")
                 match = re.fullmatch(
                     r"providers\.([A-Za-z0-9][A-Za-z0-9._-]*)\.api_key",
-                    str(action.get("path") or ""),
+                    path,
                 )
-                if match is None:
+                if path == "tools.web.search.api_key":
+                    target = raw["tools"]["web"]["search"]
+                elif match is not None:
+                    provider_id = match.group(1)
+                    target = raw["providers"].get(provider_id)
+                    if not isinstance(target, dict) or "api_key" not in target:
+                        raise RuntimeFailure(
+                            "invalid_argument", "Provider does not support API keys"
+                        )
+                else:
                     raise RuntimeFailure("invalid_argument", "Unsupported secret action")
-                provider_id = match.group(1)
-                provider = raw["providers"].get(provider_id)
-                if not isinstance(provider, dict) or "api_key" not in provider:
-                    raise RuntimeFailure("invalid_argument", "Provider does not support API keys")
                 if action.get("action") == "set":
                     value = str(action.get("value") or "")
                     if not value:
                         raise RuntimeFailure("invalid_argument", "Secret set requires a value")
-                    provider["api_key"] = value
+                    target["api_key"] = value
                 elif action.get("action") == "clear":
-                    provider["api_key"] = None
+                    target["api_key"] = None
                 else:
                     raise RuntimeFailure("invalid_argument", "Secret action must be set or clear")
             persisted_config = Config.model_validate(raw).normalized()
@@ -707,6 +714,30 @@ class RuntimeService:
 
     async def account_status(self, _params: Mapping[str, Any]) -> dict[str, Any]:
         return self.account.status()
+
+    async def tools_search_test(self, _params: Mapping[str, Any]) -> dict[str, Any]:
+        if not self.config.tools.web.search.enabled:
+            raise RuntimeFailure("invalid_argument", "Web search is disabled")
+        tool = self._tool_set().by_name["web_search"]
+        started = time.monotonic()
+        try:
+            outcome = await tool.search("OpenAI", 1)
+            latency_ms = round((time.monotonic() - started) * 1000)
+            return {
+                "ok": not outcome.error and bool(outcome.results),
+                "provider": outcome.engine,
+                "result_count": len(outcome.results),
+                "latency_ms": latency_ms,
+                **({"message": self._sanitize(outcome.error)} if outcome.error else {}),
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "provider": self.config.tools.web.search.provider,
+                "result_count": 0,
+                "latency_ms": round((time.monotonic() - started) * 1000),
+                "message": self._sanitize(str(exc)),
+            }
 
     async def account_login(self, params: Mapping[str, Any]) -> dict[str, Any]:
         username = self._required_string(params, "username")
@@ -832,9 +863,7 @@ class RuntimeService:
             or not isinstance(requested_max_output_tokens, int)
             or requested_max_output_tokens < 1
         ):
-            raise RuntimeFailure(
-                "invalid_argument", "max_output_tokens must be a positive integer"
-            )
+            raise RuntimeFailure("invalid_argument", "max_output_tokens must be a positive integer")
         provider = CustomProviderConfig(
             backend=backend,  # type: ignore[arg-type]
             name=name,
@@ -865,8 +894,7 @@ class RuntimeService:
         if requested_models:
             allowlist = list(
                 dict.fromkeys(
-                    model.strip().removeprefix(f"{provider_id}/")
-                    for model in requested_models
+                    model.strip().removeprefix(f"{provider_id}/") for model in requested_models
                 )
             )
             available = {split_model_id(model.id)[1]: model for model in discovered}
@@ -893,9 +921,7 @@ class RuntimeService:
             )
             for model in discovered
         ]
-        provider = provider.model_copy(
-            update={"endpoint": resolved_endpoint, "models": models}
-        )
+        provider = provider.model_copy(update={"endpoint": resolved_endpoint, "models": models})
         revision = params.get("revision")
         async with self._settings_lock:
             if revision is not None and revision != self._revision:
@@ -965,12 +991,8 @@ class RuntimeService:
                 config_snapshot = self.coordinator.snapshot(self.config)
                 resolved_attachments = await self.attachment_store.load(session.id)
 
-                async def on_attachment_access(
-                    action: str, attachment: ResolvedAttachment
-                ) -> None:
-                    await self._attachment_log(
-                        f"tool_{action}", session, operation, attachment
-                    )
+                async def on_attachment_access(action: str, attachment: ResolvedAttachment) -> None:
+                    await self._attachment_log(f"tool_{action}", session, operation, attachment)
 
                 agent = await self._new_agent(
                     config_snapshot,
@@ -1067,7 +1089,12 @@ class RuntimeService:
                 safe = self._sanitize(str(exc))
                 await session.append_run_end(run_id=operation.id, status="failed", error=safe)
                 code = exc.code if isinstance(exc, RuntimeFailure) else "internal_error"
-                await self._emit("operation.failed", session, operation, {"kind": "turn", "error": safe, "code": code})
+                await self._emit(
+                    "operation.failed",
+                    session,
+                    operation,
+                    {"kind": "turn", "error": safe, "code": code},
+                )
         finally:
             if operation.agent is not None:
                 await operation.agent.close()
@@ -1124,9 +1151,7 @@ class RuntimeService:
         session: Session,
         *,
         attachments: tuple[ResolvedAttachment, ...] = (),
-        on_attachment_access: Callable[
-            [str, ResolvedAttachment], Awaitable[None] | None
-        ]
+        on_attachment_access: Callable[[str, ResolvedAttachment], Awaitable[None] | None]
         | None = None,
     ) -> SessionAgent:
         effective = config.model_copy(update={"workspace": Path(session.metadata.cwd)}).normalized()
@@ -1166,6 +1191,7 @@ class RuntimeService:
             active_tool_names=(tuple(active_tools) if active_tools is not None else None),
             attachments=attachments,
             on_attachment_access=on_attachment_access,
+            cloud_search=(self.account.search if self.account.status().get("authenticated") else None),
         )
 
     async def _should_auto_rename(self, session: Session, operation: Operation) -> bool:
@@ -1692,9 +1718,7 @@ class RuntimeService:
                         "id": str(raw.get("id") or uuid.uuid4().hex),
                         "type": kind,
                         "display_name": str(
-                            raw.get("display_name")
-                            or raw.get("name")
-                            or "Assistant selection"
+                            raw.get("display_name") or raw.get("name") or "Assistant selection"
                         )[:255],
                         "text": text,
                     }
@@ -1707,8 +1731,7 @@ class RuntimeService:
         resolved = await self.attachment_store.resolve_batch(session_id, file_values, roots)
         resolved_values = iter(resolved)
         result = [
-            item if item is not None else next(resolved_values).runtime_dict()
-            for item in prepared
+            item if item is not None else next(resolved_values).runtime_dict() for item in prepared
         ]
         return result, resolved
 
@@ -1789,7 +1812,9 @@ class RuntimeService:
             if kind == "run_start":
                 if current is not None:
                     current["status"] = (
-                        "interrupted" if current["turn_id"] not in active_statuses else active_statuses[current["turn_id"]]
+                        "interrupted"
+                        if current["turn_id"] not in active_statuses
+                        else active_statuses[current["turn_id"]]
                     )
                     result.append(current)
                 current = {
@@ -2088,11 +2113,24 @@ class RuntimeService:
                 if "endpoint" in provider_patch:
                     self._http_endpoint(str(provider_patch["endpoint"]))
                 raw["providers"][provider_id].update(provider_patch)
-        for key in ("tools",):
-            if key in patch:
-                if not isinstance(patch[key], Mapping):
-                    raise RuntimeFailure("invalid_argument", f"{key} must be an object")
-                raw[key].update(patch[key])
+        if "tools" in patch:
+            tools = patch["tools"]
+            if not isinstance(tools, Mapping):
+                raise RuntimeFailure("invalid_argument", "tools must be an object")
+            for key, value in tools.items():
+                if key != "web":
+                    raw["tools"][key] = value
+                    continue
+                if not isinstance(value, Mapping):
+                    raise RuntimeFailure("invalid_argument", "tools.web must be an object")
+                for section, section_patch in value.items():
+                    if section not in {"search", "fetch"} or not isinstance(section_patch, Mapping):
+                        raise RuntimeFailure("invalid_argument", f"tools.web.{section} is invalid")
+                    if "api_key" in section_patch or "credential_configured" in section_patch:
+                        raise RuntimeFailure(
+                            "invalid_argument", "API keys must be changed through secret_actions"
+                        )
+                    raw["tools"]["web"][section].update(section_patch)
 
     def _clean_block(self, block: Mapping[str, Any]) -> dict[str, Any]:
         return {
@@ -2132,6 +2170,13 @@ class RuntimeService:
             value["credential_configured"] = bool(self.account.status().get("authenticated"))
         return value
 
+    @staticmethod
+    def _public_tool_config(tools: Any) -> dict[str, Any]:
+        value = tools.model_dump(mode="json")
+        search = value["web"]["search"]
+        search["credential_configured"] = bool(search.pop("api_key", None))
+        return value
+
     def _tool_set(
         self,
         *,
@@ -2141,6 +2186,9 @@ class RuntimeService:
             workspace or self.config.workspace,
             shell_path=self.config.tools.shell_path,
             auto_resize_images=self.config.tools.auto_resize_images,
+            web_search=self.config.tools.web.search.model_dump(),
+            web_fetch=self.config.tools.web.fetch.model_dump(),
+            cloud_search=(self.account.search if self.account.status().get("authenticated") else None),
         )
 
     @staticmethod

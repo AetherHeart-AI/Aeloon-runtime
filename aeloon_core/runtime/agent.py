@@ -143,6 +143,7 @@ class SessionAgent:
         active_tool_names: tuple[str, ...] | None = None,
         attachments: tuple[ResolvedAttachment, ...] = (),
         on_attachment_access: AttachmentAccessCallback | None = None,
+        cloud_search: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None,
     ) -> None:
         self.config = config
         self.session = session
@@ -161,6 +162,11 @@ class SessionAgent:
             auto_resize_images=self.config.tools.auto_resize_images,
             attachments=attachments,
             on_attachment_access=on_attachment_access,
+            web_search=self.config.tools.web.search.model_dump(exclude={"enabled"})
+            | {"enabled": self.config.tools.web.search.enabled},
+            web_fetch=self.config.tools.web.fetch.model_dump(exclude={"enabled"})
+            | {"enabled": self.config.tools.web.fetch.enabled},
+            cloud_search=cloud_search,
         )
 
     def subscribe(self, observer: RunObserver) -> Callable[[], None]:
@@ -190,6 +196,7 @@ class SessionAgent:
         await self.prepare()
         assert self.inference is not None and self.model is not None and self._resources is not None
         context = await self.session.build_context() if self.session is not None else None
+        self._tool_set.begin_turn(run_id)
         content = text if not images else (TextContent(text), *tuple(images))
         active_tool_names = self._tool_set.active_names(
             self._configured_active_tools,

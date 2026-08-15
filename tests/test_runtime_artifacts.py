@@ -155,7 +155,11 @@ async def test_runtime_projects_presented_files_live_and_from_history(tmp_path: 
     await operation.task
 
     first_context = provider.requests[0][1]
-    assert [tool["name"] for tool in first_context.tools] == [PRESENT_FILES_TOOL_NAME]
+    assert [tool["name"] for tool in first_context.tools] == [
+        PRESENT_FILES_TOOL_NAME,
+        "web_search",
+        "web_fetch",
+    ]
     assert "present_files exactly once" in first_context.system_prompt
 
     completed = next(
@@ -176,7 +180,7 @@ async def test_runtime_projects_presented_files_live_and_from_history(tmp_path: 
     catalog = await rpc.dispatch("catalog.get")
     present = next(item for item in catalog["tools"] if item["id"] == PRESENT_FILES_TOOL_NAME)
     assert present["description"] == "Runtime-managed final deliverable tool"
-    assert snapshot["state"]["active_tools"] == [PRESENT_FILES_TOOL_NAME]
+    assert snapshot["state"]["active_tools"] == [PRESENT_FILES_TOOL_NAME, "web_search", "web_fetch"]
     assert PRESENT_FILES_TOOL_NAME not in ALL_TOOL_NAMES
     assert DEFAULT_ACTIVE_TOOLS == ("read", "bash", "edit", "write")
 

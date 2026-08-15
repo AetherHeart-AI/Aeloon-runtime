@@ -105,6 +105,12 @@ METHOD_SPECS = (
         "settings.update", "runtime.settings_update", wire.SettingsUpdateParams, wire.SettingsResult
     ),
     MethodSpec(
+        "tools.search.test",
+        "runtime.tools_search_test",
+        wire.ToolsSearchTestParams,
+        wire.ToolsSearchTestResult,
+    ),
+    MethodSpec(
         "cloud.account.status", "runtime.account_status", wire.EmptyParams, wire.CloudStatusResult
     ),
     MethodSpec(

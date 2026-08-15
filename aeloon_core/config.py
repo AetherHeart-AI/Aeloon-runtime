@@ -29,6 +29,7 @@ class ProviderModelConfig(BaseModel):
     )
     cost: dict[str, float] = Field(default_factory=dict)
 
+
 class DeepSeekProviderConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -79,9 +80,7 @@ class CloudProviderConfig(BaseModel):
 
 
 ProviderConfig = Annotated[
-    DeepSeekProviderConfig
-    | CustomProviderConfig
-    | CloudProviderConfig,
+    DeepSeekProviderConfig | CustomProviderConfig | CloudProviderConfig,
     Field(discriminator="driver"),
 ]
 
@@ -124,6 +123,8 @@ def provider_secret_values(config: Config) -> tuple[str, ...]:
         values.extend(
             value for name, value in headers.items() if value and is_sensitive_header(name)
         )
+    if config.tools.web.search.api_key:
+        values.append(config.tools.web.search.api_key)
     return tuple(dict.fromkeys(values))
 
 
@@ -177,11 +178,45 @@ class ResourceConfig(BaseModel):
     no_context_files: bool = False
 
 
+class WebSearchConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    provider: Literal["auto", "aeloon-cloud", "tavily", "brave", "bocha", "duckduckgo"] = "auto"
+    api_key: str | None = None
+    base_url: str | None = None
+    max_results: int = Field(default=5, ge=1, le=20)
+    timeout_s: float = Field(default=10.0, gt=0, le=120)
+    max_searches_per_turn: int = Field(default=12, ge=0)
+    cache_ttl_s: int = Field(default=300, ge=0)
+    cache_size: int = Field(default=64, ge=0)
+
+
+class WebFetchConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    default_mode: Literal["skim", "full"] = "skim"
+    default_max_chars: int = Field(default=6_000, ge=1)
+    full_max_chars: int = Field(default=50_000, ge=1)
+    timeout_s: float = Field(default=20.0, gt=0, le=120)
+    cache_ttl_s: int = Field(default=600, ge=0)
+    cache_size: int = Field(default=128, ge=0)
+
+
+class WebToolsConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    search: WebSearchConfig = Field(default_factory=WebSearchConfig)
+    fetch: WebFetchConfig = Field(default_factory=WebFetchConfig)
+
+
 class ToolConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     shell_path: str | None = None
     auto_resize_images: bool = True
+    web: WebToolsConfig = Field(default_factory=WebToolsConfig)
 
 
 class Config(BaseModel):
@@ -270,6 +305,17 @@ class Config(BaseModel):
                     )
                     for provider_id, provider in self.providers.items()
                 },
+                "tools": self.tools.model_copy(
+                    update={
+                        "web": self.tools.web.model_copy(
+                            update={
+                                "search": self.tools.web.search.model_copy(
+                                    update={"api_key": self.tools.web.search.api_key or None}
+                                )
+                            }
+                        )
+                    }
+                ),
             }
         )
 
@@ -328,6 +374,8 @@ def public_config(config: Config, *, show_secrets: bool = False) -> dict[str, An
             if provider.get("api_key"):
                 provider["api_key"] = "***"
             redact_sensitive_headers(provider.get("headers") or {})
+        if value["tools"]["web"]["search"].get("api_key"):
+            value["tools"]["web"]["search"]["api_key"] = "***"
     return value
 
 
@@ -343,6 +391,9 @@ __all__ = [
     "ResourceConfig",
     "RetryConfig",
     "ToolConfig",
+    "WebFetchConfig",
+    "WebSearchConfig",
+    "WebToolsConfig",
     "default_config_path",
     "load_config",
     "is_sensitive_header",
