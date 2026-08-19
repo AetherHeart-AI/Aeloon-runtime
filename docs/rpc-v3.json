@@ -2177,10 +2177,10 @@
           ]
         },
         "staged": {
-          "type": "string"
+          "$ref": "#/$defs/GitChangeGroup_v3"
         },
         "changes": {
-          "type": "string"
+          "$ref": "#/$defs/GitChangeGroup_v3"
         }
       },
       "required": [
@@ -4036,6 +4036,62 @@
       "title": "Result_plugin_knowledge_stat_v3",
       "type": "object",
       "additionalProperties": true
+    },
+    "GitChangeFile_v3": {
+      "title": "GitChangeFile_v3",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "status",
+        "additions",
+        "deletions",
+        "binary"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "additions": {
+          "type": "integer"
+        },
+        "deletions": {
+          "type": "integer"
+        },
+        "binary": {
+          "type": "boolean"
+        },
+        "renamed_from": {
+          "type": "string"
+        }
+      }
+    },
+    "GitChangeGroup_v3": {
+      "title": "GitChangeGroup_v3",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "files",
+        "additions",
+        "deletions"
+      ],
+      "properties": {
+        "files": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/GitChangeFile_v3"
+          }
+        },
+        "additions": {
+          "type": "integer"
+        },
+        "deletions": {
+          "type": "integer"
+        }
+      }
     }
   },
   "protocol": "aeloon-rpc",
@@ -4624,7 +4680,7 @@
           "change": "same",
           "note": "",
           "params_signature": "{thread_id}",
-          "result_signature": "{branch,staged,changes}"
+          "result_signature": "{branch,staged:{files,additions,deletions},changes:{files,additions,deletions}}"
         },
         {
           "name": "git.stage",

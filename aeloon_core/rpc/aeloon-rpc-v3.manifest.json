@@ -601,6 +601,62 @@
       "title": "Event_usage_updated_v3",
       "type": "object"
     },
+    "GitChangeFile_v3": {
+      "additionalProperties": false,
+      "properties": {
+        "additions": {
+          "type": "integer"
+        },
+        "binary": {
+          "type": "boolean"
+        },
+        "deletions": {
+          "type": "integer"
+        },
+        "path": {
+          "type": "string"
+        },
+        "renamed_from": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "status",
+        "additions",
+        "deletions",
+        "binary"
+      ],
+      "title": "GitChangeFile_v3",
+      "type": "object"
+    },
+    "GitChangeGroup_v3": {
+      "additionalProperties": false,
+      "properties": {
+        "additions": {
+          "type": "integer"
+        },
+        "deletions": {
+          "type": "integer"
+        },
+        "files": {
+          "items": {
+            "$ref": "#/$defs/GitChangeFile_v3"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "files",
+        "additions",
+        "deletions"
+      ],
+      "title": "GitChangeGroup_v3",
+      "type": "object"
+    },
     "Params_artifact_download_v3": {
       "additionalProperties": false,
       "properties": {
@@ -2259,10 +2315,10 @@
           ]
         },
         "changes": {
-          "type": "string"
+          "$ref": "#/$defs/GitChangeGroup_v3"
         },
         "staged": {
-          "type": "string"
+          "$ref": "#/$defs/GitChangeGroup_v3"
         }
       },
       "required": [
