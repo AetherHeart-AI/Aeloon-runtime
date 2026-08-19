@@ -43,7 +43,7 @@ async def _handshake(reader: asyncio.StreamReader, writer: asyncio.StreamWriter)
             "id": "handshake",
             "method": "system.handshake",
             "params": {
-                "protocol": {"min": "3.0.0-draft.3", "max": "3.0.0-draft.3"},
+                "protocol": {"min": "3.0.0", "max": "3.0.0"},
                 "client": {"name": "pytest", "version": "0", "platform": "test"},
             },
         },
@@ -91,7 +91,8 @@ async def test_v3_handshake_health_and_shutdown(tmp_path: Path) -> None:
             "id": "0",
             "method": "system.handshake",
             "params": {
-                "protocol": {"min": "3.0.0", "max": "3.0.0"},
+                # A client that only speaks the next major cannot be served.
+                "protocol": {"min": "4.0.0", "max": "4.0.0"},
                 "client": {"name": "pytest", "version": "0", "platform": "test"},
             },
         },
@@ -108,7 +109,7 @@ async def test_v3_handshake_health_and_shutdown(tmp_path: Path) -> None:
             "id": "1",
             "method": "system.handshake",
             "params": {
-                "protocol": {"min": "3.0.0-draft.3", "max": "3.0.0-draft.3"},
+                "protocol": {"min": "3.0.0", "max": "3.0.0"},
                 "client": {"name": "pytest", "version": "0", "platform": "test"},
             },
         },

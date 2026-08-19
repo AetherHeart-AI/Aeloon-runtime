@@ -79,8 +79,11 @@ def test_rpc_source_and_manifest_are_strict_and_complete() -> None:
 
 
 def test_semver_endpoint_range_and_frame_limit() -> None:
-    assert _range_contains("3.0.0-draft.1", "3.0.0-draft.9", "3.0.0-draft.3")
-    assert not _range_contains("3.0.0", "3.0.0", "3.0.0-draft.3")
+    assert _range_contains("3.0.0", "3.1.0", "3.0.0")
+    # A prerelease sorts below the release it precedes, so a client that only
+    # speaks the final 3.0.0 must not be matched by a 3.0.0-rc Runtime.
+    assert not _range_contains("3.0.0", "3.0.0", "3.0.0-rc.1")
+    assert _range_contains("3.0.0-rc.1", "3.0.0", "3.0.0-rc.1")
     payload = {"data": "x" * (MAX_FRAME_BYTES - len(b'{"data":""}'))}
     assert len(pack_frame(payload)) > MAX_FRAME_BYTES
     with pytest.raises(RpcError, match="40 MiB"):

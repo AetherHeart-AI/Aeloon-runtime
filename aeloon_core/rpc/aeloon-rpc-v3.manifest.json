@@ -4293,7 +4293,7 @@
     }
   },
   "protocol": "aeloon-rpc",
-  "protocol_version": "3.0.0-draft.3",
+  "protocol_version": "3.0.0",
   "schema_version": 1,
   "transport": {
     "encoding": "utf-8-json",

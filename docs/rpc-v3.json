@@ -4039,7 +4039,7 @@
     }
   },
   "protocol": "aeloon-rpc",
-  "version": "3.0.0-draft.3",
+  "version": "3.0.0",
   "schema_version": 1,
   "json_schema_draft": "https://json-schema.org/draft/2020-12/schema",
   "frame_max_bytes": 41943040,

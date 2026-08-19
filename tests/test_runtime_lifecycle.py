@@ -60,11 +60,11 @@ def _handshake(connection: socket.socket, identifier: int = 1) -> None:
         identifier,
         "system.handshake",
         {
-            "protocol": {"min": "3.0.0-draft.3", "max": "3.0.0"},
+            "protocol": {"min": "3.0.0", "max": "3.0.0"},
             "client": {"name": "lifecycle-smoke", "version": "1", "platform": sys.platform},
         },
     )
-    assert response.get("result", {}).get("protocol") == "3.0.0-draft.3"
+    assert response.get("result", {}).get("protocol") == "3.0.0"
 
 
 def test_standalone_runtime_survives_client_disconnect_and_restores_projection(

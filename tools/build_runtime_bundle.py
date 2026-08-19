@@ -26,7 +26,7 @@ def main() -> int:
     parser.add_argument("--platform", choices=("darwin-aarch64", "linux-aarch64"), required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--runtime-version", default="0.1.0")
-    parser.add_argument("--protocol-range", default=">=3.0.0-draft.3 <4.0.0")
+    parser.add_argument("--protocol-range", default=">=3.0.0 <4.0.0")
     args = parser.parse_args()
     root = args.runtime_root.expanduser().resolve(strict=True)
     if not root.is_dir():
