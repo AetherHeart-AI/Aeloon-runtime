@@ -1,8 +1,8 @@
-# Aeloon Core
+# Aeloon Runtime
 
-Aeloon Core combines a stateless Python agent-run engine with a stateful application runtime. It
-provides a CLI and Python API for tool-driven coding tasks, resumable sessions, configurable model
-providers, retries, and automatic context compaction.
+Aeloon Runtime combines the stateless Python agent engine with a stateful application runtime. It
+provides a standalone CLI and Python API for tool-driven coding tasks, resumable sessions,
+configurable model providers, retries, and automatic context compaction.
 
 ## Requirements
 
@@ -17,10 +17,10 @@ Install the project and connect a local endpoint:
 ```bash
 uv sync
 
-uv run aeloon-core provider add studio \
+uv run aeloon-runtime provider add studio \
   --endpoint http://127.0.0.1:8000
 
-uv run aeloon-core "Inspect this repository and explain its entry points"
+uv run aeloon-runtime "Inspect this repository and explain its entry points"
 ```
 
 Pass `--api-key` when the endpoint requires one. The key is stored in the mode-`0600` config file.
@@ -31,9 +31,9 @@ Capability probe failures leave that model available as text-only and do not blo
 To use Aeloon Cloud instead:
 
 ```bash
-uv run aeloon-core login
-uv run aeloon-core models
-uv run aeloon-core "Fix the failing tests"
+uv run aeloon-runtime login
+uv run aeloon-runtime models
+uv run aeloon-runtime "Fix the failing tests"
 ```
 
 ## Common workflows
@@ -42,35 +42,45 @@ The task is the default command:
 
 ```bash
 # Start a saved task in the current workspace
-uv run aeloon-core "fix the failing tests"
+uv run aeloon-runtime "fix the failing tests"
 
 # Continue the newest task for this workspace
-uv run aeloon-core resume "continue with the implementation"
+uv run aeloon-runtime resume "continue with the implementation"
 
 # Read a task from a file or standard input
-uv run aeloon-core --file task.md
-printf 'review this change' | uv run aeloon-core
+uv run aeloon-runtime --file task.md
+printf 'review this change' | uv run aeloon-runtime
 
 # Select a workspace or model for one run
-uv run aeloon-core -C ../project -m studio/qwen3-coder "review the repository"
+uv run aeloon-runtime -C ../project -m studio/qwen3-coder "review the repository"
 
 # Run without saving, return JSON, or show tool activity
-uv run aeloon-core --ephemeral "answer without saving a session"
-uv run aeloon-core --json "return one machine-readable result"
-uv run aeloon-core -v "show concise tool activity"
-uv run aeloon-core -vv "also show lifecycle events"
+uv run aeloon-runtime --ephemeral "answer without saving a session"
+uv run aeloon-runtime --json "return one machine-readable result"
+uv run aeloon-runtime -v "show concise tool activity"
+uv run aeloon-runtime -vv "also show lifecycle events"
 ```
 
 Useful management commands:
 
 ```bash
-uv run aeloon-core provider list
-uv run aeloon-core models
-uv run aeloon-core models use studio/qwen3-coder
-uv run aeloon-core history
-uv run aeloon-core doctor
-uv run aeloon-core whoami
-uv run aeloon-core logout
+uv run aeloon-runtime provider list
+uv run aeloon-runtime models
+uv run aeloon-runtime models use studio/qwen3-coder
+uv run aeloon-runtime history
+uv run aeloon-runtime doctor
+uv run aeloon-runtime whoami
+uv run aeloon-runtime logout
+```
+
+The desktop Runtime can also run independently over a private Unix socket. It keeps serving after
+the UI exits; use `system.shutdown` (or the uninstall flow) for an explicit stop. Boundary traces
+are disabled by default and require an explicit local directory:
+
+```bash
+uv run aeloon-runtime serve --unix /tmp/aeloon-runtime.sock \
+  --data-dir ~/.aeloon-runtime --workspace-root "$PWD" \
+  --record-trace ~/.aeloon-runtime/traces
 ```
 
 Fresh installations have no pinned default model. Aeloon uses the first available model until
@@ -81,9 +91,9 @@ selection for one run without changing the saved default.
 Shell completion is available without an additional runtime dependency:
 
 ```bash
-uv run aeloon-core completion zsh > ~/.zfunc/_aeloon-core
-uv run aeloon-core completion bash > ~/.local/share/bash-completion/completions/aeloon-core
-uv run aeloon-core completion fish > ~/.config/fish/completions/aeloon-core.fish
+uv run aeloon-runtime completion zsh > ~/.zfunc/_aeloon-runtime
+uv run aeloon-runtime completion bash > ~/.local/share/bash-completion/completions/aeloon-runtime
+uv run aeloon-runtime completion fish > ~/.config/fish/completions/aeloon-runtime.fish
 ```
 
 ## Project resources
@@ -169,9 +179,9 @@ runtime = create_runtime_service()
 session = await runtime.create_session(workspace="/path/to/repository")
 ```
 
-Runtime owns sessions, context construction, persistence, provider selection, and operation
-scheduling. The Electron workbench accesses the runtime through the private `aeloon-rpc-v2`
-Unix-socket adapter.
+Runtime owns sessions, context construction, persistence, provider selection, workspace operations,
+and operation scheduling. The Electron desktop client connects through the `aeloon-rpc` v3 Unix
+socket gateway; the Runtime remains alive when the client exits.
 
 ## Security
 
@@ -186,7 +196,8 @@ the model is allowed to access the filesystem, credentials, and processes.
 uv sync
 uv run pytest -q
 uv run ruff check .
-uv run python -m aeloon_core.rpc.manifest --check
+uv run python tools/gen_v3_manifest.py --check
+uv run python tools/gen_rpc_docs.py
 uv build
 git diff --check
 ```
@@ -194,28 +205,27 @@ git diff --check
 The default test suite is offline and uses local fixtures. Optional live tests require credentials
 in an explicit test config and are not part of default CI.
 
-The checked-in `aeloon-rpc-v2.manifest.json` is generated from Core's typed RPC registry. Run
-`uv run python -m aeloon_core.rpc.manifest --output aeloon_core/rpc/aeloon-rpc-v2.manifest.json`
-after changing a public method, result, or event payload; CI rejects stale output.
+The checked-in `aeloon-rpc-v3.manifest.json` is generated from `docs/rpc-v3.json`; run
+`uv run python tools/gen_v3_manifest.py` and `uv run python tools/gen_rpc_docs.py` after changing a
+public method, result, or event payload. CI rejects stale generated output.
 
 ### Desktop distribution
 
-Aeloon Core is distributed as part of the Aeloon desktop installer. The UI release workflow locks
-this repository to an exact commit, builds a wheel, and installs the wheel plus its frozen
-production dependencies into the desktop application's bundled Python runtime. Core does not
-publish a separate PyInstaller executable or desktop archive.
+Aeloon Runtime is distributed independently as the `aeloon-runtime` wheel and as macOS ARM64 and
+Linux ARM64 bundles. The desktop lock pins the Runtime archive URL and SHA-256; the UI does not
+checkout this repository at build time.
 
-The desktop application starts Core with `python -m aeloon_core`, and the Agent, built-in Skills,
-and terminal use that same bundled interpreter. Office Lite uses those bundled lightweight Python
-libraries directly and does not create a second Python or OCR environment.
+The desktop application starts Runtime on a stable Unix socket. The Agent, built-in Skills, Git/fs,
+and terminal operations all execute in that Runtime process. Office Lite uses the bundled
+lightweight Python libraries directly and does not create a second Python or OCR environment.
 
 For local package validation:
 
 ```bash
 uv build --wheel --out-dir dist
 uv venv wheel-smoke
-uv pip install --python wheel-smoke/bin/python dist/aeloon_core-*.whl
-wheel-smoke/bin/python -m aeloon_core --version
+uv pip install --python wheel-smoke/bin/python dist/aeloon_runtime-*.whl
+wheel-smoke/bin/aeloon-runtime --version
 ```
 
 ## Documentation

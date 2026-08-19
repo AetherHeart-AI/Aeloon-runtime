@@ -2664,15 +2664,20 @@
     "attachment_processing_failed": -32028,
     "authentication_failed": -32027,
     "busy": -32022,
+    "capability_unavailable": -32013,
+    "forbidden": -32012,
     "internal_error": -32603,
     "invalid_argument": -32602,
     "invalid_attachment": -32024,
     "invalid_state": -32023,
     "method_not_found": -32601,
     "operation_not_found": -32021,
+    "payload_too_large": -32014,
     "protocol_incompatible": -32010,
     "revision_conflict": -32025,
-    "session_not_found": -32020
+    "session_not_found": -32020,
+    "thread_not_found": -32020,
+    "unauthorized": -32011
   },
   "events": {
     "cloud.account.updated": {
