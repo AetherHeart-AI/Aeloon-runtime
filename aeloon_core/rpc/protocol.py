@@ -170,6 +170,11 @@ RPC_CODES = {
     "authentication_failed": -32027,
     "internal_error": -32603,
     "method_not_found": -32601,
+    "thread_not_found": -32020,
+    "unauthorized": -32011,
+    "forbidden": -32012,
+    "capability_unavailable": -32013,
+    "payload_too_large": -32014,
 }
 
 
