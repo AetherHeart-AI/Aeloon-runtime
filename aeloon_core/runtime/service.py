@@ -80,7 +80,7 @@ from aeloon_core.runtime.types import (
     TurnInput,
 )
 from aeloon_core.tool.shell import prune_bash_logs
-from aeloon_core.version import __version__, core_commit
+from aeloon_core.version import core_commit, runtime_version
 
 PROMPT_LIMIT = 100_000
 ATTACHMENT_LIMIT = 8
@@ -164,6 +164,14 @@ class RuntimeService:
     @property
     def active_operation_count(self) -> int:
         return self.coordinator.active_count
+
+    def session_active_operation_count(self, session_id: str) -> int:
+        """Return in-flight operations without loading provider/model state."""
+
+        runtime = self._runtimes.get(session_id)
+        if runtime is None:
+            return 0
+        return sum(1 for operation in runtime.operations.values() if is_in_flight(operation.status))
 
     async def create_session(
         self,
@@ -448,6 +456,30 @@ class RuntimeService:
         queued_payload: dict[str, Any] = {"kind": "turn", "queue_position": queued}
         if input_value.get("skill_id"):
             queued_payload["skill_id"] = input_value["skill_id"]
+        # Publish the durable turn projection before operation events.  The
+        # old Workbench gateway used this ordering to let the UI attach the
+        # queued/active stream to a turn immediately, even when the Runtime
+        # task starts before the turn.start response reaches the client.
+        await self._emit(
+            "turn.created",
+            session,
+            operation,
+            {
+                "turn": {
+                    "id": operation.id,
+                    "thread_id": session.id,
+                    "core_turn_id": operation.id,
+                    "user_text": str(input_value.get("text") or ""),
+                    "attachments": self._public_input(input_value).get("attachments", []),
+                    "status": "queued",
+                    "error": None,
+                    "blocks": [],
+                    "usage": {},
+                    "created_at": operation.created_at,
+                    "updated_at": operation.created_at,
+                }
+            },
+        )
         await self._emit("operation.queued", session, operation, queued_payload)
         for attachment in newly_resolved:
             await self._attachment_log("resolved", session, operation, attachment)
@@ -496,7 +528,12 @@ class RuntimeService:
         return {"operation_id": operation.id, "accepted": True}
 
     async def turn_follow_up(self, params: Mapping[str, Any]) -> dict[str, Any]:
-        operation = self._active_operation(params)
+        if params.get("thread_id") and not params.get("operation_id"):
+            operation = self._active_operation_for_session(
+                self._required_string(params, "thread_id")
+            )
+        else:
+            operation = self._active_operation(params)
         text = self._required_string(params, "text")
         await operation.agent.follow_up(text)  # type: ignore[union-attr]
         return {"operation_id": operation.id, "accepted": True}
@@ -532,6 +569,7 @@ class RuntimeService:
             "web_fetch": "Fetch readable content from a public web page",
         }
         return {
+            "default_model_id": self.config.agent.model or None,
             "providers": providers,
             "models": [
                 {
@@ -608,6 +646,11 @@ class RuntimeService:
                 provider_id: self._public_provider_config(provider)
                 for provider_id, provider in config.providers.items()
             },
+            # Keep the plugin namespace in the same revisioned settings
+            # document even though the base release has no plugin host. A
+            # later capability can therefore add its own schema without
+            # changing the settings transport or dropping unknown values.
+            "plugins": self._public_plugin_config(config.plugins),
         }
 
     async def settings_update(self, params: Mapping[str, Any]) -> dict[str, Any]:
@@ -627,7 +670,7 @@ class RuntimeService:
                 raise RuntimeFailure(
                     "revision_conflict", "Core settings changed; refresh and try again"
                 )
-            raw = load_config(self.config_path).model_dump(mode="json")
+            raw = self._persistent_config().model_dump(mode="json")
             self._apply_settings_patch(raw, patch, valid_model_ids=valid_model_ids)
             for action in actions:
                 if not isinstance(action, Mapping):
@@ -715,13 +758,17 @@ class RuntimeService:
     async def account_status(self, _params: Mapping[str, Any]) -> dict[str, Any]:
         return self.account.status()
 
-    async def tools_search_test(self, _params: Mapping[str, Any]) -> dict[str, Any]:
+    async def tools_search_test(self, params: Mapping[str, Any]) -> dict[str, Any]:
         if not self.config.tools.web.search.enabled:
             raise RuntimeFailure("invalid_argument", "Web search is disabled")
         tool = self._tool_set().by_name["web_search"]
         started = time.monotonic()
         try:
-            outcome = await tool.search("OpenAI", 1)
+            # The v3 method exposes the query so Settings can test the exact
+            # configured search path; retain the legacy default for direct
+            # in-process callers that predate the v3 boundary.
+            query = str(params.get("query") or "OpenAI")
+            outcome = await tool.search(query, 1)
             latency_ms = round((time.monotonic() - started) * 1000)
             return {
                 "ok": not outcome.error and bool(outcome.results),
@@ -816,7 +863,7 @@ class RuntimeService:
                     raise RuntimeFailure(
                         "revision_conflict", "Core settings changed; refresh and try again"
                     )
-                raw = load_config(self.config_path).model_dump(mode="json")
+                raw = self._persistent_config().model_dump(mode="json")
                 raw["providers"][provider_id].update(
                     {
                         "endpoint": resolved_endpoint,
@@ -930,7 +977,7 @@ class RuntimeService:
                 )
             if provider_id in self.config.providers:
                 raise RuntimeFailure("invalid_argument", f"Provider already exists: {provider_id}")
-            raw = load_config(self.config_path).model_dump(mode="json")
+            raw = self._persistent_config().model_dump(mode="json")
             raw["providers"][provider_id] = provider.model_dump(mode="json")
             await run_blocking(
                 save_config, Config.model_validate(raw).normalized(), self.config_path
@@ -955,7 +1002,7 @@ class RuntimeService:
                 )
             if provider_id not in self.config.providers:
                 raise RuntimeFailure("invalid_argument", f"Unknown Provider: {provider_id}")
-            raw = load_config(self.config_path).model_dump(mode="json")
+            raw = self._persistent_config().model_dump(mode="json")
             del raw["providers"][provider_id]
             fallback = self.config.agent.model
             try:
@@ -1239,6 +1286,19 @@ class RuntimeService:
         if self._data_dir_override is not None:
             config = config.model_copy(update={"data_dir": self._data_dir_override}).normalized()
         self.config = config
+
+    def _persistent_config(self) -> Config:
+        """Load disk config while retaining the Runtime-owned data directory.
+
+        Standalone Runtime always owns ``data_dir`` through its composition
+        root. Provider/settings writes must not silently put that field back
+        to the legacy CLI default when the config file omitted it.
+        """
+
+        config = load_config(self.config_path)
+        if self._data_dir_override is not None:
+            config = config.model_copy(update={"data_dir": self._data_dir_override}).normalized()
+        return config
 
     @staticmethod
     def _http_endpoint(value: str) -> str:
@@ -1684,6 +1744,19 @@ class RuntimeService:
             raise RuntimeFailure("invalid_state", "steer/follow_up requires the active turn")
         return operation
 
+    def _active_operation_for_session(self, session_id: str) -> Operation:
+        runtime = self._runtimes.get(session_id)
+        if runtime is None:
+            raise RuntimeFailure("operation_not_found", f"No active operation for thread {session_id}")
+        active = [
+            operation
+            for operation in runtime.operations.values()
+            if operation.status == "active" and operation.agent is not None
+        ]
+        if not active:
+            raise RuntimeFailure("invalid_state", "steer/follow_up requires the active turn")
+        return max(active, key=lambda operation: operation.created_at)
+
     async def _session_metadata(self, session: Session) -> dict[str, Any]:
         return {
             "session_id": session.id,
@@ -1783,7 +1856,7 @@ class RuntimeService:
             {
                 "category": "attachment",
                 "action": action,
-                "core_version": __version__,
+                "core_version": runtime_version(),
                 "core_commit": core_commit(),
                 "attachment_id": attachment.id,
                 "canonical_path": str(attachment.canonical_path),
@@ -2018,6 +2091,7 @@ class RuntimeService:
         allowed = {
             "default_model_id",
             "default_thinking_level",
+            "plugins",
             "retry",
             "compaction",
             "resources",
@@ -2040,6 +2114,22 @@ class RuntimeService:
             raw["agent"]["model"] = model_id
         if "default_thinking_level" in patch:
             raw["agent"]["thinking_level"] = self._thinking_level(patch["default_thinking_level"])
+        if "plugins" in patch:
+            plugins = patch["plugins"]
+            if not isinstance(plugins, Mapping):
+                raise RuntimeFailure("invalid_argument", "plugins must be an object")
+            for plugin_id, plugin_patch in plugins.items():
+                if not isinstance(plugin_id, str) or not plugin_id.strip():
+                    raise RuntimeFailure("invalid_argument", "Plugin ids must be non-empty strings")
+                if not isinstance(plugin_patch, Mapping):
+                    raise RuntimeFailure(
+                        "invalid_argument", f"plugins.{plugin_id} must be an object"
+                    )
+                current = raw.setdefault("plugins", {}).get(plugin_id, {})
+                if not isinstance(current, dict):
+                    current = {}
+                current.update(dict(plugin_patch))
+                raw.setdefault("plugins", {})[plugin_id] = current
         for key in ("retry", "compaction"):
             if key in patch:
                 if not isinstance(patch[key], Mapping):
@@ -2169,6 +2259,15 @@ class RuntimeService:
         if provider.driver == "cloud":
             value["credential_configured"] = bool(self.account.status().get("authenticated"))
         return value
+
+    @staticmethod
+    def _public_plugin_config(plugins: Mapping[str, Any]) -> dict[str, Any]:
+        """Return plugin settings without exposing conventional secret keys."""
+
+        from aeloon_core.config import _redact_plugin_values
+
+        value = _redact_plugin_values(dict(plugins))
+        return value if isinstance(value, dict) else {}
 
     @staticmethod
     def _public_tool_config(tools: Any) -> dict[str, Any]:

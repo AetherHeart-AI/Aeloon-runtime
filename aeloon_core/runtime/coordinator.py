@@ -54,7 +54,15 @@ class OperationCoordinator:
 
     @property
     def active_count(self) -> int:
-        return sum(1 for runtime in self.runtimes.values() if runtime.active is not None)
+        # A queued operation is still owned by the Runtime and must prevent a
+        # root-authority restart or uninstall.  Counting only ``runtime.active``
+        # would allow those queued turns to be abandoned during a reconnect.
+        return sum(
+            1
+            for runtime in self.runtimes.values()
+            for operation in runtime.operations.values()
+            if operation.status in {"queued", "active", "cancelling"}
+        )
 
     def runtime(self, session_id: str) -> SessionRuntime:
         return self.runtimes.setdefault(session_id, SessionRuntime())

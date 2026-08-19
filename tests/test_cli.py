@@ -501,6 +501,32 @@ def test_rpc_serve_has_no_browser_runtime_interface(tmp_path: Path) -> None:
         )
 
 
+def test_runtime_serve_accepts_explicit_trace_directory(tmp_path: Path) -> None:
+    args = cli.build_parser().parse_args(
+        [
+            "serve",
+            "--unix",
+            str(tmp_path / "runtime.sock"),
+            "--record-trace",
+            str(tmp_path / "traces"),
+        ]
+    )
+    assert args.record_trace == tmp_path / "traces"
+
+
+def test_runtime_serve_accepts_no_workspace_root(tmp_path: Path) -> None:
+    args = cli.build_parser().parse_args(
+        [
+            "serve",
+            "--unix",
+            str(tmp_path / "runtime.sock"),
+            "--no-workspace-root",
+        ]
+    )
+    assert args.no_workspace_root is True
+    assert args.workspace_root is None
+
+
 def test_default_task_command_and_explicit_separator_are_normalized() -> None:
     task = cli._TASK_COMMAND
     assert cli._normalize_argv(["fix", "the", "tests"]) == [task, "fix", "the", "tests"]
@@ -809,11 +835,11 @@ def test_completion_command_emits_shell_script(capsys) -> None:
     assert "resume history login logout" in rendered
 
 
-def test_package_exposes_only_the_aeloon_core_command() -> None:
+def test_package_exposes_only_the_aeloon_runtime_command() -> None:
     metadata = tomllib.loads(
         (Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8")
     )
 
     assert metadata["project"]["scripts"] == {
-        "aeloon-core": "aeloon_core.__main__:main",
+        "aeloon-runtime": "aeloon_core.__main__:main",
     }

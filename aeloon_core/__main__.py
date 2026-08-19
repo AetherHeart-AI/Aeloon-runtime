@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import getpass
 import json
+import os
 import sys
 import time
 from dataclasses import asdict, is_dataclass
@@ -32,6 +33,7 @@ from aeloon_core.core import (
     RunEvent,
     message_to_dict,
 )
+from aeloon_core.migration import migrate_workbench
 from aeloon_core.rpc.protocol import RpcError
 from aeloon_core.rpc.server import run_rpc_server
 from aeloon_core.runtime import (
@@ -46,6 +48,7 @@ from aeloon_core.runtime.providers import (
     resolve_model_id,
 )
 from aeloon_core.runtime.skill_runtime import run_bundled_skill
+from aeloon_core.runtime_server_v3 import serve_v3
 from aeloon_core.version import __version__
 
 CONFIG_PATHS: dict[str, tuple[str, ...]] = {
@@ -92,6 +95,8 @@ _KNOWN_COMMANDS = {
     "provider",
     "system",
     "rpc",
+    "serve",
+    "migrate",
 }
 
 
@@ -227,6 +232,35 @@ def _add_rpc_commands(parent: argparse.ArgumentParser) -> None:
     serve.add_argument("--max-concurrent-operations", type=int, default=4)
 
 
+def _add_runtime_serve_command(commands: Any) -> None:
+    serve = commands.add_parser("serve", help="Run the standalone aeloon Runtime.")
+    serve.add_argument("--unix", type=Path, required=True, help="Unix socket path.")
+    serve.add_argument("--config", type=Path)
+    serve.add_argument("--data-dir", type=Path)
+    serve.add_argument("--workspace-root", type=Path, action="append")
+    serve.add_argument(
+        "--no-workspace-root",
+        action="store_true",
+        help="Start with no authorized workspace roots (desktop before folder pick).",
+    )
+    serve.add_argument(
+        "--record-trace",
+        type=Path,
+        help="Opt in to a redacted JSONL boundary trace under DIRECTORY.",
+    )
+    serve.add_argument("--max-concurrent-operations", type=int, default=4)
+
+
+def _add_runtime_migrate_command(commands: Any) -> None:
+    migrate = commands.add_parser(
+        "migrate", help="Migrate Workbench/Core data into Runtime storage."
+    )
+    migrate.add_argument("--from-workbench", type=Path, required=True)
+    migrate.add_argument("--from-core", type=Path, required=True)
+    migrate.add_argument("--data-dir", type=Path, required=True)
+    migrate.add_argument("--roots-output", type=Path, required=True)
+
+
 def _hide_internal_subcommands(commands: Any) -> None:
     """Hide implementation-only commands from top-level help."""
 
@@ -236,23 +270,27 @@ def _hide_internal_subcommands(commands: Any) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    runtime_entrypoint = Path(sys.argv[0]).name == "aeloon-runtime" or os.environ.get(
+        "AELOON_RUNTIME_MODE"
+    ) == "1"
+    program_name = "aeloon-runtime" if runtime_entrypoint else "aeloon-core"
     parser = argparse.ArgumentParser(
-        prog="aeloon-core",
+        prog=program_name,
         description="A coding agent for the current workspace.",
         epilog=(
             "examples:\n"
-            '  aeloon-core "fix the failing tests"\n'
-            '  aeloon-core resume "continue with the implementation"\n'
-            "  aeloon-core provider add studio --endpoint http://127.0.0.1:8000\n"
-            "  aeloon-core login\n"
-            "  aeloon-core doctor\n\n"
+            f'  {program_name} "fix the failing tests"\n'
+            f"  {program_name} resume \"continue with the implementation\"\n"
+            f"  {program_name} provider add studio --endpoint http://127.0.0.1:8000\n"
+            f"  {program_name} login\n"
+            f"  {program_name} doctor\n\n"
             "task options: -C PATH, -m MODEL, --json, -v, --ephemeral\n"
-            "Use `aeloon-core -- TASK` when TASK starts with a command name.\n"
-            "Run `aeloon-core COMMAND --help` for command-specific options."
+            f"Use `{program_name} -- TASK` when TASK starts with a command name.\n"
+            f"Run `{program_name} COMMAND --help` for command-specific options."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {cli_version()}")
     commands = parser.add_subparsers(dest="command", metavar="COMMAND")
 
     run = commands.add_parser(_TASK_COMMAND, help=argparse.SUPPRESS)
@@ -321,6 +359,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     rpc = commands.add_parser("rpc", help=argparse.SUPPRESS)
     _add_rpc_commands(rpc)
+    _add_runtime_serve_command(commands)
+    _add_runtime_migrate_command(commands)
 
     system = commands.add_parser("system", help=argparse.SUPPRESS)
     system_commands = system.add_subparsers(dest="system_command", required=True, metavar="COMMAND")
@@ -352,7 +392,7 @@ def build_parser() -> argparse.ArgumentParser:
         _add_provider_runtime_arguments(command)
     _hide_internal_subcommands(commands)
     # Set this after child parsers are created so their own usage remains concise.
-    parser.usage = "aeloon-core [TASK...] | aeloon-core COMMAND ..."
+    parser.usage = f"{program_name} [TASK...] | {program_name} COMMAND ..."
     return parser
 
 
@@ -1383,6 +1423,33 @@ async def async_main(argv: list[str] | None = None) -> int:
         return completion_command(args)
     if args.command == "rpc":
         return await rpc_command(args)
+    if args.command == "serve":
+        if args.no_workspace_root and args.workspace_root:
+            parser.error("--no-workspace-root cannot be combined with --workspace-root")
+        if args.no_workspace_root:
+            workspace_roots: tuple[Path, ...] | None = ()
+        elif args.workspace_root:
+            workspace_roots = tuple(args.workspace_root)
+        else:
+            workspace_roots = None
+        await serve_v3(
+            socket_path=args.unix,
+            data_dir=args.data_dir,
+            config_path=args.config,
+            workspace_roots=workspace_roots,
+            max_concurrent_operations=args.max_concurrent_operations,
+            record_trace=args.record_trace,
+        )
+        return 0
+    if args.command == "migrate":
+        result = migrate_workbench(
+            from_workbench=args.from_workbench,
+            from_core=args.from_core,
+            data_dir=args.data_dir,
+            roots_output=args.roots_output,
+        )
+        print(_json(result))
+        return 0
     if args.command == "system":
         return run_bundled_skill(
             args.skill_id,
@@ -1404,6 +1471,17 @@ def _normalize_argv(argv: list[str]) -> list[str]:
     if argv[0] in {"-h", "--help", "--version"} or argv[0] in _KNOWN_COMMANDS:
         return argv
     return [_TASK_COMMAND, *argv]
+
+
+def cli_version() -> str:
+    """Expose the standalone Runtime release independently of legacy Core CLI."""
+
+    return (
+        "0.1.0"
+        if Path(sys.argv[0]).name == "aeloon-runtime"
+        or os.environ.get("AELOON_RUNTIME_MODE") == "1"
+        else __version__
+    )
 
 
 def _json_errors_for(argv: list[str]) -> bool:

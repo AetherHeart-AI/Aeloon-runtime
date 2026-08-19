@@ -103,7 +103,7 @@ def test_wheel_packaging_uses_only_lite_python_office_dependencies() -> None:
     ):
         assert removed not in manifest.lower()
     assert "https://pypi.tuna.tsinghua.edu.cn/simple" in manifest
-    assert '[project.scripts]\naeloon-core = "aeloon_core.__main__:main"' in manifest
+    assert '[project.scripts]\naeloon-runtime = "aeloon_core.__main__:main"' in manifest
     assert '\naeloon = "' not in manifest
     assert not list(RESOURCE_ROOT.rglob("package.json"))
     assert not list(RESOURCE_ROOT.rglob("*.js"))

@@ -94,6 +94,10 @@ _SENSITIVE_HEADERS = {
     "x-api-key",
     "x-auth-token",
 }
+_SENSITIVE_CONFIG_KEY = re.compile(
+    r"(?:password|passwd|api[_-]?key|authorization|auth[_-]?header|cookie|secret|token|credential)",
+    re.IGNORECASE,
+)
 
 
 def _normalize_api_key(value: Any) -> Any:
@@ -227,6 +231,12 @@ class Config(BaseModel):
     workspace: Path = Field(default_factory=Path.cwd)
     data_dir: Path = Field(default_factory=lambda: Path("~/.aeloon-core").expanduser())
     providers: dict[str, ProviderConfig] = Field(default_factory=_default_providers)
+    # Plugin settings deliberately live in an open, namespaced boundary while
+    # the rest of Config remains ``extra=forbid``.  The base Runtime does not
+    # load plugin hosts yet, but preserving this section is required so a
+    # future capability can configure itself without making settings.update
+    # rewrite or discard unknown plugin data.
+    plugins: dict[str, dict[str, Any]] = Field(default_factory=dict)
     agent: AgentConfig = Field(default_factory=AgentConfig)
     resources: ResourceConfig = Field(default_factory=ResourceConfig)
     tools: ToolConfig = Field(default_factory=ToolConfig)
@@ -376,6 +386,22 @@ def public_config(config: Config, *, show_secrets: bool = False) -> dict[str, An
             redact_sensitive_headers(provider.get("headers") or {})
         if value["tools"]["web"]["search"].get("api_key"):
             value["tools"]["web"]["search"]["api_key"] = "***"
+        value["plugins"] = _redact_plugin_values(value.get("plugins", {}))
+    return value
+
+
+def _redact_plugin_values(value: Any, key: str = "") -> Any:
+    """Redact conventional plugin secrets without imposing a plugin schema."""
+
+    if _SENSITIVE_CONFIG_KEY.search(key):
+        return "***"
+    if isinstance(value, dict):
+        return {
+            str(child_key): _redact_plugin_values(child_value, str(child_key))
+            for child_key, child_value in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_plugin_values(item, key) for item in value]
     return value
 
 
