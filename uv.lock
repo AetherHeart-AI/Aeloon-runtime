@@ -25,8 +25,8 @@ resolution-markers = [
 ]
 
 [[package]]
-name = "aeloon-core"
-version = "0.0.16"
+name = "aeloon-runtime"
+version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },

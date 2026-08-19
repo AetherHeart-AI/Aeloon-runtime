@@ -1,0 +1,10 @@
+FROM python:3.12-slim
+
+WORKDIR /workspace
+COPY . /opt/aeloon-core
+RUN python -m pip wheel --no-cache-dir --wheel-dir /tmp/aeloon-wheel /opt/aeloon-core \
+    && python -m pip install --no-cache-dir /tmp/aeloon-wheel/*.whl \
+    && rm -rf /tmp/aeloon-wheel /opt/aeloon-core
+
+VOLUME ["/workspace", "/data", "/run/aeloon"]
+ENTRYPOINT ["aeloon-runtime", "serve", "--unix", "/run/aeloon/runtime.sock", "--data-dir", "/data", "--workspace-root", "/workspace"]

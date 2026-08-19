@@ -3,9 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "aeloon-core"
-version = "0.0.16"
-description = "A stateless agent core with a stateful pure-Python runtime."
+name = "aeloon-runtime"
+version = "0.1.0"
+description = "A standalone pure-Python Aeloon Runtime service."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -34,7 +34,7 @@ dev = [
   "tqdm>=4.66",
 ]
 [project.scripts]
-aeloon-core = "aeloon_core.__main__:main"
+aeloon-runtime = "aeloon_core.__main__:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["aeloon_core"]
