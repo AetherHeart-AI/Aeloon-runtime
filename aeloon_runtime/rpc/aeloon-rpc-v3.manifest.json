@@ -99,12 +99,6 @@
         "category": {
           "type": "string"
         },
-        "core_commit": {
-          "type": "string"
-        },
-        "core_version": {
-          "type": "string"
-        },
         "data": {
           "additionalProperties": true,
           "type": "object"
@@ -127,6 +121,12 @@
             "type": "integer"
           },
           "type": "array"
+        },
+        "runtime_commit": {
+          "type": "string"
+        },
+        "runtime_version": {
+          "type": "string"
         }
       },
       "title": "Event_log_entry_v3",

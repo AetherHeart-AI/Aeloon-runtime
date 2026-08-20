@@ -80,7 +80,7 @@ from aeloon_runtime.runtime.types import (
     TurnInput,
 )
 from aeloon_runtime.tool.shell import prune_bash_logs
-from aeloon_runtime.version import core_commit, runtime_version
+from aeloon_runtime.version import runtime_commit, runtime_version
 
 PROMPT_LIMIT = 100_000
 ATTACHMENT_LIMIT = 8
@@ -1857,7 +1857,7 @@ class RuntimeService:
                 "category": "attachment",
                 "action": action,
                 "core_version": runtime_version(),
-                "core_commit": core_commit(),
+                "core_commit": runtime_commit(),
                 "attachment_id": attachment.id,
                 "canonical_path": str(attachment.canonical_path),
                 **dict(extra or {}),

@@ -3,7 +3,7 @@
 
 The archive builder deliberately treats this file as input data. Keeping the
 manifest generation here makes the release workflow unable to silently publish
-an archive whose executable hashes or Core site tree do not describe its bytes.
+an archive whose executable hashes or Runtime site tree do not describe its bytes.
 """
 
 from __future__ import annotations
@@ -19,10 +19,12 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--platform", required=True)
-    parser.add_argument("--runtime-version", default="0.1.0")
+    # Three distinct versions travel in one manifest: the bundle build, the
+    # Runtime distribution inside it, and the desktop app that pins them.
+    parser.add_argument("--bundle-version", default="0.1.0")
     parser.add_argument("--app-version", default="0.0.17")
-    parser.add_argument("--core-version", default="0.1.0")
-    parser.add_argument("--core-commit", default=os.environ.get("GITHUB_SHA", "unknown"))
+    parser.add_argument("--runtime-version", default="0.1.0")
+    parser.add_argument("--runtime-commit", default=os.environ.get("GITHUB_SHA", "unknown"))
     args = parser.parse_args()
     root = args.root.expanduser().resolve(strict=True)
     required = {
@@ -42,25 +44,25 @@ def main() -> int:
             field: executable,
             "executableSha256": _sha256(executable_path),
         }
-    core_site = root / "core-site"
-    tree_hash = _tree_sha256(core_site)
+    runtime_site = root / "runtime-site"
+    tree_hash = _tree_sha256(runtime_site)
     manifest = {
         "schemaVersion": 5,
-        "runtimeVersion": args.runtime_version,
+        "bundleVersion": args.bundle_version,
         "appVersion": args.app_version,
         "rpcProtocol": "aeloon-rpc",
-        "core": {
-            "version": args.core_version,
+        "runtime": {
+            "version": args.runtime_version,
             "repository": "AetherHeart-AI/Aeloon-runtime",
-            "commit": args.core_commit,
-            "sitePackages": "core-site",
+            "commit": args.runtime_commit,
+            "sitePackages": "runtime-site",
             "treeSha256": tree_hash,
         },
         "toolVersions": {
             "python": components["python"]["version"],
             "uv": components["uv"]["version"],
             "ripgrep": components["ripgrep"]["version"],
-            "core": args.core_version,
+            "runtime": args.runtime_version,
         },
         "defaultSources": {
             "python": "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple",

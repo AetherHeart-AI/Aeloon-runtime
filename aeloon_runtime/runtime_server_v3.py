@@ -53,10 +53,10 @@ from aeloon_runtime.runtime.types import RuntimeFailure
 from aeloon_runtime.runtime_log import RuntimeLog
 from aeloon_runtime.store import AsyncRuntimeStore, RuntimeStore
 from aeloon_runtime.trace import TraceRecorder
-from aeloon_runtime.version import RUNTIME_VERSION, core_commit
+from aeloon_runtime.version import RUNTIME_VERSION, runtime_commit
 
 PROTOCOL = "aeloon-rpc"
-RUNTIME_COMMIT = core_commit()
+RUNTIME_COMMIT = runtime_commit()
 MAX_CLIENTS = 8
 EVENT_LIMIT = 10_000
 EVENT_QUEUE_LIMIT = 1_000
@@ -318,6 +318,18 @@ class RuntimeV3Server:
             "session.renamed": "thread.renamed",
             "cloud.account.updated": "plugin.cloud.account_updated",
         }.get(raw.get("name"), raw.get("name"))
+        if raw.get("name") == "log.entry":
+            # The producer is shared with the frozen v2 surface, which has to go
+            # on emitting `core_*`. Rename on the way out so v3 never exposes
+            # the old identity.
+            payload = raw.get("payload")
+            if isinstance(payload, dict):
+                for legacy, current in (
+                    ("core_version", "runtime_version"),
+                    ("core_commit", "runtime_commit"),
+                ):
+                    if legacy in payload:
+                        payload[current] = payload.pop(legacy)
         event_name = raw.get("name")
         validator = _EVENT_SCHEMAS.get(event_name) if isinstance(event_name, str) else None
         if validator is not None:

@@ -109,8 +109,8 @@ def _event_payload_schema(event: str) -> dict[str, Any] | None:
             {
                 "category": string,
                 "action": string,
-                "core_version": string,
-                "core_commit": string,
+                "runtime_version": string,
+                "runtime_commit": string,
                 "attachment_id": string,
                 "canonical_path": string,
                 "metadata": json_object,

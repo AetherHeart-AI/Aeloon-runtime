@@ -49,20 +49,20 @@ def test_protocol_package_is_generated_from_the_v3_manifest() -> None:
     assert "terminal_id?: string | null" in source
 
 
-def test_runtime_release_bundle_installs_wheel_dependencies_into_core_site() -> None:
+def test_runtime_release_bundle_installs_wheel_dependencies_into_runtime_site() -> None:
     workflow = (
         Path(__file__).parents[1] / ".github" / "workflows" / "runtime-release.yml"
     ).read_text(encoding="utf-8")
     assert 'UV_PYTHON="$runtime_python" UV_PYTHON_DOWNLOADS=never' in workflow
     assert '"$root/components/uv/uv" pip install' in workflow
-    assert '--target "$root/core-site"' in workflow
+    assert '--target "$root/runtime-site"' in workflow
     assert "uv export --frozen --no-dev --no-emit-project" in workflow
     assert "astral-sh/python-build-standalone/releases/download" in workflow
     assert "indygreg/python-build-standalone" not in workflow
     assert '--requirement "$RUNNER_TEMP/runtime-requirements.txt"' in workflow
     assert '"$(find "$RUNNER_TEMP/wheel" -name \'*.whl\' -print -quit)"' in workflow
-    assert 'export AELOON_RUNTIME_COMMIT="__CORE_COMMIT__"' in workflow
-    assert 'sed -i.bak "s/__CORE_COMMIT__/${GITHUB_SHA}/"' in workflow
+    assert 'export AELOON_RUNTIME_COMMIT="__RUNTIME_COMMIT__"' in workflow
+    assert 'sed -i.bak "s/__RUNTIME_COMMIT__/${GITHUB_SHA}/"' in workflow
     assert 'export AELOON_RUNTIME_COMMIT="${GITHUB_SHA}"' not in workflow
     # The checked-out desktop repository is core-ui; dispatching to the old
     # aeloon-ui name would silently leave the published Runtime unpinned.

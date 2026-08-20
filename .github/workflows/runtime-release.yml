@@ -132,7 +132,7 @@ jobs:
         run: |
           set -euo pipefail
           root="$RUNNER_TEMP/aeloon-runtime"
-          mkdir -p "$root/bin" "$root/components" "$root/core-site"
+          mkdir -p "$root/bin" "$root/components" "$root/runtime-site"
           cp -R "$RUNNER_TEMP/runtime-components/python" "$root/components/python"
           mkdir -p "$root/components/uv" "$root/components/ripgrep"
           uv_path="$(find "$RUNNER_TEMP/runtime-components/uv" -type f -name uv -perm -111 -print -quit)"
@@ -147,35 +147,35 @@ jobs:
           #!/bin/sh
           set -eu
           root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-          export PYTHONPATH="$root/core-site${PYTHONPATH:+:$PYTHONPATH}"
+          export PYTHONPATH="$root/runtime-site${PYTHONPATH:+:$PYTHONPATH}"
           export AELOON_RUNTIME_MODE=1
-          export AELOON_RUNTIME_COMMIT="__CORE_COMMIT__"
+          export AELOON_RUNTIME_COMMIT="__RUNTIME_COMMIT__"
           exec "$root/components/python/bin/python3" -m aeloon_runtime "$@"
           SH
           # The release commit is embedded at build time. Leaving a
           # ``${GITHUB_SHA}`` expansion in the shipped launcher would make a
           # standalone user invocation fail with ``set -u`` outside Actions.
-          sed -i.bak "s/__CORE_COMMIT__/${GITHUB_SHA}/" "$root/bin/aeloon-runtime"
+          sed -i.bak "s/__RUNTIME_COMMIT__/${GITHUB_SHA}/" "$root/bin/aeloon-runtime"
           rm -f "$root/bin/aeloon-runtime.bak"
           chmod 0755 "$root/bin/aeloon-runtime" "$root/components/uv/uv" "$root/components/ripgrep/rg"
           runtime_python="$root/components/python/bin/python3"
           UV_PYTHON="$runtime_python" UV_PYTHON_DOWNLOADS=never \
             "$root/components/uv/uv" pip install \
-              --target "$root/core-site" \
+              --target "$root/runtime-site" \
               --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
               --requirement "$RUNNER_TEMP/runtime-requirements.txt"
           UV_PYTHON="$runtime_python" UV_PYTHON_DOWNLOADS=never \
             "$root/components/uv/uv" pip install \
-              --target "$root/core-site" \
+              --target "$root/runtime-site" \
               --no-deps \
               "$(find "$RUNNER_TEMP/wheel" -name '*.whl' -print -quit)"
           PYTHON_VERSION="$PYTHON_VERSION" UV_VERSION="$UV_VERSION" RIPGREP_VERSION="$RIPGREP_VERSION" \
             python tools/write_runtime_manifest.py \
               --root "$root" \
               --platform "${{ matrix.platform }}" \
+              --bundle-version "$RUNTIME_VERSION" \
               --runtime-version "$RUNTIME_VERSION" \
-              --core-version "$RUNTIME_VERSION" \
-              --core-commit "$GITHUB_SHA"
+              --runtime-commit "$GITHUB_SHA"
           AELOON_RUNTIME_MODE=1 "$root/bin/aeloon-runtime" --version
           python tools/build_runtime_bundle.py \
             --runtime-root "$root" \
@@ -225,7 +225,7 @@ jobs:
           gh api --method POST repos/AetherHeart-AI/core-ui/dispatches \
             --input - \
             -H "Authorization: Bearer ${UI_TOKEN}" <<JSON
-          {"event_type":"runtime-release","client_payload":{"runtime_version":"${RUNTIME_VERSION}","release_tag":"${tag}","core_commit":"${GITHUB_SHA}"}}
+          {"event_type":"runtime-release","client_payload":{"runtime_version":"${RUNTIME_VERSION}","release_tag":"${tag}","runtime_commit":"${GITHUB_SHA}"}}
           JSON
 
       - name: Publish @aeloon/protocol to npm when configured

@@ -29,7 +29,7 @@ from aeloon_runtime.runtime.service import (
 )
 from aeloon_runtime.runtime.session import SessionError
 from aeloon_runtime.runtime.types import RuntimeEvent, RuntimeFailure, TurnInput
-from aeloon_runtime.version import __version__, core_commit
+from aeloon_runtime.version import __version__, runtime_commit
 
 EVENT_LIMIT = 5_000
 RpcEventListener = Callable[[dict[str, Any]], Awaitable[None] | None]
@@ -131,7 +131,7 @@ class AeloonRpcAdapter:
         return {
             "protocol": PROTOCOL_NAME,
             "core_version": __version__,
-            "core_commit": core_commit(),
+            "core_commit": runtime_commit(),
             "server_instance_id": self.server_instance_id,
             "methods": list(METHODS),
             "events": list(EVENTS),

@@ -27,7 +27,7 @@ def runtime_version() -> str:
 
 
 @lru_cache(maxsize=1)
-def core_commit() -> str:
+def runtime_commit() -> str:
     """Return the embedded release commit, with source-tree fallbacks for development."""
 
     build_info = Path(__file__).with_name("_build_info.json")
@@ -62,4 +62,4 @@ def _valid_commit(value: str) -> bool:
     return len(value) == 40 and all(character in "0123456789abcdef" for character in value)
 
 
-__all__ = ["__version__", "RUNTIME_VERSION", "runtime_version", "core_commit"]
+__all__ = ["__version__", "RUNTIME_VERSION", "runtime_version", "runtime_commit"]
