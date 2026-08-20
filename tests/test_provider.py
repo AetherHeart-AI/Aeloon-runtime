@@ -6,7 +6,7 @@ import json
 import httpx
 import pytest
 
-from aeloon_core.core import (
+from aeloon_runtime.core import (
     ImageContent,
     InferenceContext,
     InferenceError,
@@ -18,14 +18,14 @@ from aeloon_core.core import (
     ToolResultMessage,
     UserMessage,
 )
-from aeloon_core.core.events import RunEventDispatcher
-from aeloon_core.core.inference_runtime import InferenceRuntime, collect_assistant
-from aeloon_core.runtime.providers import (
+from aeloon_runtime.core.events import RunEventDispatcher
+from aeloon_runtime.core.inference_runtime import InferenceRuntime, collect_assistant
+from aeloon_runtime.runtime.providers import (
     DEEPSEEK_V4_FLASH,
     DeepSeekProvider,
     OpenAICompatibleProvider,
 )
-from aeloon_core.runtime.providers.openai import _openai_payload
+from aeloon_runtime.runtime.providers.openai import _openai_payload
 
 
 def test_openai_tool_images_follow_the_complete_tool_result_batch() -> None:

@@ -9,7 +9,7 @@ import pytest
 import yaml
 
 SKILL_DIR = (
-    Path(__file__).parents[1] / "aeloon_core" / "resources" / "skills" / "aeloon-office-lite"
+    Path(__file__).parents[1] / "aeloon_runtime" / "resources" / "skills" / "aeloon-office-lite"
 )
 
 

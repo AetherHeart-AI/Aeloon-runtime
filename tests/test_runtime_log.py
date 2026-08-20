@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from aeloon_core.runtime_log import RuntimeLog
+from aeloon_runtime.runtime_log import RuntimeLog
 
 
 def test_runtime_log_rotates_private_lifecycle_file(tmp_path: Path) -> None:

@@ -6,7 +6,7 @@ The benchmark runner has one public command:
 uv run python run_bench.py \
   --harness aeloon \
   --model deepseek-v4-flash \
-  --config ~/.aeloon-core/config.json \
+  --config ~/.aeloon-runtime/config.json \
   --benchmark refactorbench
 ```
 

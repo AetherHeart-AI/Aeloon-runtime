@@ -4,14 +4,14 @@ from pathlib import Path
 
 import pytest
 
-from aeloon_core.config import Config, save_config
-from aeloon_core.core import (
+from aeloon_runtime.config import Config, save_config
+from aeloon_runtime.core import (
     AssistantMessage,
     TextContent,
     ToolCall,
 )
-from aeloon_core.rpc import AeloonRpcAdapter
-from aeloon_core.runtime import (
+from aeloon_runtime.rpc import AeloonRpcAdapter
+from aeloon_runtime.runtime import (
     PRESENT_FILES_TOOL_NAME,
     Artifact,
     JsonlSessionRepository,
@@ -19,8 +19,8 @@ from aeloon_core.runtime import (
     ProviderManager,
     RuntimeService,
 )
-from aeloon_core.runtime.providers.testing import ScriptedProvider
-from aeloon_core.tool import BuiltinToolSet
+from aeloon_runtime.runtime.providers.testing import ScriptedProvider
+from aeloon_runtime.tool import BuiltinToolSet
 
 ALL_TOOL_NAMES = BuiltinToolSet.all_names
 DEFAULT_ACTIVE_TOOLS = BuiltinToolSet.default_active_names

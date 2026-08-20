@@ -8,12 +8,12 @@ from pathlib import Path
 import pytest
 from jsonschema import Draft202012Validator
 
-from aeloon_core.config import Config, save_config
-from aeloon_core.rpc import AeloonRpcAdapter, RpcError
-from aeloon_core.rpc.manifest import MANIFEST_PATH
-from aeloon_core.rpc.server import AeloonRpcServer, rpc_request
-from aeloon_core.runtime import RuntimeService
-from aeloon_core.runtime.providers import DEEPSEEK_MODELS, BaseProvider, ProviderManager
+from aeloon_runtime.config import Config, save_config
+from aeloon_runtime.rpc import AeloonRpcAdapter, RpcError
+from aeloon_runtime.rpc.manifest import MANIFEST_PATH
+from aeloon_runtime.rpc.server import AeloonRpcServer, rpc_request
+from aeloon_runtime.runtime import RuntimeService
+from aeloon_runtime.runtime.providers import DEEPSEEK_MODELS, BaseProvider, ProviderManager
 
 
 class EmptyProvider(BaseProvider):

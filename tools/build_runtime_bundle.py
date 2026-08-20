@@ -51,7 +51,7 @@ def main() -> int:
     print(
         json.dumps(
             {
-                "url": "https://github.com/AetherHeart-AI/Aeloon-core/releases/download/"
+                "url": "https://github.com/AetherHeart-AI/Aeloon-runtime/releases/download/"
                 f"runtime-v{args.runtime_version}/aeloon-runtime-{args.platform}.tar.zst",
                 "sha256": digest,
                 "size_bytes": output.stat().st_size,

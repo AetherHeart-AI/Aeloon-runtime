@@ -4,12 +4,12 @@ from pathlib import Path
 
 import pytest
 
-from aeloon_core.config import Config, save_config
-from aeloon_core.core import AssistantMessage, TextContent
-from aeloon_core.rpc import AeloonRpcAdapter
-from aeloon_core.runtime import ProviderManager, RuntimeService
-from aeloon_core.runtime.providers.testing import ScriptedProvider
-from aeloon_core.runtime.rename import fallback_session_title, normalize_session_title
+from aeloon_runtime.config import Config, save_config
+from aeloon_runtime.core import AssistantMessage, TextContent
+from aeloon_runtime.rpc import AeloonRpcAdapter
+from aeloon_runtime.runtime import ProviderManager, RuntimeService
+from aeloon_runtime.runtime.providers.testing import ScriptedProvider
+from aeloon_runtime.runtime.rename import fallback_session_title, normalize_session_title
 
 
 def test_normalize_session_title_removes_model_formatting() -> None:

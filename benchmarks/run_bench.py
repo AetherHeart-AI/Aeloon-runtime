@@ -61,7 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--config",
         type=Path,
         default=None,
-        help="Aeloon Core config JSON path (used by the aeloon harness).",
+        help="Aeloon Runtime config JSON path (used by the aeloon harness).",
     )
     parser.add_argument(
         "--workers",

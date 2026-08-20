@@ -41,8 +41,8 @@ jobs:
         run: |
           set -euo pipefail
           baseline="$RUNNER_TEMP/rpc-v3-baseline.json"
-          if [ -n "${BASE_SHA:-}" ] && git show "$BASE_SHA:aeloon_core/rpc/aeloon-rpc-v3.manifest.json" > "$baseline" 2>/dev/null; then
-            uv run --frozen python tools/check_rpc_compat.py "$baseline" aeloon_core/rpc/aeloon-rpc-v3.manifest.json
+          if [ -n "${BASE_SHA:-}" ] && git show "$BASE_SHA:aeloon_runtime/rpc/aeloon-rpc-v3.manifest.json" > "$baseline" 2>/dev/null; then
+            uv run --frozen python tools/check_rpc_compat.py "$baseline" aeloon_runtime/rpc/aeloon-rpc-v3.manifest.json
           else
             echo "No previous v3 manifest exists; compatibility check starts with this revision."
           fi
@@ -56,10 +56,10 @@ jobs:
           expected_version="$(uv run --frozen python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
           uv venv --python 3.12 wheel-smoke
           uv pip install --python wheel-smoke/bin/python "$wheel"
-          test "$(AELOON_RUNTIME_MODE=1 wheel-smoke/bin/python -m aeloon_core --version)" = "aeloon-runtime ${expected_version}"
+          test "$(AELOON_RUNTIME_MODE=1 wheel-smoke/bin/python -m aeloon_runtime --version)" = "aeloon-runtime ${expected_version}"
           test -x wheel-smoke/bin/aeloon-runtime
           test ! -e wheel-smoke/bin/aeloon
           test "$(wheel-smoke/bin/aeloon-runtime --version)" = "aeloon-runtime ${expected_version}"
           wheel-smoke/bin/aeloon-runtime serve --help >/dev/null
-          test -f "aeloon_core/resources/skills/aeloon-office-lite/SKILL.md"
-          test -f "aeloon_core/resources/skills/aeloon-office-lite/scripts/cli.py"
+          test -f "aeloon_runtime/resources/skills/aeloon-office-lite/SKILL.md"
+          test -f "aeloon_runtime/resources/skills/aeloon-office-lite/scripts/cli.py"

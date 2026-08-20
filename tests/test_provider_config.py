@@ -5,7 +5,7 @@ import json
 import pytest
 from pydantic import ValidationError
 
-from aeloon_core.config import (
+from aeloon_runtime.config import (
     Config,
     CustomProviderConfig,
     DeepSeekProviderConfig,

@@ -1,4 +1,4 @@
-"""Aeloon Core harness."""
+"""Aeloon Runtime harness."""
 
 from __future__ import annotations
 
@@ -31,13 +31,13 @@ class AeloonHarness(Harness):
             check=False,
         )
         revision = completed.stdout.strip() if completed.returncode == 0 else None
-        return f"aeloon-core@{revision}" if revision else "aeloon-core"
+        return f"aeloon-runtime@{revision}" if revision else "aeloon-runtime"
 
     def build_invocation(self, request: HarnessRequest) -> HarnessInvocation:
         command = [
             self.executable,
             "-m",
-            "aeloon_core",
+            "aeloon_runtime",
             "run",
             "--workspace",
             str(request.workspace),

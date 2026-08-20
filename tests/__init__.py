@@ -1,1 +1,1 @@
-"""Focused regression tests for Aeloon Core."""
+"""Focused regression tests for Aeloon Runtime."""

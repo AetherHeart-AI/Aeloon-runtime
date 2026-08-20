@@ -33,7 +33,7 @@ def main() -> int:
         metadata = (staging / "pyproject.toml").read_text(encoding="utf-8")
         metadata = metadata.replace('name = "aeloon-runtime"', 'name = "aeloon-runtime"', 1)
         metadata = metadata.replace('version = "0.1.0"', 'version = "0.1.0"', 1)
-        if '[project.scripts]\naeloon-runtime = "aeloon_core.__main__:main"' not in metadata:
+        if '[project.scripts]\naeloon-runtime = "aeloon_runtime.__main__:main"' not in metadata:
             raise SystemExit("source metadata must expose only the aeloon-runtime script")
         (staging / "pyproject.toml").write_text(metadata, encoding="utf-8")
         subprocess.run(

@@ -5,8 +5,8 @@ from pathlib import Path
 
 from jsonschema import Draft202012Validator
 
-from aeloon_core.rpc.manifest import MANIFEST_PATH, build_manifest, render_manifest
-from aeloon_core.rpc.protocol import EVENT_REGISTRY, METHOD_REGISTRY
+from aeloon_runtime.rpc.manifest import MANIFEST_PATH, build_manifest, render_manifest
+from aeloon_runtime.rpc.protocol import EVENT_REGISTRY, METHOD_REGISTRY
 
 
 def test_checked_in_protocol_manifest_is_current_and_valid() -> None:
@@ -37,7 +37,7 @@ def test_manifest_registry_has_resolvable_exact_shapes() -> None:
 
 
 def test_production_adapter_does_not_import_manifest_generator() -> None:
-    adapter_source = (Path(__file__).parents[1] / "aeloon_core" / "rpc" / "adapter.py").read_text(
+    adapter_source = (Path(__file__).parents[1] / "aeloon_runtime" / "rpc" / "adapter.py").read_text(
         encoding="utf-8"
     )
     assert "rpc.manifest" not in adapter_source

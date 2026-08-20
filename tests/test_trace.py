@@ -4,7 +4,7 @@ import base64
 import json
 from pathlib import Path
 
-from aeloon_core.trace import TraceRecorder
+from aeloon_runtime.trace import TraceRecorder
 from tools.sanitize_trace import Sanitizer, sanitize_lines
 
 

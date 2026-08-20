@@ -5,17 +5,17 @@ from pathlib import Path
 import pytest
 from reportlab.pdfgen import canvas
 
-from aeloon_core.config import Config, CustomProviderConfig, ProviderModelConfig, save_config
-from aeloon_core.core import AssistantMessage, ImageContent, Model, TextContent
-from aeloon_core.rpc import AeloonRpcAdapter
-from aeloon_core.runtime import ProviderManager, RuntimeService
-from aeloon_core.runtime.attachments import (
+from aeloon_runtime.config import Config, CustomProviderConfig, ProviderModelConfig, save_config
+from aeloon_runtime.core import AssistantMessage, ImageContent, Model, TextContent
+from aeloon_runtime.rpc import AeloonRpcAdapter
+from aeloon_runtime.runtime import ProviderManager, RuntimeService
+from aeloon_runtime.runtime.attachments import (
     AttachmentMetadataTool,
     AttachmentReadTool,
     AttachmentStore,
 )
-from aeloon_core.runtime.providers.testing import ScriptedProvider
-from aeloon_core.runtime.types import RuntimeFailure
+from aeloon_runtime.runtime.providers.testing import ScriptedProvider
+from aeloon_runtime.runtime.types import RuntimeFailure
 
 
 def _descriptor(path: Path, *, attachment_id: str = "attachment-1") -> dict[str, object]:

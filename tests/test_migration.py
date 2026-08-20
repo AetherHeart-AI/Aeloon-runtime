@@ -9,9 +9,9 @@ from pathlib import Path
 
 import pytest
 
-import aeloon_core.migration as migration
-from aeloon_core.migration import migrate_workbench
-from aeloon_core.store import RuntimeStore
+import aeloon_runtime.migration as migration
+from aeloon_runtime.migration import migrate_workbench
+from aeloon_runtime.store import RuntimeStore
 
 
 def _create_legacy_db(path: Path, *, project_path: str = "/tmp", thread: tuple[str, str, str] | None = None) -> None:

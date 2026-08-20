@@ -51,7 +51,7 @@ def main() -> int:
         "rpcProtocol": "aeloon-rpc",
         "core": {
             "version": args.core_version,
-            "repository": "AetherHeart-AI/Aeloon-core",
+            "repository": "AetherHeart-AI/Aeloon-runtime",
             "commit": args.core_commit,
             "sitePackages": "core-site",
             "treeSha256": tree_hash,

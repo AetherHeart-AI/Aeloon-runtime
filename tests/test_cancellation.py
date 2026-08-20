@@ -7,10 +7,10 @@ from pathlib import Path
 
 import pytest
 
-from aeloon_core.blocking import run_blocking
-from aeloon_core.runtime.coordinator import Operation
-from aeloon_core.runtime.service import RuntimeService
-from aeloon_core.tool import BashTool, ToolContext
+from aeloon_runtime.blocking import run_blocking
+from aeloon_runtime.runtime.coordinator import Operation
+from aeloon_runtime.runtime.service import RuntimeService
+from aeloon_runtime.tool import BashTool, ToolContext
 
 
 @pytest.mark.asyncio

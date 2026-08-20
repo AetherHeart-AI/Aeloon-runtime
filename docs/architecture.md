@@ -18,7 +18,7 @@ The fixed dependency directions are `rpc → runtime → core`, `runtime → too
 
 ## Core: one stateless inference run
 
-`aeloon_core.core.run_agent()` receives a complete `RunRequest` and returns a `RunResult`.
+`aeloon_runtime.core.run_agent()` receives a complete `RunRequest` and returns a `RunResult`.
 `RunRequest.inference` is an `InferencePort`; tools implement the neutral `Tool` protocol. Core
 owns only invocation-local engine, controller, queues, cancellation tasks, messages, and tool-loop
 state. Nothing is retained after the await completes.
@@ -30,7 +30,7 @@ discovery, or vendor compatibility logic.
 
 ## Tool: object-oriented built-ins
 
-`aeloon_core.tool` contains `BaseTool`, `ToolContext`, filesystem tools, `BashTool`, search tools,
+`aeloon_runtime.tool` contains `BaseTool`, `ToolContext`, filesystem tools, `BashTool`, search tools,
 and `BuiltinToolSet`. A ToolSet shares one context-scoped mutation-lock map; there is no process
 global write registry. Writes and edits replace their target atomically.
 
@@ -60,7 +60,7 @@ Bootstrap also gives each Manager a lazy Cloud account gateway bound to the same
 snapshot. Updating settings can therefore replace the service-level account client without
 mutating an operation that is already running.
 
-Concrete implementations live in `aeloon_core.runtime.providers`: Custom OpenAI-compatible APIs,
+Concrete implementations live in `aeloon_runtime.runtime.providers`: Custom OpenAI-compatible APIs,
 DeepSeek, Aeloon Cloud, and the testing-only `ScriptedProvider`.
 
 ## Local RPC and Cloud

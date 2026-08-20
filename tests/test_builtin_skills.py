@@ -1,11 +1,11 @@
 from pathlib import Path
 
-from aeloon_core.runtime.builtin_skills import (
+from aeloon_runtime.runtime.builtin_skills import (
     BUILTIN_SKILL_IDS,
     provision_builtin_skills,
 )
-from aeloon_core.runtime.resources import ResourceLoader
-from aeloon_core.runtime.service import RuntimeService
+from aeloon_runtime.runtime.resources import ResourceLoader
+from aeloon_runtime.runtime.service import RuntimeService
 
 
 def test_provision_builtin_skills_is_idempotent_and_preserves_existing(tmp_path: Path) -> None:

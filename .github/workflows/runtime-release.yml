@@ -41,7 +41,7 @@ jobs:
           test -n "$wheel"
           uv venv --python 3.12 "$RUNNER_TEMP/wheel-smoke"
           uv pip install --python "$RUNNER_TEMP/wheel-smoke/bin/python" "$wheel"
-          test "$(AELOON_RUNTIME_MODE=1 "$RUNNER_TEMP/wheel-smoke/bin/python" -m aeloon_core --version)" = "aeloon-runtime ${RUNTIME_VERSION}"
+          test "$(AELOON_RUNTIME_MODE=1 "$RUNNER_TEMP/wheel-smoke/bin/python" -m aeloon_runtime --version)" = "aeloon-runtime ${RUNTIME_VERSION}"
       - uses: actions/upload-artifact@v4
         with:
           name: aeloon-runtime-wheel
@@ -101,7 +101,7 @@ jobs:
       - name: Verify Runtime source
         run: |
           uv run --frozen pytest -q
-          uv run --frozen ruff check aeloon_core tools tests
+          uv run --frozen ruff check aeloon_runtime tools tests
           uv run --frozen python tools/gen_v3_manifest.py --check
           uv run --frozen python tools/gen_rpc_docs.py --check
           uv run --frozen python tools/docker_smoke.py --check-only
@@ -149,8 +149,8 @@ jobs:
           root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
           export PYTHONPATH="$root/core-site${PYTHONPATH:+:$PYTHONPATH}"
           export AELOON_RUNTIME_MODE=1
-          export AELOON_CORE_COMMIT="__CORE_COMMIT__"
-          exec "$root/components/python/bin/python3" -m aeloon_core "$@"
+          export AELOON_RUNTIME_COMMIT="__CORE_COMMIT__"
+          exec "$root/components/python/bin/python3" -m aeloon_runtime "$@"
           SH
           # The release commit is embedded at build time. Leaving a
           # ``${GITHUB_SHA}`` expansion in the shipped launcher would make a

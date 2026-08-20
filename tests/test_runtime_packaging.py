@@ -5,20 +5,20 @@ import subprocess
 import sys
 from pathlib import Path
 
-from aeloon_core.version import runtime_version
+from aeloon_runtime.version import runtime_version
 
 
 def test_runtime_distribution_metadata_has_release_command_and_version() -> None:
     metadata = (Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8")
     assert 'name = "aeloon-runtime"' in metadata
     assert 'version = "0.1.0"' in metadata
-    assert 'aeloon-runtime = "aeloon_core.__main__:main"' in metadata
+    assert 'aeloon-runtime = "aeloon_runtime.__main__:main"' in metadata
 
 
 def test_runtime_entrypoint_reports_runtime_identity() -> None:
     environment = {**os.environ, "AELOON_RUNTIME_MODE": "1"}
     result = subprocess.run(
-        [sys.executable, "-m", "aeloon_core", "--version"],
+        [sys.executable, "-m", "aeloon_runtime", "--version"],
         check=True,
         capture_output=True,
         text=True,
@@ -61,9 +61,9 @@ def test_runtime_release_bundle_installs_wheel_dependencies_into_core_site() -> 
     assert "indygreg/python-build-standalone" not in workflow
     assert '--requirement "$RUNNER_TEMP/runtime-requirements.txt"' in workflow
     assert '"$(find "$RUNNER_TEMP/wheel" -name \'*.whl\' -print -quit)"' in workflow
-    assert 'export AELOON_CORE_COMMIT="__CORE_COMMIT__"' in workflow
+    assert 'export AELOON_RUNTIME_COMMIT="__CORE_COMMIT__"' in workflow
     assert 'sed -i.bak "s/__CORE_COMMIT__/${GITHUB_SHA}/"' in workflow
-    assert 'export AELOON_CORE_COMMIT="${GITHUB_SHA}"' not in workflow
+    assert 'export AELOON_RUNTIME_COMMIT="${GITHUB_SHA}"' not in workflow
     # The checked-out desktop repository is core-ui; dispatching to the old
     # aeloon-ui name would silently leave the published Runtime unpinned.
     assert "repos/AetherHeart-AI/core-ui/dispatches" in workflow
@@ -85,5 +85,5 @@ def test_package_workflow_checks_protocol_compatibility_against_base_revision() 
     ).read_text(encoding="utf-8")
     assert "fetch-depth: 0" in workflow
     assert "BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}" in workflow
-    assert "git show \"$BASE_SHA:aeloon_core/rpc/aeloon-rpc-v3.manifest.json\"" in workflow
+    assert "git show \"$BASE_SHA:aeloon_runtime/rpc/aeloon-rpc-v3.manifest.json\"" in workflow
     assert "tools/check_rpc_compat.py" in workflow

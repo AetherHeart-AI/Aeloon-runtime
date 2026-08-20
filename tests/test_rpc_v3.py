@@ -6,11 +6,11 @@ from pathlib import Path
 import pytest
 from jsonschema import Draft202012Validator, ValidationError
 
-from aeloon_core.rpc.protocol import RPC_CODES
+from aeloon_runtime.rpc.protocol import RPC_CODES
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "docs" / "rpc-v3.json"
-MANIFEST = ROOT / "aeloon_core" / "rpc" / "aeloon-rpc-v3.manifest.json"
+MANIFEST = ROOT / "aeloon_runtime" / "rpc" / "aeloon-rpc-v3.manifest.json"
 
 
 def test_v3_source_and_generated_manifest_are_current() -> None:

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from aeloon_core.store import SCHEMA_VERSION, AsyncRuntimeStore, RuntimeStore
+from aeloon_runtime.store import SCHEMA_VERSION, AsyncRuntimeStore, RuntimeStore
 
 
 def test_store_migrates_and_persists_projection(tmp_path: Path) -> None:

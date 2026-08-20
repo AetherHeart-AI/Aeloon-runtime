@@ -81,7 +81,7 @@ def test_standalone_runtime_survives_client_disconnect_and_restores_projection(
         [
             sys.executable,
             "-m",
-            "aeloon_core",
+            "aeloon_runtime",
             "serve",
             "--unix",
             str(socket_path),

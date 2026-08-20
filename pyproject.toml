@@ -34,10 +34,10 @@ dev = [
   "tqdm>=4.66",
 ]
 [project.scripts]
-aeloon-runtime = "aeloon_core.__main__:main"
+aeloon-runtime = "aeloon_runtime.__main__:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["aeloon_core"]
+packages = ["aeloon_runtime"]
 
 [[tool.uv.index]]
 name = "tsinghua"

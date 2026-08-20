@@ -7,16 +7,16 @@ from typing import Any
 import httpx
 import pytest
 
-from aeloon_core.config import (
+from aeloon_runtime.config import (
     Config,
     CustomProviderConfig,
     ProviderModelConfig,
     save_config,
 )
-from aeloon_core.core import InferenceContext, Model, StreamOptions, UserMessage
-from aeloon_core.core.inference_runtime import collect_assistant
-from aeloon_core.rpc import AeloonRpcAdapter
-from aeloon_core.runtime import (
+from aeloon_runtime.core import InferenceContext, Model, StreamOptions, UserMessage
+from aeloon_runtime.core.inference_runtime import collect_assistant
+from aeloon_runtime.rpc import AeloonRpcAdapter
+from aeloon_runtime.runtime import (
     ProviderManager,
     RuntimeService,
     normalize_model_id,
@@ -24,7 +24,7 @@ from aeloon_core.runtime import (
     resolve_model_id,
     split_model_id,
 )
-from aeloon_core.runtime.providers import BaseProvider, CustomProvider, model_from_config
+from aeloon_runtime.runtime.providers import BaseProvider, CustomProvider, model_from_config
 
 
 class TrackingProvider(BaseProvider):

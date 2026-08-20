@@ -19,7 +19,7 @@ from jsonschema import Draft202012Validator
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "docs" / "rpc-v3.json"
-DEFAULT_OUTPUT = ROOT / "aeloon_core" / "rpc" / "aeloon-rpc-v3.manifest.json"
+DEFAULT_OUTPUT = ROOT / "aeloon_runtime" / "rpc" / "aeloon-rpc-v3.manifest.json"
 
 ERROR_CODES = {
     "protocol_incompatible": -32010,

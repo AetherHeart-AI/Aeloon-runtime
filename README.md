@@ -98,11 +98,11 @@ uv run aeloon-runtime completion fish > ~/.config/fish/completions/aeloon-runtim
 
 ## Project resources
 
-Global resources live in `~/.aeloon-core`; workspace resources live in
-`<workspace>/.aeloon-core`:
+Global resources live in `~/.aeloon-runtime`; workspace resources live in
+`<workspace>/.aeloon-runtime`:
 
 ```text
-.aeloon-core/
+.aeloon-runtime/
 ├── SYSTEM.md
 ├── APPEND_SYSTEM.md
 ├── skills/<name>/SKILL.md
@@ -117,7 +117,7 @@ Runtime bundles one Python-driven Office skill: `aeloon-office-lite` for fast, s
 creation, validation, and visual rendering of local PDF, DOCX, PPTX, and XLSX files. On first
 startup after installation, the missing built-in skill is copied from package resources into
 `<data_dir>/skills` (normally
-`~/.aeloon-core/skills`). Existing same-named files and directories are preserved, so local
+`~/.aeloon-runtime/skills`). Existing same-named files and directories are preserved, so local
 customizations are never overwritten or removed.
 
 The main package contains only lightweight Python document libraries. Text-bearing files are read
@@ -146,9 +146,9 @@ artifacts; stateless core tools and message types remain format-agnostic.
 ## Python API
 
 ```python
-from aeloon_core.core import RunRequest, UserMessage, run_agent
-from aeloon_core.runtime.providers import DeepSeekProvider, get_deepseek_model
-from aeloon_core.tool import BuiltinToolSet
+from aeloon_runtime.core import RunRequest, UserMessage, run_agent
+from aeloon_runtime.runtime.providers import DeepSeekProvider, get_deepseek_model
+from aeloon_runtime.tool import BuiltinToolSet
 
 workspace = "/path/to/repository"
 provider = DeepSeekProvider(api_key="...")
@@ -173,7 +173,7 @@ finally:
 `run_agent()` retains no state after it returns. Stateful applications should use the runtime API:
 
 ```python
-from aeloon_core.bootstrap import create_runtime_service
+from aeloon_runtime.bootstrap import create_runtime_service
 
 runtime = create_runtime_service()
 session = await runtime.create_session(workspace="/path/to/repository")

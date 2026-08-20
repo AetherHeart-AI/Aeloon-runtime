@@ -3,7 +3,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from aeloon_core.git_workspace import changes, status
+from aeloon_runtime.git_workspace import changes, status
 
 
 def _git(path: Path, *args: str) -> None:

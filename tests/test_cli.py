@@ -6,10 +6,10 @@ from pathlib import Path
 
 import pytest
 
-import aeloon_core.__main__ as cli
-from aeloon_core.core import AssistantMessage, Model, TextContent, Usage
-from aeloon_core.runtime.providers import ProviderManager as RuntimeProviderManager
-from aeloon_core.runtime.providers.testing import ScriptedProvider
+import aeloon_runtime.__main__ as cli
+from aeloon_runtime.core import AssistantMessage, Model, TextContent, Usage
+from aeloon_runtime.runtime.providers import ProviderManager as RuntimeProviderManager
+from aeloon_runtime.runtime.providers.testing import ScriptedProvider
 
 
 def _provider(text: str = "done", *, models=()) -> ScriptedProvider:
@@ -455,14 +455,14 @@ def test_run_without_any_connected_model_explains_setup(tmp_path: Path, capsys) 
     )
     error = capsys.readouterr().err
     assert "No connected model is available" in error
-    assert "aeloon-core provider add" in error
+    assert "aeloon-runtime provider add" in error
     assert "first available model automatically" in error
 
 
 def test_top_level_help_focuses_on_user_tasks() -> None:
     help_text = cli.build_parser().format_help()
 
-    assert 'aeloon-core "fix the failing tests"' in help_text
+    assert 'aeloon-runtime "fix the failing tests"' in help_text
     assert "resume" in help_text
     assert "history" in help_text
     assert "doctor" in help_text
@@ -551,7 +551,7 @@ def test_commands_use_actionable_errors(tmp_path: Path, capsys) -> None:
     )
     human = capsys.readouterr().err
     assert human.startswith("Error: No saved task")
-    assert "aeloon-core history" in human
+    assert "aeloon-runtime history" in human
 
 @pytest.mark.asyncio
 async def test_default_task_runs_without_run_verb(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -705,7 +705,7 @@ async def test_models_and_doctor_offer_human_and_machine_views(tmp_path: Path, c
     assert diagnosis["ok"] is False
     model = next(item for item in diagnosis["checks"] if item["name"] == "model")
     assert model["status"] == "error"
-    assert "aeloon-core provider add" in model["fix"]
+    assert "aeloon-runtime provider add" in model["fix"]
 
 
 @pytest.mark.asyncio
@@ -831,7 +831,7 @@ async def test_explicit_short_model_uses_first_matching_provider(
 def test_completion_command_emits_shell_script(capsys) -> None:
     assert cli.main(["completion", "zsh"]) == 0
     rendered = capsys.readouterr().out
-    assert rendered.startswith("#compdef aeloon-core")
+    assert rendered.startswith("#compdef aeloon-runtime")
     assert "resume history login logout" in rendered
 
 
@@ -841,5 +841,5 @@ def test_package_exposes_only_the_aeloon_runtime_command() -> None:
     )
 
     assert metadata["project"]["scripts"] == {
-        "aeloon-runtime": "aeloon_core.__main__:main",
+        "aeloon-runtime": "aeloon_runtime.__main__:main",
     }

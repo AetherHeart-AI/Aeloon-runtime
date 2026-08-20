@@ -13,11 +13,11 @@ from typing import Any
 
 import pytest
 
-import aeloon_core.runtime_server_v3 as runtime_server_v3
-from aeloon_core.bootstrap import create_runtime_service
-from aeloon_core.rpc.protocol import RpcError
-from aeloon_core.runtime.session import SessionError
-from aeloon_core.runtime_server_v3 import (
+import aeloon_runtime.runtime_server_v3 as runtime_server_v3
+from aeloon_runtime.bootstrap import create_runtime_service
+from aeloon_runtime.rpc.protocol import RpcError
+from aeloon_runtime.runtime.session import SessionError
+from aeloon_runtime.runtime_server_v3 import (
     MAX_FRAME_BYTES,
     RuntimeV3Connection,
     RuntimeV3Server,
@@ -713,7 +713,7 @@ async def test_v3_worktree_create_rolls_back_implicit_project_on_git_failure(
     def fail_worktree(*_: object, **__: object) -> object:
         raise RuntimeError("git worktree unavailable")
 
-    monkeypatch.setattr("aeloon_core.runtime_server_v3.git_create_worktree", fail_worktree)
+    monkeypatch.setattr("aeloon_runtime.runtime_server_v3.git_create_worktree", fail_worktree)
     try:
         with pytest.raises(RpcError, match="git worktree unavailable"):
             await server.dispatch(

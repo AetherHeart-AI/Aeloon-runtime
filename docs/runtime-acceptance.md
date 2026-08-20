@@ -4,10 +4,10 @@ The base release is frozen only after these commands and platform jobs pass:
 
 ```bash
 uv run python tools/gen_v3_manifest.py --check
-uv run python tools/check_rpc_compat.py OLD.json aeloon_core/rpc/aeloon-rpc-v3.manifest.json
+uv run python tools/check_rpc_compat.py OLD.json aeloon_runtime/rpc/aeloon-rpc-v3.manifest.json
 uv run python tools/docker_smoke.py
 uv run pytest -q
-uv run ruff check aeloon_core tools tests
+uv run ruff check aeloon_runtime tools tests
 ```
 
 The Docker smoke builds the image and starts it with mounted workspace, data,

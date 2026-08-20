@@ -7,9 +7,9 @@ from pathlib import Path
 import pytest
 from jsonschema import Draft202012Validator, ValidationError
 
-from aeloon_core.bootstrap import create_runtime_service
-from aeloon_core.rpc.protocol import RpcError
-from aeloon_core.runtime_server_v3 import (
+from aeloon_runtime.bootstrap import create_runtime_service
+from aeloon_runtime.rpc.protocol import RpcError
+from aeloon_runtime.runtime_server_v3 import (
     FILE_BYTES,
     IMAGE_BYTES,
     MAX_FRAME_BYTES,
@@ -22,7 +22,7 @@ from aeloon_core.runtime_server_v3 import (
 def test_rpc_source_and_manifest_are_strict_and_complete() -> None:
     source = json.loads(Path("docs/rpc-v3.json").read_text(encoding="utf-8"))
     manifest = json.loads(
-        Path("aeloon_core/rpc/aeloon-rpc-v3.manifest.json").read_text(encoding="utf-8")
+        Path("aeloon_runtime/rpc/aeloon-rpc-v3.manifest.json").read_text(encoding="utf-8")
     )
     assert source["$schema"].endswith("draft/2020-12/schema")
     assert source["frame_max_bytes"] == MAX_FRAME_BYTES

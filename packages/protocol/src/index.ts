@@ -1,5 +1,5 @@
 /* eslint-disable */
-/** Generated from aeloon_core/rpc/aeloon-rpc-v3.manifest.json. DO NOT EDIT. */
+/** Generated from aeloon_runtime/rpc/aeloon-rpc-v3.manifest.json. DO NOT EDIT. */
 
 export interface Event_capabilities_updated_v3 {
   capabilities: ({ [k: string]: unknown })[];
@@ -188,6 +188,21 @@ export interface Event_turn_created_v3 {
 export interface Event_usage_updated_v3 {
   stats?: { [k: string]: unknown };
   usage?: { [k: string]: unknown };
+}
+
+export interface GitChangeFile_v3 {
+  additions: number;
+  binary: boolean;
+  deletions: number;
+  path: string;
+  renamed_from?: string;
+  status: string;
+}
+
+export interface GitChangeGroup_v3 {
+  additions: number;
+  deletions: number;
+  files: (GitChangeFile_v3)[];
 }
 
 export interface Params_artifact_download_v3 {
@@ -604,8 +619,8 @@ export interface Result_git_branches_v3 {
 
 export interface Result_git_changes_v3 {
   branch: string | null;
-  changes: string;
-  staged: string;
+  changes: GitChangeGroup_v3;
+  staged: GitChangeGroup_v3;
 }
 
 export interface Result_git_commit_v3 {
@@ -1041,5 +1056,5 @@ export type RuntimeEvent =
 export type RuntimeEventName = RuntimeEvent["name"];
 
 export const RUNTIME_RPC_PROTOCOL = "aeloon-rpc" as const;
-export const RUNTIME_RPC_VERSION = "3.0.0-draft.3" as const;
+export const RUNTIME_RPC_VERSION = "3.0.0" as const;
 export const RUNTIME_RPC_MAX_FRAME_BYTES = 41943040 as const;
