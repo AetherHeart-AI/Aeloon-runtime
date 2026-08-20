@@ -222,7 +222,7 @@ jobs:
           gh release upload "$tag" release/*.tgz --clobber
           gh release upload "$tag" release/*.whl --clobber
           test -n "$UI_TOKEN"
-          gh api --method POST repos/AetherHeart-AI/core-ui/dispatches \
+          gh api --method POST repos/AetherHeart-AI/Aeloon-ui/dispatches \
             --input - \
             -H "Authorization: Bearer ${UI_TOKEN}" <<JSON
           {"event_type":"runtime-release","client_payload":{"runtime_version":"${RUNTIME_VERSION}","release_tag":"${tag}","runtime_commit":"${GITHUB_SHA}"}}

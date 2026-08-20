@@ -64,9 +64,9 @@ def test_runtime_release_bundle_installs_wheel_dependencies_into_runtime_site() 
     assert 'export AELOON_RUNTIME_COMMIT="__RUNTIME_COMMIT__"' in workflow
     assert 'sed -i.bak "s/__RUNTIME_COMMIT__/${GITHUB_SHA}/"' in workflow
     assert 'export AELOON_RUNTIME_COMMIT="${GITHUB_SHA}"' not in workflow
-    # The checked-out desktop repository is core-ui; dispatching to the old
-    # aeloon-ui name would silently leave the published Runtime unpinned.
-    assert "repos/AetherHeart-AI/core-ui/dispatches" in workflow
+    # A dispatch to the wrong repository name fails silently and leaves the
+    # published Runtime unpinned, so the desktop repository is asserted here.
+    assert "repos/AetherHeart-AI/Aeloon-ui/dispatches" in workflow
 
 
 def test_runtime_release_publishes_the_runtime_wheel_alongside_bundles() -> None:
