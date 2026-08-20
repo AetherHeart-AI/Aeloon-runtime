@@ -1,5 +1,39 @@
 {
   "$defs": {
+    "Device_v3": {
+      "additionalProperties": false,
+      "properties": {
+        "connected": {
+          "type": "boolean"
+        },
+        "id": {
+          "type": "string"
+        },
+        "last_seen_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "paired_at": {
+          "type": "string"
+        },
+        "platform": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "platform",
+        "paired_at"
+      ],
+      "title": "Device_v3",
+      "type": "object"
+    },
     "Event_capabilities_updated_v3": {
       "additionalProperties": false,
       "properties": {
@@ -766,6 +800,31 @@
       "title": "Params_catalog_get_v3",
       "type": "object"
     },
+    "Params_devices_enroll_v3": {
+      "additionalProperties": false,
+      "properties": {},
+      "title": "Params_devices_enroll_v3",
+      "type": "object"
+    },
+    "Params_devices_list_v3": {
+      "additionalProperties": false,
+      "properties": {},
+      "title": "Params_devices_list_v3",
+      "type": "object"
+    },
+    "Params_devices_revoke_v3": {
+      "additionalProperties": false,
+      "properties": {
+        "device_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "device_id"
+      ],
+      "title": "Params_devices_revoke_v3",
+      "type": "object"
+    },
     "Params_events_subscribe_v3": {
       "additionalProperties": false,
       "properties": {
@@ -1328,15 +1387,15 @@
         "auth": {
           "additionalProperties": false,
           "properties": {
+            "code": {
+              "type": "string"
+            },
             "scheme": {
-              "anyOf": [
-                {
-                  "const": "bearer"
-                },
-                {
-                  "const": "mtls"
-                }
-              ]
+              "enum": [
+                "bearer",
+                "enrollment"
+              ],
+              "type": "string"
             },
             "token": {
               "type": "string"
@@ -2107,6 +2166,63 @@
         "default_model_id"
       ],
       "title": "Result_catalog_get_v3",
+      "type": "object"
+    },
+    "Result_devices_enroll_v3": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "expires_at": {
+          "type": "string"
+        },
+        "pairing_url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "expires_at",
+        "pairing_url"
+      ],
+      "title": "Result_devices_enroll_v3",
+      "type": "object"
+    },
+    "Result_devices_list_v3": {
+      "additionalProperties": false,
+      "properties": {
+        "devices": {
+          "items": {
+            "$ref": "#/$defs/Device_v3"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "devices"
+      ],
+      "title": "Result_devices_list_v3",
+      "type": "object"
+    },
+    "Result_devices_revoke_v3": {
+      "additionalProperties": false,
+      "properties": {
+        "devices": {
+          "items": {
+            "$ref": "#/$defs/Device_v3"
+          },
+          "type": "array"
+        },
+        "revoked": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "revoked",
+        "devices"
+      ],
+      "title": "Result_devices_revoke_v3",
       "type": "object"
     },
     "Result_events_subscribe_v3": {
@@ -2935,6 +3051,22 @@
     "Result_system_handshake_v3": {
       "additionalProperties": false,
       "properties": {
+        "device": {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "token": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "token"
+          ],
+          "type": "object"
+        },
         "limits": {
           "additionalProperties": false,
           "properties": {
@@ -3801,6 +3933,30 @@
         "$ref": "#/$defs/Result_catalog_get_v3"
       }
     },
+    "devices.enroll": {
+      "params": {
+        "$ref": "#/$defs/Params_devices_enroll_v3"
+      },
+      "result": {
+        "$ref": "#/$defs/Result_devices_enroll_v3"
+      }
+    },
+    "devices.list": {
+      "params": {
+        "$ref": "#/$defs/Params_devices_list_v3"
+      },
+      "result": {
+        "$ref": "#/$defs/Result_devices_list_v3"
+      }
+    },
+    "devices.revoke": {
+      "params": {
+        "$ref": "#/$defs/Params_devices_revoke_v3"
+      },
+      "result": {
+        "$ref": "#/$defs/Result_devices_revoke_v3"
+      }
+    },
     "events.subscribe": {
       "params": {
         "$ref": "#/$defs/Params_events_subscribe_v3"
@@ -4349,7 +4505,7 @@
     }
   },
   "protocol": "aeloon-rpc",
-  "protocol_version": "3.0.0",
+  "protocol_version": "3.1.0",
   "schema_version": 1,
   "transport": {
     "encoding": "utf-8-json",

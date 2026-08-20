@@ -20,7 +20,8 @@ def test_v3_source_and_generated_manifest_are_current() -> None:
     assert list(Draft202012Validator(source).iter_errors(source)) == []
     assert source["additionalProperties"] is False
     methods = [method for group in source["groups"] for method in group["methods"]]
-    assert len(methods) == 66
+    # 66 first-class methods at 3.0.0, plus devices.list/revoke/enroll at 3.1.0.
+    assert len(methods) == 69
     assert manifest["protocol"] == "aeloon-rpc"
     assert manifest["protocol_version"] == source["version"]
     assert manifest["transport"]["max_frame_bytes"] == 40 * 1024 * 1024

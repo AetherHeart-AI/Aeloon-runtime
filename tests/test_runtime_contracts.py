@@ -28,7 +28,7 @@ def test_rpc_source_and_manifest_are_strict_and_complete() -> None:
     assert source["frame_max_bytes"] == MAX_FRAME_BYTES
     assert source["file_max_bytes"] == FILE_BYTES
     assert source["image_max_bytes"] == IMAGE_BYTES
-    assert len(manifest["methods"]) == 66
+    assert len(manifest["methods"]) == 69
     assert len(manifest["plugin_methods"]) == 9
     assert len(manifest["events"]) >= 30
     assert len(manifest["errors"]) >= 15
@@ -76,6 +76,27 @@ def test_rpc_source_and_manifest_are_strict_and_complete() -> None:
         {"$defs": defs, "$ref": "#/$defs/Params_plugin_cloud_account_login_v3"}
     )
     cloud_login.validate({"username": "user", "password": "pass", "workspace": "/tmp"})
+
+
+def test_handshake_negotiates_a_window_not_an_exact_version() -> None:
+    from aeloon_runtime.runtime_server_v3 import SUPPORTED_PROTOCOLS, _range_contains
+
+    # Newest first: a client that speaks both must be answered with the newer one.
+    assert SUPPORTED_PROTOCOLS[0] == "3.1.0"
+    assert "3.0.0" in SUPPORTED_PROTOCOLS
+
+    def negotiate(minimum: str, maximum: str) -> str | None:
+        return next(
+            (v for v in SUPPORTED_PROTOCOLS if _range_contains(minimum, maximum, v)),
+            None,
+        )
+
+    # A client pinned to the previous minor keeps working after the Runtime moves
+    # on; that is the whole point of versioning the two sides independently.
+    assert negotiate("3.0.0", "3.0.0") == "3.0.0"
+    assert negotiate("3.0.0", "3.1.0") == "3.1.0"
+    assert negotiate("3.1.0", "3.1.0") == "3.1.0"
+    assert negotiate("4.0.0", "4.0.0") is None
 
 
 def test_semver_endpoint_range_and_frame_limit() -> None:

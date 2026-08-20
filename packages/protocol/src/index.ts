@@ -1,6 +1,15 @@
 /* eslint-disable */
 /** Generated from aeloon_runtime/rpc/aeloon-rpc-v3.manifest.json. DO NOT EDIT. */
 
+export interface Device_v3 {
+  connected?: boolean;
+  id: string;
+  last_seen_at?: string | null;
+  name: string;
+  paired_at: string;
+  platform: string;
+}
+
 export interface Event_capabilities_updated_v3 {
   capabilities: ({ [k: string]: unknown })[];
 }
@@ -29,14 +38,14 @@ export interface Event_log_entry_v3 {
   attachment_id?: string;
   canonical_path?: string;
   category?: string;
-  core_commit?: string;
-  core_version?: string;
   data?: { [k: string]: unknown };
   dpi?: number;
   level?: string;
   message?: string;
   metadata?: { [k: string]: unknown };
   pages?: (number)[];
+  runtime_commit?: string;
+  runtime_version?: string;
 }
 
 export interface Event_operation_cancelled_v3 {
@@ -236,6 +245,16 @@ export interface Params_attachment_upload_v3 {
 export interface Params_catalog_get_v3 {
   thread_id?: string;
   workspace?: string;
+}
+
+export interface Params_devices_enroll_v3 {
+}
+
+export interface Params_devices_list_v3 {
+}
+
+export interface Params_devices_revoke_v3 {
+  device_id: string;
 }
 
 export interface Params_events_subscribe_v3 {
@@ -581,6 +600,21 @@ export interface Result_catalog_get_v3 {
   tools: ({ [k: string]: unknown })[];
 }
 
+export interface Result_devices_enroll_v3 {
+  code: string;
+  expires_at: string;
+  pairing_url: string;
+}
+
+export interface Result_devices_list_v3 {
+  devices: (Device_v3)[];
+}
+
+export interface Result_devices_revoke_v3 {
+  devices: (Device_v3)[];
+  revoked: boolean;
+}
+
 export interface Result_events_subscribe_v3 {
   current_seq: number;
   cursor: { [k: string]: unknown };
@@ -776,6 +810,7 @@ export interface Result_system_capabilities_v3 {
 }
 
 export interface Result_system_handshake_v3 {
+  device?: { [k: string]: unknown };
   limits: { [k: string]: unknown };
   protocol: string;
   runtime: { [k: string]: unknown };
@@ -933,6 +968,9 @@ export interface RuntimeRpcMethodMap {
   "attachment.preview": { params: Params_attachment_preview_v3; result: Result_attachment_preview_v3 };
   "attachment.upload": { params: Params_attachment_upload_v3; result: Result_attachment_upload_v3 };
   "catalog.get": { params: Params_catalog_get_v3; result: Result_catalog_get_v3 };
+  "devices.enroll": { params: Params_devices_enroll_v3; result: Result_devices_enroll_v3 };
+  "devices.list": { params: Params_devices_list_v3; result: Result_devices_list_v3 };
+  "devices.revoke": { params: Params_devices_revoke_v3; result: Result_devices_revoke_v3 };
   "events.subscribe": { params: Params_events_subscribe_v3; result: Result_events_subscribe_v3 };
   "fs.list": { params: Params_fs_list_v3; result: Result_fs_list_v3 };
   "fs.read": { params: Params_fs_read_v3; result: Result_fs_read_v3 };
@@ -1056,5 +1094,5 @@ export type RuntimeEvent =
 export type RuntimeEventName = RuntimeEvent["name"];
 
 export const RUNTIME_RPC_PROTOCOL = "aeloon-rpc" as const;
-export const RUNTIME_RPC_VERSION = "3.0.0" as const;
+export const RUNTIME_RPC_VERSION = "3.1.0" as const;
 export const RUNTIME_RPC_MAX_FRAME_BYTES = 41943040 as const;

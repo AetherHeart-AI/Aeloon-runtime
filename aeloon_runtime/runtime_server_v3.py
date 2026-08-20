@@ -64,6 +64,9 @@ _MANIFEST = json.loads(
     (Path(__file__).with_name("rpc") / "aeloon-rpc-v3.manifest.json").read_text(encoding="utf-8")
 )
 PROTOCOL_VERSION = str(_MANIFEST["protocol_version"])
+# Newest first. One minor back stays supported so a client and a Runtime can be
+# upgraded independently; drop an entry only in a major bump.
+SUPPORTED_PROTOCOLS: tuple[str, ...] = (PROTOCOL_VERSION, "3.0.0")
 MAX_FRAME_BYTES = int(_MANIFEST["transport"]["max_frame_bytes"])
 FILE_BYTES = int(_MANIFEST["transport"]["file_bytes"])
 IMAGE_BYTES = int(_MANIFEST["transport"]["image_bytes"])
@@ -569,10 +572,14 @@ class RuntimeV3Server:
             if value.get("message"):
                 result["error"] = value["message"]
             return result
+        # Declared in the manifest but not yet enabled. "Not enabled" and "no such
+        # method" are different answers: the first says the capability exists and
+        # may light up, the second says it never will.
         if (
             method.startswith("plugins.")
             or method.startswith("plugin.memory.")
             or method.startswith("plugin.knowledge.")
+            or method.startswith("devices.")
         ):
             raise RpcError("capability_unavailable", f"Capability is not enabled: {method}")
         if method.startswith("project."):
@@ -1452,13 +1459,27 @@ class RuntimeV3Server:
             raise RpcError("protocol_incompatible", "Client did not provide a protocol range")
         minimum = str(offered.get("min") or "")
         maximum = str(offered.get("max") or "")
-        if not _range_contains(minimum, maximum, PROTOCOL_VERSION):
+        # A compatibility window, not an exact match: the Runtime answers with the
+        # newest protocol it speaks that the client also speaks. Requiring the
+        # client range to contain this Runtime's exact version would break every
+        # older client on each minor bump, which is the opposite of what
+        # independent versioning is for.
+        negotiated = next(
+            (
+                candidate
+                for candidate in SUPPORTED_PROTOCOLS
+                if _range_contains(minimum, maximum, candidate)
+            ),
+            None,
+        )
+        if negotiated is None:
+            supported = ", ".join(SUPPORTED_PROTOCOLS)
             raise RpcError(
                 "protocol_incompatible",
-                f"Runtime supports {PROTOCOL_VERSION}; client offered {minimum}..{maximum}",
+                f"Runtime speaks {supported}; client offered {minimum}..{maximum}",
             )
         return {
-            "protocol": PROTOCOL_VERSION,
+            "protocol": negotiated,
             "runtime": {"version": RUNTIME_VERSION, "commit": RUNTIME_COMMIT},
             "limits": {
                 "prompt_chars": 100_000,

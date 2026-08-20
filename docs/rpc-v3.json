@@ -539,16 +539,16 @@
           "additionalProperties": false,
           "properties": {
             "scheme": {
-              "anyOf": [
-                {
-                  "const": "bearer"
-                },
-                {
-                  "const": "mtls"
-                }
+              "type": "string",
+              "enum": [
+                "bearer",
+                "enrollment"
               ]
             },
             "token": {
+              "type": "string"
+            },
+            "code": {
               "type": "string"
             }
           },
@@ -623,6 +623,22 @@
           "items": {
             "type": "string"
           }
+        },
+        "device": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "token": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "token"
+          ]
         }
       },
       "required": [
@@ -4092,10 +4108,126 @@
           "type": "integer"
         }
       }
+    },
+    "Device_v3": {
+      "title": "Device_v3",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name",
+        "platform",
+        "paired_at"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "platform": {
+          "type": "string"
+        },
+        "paired_at": {
+          "type": "string"
+        },
+        "last_seen_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "connected": {
+          "type": "boolean"
+        }
+      }
+    },
+    "Params_devices_list_v3": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {},
+      "title": "Params_devices_list_v3"
+    },
+    "Result_devices_list_v3": {
+      "title": "Result_devices_list_v3",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "devices"
+      ],
+      "properties": {
+        "devices": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Device_v3"
+          }
+        }
+      }
+    },
+    "Params_devices_revoke_v3": {
+      "title": "Params_devices_revoke_v3",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "device_id"
+      ],
+      "properties": {
+        "device_id": {
+          "type": "string"
+        }
+      }
+    },
+    "Result_devices_revoke_v3": {
+      "title": "Result_devices_revoke_v3",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "revoked",
+        "devices"
+      ],
+      "properties": {
+        "revoked": {
+          "type": "boolean"
+        },
+        "devices": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Device_v3"
+          }
+        }
+      }
+    },
+    "Params_devices_enroll_v3": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {},
+      "title": "Params_devices_enroll_v3"
+    },
+    "Result_devices_enroll_v3": {
+      "title": "Result_devices_enroll_v3",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "expires_at",
+        "pairing_url"
+      ],
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "expires_at": {
+          "type": "string"
+        },
+        "pairing_url": {
+          "type": "string"
+        }
+      }
     }
   },
   "protocol": "aeloon-rpc",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "schema_version": 1,
   "json_schema_draft": "https://json-schema.org/draft/2020-12/schema",
   "frame_max_bytes": 41943040,
@@ -5055,6 +5187,54 @@
           "note": "原 tools.search.test（三段命名）",
           "params_signature": "{query, provider?}",
           "result_signature": "{results[], engine, error?}"
+        }
+      ]
+    },
+    {
+      "id": "devices",
+      "title": "devices · 设备配对与令牌（3.1.0 新增）",
+      "methods": [
+        {
+          "name": "devices.list",
+          "params": {
+            "$ref": "#/$defs/Params_devices_list_v3"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_devices_list_v3"
+          },
+          "src": "new",
+          "change": "new",
+          "note": "单租户：这里列的是同一个所有者的多台设备，不是多个用户",
+          "params_signature": "{}",
+          "result_signature": "{devices:[{id,name,platform,paired_at,last_seen_at,connected}]}"
+        },
+        {
+          "name": "devices.revoke",
+          "params": {
+            "$ref": "#/$defs/Params_devices_revoke_v3"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_devices_revoke_v3"
+          },
+          "src": "new",
+          "change": "new",
+          "note": "吊销后立即断开该设备的活动连接，而不是等它下次握手",
+          "params_signature": "{device_id}",
+          "result_signature": "{revoked,devices[]}"
+        },
+        {
+          "name": "devices.enroll",
+          "params": {
+            "$ref": "#/$defs/Params_devices_enroll_v3"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_devices_enroll_v3"
+          },
+          "src": "new",
+          "change": "new",
+          "note": "从已配对设备生成新注册码，配第二台机器时不必回到服务器终端。短时效、一次性",
+          "params_signature": "{}",
+          "result_signature": "{code,expires_at,pairing_url}"
         }
       ]
     },
