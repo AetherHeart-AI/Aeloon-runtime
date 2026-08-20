@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import ssl
 import struct
 from pathlib import Path
 
@@ -20,11 +21,10 @@ def test_parse_listen_accepts_loopback_forms() -> None:
 
 
 @pytest.mark.parametrize("value", ["0.0.0.0:7420", "192.168.1.5:7420", "example.com:443"])
-def test_parse_listen_refuses_routable_addresses(value: str) -> None:
-    # Until device pairing exists there is nothing to authenticate against, so a
-    # routable bind would publish an unauthenticated Runtime.
-    with pytest.raises(ValueError, match="loopback only"):
-        parse_listen(value)
+def test_parse_listen_accepts_routable_addresses_for_later_policy(value: str) -> None:
+    host, port = parse_listen(value)
+    assert port > 0
+    assert host
 
 
 @pytest.mark.parametrize("value", ["127.0.0.1", "127.0.0.1:abc", "127.0.0.1:0", "[::1]7420"])
@@ -97,19 +97,71 @@ async def test_byte_stream_ignores_text_frames() -> None:
         await stream.readexactly(1)
 
 
-async def _ws_request(url: str, method: str, params: dict) -> dict:
-    async with websockets.connect(url, max_size=None) as connection:
+async def _ws_request(
+    url: str,
+    method: str,
+    params: dict,
+    *,
+    token: str,
+    ssl_ctx: ssl.SSLContext,
+) -> dict:
+    async with websockets.connect(url, max_size=None, ssl=ssl_ctx) as connection:
         await connection.send(_frame({
             "id": "1",
             "method": "system.handshake",
             "params": {
                 "protocol": {"min": "3.0.0", "max": "3.0.0"},
                 "client": {"name": "pytest", "version": "0", "platform": "test"},
+                "auth": {"scheme": "bearer", "token": token},
             },
         }))
         await _read(connection)
         await connection.send(_frame({"id": "2", "method": method, "params": params}))
         return await _read(connection)
+
+
+def _insecure_client_ssl() -> ssl.SSLContext:
+    ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
+    return ssl_ctx
+
+
+async def _unix_enroll(socket_path: Path) -> str:
+    reader, writer = await asyncio.open_unix_connection(str(socket_path))
+    writer.write(_frame({
+        "id": "1",
+        "method": "system.handshake",
+        "params": {
+            "protocol": {"min": "3.0.0", "max": "3.1.0"},
+            "client": {"name": "pytest", "version": "0", "platform": "test"},
+        },
+    }))
+    await writer.drain()
+    size = struct.unpack("!I", await reader.readexactly(4))[0]
+    await reader.readexactly(size)
+    writer.write(_frame({"id": "2", "method": "devices.enroll", "params": {}}))
+    await writer.drain()
+    size = struct.unpack("!I", await reader.readexactly(4))[0]
+    enrolled = json.loads(await reader.readexactly(size))
+    writer.close()
+    await writer.wait_closed()
+    return enrolled["result"]["code"]
+
+
+async def _ws_enroll(url: str, code: str, ssl_ctx: ssl.SSLContext) -> str:
+    async with websockets.connect(url, max_size=None, ssl=ssl_ctx) as connection:
+        await connection.send(_frame({
+            "id": "1",
+            "method": "system.handshake",
+            "params": {
+                "protocol": {"min": "3.0.0", "max": "3.1.0"},
+                "client": {"name": "pytest", "version": "0", "platform": "test"},
+                "auth": {"scheme": "enrollment", "code": code},
+            },
+        }))
+        result = await _read(connection)
+        return result["result"]["device"]["token"]
 
 
 def _frame(value: dict) -> bytes:
@@ -132,6 +184,8 @@ async def test_websocket_transport_serves_the_same_method_table(tmp_path: Path) 
     # AF_UNIX paths are capped near 104 bytes, and pytest's tmp_path is longer.
     socket_path = Path("/tmp") / f"aeloon-ws-{os.getpid()}.sock"
     port = 45_501
+    ssl_ctx = _insecure_client_ssl()
+    url = f"wss://127.0.0.1:{port}"
     task = asyncio.create_task(
         serve_v3(
             socket_path=socket_path,
@@ -145,15 +199,17 @@ async def test_websocket_transport_serves_the_same_method_table(tmp_path: Path) 
             if socket_path.exists():
                 break
             await asyncio.sleep(0.02)
-        # The listener comes up after the Unix socket; retry until it accepts.
+        code = None
         for _ in range(200):
             try:
-                health = await _ws_request(f"ws://127.0.0.1:{port}", "system.health", {})
+                code = await _unix_enroll(socket_path)
                 break
             except OSError:
                 await asyncio.sleep(0.02)
         else:  # pragma: no cover - only on a wedged listener
-            raise AssertionError("WebSocket listener never accepted a connection")
+            raise AssertionError("Unix socket never accepted a connection")
+        token = await _ws_enroll(url, code, ssl_ctx)
+        health = await _ws_request(url, "system.health", {}, token=token, ssl_ctx=ssl_ctx)
         assert health["result"]["ok"] is True
         # The Unix socket keeps serving while the WebSocket listener is up.
         reader, writer = await asyncio.open_unix_connection(str(socket_path))
@@ -167,6 +223,19 @@ async def test_websocket_transport_serves_the_same_method_table(tmp_path: Path) 
         writer.close()
         await writer.wait_closed()
     finally:
-        await _ws_request(f"ws://127.0.0.1:{port}", "system.shutdown", {})
+        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        writer.write(_frame({"id": "1", "method": "system.handshake", "params": {
+            "protocol": {"min": "3.0.0", "max": "3.0.0"},
+            "client": {"name": "pytest", "version": "0", "platform": "test"},
+        }}))
+        await writer.drain()
+        header = await reader.readexactly(4)
+        await reader.readexactly(struct.unpack("!I", header)[0])
+        writer.write(_frame({"id": "2", "method": "system.shutdown", "params": {}}))
+        await writer.drain()
+        header = await reader.readexactly(4)
+        await reader.readexactly(struct.unpack("!I", header)[0])
+        writer.close()
+        await writer.wait_closed()
         await asyncio.wait_for(task, timeout=5)
         socket_path.unlink(missing_ok=True)

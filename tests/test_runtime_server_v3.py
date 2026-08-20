@@ -225,11 +225,13 @@ async def test_v3_control_requests_are_not_blocked_by_a_long_request(tmp_path: P
     release = asyncio.Event()
     original_dispatch = server.dispatch
 
-    async def delayed_dispatch(method: str, params: Mapping[str, Any]) -> Any:
+    async def delayed_dispatch(
+        method: str, params: Mapping[str, Any], connection: Any = None
+    ) -> Any:
         if method == "catalog.get":
             entered.set()
             await release.wait()
-        return await original_dispatch(method, params)
+        return await original_dispatch(method, params, connection)
 
     server.dispatch = delayed_dispatch  # type: ignore[method-assign]
     slow = {"id": "slow", "method": "catalog.get", "params": {}}

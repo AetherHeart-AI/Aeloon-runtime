@@ -46,6 +46,7 @@ from aeloon_runtime.git_workspace import stage as git_stage
 from aeloon_runtime.git_workspace import status as git_status
 from aeloon_runtime.git_workspace import unstage as git_unstage
 from aeloon_runtime.git_workspace import worktree_status as git_worktree_status
+from aeloon_runtime.pairing import PairingState
 from aeloon_runtime.pty_manager import PTYManager
 from aeloon_runtime.rpc.protocol import RpcError
 from aeloon_runtime.runtime.service import RuntimeService
@@ -57,7 +58,10 @@ from aeloon_runtime.version import RUNTIME_VERSION, runtime_commit
 
 PROTOCOL = "aeloon-rpc"
 RUNTIME_COMMIT = runtime_commit()
-MAX_CLIENTS = 8
+MAX_CLIENTS = 16
+MAX_CLIENTS_PER_DEVICE = 4
+MAX_PENDING_AUTH = 16
+AUTH_HANDSHAKE_TIMEOUT_S = 10.0
 EVENT_LIMIT = 10_000
 EVENT_QUEUE_LIMIT = 1_000
 _MANIFEST = json.loads(
@@ -137,6 +141,8 @@ class RuntimeV3Server:
         preacquired_lock_fd: int | None = None,
         listen: tuple[str, int] | None = None,
         tls_context: Any | None = None,
+        tls_certificate: Path | None = None,
+        tls_key: Path | None = None,
     ) -> None:
         self.runtime = runtime
         # A WebSocket listener is additive: the Unix socket always exists, so a
@@ -144,6 +150,8 @@ class RuntimeV3Server:
         # against identical state.
         self.listen = listen
         self.tls_context = tls_context
+        self.tls_certificate = tls_certificate
+        self.tls_key = tls_key
         self.socket_path = socket_path.expanduser().resolve(strict=False)
         # Empty means no authorized roots. The CLI default of cwd is applied
         # in ``serve_v3`` when the caller omits ``--workspace-root``; the
@@ -156,6 +164,7 @@ class RuntimeV3Server:
         self.trace = trace_recorder
         self.server: asyncio.AbstractServer | None = None
         self.connections: set[RuntimeV3Connection] = set()
+        self.pending_connections: set[RuntimeV3Connection] = set()
         self.started_at = time.monotonic()
         self.server_instance_id = str(uuid.uuid4())
         self.current_seq = 0
@@ -171,6 +180,7 @@ class RuntimeV3Server:
         self.store = RuntimeStore(self.data_dir / "runtime.sqlite")
         self.async_store = AsyncRuntimeStore(self.store)
         self.pty = PTYManager(self._on_runtime_event)
+        self.pairing = PairingState(self.data_dir)
 
     async def _store_call(self, method: str, *args: Any, **kwargs: Any) -> Any:
         """Run one projection operation on the dedicated SQLite worker."""
@@ -259,16 +269,42 @@ class RuntimeV3Server:
             await self._close_store()
             raise
         websocket_server = None
-        if self.listen is not None:
-            from aeloon_runtime.gateway_ws import serve_websocket
-
-            host, port = self.listen
-            websocket_server = await serve_websocket(
-                self, host=host, port=port, tls=self.tls_context
-            )
-            if self.log is not None:
-                self.log.write("listening", host=host, port=port, tls=self.tls_context is not None)
         try:
+            if self.listen is not None:
+                from aeloon_runtime.gateway_ws import require_listen_host, serve_websocket
+                from aeloon_runtime.pairing import is_loopback_host
+
+                host, port = self.listen
+                # Fail closed on a routable bind with zero paired devices *before*
+                # opening the listener. TLS alone is not enough: anyone on the
+                # network could otherwise walk enrollment.
+                if not is_loopback_host(host) and not self.pairing.store.has_devices():
+                    require_listen_host(host, tls_ready=False, paired=False)
+                self.tls_context = self.pairing.prepare_listen(
+                    host,
+                    port,
+                    certificate=self.tls_certificate,
+                    key=self.tls_key,
+                )
+                require_listen_host(
+                    host,
+                    tls_ready=self.tls_context is not None,
+                    paired=self.pairing.store.has_devices(),
+                )
+                # A zero-device loopback Runtime needs a bootstrap path. Once
+                # a device exists, or for any routable listener, enrollment is
+                # explicit through devices.enroll and must not mint a new code
+                # on every process restart.
+                if is_loopback_host(host) and not self.pairing.store.has_devices():
+                    _code, _expires_at, url = self.pairing.issue_enrollment()
+                    print(url, flush=True)
+                websocket_server = await serve_websocket(
+                    self, host=host, port=port, tls=self.tls_context
+                )
+                if self.log is not None:
+                    self.log.write(
+                        "listening", host=host, port=port, tls=self.tls_context is not None
+                    )
             await self.stop_event.wait()
         finally:
             if websocket_server is not None:
@@ -319,12 +355,18 @@ class RuntimeV3Server:
             writer.close()
             await writer.wait_closed()
             return
-        connection = RuntimeV3Connection(self, reader, writer)
+        connection = RuntimeV3Connection(self, reader, writer, requires_auth=False)
         self.connections.add(connection)
         try:
             await connection.run()
         finally:
             self.connections.discard(connection)
+
+    def activate_connection(self, connection: RuntimeV3Connection) -> None:
+        if len(self.connections) >= MAX_CLIENTS:
+            raise RpcError("busy", "Runtime connection limit reached")
+        self.pending_connections.discard(connection)
+        self.connections.add(connection)
 
     async def _on_runtime_event(self, event: Any) -> None:
         raw = event.to_dict() if hasattr(event, "to_dict") else dict(event)
@@ -422,7 +464,12 @@ class RuntimeV3Server:
             return_exceptions=True,
         )
 
-    async def dispatch(self, method: str, params: Mapping[str, Any]) -> Any:
+    async def dispatch(
+        self,
+        method: str,
+        params: Mapping[str, Any],
+        connection: RuntimeV3Connection | None = None,
+    ) -> Any:
         validator = _METHOD_SCHEMAS.get(method)
         if validator is not None:
             try:
@@ -434,7 +481,7 @@ class RuntimeV3Server:
                     "invalid_argument", f"Invalid parameters{detail}: {exc.message}"
                 ) from None
         if method == "system.handshake":
-            return self._handshake(params)
+            return await self._handshake(params, connection)
         if method == "system.health":
             return {
                 "ok": True,
@@ -579,9 +626,10 @@ class RuntimeV3Server:
             method.startswith("plugins.")
             or method.startswith("plugin.memory.")
             or method.startswith("plugin.knowledge.")
-            or method.startswith("devices.")
         ):
             raise RpcError("capability_unavailable", f"Capability is not enabled: {method}")
+        if method.startswith("devices."):
+            return await self._devices_dispatch(method, params, connection)
         if method.startswith("project."):
             return await self._project_dispatch(method, params)
         if method.startswith("thread."):
@@ -1453,10 +1501,18 @@ class RuntimeV3Server:
             raise RpcError("invalid_argument", f"{key} is required")
         return value.strip()
 
-    def _handshake(self, params: Mapping[str, Any]) -> dict[str, Any]:
+    async def _handshake(
+        self,
+        params: Mapping[str, Any],
+        connection: RuntimeV3Connection | None = None,
+    ) -> dict[str, Any]:
         offered = params.get("protocol")
         if not isinstance(offered, Mapping):
-            raise RpcError("protocol_incompatible", "Client did not provide a protocol range")
+            raise RpcError(
+                "protocol_incompatible",
+                "Client did not provide a protocol range",
+                {"runtime_min": SUPPORTED_PROTOCOLS[0], "runtime_max": SUPPORTED_PROTOCOLS[-1]},
+            )
         minimum = str(offered.get("min") or "")
         maximum = str(offered.get("max") or "")
         # A compatibility window, not an exact match: the Runtime answers with the
@@ -1477,8 +1533,14 @@ class RuntimeV3Server:
             raise RpcError(
                 "protocol_incompatible",
                 f"Runtime speaks {supported}; client offered {minimum}..{maximum}",
+                {
+                    "client_min": minimum,
+                    "client_max": maximum,
+                    "runtime_min": SUPPORTED_PROTOCOLS[0],
+                    "runtime_max": SUPPORTED_PROTOCOLS[-1],
+                },
             )
-        return {
+        result: dict[str, Any] = {
             "protocol": negotiated,
             "runtime": {"version": RUNTIME_VERSION, "commit": RUNTIME_COMMIT},
             "limits": {
@@ -1491,6 +1553,159 @@ class RuntimeV3Server:
             },
             "workspace_roots": [str(root) for root in self.workspace_roots],
         }
+        if connection is not None:
+            device = await self._authenticate_handshake(params, connection)
+            if device is not None:
+                result["device"] = device
+        return result
+
+    async def _authenticate_handshake(
+        self,
+        params: Mapping[str, Any],
+        connection: RuntimeV3Connection,
+    ) -> dict[str, str] | None:
+        requires_auth = connection.requires_auth and connection.device_id is None
+        auth = params.get("auth")
+        if not requires_auth and not isinstance(auth, Mapping):
+            return None
+        source = connection.auth_source or ("websocket" if connection.requires_auth else "unix")
+        async with self.pairing.limiter.lock_for(source):
+            return await self._authenticate_handshake_locked(params, connection, source, auth)
+
+    async def _authenticate_handshake_locked(
+        self,
+        params: Mapping[str, Any],
+        connection: RuntimeV3Connection,
+        source: str,
+        auth: Any,
+    ) -> dict[str, str] | None:
+        delay = self.pairing.limiter.delay_for(source)
+        if delay > 0:
+            await asyncio.sleep(delay)
+        if not isinstance(auth, Mapping):
+            await self._auth_failed(source, "missing")
+            connection.close_after_response = True
+            raise RpcError("unauthorized", "This connection requires device authentication")
+        scheme = auth.get("scheme")
+        try:
+            if scheme == "enrollment":
+                return self._enroll_device(params, connection, source)
+            if scheme == "bearer":
+                self._accept_bearer(auth, connection, source)
+                return None
+            raise RpcError("unauthorized", "Unsupported authentication scheme")
+        except RpcError as exc:
+            if exc.code == "unauthorized":
+                await self._auth_failed(source, str(scheme or "unknown"))
+            if connection.requires_auth:
+                connection.close_after_response = True
+            raise
+
+    def _enroll_device(
+        self,
+        params: Mapping[str, Any],
+        connection: RuntimeV3Connection,
+        source: str,
+    ) -> dict[str, str]:
+        auth = params.get("auth")
+        code = auth.get("code") if isinstance(auth, Mapping) else None
+        if not isinstance(code, str) or not code.strip():
+            raise RpcError("unauthorized", "Enrollment requires a pairing code")
+        if not self.pairing.enrollment.consume(code):
+            raise RpcError("unauthorized", "Enrollment code is invalid or expired")
+        client = params.get("client") if isinstance(params.get("client"), Mapping) else {}
+        record, token = self.pairing.store.issue(
+            name=str(client.get("name") or "device"),
+            platform=str(client.get("platform") or "unknown"),
+        )
+        connection.device_id = str(record["id"])
+        try:
+            self._enforce_device_limit(connection.device_id)
+            self.activate_connection(connection)
+        except RpcError:
+            connection.device_id = None
+            self.pairing.store.revoke(str(record["id"]))
+            raise
+        self.pairing.limiter.record_success(source)
+        if self.log is not None:
+            self.log.write("paired", device_id=record["id"], name=record["name"])
+        return {"id": str(record["id"]), "token": token}
+
+    def _accept_bearer(
+        self, auth: Mapping[str, Any], connection: RuntimeV3Connection, source: str
+    ) -> None:
+        token = auth.get("token")
+        if not isinstance(token, str) or not token:
+            raise RpcError("unauthorized", "Bearer authentication requires a token")
+        record = self.pairing.store.verify(token)
+        if record is None:
+            raise RpcError("unauthorized", "Device token is invalid")
+        connection.device_id = str(record["id"])
+        try:
+            self._enforce_device_limit(connection.device_id)
+            self.activate_connection(connection)
+        except RpcError:
+            connection.device_id = None
+            raise
+        self.pairing.store.touch(str(record["id"]))
+        self.pairing.limiter.record_success(source)
+
+    async def _auth_failed(self, source: str, scheme: str) -> None:
+        self.pairing.limiter.record_failure(source)
+        if self.log is not None:
+            self.log.write("auth_failed", source=source, scheme=scheme)
+
+    def _enforce_device_limit(self, device_id: str) -> None:
+        count = sum(1 for item in self.connections if item.device_id == device_id)
+        if count >= MAX_CLIENTS_PER_DEVICE:
+            raise RpcError("busy", "This device already has the maximum number of connections")
+
+    def _device_public(self, record: Mapping[str, Any]) -> dict[str, Any]:
+        device_id = str(record.get("id") or "")
+        return {
+            "id": device_id,
+            "name": str(record.get("name") or "device"),
+            "platform": str(record.get("platform") or "unknown"),
+            "paired_at": str(record.get("paired_at") or ""),
+            "last_seen_at": record.get("last_seen_at"),
+            "connected": any(item.device_id == device_id for item in self.connections),
+        }
+
+    async def _devices_dispatch(
+        self,
+        method: str,
+        params: Mapping[str, Any],
+        connection: RuntimeV3Connection | None,
+    ) -> dict[str, Any]:
+        if method == "devices.list":
+            return {
+                "devices": [self._device_public(item) for item in self.pairing.store.list_devices()]
+            }
+        if method == "devices.revoke":
+            device_id = self._required_string(params, "device_id")
+            revoked = self.pairing.store.revoke(device_id)
+            for item in tuple(self.connections):
+                if item.device_id != device_id:
+                    continue
+                if item is connection:
+                    item.close_after_response = True
+                    continue
+                await item.close()
+            if self.log is not None:
+                self.log.write("revoked", device_id=device_id, revoked=revoked)
+            return {
+                "revoked": revoked,
+                "devices": [
+                    self._device_public(item) for item in self.pairing.store.list_devices()
+                ],
+            }
+        if method == "devices.enroll":
+            try:
+                code, expires_at, url = self.pairing.issue_enrollment()
+            except RuntimeError as exc:
+                raise RpcError("invalid_state", str(exc)) from None
+            return {"code": code, "expires_at": expires_at, "pairing_url": url}
+        raise RpcError("method_not_found", f"Unknown v3 method: {method}")
 
     def _subscribe(self, params: Mapping[str, Any]) -> dict[str, Any]:
         after_seq = int(params.get("after_seq") or 0)
@@ -1527,11 +1742,21 @@ class RuntimeV3Server:
 
 class RuntimeV3Connection:
     def __init__(
-        self, server: RuntimeV3Server, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        self,
+        server: RuntimeV3Server,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        *,
+        requires_auth: bool = False,
+        auth_source: str = "",
     ) -> None:
         self.server = server
         self.reader = reader
         self.writer = writer
+        self.requires_auth = requires_auth
+        self.auth_source = auth_source
+        self.device_id: str | None = None
+        self.close_after_response = False
         self.thread_ids: set[str] = set()
         self.subscribed = False
         self.handshaken = False
@@ -1554,7 +1779,14 @@ class RuntimeV3Connection:
         try:
             while True:
                 try:
-                    request = await read_frame(self.reader)
+                    read = read_frame(self.reader)
+                    request = await (
+                        asyncio.wait_for(read, AUTH_HANDSHAKE_TIMEOUT_S)
+                        if self.requires_auth and not self.handshaken
+                        else read
+                    )
+                except TimeoutError:
+                    return
                 except EOFError:
                     return
                 except RpcError as exc:
@@ -1565,9 +1797,18 @@ class RuntimeV3Connection:
                     with contextlib.suppress(Exception):
                         await self.send({"id": None, "error": exc.to_rpc()})
                     return
-                task = asyncio.create_task(self.handle(request))
-                self._request_tasks.add(task)
-                task.add_done_callback(self._request_done)
+                if not self.handshaken:
+                    # Authentication is deliberately serialized. Otherwise a
+                    # burst of concurrent guesses can all observe the same
+                    # enrollment state before the limiter or one-time consume
+                    # path runs.
+                    await self.handle(request)
+                    if self._closed:
+                        return
+                else:
+                    task = asyncio.create_task(self.handle(request))
+                    self._request_tasks.add(task)
+                    task.add_done_callback(self._request_done)
         finally:
             tasks = tuple(self._request_tasks)
             for task in tasks:
@@ -1608,7 +1849,7 @@ class RuntimeV3Connection:
                 raise RpcError(
                     "protocol_incompatible", "Complete system.handshake before other methods"
                 )
-            result = await self.server.dispatch(method, params)
+            result = await self.server.dispatch(method, params, self)
             if method == "system.handshake":
                 self.handshaken = True
             self.server.validate_result(method, result)
@@ -1620,7 +1861,11 @@ class RuntimeV3Connection:
             if self.server.trace is not None:
                 self.server.trace.response(request_id, method, result)
             await self.send({"id": request_id, "result": result})
+            if self.close_after_response:
+                await self.close()
         except RpcError as exc:
+            if method == "system.handshake" and self.requires_auth:
+                self.close_after_response = True
             if self.server.trace is not None:
                 self.server.trace.error(request_id, method, exc.code, str(exc))
             await self.send({"id": request_id, "error": exc.to_rpc()})
@@ -1849,6 +2094,8 @@ async def serve_v3(
     record_trace: Path | None = None,
     listen: tuple[str, int] | None = None,
     tls_context: Any | None = None,
+    tls_certificate: Path | None = None,
+    tls_key: Path | None = None,
 ) -> None:
     resolved_data = (
         (data_dir or Path("~/.aeloon-runtime").expanduser()).expanduser().resolve(strict=False)
@@ -1885,6 +2132,8 @@ async def serve_v3(
             preacquired_lock_fd=lock_fd,
             listen=listen,
             tls_context=tls_context,
+            tls_certificate=tls_certificate,
+            tls_key=tls_key,
         )
         lock_fd = None
         await server.run()

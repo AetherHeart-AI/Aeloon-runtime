@@ -7,6 +7,7 @@ import asyncio
 import getpass
 import json
 import os
+import struct
 import sys
 import time
 from dataclasses import asdict, is_dataclass
@@ -33,6 +34,7 @@ from aeloon_runtime.core import (
     RunEvent,
     message_to_dict,
 )
+from aeloon_runtime.gateway_ws import parse_listen
 from aeloon_runtime.migration import migrate_workbench
 from aeloon_runtime.rpc.protocol import RpcError
 from aeloon_runtime.rpc.server import run_rpc_server
@@ -48,7 +50,6 @@ from aeloon_runtime.runtime.providers import (
     resolve_model_id,
 )
 from aeloon_runtime.runtime.skill_runtime import run_bundled_skill
-from aeloon_runtime.gateway_ws import build_tls_context, parse_listen
 from aeloon_runtime.runtime_server_v3 import serve_v3
 from aeloon_runtime.version import __version__
 
@@ -98,6 +99,7 @@ _KNOWN_COMMANDS = {
     "rpc",
     "serve",
     "migrate",
+    "devices",
 }
 
 
@@ -233,8 +235,8 @@ def _add_rpc_commands(parent: argparse.ArgumentParser) -> None:
     serve.add_argument(
         "--listen",
         help=(
-            "Also serve aeloon-rpc over WebSocket at HOST:PORT. Loopback only "
-            "until device pairing lands; the Unix socket is always served."
+            "Also serve aeloon-rpc over WebSocket at HOST:PORT. Loopback is always "
+            "allowed; a routable address requires at least one paired device."
         ),
     )
     serve.add_argument("--tls-cert", type=Path, help="TLS certificate for --listen.")
@@ -261,8 +263,8 @@ def _add_runtime_serve_command(commands: Any) -> None:
     serve.add_argument(
         "--listen",
         help=(
-            "Also serve aeloon-rpc over WebSocket at HOST:PORT. Loopback only "
-            "until device pairing lands; the Unix socket is always served."
+            "Also serve aeloon-rpc over WebSocket at HOST:PORT. Loopback is always "
+            "allowed; a routable address requires at least one paired device."
         ),
     )
     serve.add_argument("--tls-cert", type=Path, help="TLS certificate for --listen.")
@@ -278,6 +280,20 @@ def _add_runtime_migrate_command(commands: Any) -> None:
     migrate.add_argument("--from-core", type=Path, required=True)
     migrate.add_argument("--data-dir", type=Path, required=True)
     migrate.add_argument("--roots-output", type=Path, required=True)
+
+
+def _add_runtime_devices_command(commands: Any) -> None:
+    devices = commands.add_parser("devices", help="List, revoke, or enroll paired devices.")
+    devices.add_argument("--config", type=Path, help=argparse.SUPPRESS)
+    devices.add_argument("--data-dir", type=Path, help=argparse.SUPPRESS)
+    devices.add_argument("--json", action="store_true", help="Print JSON output.")
+    sub = devices.add_subparsers(dest="devices_command", required=True, metavar="COMMAND")
+    sub.add_parser("list", help="List paired devices.")
+    revoke = sub.add_parser("revoke", help="Revoke a paired device.")
+    revoke.add_argument("device_id", help="Device id from `aeloon-runtime devices list`.")
+    sub.add_parser(
+        "enroll", help="Issue a one-time pairing code. The Runtime must be serving."
+    )
 
 
 def _hide_internal_subcommands(commands: Any) -> None:
@@ -380,6 +396,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_rpc_commands(rpc)
     _add_runtime_serve_command(commands)
     _add_runtime_migrate_command(commands)
+    _add_runtime_devices_command(commands)
 
     system = commands.add_parser("system", help=argparse.SUPPRESS)
     system_commands = system.add_subparsers(dest="system_command", required=True, metavar="COMMAND")
@@ -1417,6 +1434,150 @@ def _json(value: Any) -> str:
     )
 
 
+def _runtime_pid_socket(data_dir: Path) -> Path | None:
+    path = data_dir / "runtime.pid.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    socket_path = payload.get("socket") if isinstance(payload, dict) else None
+    return Path(socket_path) if isinstance(socket_path, str) and socket_path else None
+
+
+async def _unix_rpc(socket_path: Path, method: str, params: dict[str, Any]) -> Any:
+    from aeloon_runtime.runtime_server_v3 import PROTOCOL_VERSION
+
+    reader, writer = await asyncio.open_unix_connection(str(socket_path))
+
+    async def request(
+        identifier: str,
+        rpc_method: str,
+        rpc_params: dict[str, Any],
+    ) -> dict[str, Any]:
+        payload = json.dumps(
+            {"id": identifier, "method": rpc_method, "params": rpc_params},
+            separators=(",", ":"),
+        ).encode()
+        writer.write(struct.pack("!I", len(payload)) + payload)
+        await writer.drain()
+        size = struct.unpack("!I", await reader.readexactly(4))[0]
+        return json.loads((await reader.readexactly(size)).decode("utf-8"))
+
+    try:
+        handshake = await request(
+            "1",
+            "system.handshake",
+            {
+                "protocol": {"min": "3.0.0", "max": PROTOCOL_VERSION},
+                "client": {
+                    "name": "aeloon-runtime",
+                    "version": cli_version(),
+                    "platform": sys.platform,
+                },
+            },
+        )
+        if handshake.get("error"):
+            error = handshake["error"]
+            code = (
+                error.get("data", {}).get("code")
+                if isinstance(error.get("data"), dict)
+                else "internal_error"
+            )
+            raise RpcError(str(code), str(error.get("message") or "handshake failed"))
+        result = await request("2", method, params)
+        if result.get("error"):
+            error = result["error"]
+            code = (
+                error.get("data", {}).get("code")
+                if isinstance(error.get("data"), dict)
+                else "internal_error"
+            )
+            raise RpcError(str(code), str(error.get("message") or method))
+        return result.get("result")
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
+def _public_device(record: dict[str, Any], *, connected: bool) -> dict[str, Any]:
+    return {
+        "id": record.get("id"),
+        "name": record.get("name"),
+        "platform": record.get("platform"),
+        "paired_at": record.get("paired_at"),
+        "last_seen_at": record.get("last_seen_at"),
+        "connected": connected,
+    }
+
+
+async def devices_command(args: argparse.Namespace) -> int:
+    from aeloon_runtime.pairing import DeviceStore
+
+    config = load_config(args.config)
+    if args.data_dir is not None:
+        config = config.model_copy(update={"data_dir": args.data_dir}).normalized()
+    data_dir = config.data_dir
+    socket_path = _runtime_pid_socket(data_dir)
+    live = False
+    if socket_path is not None:
+        try:
+            reader, writer = await asyncio.open_unix_connection(str(socket_path))
+            writer.close()
+            await writer.wait_closed()
+            live = True
+        except (ConnectionRefusedError, FileNotFoundError, OSError):
+            live = False
+
+    if args.devices_command == "enroll" and not live:
+        raise ValueError("Runtime is not serving; start `aeloon-runtime serve --listen ...` first")
+
+    if live and socket_path is not None:
+        params: dict[str, Any] = {}
+        method = f"devices.{args.devices_command}"
+        if args.devices_command == "revoke":
+            params = {"device_id": args.device_id}
+        result = await _unix_rpc(socket_path, method, params)
+    elif args.devices_command == "list":
+        result = {
+            "devices": [
+                _public_device(item, connected=False)
+                for item in DeviceStore(data_dir).list_devices()
+            ]
+        }
+    elif args.devices_command == "revoke":
+        revoked = DeviceStore(data_dir).revoke(args.device_id)
+        result = {
+            "revoked": revoked,
+            "devices": [
+                _public_device(item, connected=False)
+                for item in DeviceStore(data_dir).list_devices()
+            ]
+        }
+    else:
+        raise ValueError(f"Unknown devices command: {args.devices_command}")
+
+    if args.json:
+        print(_json(result))
+        return 0
+    if args.devices_command == "list":
+        devices = result.get("devices") or []
+        if not devices:
+            print("No paired devices.")
+            return 0
+        for device in devices:
+            seen = device.get("last_seen_at") or "never"
+            state = "connected" if device.get("connected") else "offline"
+            print(f"{device['id']}\t{device['name']}\t{device['platform']}\t{state}\t{seen}")
+        return 0
+    if args.devices_command == "revoke":
+        print("revoked" if result.get("revoked") else "not found")
+        return 0
+    print(result.get("pairing_url") or result.get("code"))
+    if result.get("expires_at"):
+        print(f"expires {result['expires_at']}")
+    return 0
+
+
 async def async_main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     normalized = _normalize_argv(raw)
@@ -1459,7 +1620,8 @@ async def async_main(argv: list[str] | None = None) -> int:
             max_concurrent_operations=args.max_concurrent_operations,
             record_trace=args.record_trace,
             listen=parse_listen(args.listen) if args.listen else None,
-            tls_context=build_tls_context(args.tls_cert, args.tls_key),
+            tls_certificate=args.tls_cert,
+            tls_key=args.tls_key,
         )
         return 0
     if args.command == "migrate":
@@ -1471,6 +1633,8 @@ async def async_main(argv: list[str] | None = None) -> int:
         )
         print(_json(result))
         return 0
+    if args.command == "devices":
+        return await devices_command(args)
     if args.command == "system":
         return run_bundled_skill(
             args.skill_id,
@@ -1511,7 +1675,7 @@ def _json_errors_for(argv: list[str]) -> bool:
     for index, value in enumerate(argv[:-1]):
         if value == "--output" and argv[index + 1] in {"json", "stream-json"}:
             return True
-    return bool(argv and argv[0] in {"config", "rpc", "provider"})
+    return bool(argv and argv[0] in {"config", "rpc", "provider", "devices"})
 
 
 def _print_cli_error(code: str, message: str, *, as_json: bool) -> None:

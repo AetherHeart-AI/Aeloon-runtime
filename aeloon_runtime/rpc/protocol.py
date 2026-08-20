@@ -181,15 +181,16 @@ RPC_CODES = {
 class RpcError(RuntimeError):
     """Sanitized failure crossing the Core process boundary."""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, data: dict[str, Any] | None = None) -> None:
         super().__init__(message)
         self.code = code if code in RPC_CODES else "internal_error"
+        self.data = dict(data or {})
 
     def to_rpc(self) -> dict[str, Any]:
         return {
             "code": RPC_CODES[self.code],
             "message": str(self),
-            "data": {"code": self.code},
+            "data": {"code": self.code, **self.data},
         }
 
 

@@ -11,9 +11,9 @@ WebSocket already delimits messages. One framing everywhere means ``read_frame``
 and ``pack_frame`` stay transport-agnostic and the wire is identical on both
 paths; four bytes per message is not worth a second set of framing rules.
 
-Binding is restricted to loopback until the pairing and token work lands. An
-unauthenticated listener on a routable address would be an open door, and this
-module has no way to tell an owner from anyone else yet.
+A routable bind is allowed only when TLS is ready *and* at least one device is
+already paired. An empty pairing store on a LAN address would let anyone walk
+the enrollment flow.
 """
 
 from __future__ import annotations
@@ -25,7 +25,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import websockets
-from websockets.asyncio.server import ServerConnection, serve as ws_serve
+from websockets.asyncio.server import ServerConnection
+from websockets.asyncio.server import serve as ws_serve
+
+from aeloon_runtime.pairing import is_loopback_host
+from aeloon_runtime.rpc.protocol import RpcError
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle only matters for type checkers
     from aeloon_runtime.runtime_server_v3 import RuntimeV3Server
@@ -64,6 +68,10 @@ class WebSocketByteStream:
                 # peer is not talking aeloon-rpc, so stop rather than guess.
                 self._eof = True
                 continue
+            max_bytes = 40 * 1024 * 1024 + 4
+            if len(message) > max_bytes or len(self._buffer) + len(message) > max_bytes:
+                self._eof = True
+                raise RpcError("payload_too_large", "RPC frame exceeds 40 MiB")
             self._buffer.extend(message)
         chunk = bytes(self._buffer[:count])
         del self._buffer[:count]
@@ -98,25 +106,30 @@ class WebSocketByteStream:
         await self._connection.close()
 
 
-def _require_loopback(host: str) -> None:
+def _require_loopback(host: str, *, tls_ready: bool = False, paired: bool = False) -> None:
+    """Reject a routable bind unless TLS and a non-empty pairing store are both ready."""
+
+    if is_loopback_host(host):
+        return
+    if tls_ready and paired:
+        return
     try:
-        address = ipaddress.ip_address(host)
+        ipaddress.ip_address(host)
+        shown = host
     except ValueError:
-        if host in {"localhost", ""}:
-            return
-        raise ValueError(
-            f"--listen currently accepts loopback only; {host!r} would expose an "
-            "unauthenticated Runtime. Device pairing unlocks other addresses."
-        ) from None
-    if not address.is_loopback:
-        raise ValueError(
-            f"--listen currently accepts loopback only; {host} would expose an "
-            "unauthenticated Runtime. Device pairing unlocks other addresses."
-        )
+        shown = repr(host)
+    raise ValueError(
+        f"--listen currently accepts loopback only; {shown} would expose an "
+        "unauthenticated Runtime. Device pairing unlocks other addresses."
+    )
 
 
 def parse_listen(value: str) -> tuple[str, int]:
-    """Parse ``HOST:PORT`` — including bracketed IPv6 — and reject routable hosts."""
+    """Parse ``HOST:PORT`` — including bracketed IPv6.
+
+    Bind policy lives in ``_require_loopback`` so a routable address can be
+    accepted only after pairing and TLS are actually ready.
+    """
     text = value.strip()
     if text.startswith("["):
         closing = text.find("]")
@@ -133,16 +146,12 @@ def parse_listen(value: str) -> tuple[str, int]:
         raise ValueError(f"--listen port is not a number: {port_text}") from None
     if not 1 <= port <= 65535:
         raise ValueError(f"--listen port is out of range: {port}")
-    _require_loopback(host)
     return host or "127.0.0.1", port
 
 
 def build_tls_context(certificate: Path | None, key: Path | None) -> ssl.SSLContext | None:
-    """TLS is opt-in for now: R1 serves loopback, where the socket is the boundary.
+    """Load an explicit certificate pair. Auto-generation lives in pairing."""
 
-    Certificate generation belongs with pairing, because the fingerprint only
-    means something once it travels with the pairing string.
-    """
     if certificate is None and key is None:
         return None
     if certificate is None or key is None:
@@ -161,21 +170,38 @@ async def serve_websocket(
     tls: ssl.SSLContext | None = None,
 ) -> Any:
     """Start the WebSocket listener and return it, already serving."""
-    from aeloon_runtime.runtime_server_v3 import MAX_CLIENTS, RuntimeV3Connection
+    from aeloon_runtime.runtime_server_v3 import (
+        MAX_CLIENTS,
+        MAX_FRAME_BYTES,
+        MAX_PENDING_AUTH,
+        RuntimeV3Connection,
+    )
 
     async def handler(connection: ServerConnection) -> None:
-        if len(server.connections) >= MAX_CLIENTS:
+        if (
+            len(server.connections) >= MAX_CLIENTS
+            or len(server.pending_connections) >= MAX_PENDING_AUTH
+        ):
             await connection.close(code=1013, reason="Runtime connection limit reached")
             return
         stream = WebSocketByteStream(connection)
+        remote = connection.remote_address
+        # Rate limiting is intentionally keyed to the peer IP, never its
+        # ephemeral source port. A caller must not bypass backoff by opening a
+        # fresh TCP connection for every guess.
+        source = str(remote[0]) if remote else "websocket"
         # Reader and writer are the same adapter; the gateway never distinguishes
-        # them beyond the six methods.
-        rpc_connection = RuntimeV3Connection(server, stream, stream)
-        server.connections.add(rpc_connection)
+        # them beyond the six methods. WebSocket always requires a device token
+        # (or a one-time enrollment code); the Unix socket is the local boundary.
+        rpc_connection = RuntimeV3Connection(
+            server, stream, stream, requires_auth=True, auth_source=source
+        )
+        server.pending_connections.add(rpc_connection)
         try:
             await rpc_connection.run()
         finally:
             server.connections.discard(rpc_connection)
+            server.pending_connections.discard(rpc_connection)
 
     return await ws_serve(
         handler,
@@ -184,7 +210,7 @@ async def serve_websocket(
         ssl=tls,
         # Frames are already bounded by the gateway's own limit; letting the
         # library enforce a smaller one would truncate legitimate attachments.
-        max_size=None,
+        max_size=MAX_FRAME_BYTES + 4,
         ping_interval=20,
         ping_timeout=20,
     )
@@ -194,5 +220,10 @@ __all__ = [
     "WebSocketByteStream",
     "build_tls_context",
     "parse_listen",
+    "require_listen_host",
     "serve_websocket",
 ]
+
+
+def require_listen_host(host: str, *, tls_ready: bool, paired: bool) -> None:
+    _require_loopback(host, tls_ready=tls_ready, paired=paired)

@@ -471,6 +471,17 @@ def test_top_level_help_focuses_on_user_tasks() -> None:
     assert "==SUPPRESS==" not in help_text
 
 
+def test_devices_commands_are_visible() -> None:
+    parser = cli.build_parser()
+    help_text = parser.format_help()
+    assert "devices" in help_text
+    args = parser.parse_args(["devices", "list"])
+    assert args.command == "devices"
+    assert args.devices_command == "list"
+    revoked = parser.parse_args(["devices", "revoke", "device-1"])
+    assert revoked.device_id == "device-1"
+
+
 def test_removed_local_and_provider_login_commands_are_absent() -> None:
     parser = cli.build_parser()
 
