@@ -1,4 +1,4 @@
-# Aeloon RPC 3.0.0-draft.3
+# Aeloon RPC 3.0.0
 
 This file is generated from `docs/rpc-v3.json`; do not edit by hand.
 
