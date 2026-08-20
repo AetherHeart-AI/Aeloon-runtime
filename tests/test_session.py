@@ -152,7 +152,7 @@ async def test_incremental_stats_match_full_recomputation(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_jsonl_v3_is_message_durable_and_recovers_truncated_tail(tmp_path: Path) -> None:
+async def test_jsonl_v4_is_message_durable_and_recovers_truncated_tail(tmp_path: Path) -> None:
     repository = JsonlSessionRepository(tmp_path)
     session = await repository.create(cwd=tmp_path, session_id="durable")
     await session.append_message(UserMessage("hello"))

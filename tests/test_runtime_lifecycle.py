@@ -11,6 +11,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from aeloon_runtime.runtime_server import _root_id
+
 
 def _recv_exact(connection: socket.socket, size: int) -> bytes:
     value = bytearray()
@@ -60,11 +62,11 @@ def _handshake(connection: socket.socket, identifier: int = 1) -> None:
         identifier,
         "system.handshake",
         {
-            "protocol": {"min": "3.0.0", "max": "3.0.0"},
+            "protocol": {"min": "4.0.0", "max": "4.0.0"},
             "client": {"name": "lifecycle-smoke", "version": "1", "platform": sys.platform},
         },
     )
-    assert response.get("result", {}).get("protocol") == "3.0.0"
+    assert response.get("result", {}).get("protocol") == "4.0.0"
 
 
 def test_standalone_runtime_survives_client_disconnect_and_restores_projection(
@@ -101,7 +103,12 @@ def test_standalone_runtime_survives_client_disconnect_and_restores_projection(
     try:
         first = _connect(socket_path)
         _handshake(first)
-        project = _request(first, 2, "project.add", {"path": str(workspace)})["result"]["project"]
+        project = _request(
+            first,
+            2,
+            "project.add",
+            {"root_id": _root_id(workspace), "relative_path": "."},
+        )["result"]["project"]
         thread = _request(
             first,
             3,

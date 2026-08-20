@@ -764,9 +764,9 @@ class RuntimeService:
         tool = self._tool_set().by_name["web_search"]
         started = time.monotonic()
         try:
-            # The v3 method exposes the query so Settings can test the exact
+            # The v4 method exposes the query so Settings can test the exact
             # configured search path; retain the legacy default for direct
-            # in-process callers that predate the v3 boundary.
+            # in-process callers that predate the v4 boundary.
             query = str(params.get("query") or "OpenAI")
             outcome = await tool.search(query, 1)
             latency_ms = round((time.monotonic() - started) * 1000)

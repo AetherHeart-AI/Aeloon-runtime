@@ -1,6 +1,6 @@
-"""WebSocket transport for the v3 gateway.
+"""WebSocket transport for the v4 gateway.
 
-``RuntimeV3Connection`` reads and writes through six byte-stream methods —
+``RuntimeConnection`` reads and writes through six byte-stream methods —
 ``readexactly`` on the reader, ``write``/``drain``/``is_closing``/``close``/
 ``wait_closed`` on the writer. That is the whole transport surface, so a
 WebSocket becomes another transport by supplying those six methods rather than
@@ -32,7 +32,7 @@ from aeloon_runtime.pairing import is_loopback_host
 from aeloon_runtime.rpc.protocol import RpcError
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle only matters for type checkers
-    from aeloon_runtime.runtime_server_v3 import RuntimeV3Server
+    from aeloon_runtime.runtime_server import RuntimeServer
 
 
 class WebSocketByteStream:
@@ -163,18 +163,18 @@ def build_tls_context(certificate: Path | None, key: Path | None) -> ssl.SSLCont
 
 
 async def serve_websocket(
-    server: RuntimeV3Server,
+    server: RuntimeServer,
     *,
     host: str,
     port: int,
     tls: ssl.SSLContext | None = None,
 ) -> Any:
     """Start the WebSocket listener and return it, already serving."""
-    from aeloon_runtime.runtime_server_v3 import (
+    from aeloon_runtime.runtime_server import (
         MAX_CLIENTS,
         MAX_FRAME_BYTES,
         MAX_PENDING_AUTH,
-        RuntimeV3Connection,
+        RuntimeConnection,
     )
 
     async def handler(connection: ServerConnection) -> None:
@@ -193,7 +193,7 @@ async def serve_websocket(
         # Reader and writer are the same adapter; the gateway never distinguishes
         # them beyond the six methods. WebSocket always requires a device token
         # (or a one-time enrollment code); the Unix socket is the local boundary.
-        rpc_connection = RuntimeV3Connection(
+        rpc_connection = RuntimeConnection(
             server, stream, stream, requires_auth=True, auth_source=source
         )
         server.pending_connections.add(rpc_connection)

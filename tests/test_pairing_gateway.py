@@ -11,7 +11,7 @@ import pytest
 import websockets
 
 from aeloon_runtime.gateway_ws import parse_listen, require_listen_host
-from aeloon_runtime.runtime_server_v3 import serve_v3
+from aeloon_runtime.runtime_server import serve
 
 
 def test_parse_listen_accepts_loopback_and_routable_forms() -> None:
@@ -67,7 +67,7 @@ async def _unix_request(
 
 def _handshake_params(**auth: object) -> dict:
     params: dict = {
-        "protocol": {"min": "3.0.0", "max": "3.1.0"},
+        "protocol": {"min": "4.0.0", "max": "4.0.0"},
         "client": {"name": "pytest", "version": "0", "platform": "test"},
     }
     if auth:
@@ -79,7 +79,7 @@ async def _start_runtime(tmp_path: Path, port: int) -> tuple[asyncio.Task, Path]
     socket_path = Path("/tmp") / f"aeloon-pair-{os.getpid()}-{port}.sock"
     socket_path.unlink(missing_ok=True)
     task = asyncio.create_task(
-        serve_v3(
+        serve(
             socket_path=socket_path,
             data_dir=tmp_path / "data",
             workspace_roots=(tmp_path,),
@@ -158,19 +158,38 @@ async def _enroll_over_unix(socket_path: Path) -> dict:
     raise AssertionError(f"devices.enroll never succeeded: {last_error}")
 
 
+async def _claim_over_websocket(url: str, code: str, ssl_ctx: ssl.SSLContext) -> dict:
+    async with websockets.connect(url, ssl=ssl_ctx, max_size=None) as connection:
+        await connection.send(
+            _frame(
+                {
+                    "id": "claim",
+                    "method": "devices.claim",
+                    "params": {
+                        "code": code,
+                        "client": {"name": "pytest", "version": "0"},
+                    },
+                }
+            )
+        )
+        response = await _read(connection)
+        assert "result" in response
+        return response["result"]
+
+
 @pytest.mark.asyncio
 async def test_listen_on_all_interfaces_without_devices_is_rejected(tmp_path: Path) -> None:
     socket_path = Path("/tmp") / f"aeloon-lan-{os.getpid()}.sock"
     socket_path.unlink(missing_ok=True)
     task = asyncio.create_task(
-        serve_v3(
+        serve(
             socket_path=socket_path,
             data_dir=tmp_path / "data",
             workspace_roots=(tmp_path,),
             listen=("0.0.0.0", 47_401),
         )
     )
-    with pytest.raises(ValueError, match="loopback only"):
+    with pytest.raises(ValueError, match="advertise-url"):
         await asyncio.wait_for(task, timeout=5)
     socket_path.unlink(missing_ok=True)
 
@@ -198,30 +217,11 @@ async def test_listen_prints_pairing_url_and_issues_a_token(
         ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ssl_ctx.check_hostname = False
         ssl_ctx.verify_mode = ssl.CERT_NONE
-        first = None
-        for _ in range(200):
-            try:
-                async with websockets.connect(
-                    f"wss://127.0.0.1:{port}", ssl=ssl_ctx, max_size=None
-                ) as connection:
-                    await connection.send(
-                        _frame(
-                            {
-                                "id": "1",
-                                "method": "system.handshake",
-                                "params": _handshake_params(
-                                    scheme="enrollment", code=enrollment["code"]
-                                ),
-                            }
-                        )
-                    )
-                    first = await _read(connection)
-                    break
-            except OSError:
-                await asyncio.sleep(0.02)
-        assert first is not None
-        token = first["result"]["device"]["token"]
-        device_id = first["result"]["device"]["id"]
+        claimed = await _claim_over_websocket(
+            f"wss://127.0.0.1:{port}", enrollment["code"], ssl_ctx
+        )
+        token = claimed["token"]
+        device_id = claimed["device_id"]
         async with websockets.connect(
             f"wss://127.0.0.1:{port}", ssl=ssl_ctx, max_size=None
         ) as connection:
@@ -230,13 +230,13 @@ async def test_listen_prints_pairing_url_and_issues_a_token(
                     {
                         "id": "1",
                         "method": "system.handshake",
-                        "params": _handshake_params(scheme="bearer", token=token),
+                        "params": _handshake_params(kind="device_token", token=token),
                     }
                 )
             )
             second = await _read(connection)
             assert "device" not in second["result"]
-            assert second["result"]["protocol"] in {"3.1.0", "3.0.0"}
+            assert second["result"]["protocol"] in {"4.0.0", "4.0.0"}
         async with websockets.connect(
             f"wss://127.0.0.1:{port}", ssl=ssl_ctx, max_size=None
         ) as connection:
@@ -245,15 +245,16 @@ async def test_listen_prints_pairing_url_and_issues_a_token(
                     {
                         "id": "1",
                         "method": "system.handshake",
-                        "params": _handshake_params(scheme="bearer", token="nope"),
+                        "params": _handshake_params(kind="device_token", token="nope"),
                     }
                 )
             )
             failed = await _read(connection)
             assert failed["error"]["data"]["code"] == "unauthorized"
-        listed = json.loads((tmp_path / "data" / "devices.json").read_text(encoding="utf-8"))
+            await asyncio.wait_for(connection.wait_closed(), timeout=1)
+        listed = json.loads((tmp_path / "data" / "devices-v4.json").read_text(encoding="utf-8"))
         assert listed["devices"][0]["id"] == device_id
-        assert token not in (tmp_path / "data" / "devices.json").read_text(encoding="utf-8")
+        assert token not in (tmp_path / "data" / "devices-v4.json").read_text(encoding="utf-8")
     finally:
         await _stop_runtime(task, socket_path, port)
 
@@ -288,6 +289,46 @@ async def test_websocket_without_auth_is_unauthorized(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_websocket_permanently_forbids_runtime_lifecycle_methods(tmp_path: Path) -> None:
+    port = 47_406
+    task, socket_path = await _start_runtime(tmp_path, port)
+    try:
+        enrollment = await _enroll_over_unix(socket_path)
+        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_NONE
+        claimed = await _claim_over_websocket(
+            f"wss://127.0.0.1:{port}", enrollment["code"], ssl_ctx
+        )
+        async with websockets.connect(
+            f"wss://127.0.0.1:{port}", ssl=ssl_ctx, max_size=None
+        ) as connection:
+            await connection.send(
+                _frame(
+                    {
+                        "id": "handshake",
+                        "method": "system.handshake",
+                        "params": _handshake_params(
+                            kind="device_token", token=claimed["token"]
+                        ),
+                    }
+                )
+            )
+            assert "result" in await _read(connection)
+            for index, method in enumerate(
+                ("system.shutdown", "system.uninstall_inspect", "system.uninstall_prepare")
+            ):
+                await connection.send(
+                    _frame({"id": f"lifecycle-{index}", "method": method, "params": {}})
+                )
+                response = await _read(connection)
+                assert response["error"]["data"]["code"] == "forbidden"
+        assert not task.done()
+    finally:
+        await _stop_runtime(task, socket_path, port)
+
+
+@pytest.mark.asyncio
 async def test_revoke_disconnects_the_active_connection(tmp_path: Path) -> None:
     port = 47_404
     task, socket_path = await _start_runtime(tmp_path, port)
@@ -296,6 +337,9 @@ async def test_revoke_disconnects_the_active_connection(tmp_path: Path) -> None:
         ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ssl_ctx.check_hostname = False
         ssl_ctx.verify_mode = ssl.CERT_NONE
+        claimed = await _claim_over_websocket(
+            f"wss://127.0.0.1:{port}", enrollment["code"], ssl_ctx
+        )
         async with websockets.connect(
             f"wss://127.0.0.1:{port}", ssl=ssl_ctx, max_size=None
         ) as connection:
@@ -304,12 +348,14 @@ async def test_revoke_disconnects_the_active_connection(tmp_path: Path) -> None:
                     {
                         "id": "1",
                         "method": "system.handshake",
-                        "params": _handshake_params(scheme="enrollment", code=enrollment["code"]),
+                        "params": _handshake_params(
+                            kind="device_token", token=claimed["token"]
+                        ),
                     }
                 )
             )
             first = await _read(connection)
-            device_id = first["result"]["device"]["id"]
+            device_id = claimed["device_id"]
             reader, writer = await asyncio.open_unix_connection(str(socket_path))
             await _unix_request(
                 reader,
@@ -340,7 +386,7 @@ async def test_unix_socket_still_works_without_auth(tmp_path: Path) -> None:
             writer,
             {"id": "1", "method": "system.handshake", "params": _handshake_params()},
         )
-        assert handshake["result"]["protocol"] in {"3.1.0", "3.0.0"}
+        assert handshake["result"]["protocol"] in {"4.0.0", "4.0.0"}
         assert "device" not in handshake["result"]
         health = await _unix_request(
             reader, writer, {"id": "2", "method": "system.health", "params": {}}

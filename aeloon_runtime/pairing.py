@@ -26,14 +26,14 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 4
 ENROLLMENT_TTL_S = 10 * 60
 TOKEN_BYTES = 32
 CODE_LENGTH = 10
@@ -101,8 +101,15 @@ def is_loopback_host(host: str) -> bool:
 
 
 def pairing_url(*, host: str, port: int, fingerprint: str, code: str) -> str:
+    endpoint_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    endpoint = f"wss://{endpoint_host}:{port}"
     query = urlencode(
-        {"host": host, "port": str(port), "fp": fingerprint, "code": code},
+        {
+            "v": "2",
+            "endpoint": endpoint,
+            "fingerprint": fingerprint.lower(),
+            "code": code,
+        },
         safe=":",
     )
     return f"aeloon://pair?{query}"
@@ -126,22 +133,36 @@ def parse_pairing_url(value: str) -> dict[str, str]:
         key: values[-1]
         for key, values in parse_qs(parsed.query, keep_blank_values=False).items()
     }
-    for key in ("host", "port", "fp", "code"):
+    if fields.get("v") != "2":
+        raise ValueError("Pairing string version must be v=2")
+    for key in ("endpoint", "fingerprint", "code"):
         if not fields.get(key):
             raise ValueError(f"Pairing string is missing {key}")
-    host = fields["host"].strip()
-    if host.startswith("[") and host.endswith("]"):
-        host = host[1:-1]
-    if not _valid_pairing_host(host):
-        raise ValueError("Pairing string host is invalid")
-    fields["host"] = host
-    port = fields["port"]
-    if not port.isdigit() or not 1 <= int(port) <= 65535:
-        raise ValueError("Pairing string port is invalid")
-    fingerprint = fields["fp"].lower()
+    try:
+        endpoint = urlparse(fields["endpoint"])
+    except ValueError:
+        raise ValueError("Pairing string endpoint is invalid") from None
+    if (
+        endpoint.scheme != "wss"
+        or endpoint.username
+        or endpoint.password
+        or endpoint.path not in ("", "/")
+        or endpoint.params
+        or endpoint.query
+        or endpoint.fragment
+        or not endpoint.hostname
+        or endpoint.port is None
+        or not 1 <= endpoint.port <= 65535
+        or not _valid_pairing_host(endpoint.hostname)
+    ):
+        raise ValueError("Pairing string endpoint must be a bare wss:// URL")
+    host = endpoint.hostname
+    endpoint_host = f"[{host}]" if ":" in host else host
+    fields["endpoint"] = f"wss://{endpoint_host}:{endpoint.port}"
+    fingerprint = fields["fingerprint"].lower()
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", fingerprint):
         raise ValueError("Pairing string fingerprint must be sha256:<hex>")
-    fields["fp"] = fingerprint
+    fields["fingerprint"] = fingerprint
     code = normalize_enrollment_code(fields["code"])
     if len(code) != CODE_LENGTH or any(char not in CROCKFORD_ALPHABET for char in code):
         raise ValueError("Pairing string code is invalid")
@@ -171,11 +192,15 @@ def _valid_pairing_host(host: str) -> bool:
 
 
 class DeviceStore:
-    """JSON device list under ``<data-dir>/devices.json`` (mode 0600)."""
+    """JSON device list under the incompatible v4 store (mode 0600).
+
+    The old ``devices.json`` file is intentionally never read. A destructive
+    v4 upgrade requires every client to pair again.
+    """
 
     def __init__(self, data_dir: Path) -> None:
         self.data_dir = data_dir.expanduser().resolve(strict=False)
-        self.path = self.data_dir / "devices.json"
+        self.path = self.data_dir / "devices-v4.json"
         self._devices: list[dict[str, Any]] = []
         self.load()
 
@@ -497,6 +522,7 @@ class PairingState:
         self.fingerprint: str | None = None
         self.listen_host: str | None = None
         self.listen_port: int | None = None
+        self.advertise_url: str | None = None
 
     def prepare_listen(
         self,
@@ -505,6 +531,7 @@ class PairingState:
         *,
         certificate: Path | None = None,
         key: Path | None = None,
+        advertise_url: str | None = None,
     ) -> ssl.SSLContext:
         cert_path, key_path = ensure_tls_files(
             self.data_dir, host, certificate=certificate, key=key
@@ -512,8 +539,14 @@ class PairingState:
         self.certificate = cert_path
         self.key = key_path
         self.fingerprint = certificate_fingerprint(cert_path)
-        self.listen_host = advertised_host(host)
-        self.listen_port = port
+        self.advertise_url = _normalize_advertise_url(advertise_url) if advertise_url else None
+        if self.advertise_url:
+            advertised = urlparse(self.advertise_url)
+            self.listen_host = advertised.hostname
+            self.listen_port = advertised.port
+        else:
+            self.listen_host = advertised_host(host)
+            self.listen_port = port
         return build_server_tls_context(cert_path, key_path)
 
     def issue_enrollment(self) -> tuple[str, str, str]:
@@ -527,6 +560,27 @@ class PairingState:
             code=code,
         )
         return code, expires_at, url
+
+
+def _normalize_advertise_url(value: str) -> str:
+    parsed = urlparse(value.strip())
+    if (
+        parsed.scheme != "wss"
+        or parsed.username
+        or parsed.password
+        or parsed.path not in ("", "/")
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+        or not parsed.hostname
+        or parsed.port is None
+        or not 1 <= parsed.port <= 65535
+        or not _valid_pairing_host(parsed.hostname)
+    ):
+        raise ValueError("--advertise-url must be a bare wss://host:port URL")
+    host = parsed.hostname
+    endpoint_host = f"[{host}]" if ":" in host else host
+    return f"wss://{endpoint_host}:{parsed.port}"
 
 
 __all__ = [

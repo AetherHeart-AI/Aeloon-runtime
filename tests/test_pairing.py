@@ -21,13 +21,13 @@ from aeloon_runtime.pairing import (
 def test_device_store_persists_hashes_not_tokens(tmp_path: Path) -> None:
     store = DeviceStore(tmp_path)
     record, token = store.issue(name="MacBook", platform="darwin")
-    payload = json.loads((tmp_path / "devices.json").read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 1
-    assert token not in (tmp_path / "devices.json").read_text(encoding="utf-8")
+    payload = json.loads((tmp_path / "devices-v4.json").read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 4
+    assert token not in (tmp_path / "devices-v4.json").read_text(encoding="utf-8")
     assert payload["devices"][0]["token_sha256"] == hash_token(token)
     assert store.verify(token)["id"] == record["id"]
     assert store.verify("not-the-token") is None
-    assert (tmp_path / "devices.json").stat().st_mode & 0o777 == 0o600
+    assert (tmp_path / "devices-v4.json").stat().st_mode & 0o777 == 0o600
 
 
 def test_enrollment_code_is_single_use_and_in_memory() -> None:
@@ -70,9 +70,8 @@ def test_self_signed_certificate_fingerprint_and_pairing_url(tmp_path: Path) -> 
     assert fingerprint == fingerprint.lower()
     url = pairing_url(host="127.0.0.1", port=7420, fingerprint=fingerprint, code="0123456789")
     parsed = parse_pairing_url(url)
-    assert parsed["host"] == "127.0.0.1"
-    assert parsed["port"] == "7420"
-    assert parsed["fp"] == fingerprint
+    assert parsed["endpoint"] == "wss://127.0.0.1:7420"
+    assert parsed["fingerprint"] == fingerprint
     assert parsed["code"] == "0123456789"
 
 

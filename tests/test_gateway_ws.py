@@ -11,7 +11,7 @@ import pytest
 import websockets
 
 from aeloon_runtime.gateway_ws import WebSocketByteStream, build_tls_context, parse_listen
-from aeloon_runtime.runtime_server_v3 import serve_v3
+from aeloon_runtime.runtime_server import serve
 
 
 def test_parse_listen_accepts_loopback_forms() -> None:
@@ -110,9 +110,9 @@ async def _ws_request(
             "id": "1",
             "method": "system.handshake",
             "params": {
-                "protocol": {"min": "3.0.0", "max": "3.0.0"},
+                "protocol": {"min": "4.0.0", "max": "4.0.0"},
                 "client": {"name": "pytest", "version": "0", "platform": "test"},
-                "auth": {"scheme": "bearer", "token": token},
+                "auth": {"kind": "device_token", "token": token},
             },
         }))
         await _read(connection)
@@ -133,7 +133,7 @@ async def _unix_enroll(socket_path: Path) -> str:
         "id": "1",
         "method": "system.handshake",
         "params": {
-            "protocol": {"min": "3.0.0", "max": "3.1.0"},
+            "protocol": {"min": "4.0.0", "max": "4.0.0"},
             "client": {"name": "pytest", "version": "0", "platform": "test"},
         },
     }))
@@ -153,15 +153,11 @@ async def _ws_enroll(url: str, code: str, ssl_ctx: ssl.SSLContext) -> str:
     async with websockets.connect(url, max_size=None, ssl=ssl_ctx) as connection:
         await connection.send(_frame({
             "id": "1",
-            "method": "system.handshake",
-            "params": {
-                "protocol": {"min": "3.0.0", "max": "3.1.0"},
-                "client": {"name": "pytest", "version": "0", "platform": "test"},
-                "auth": {"scheme": "enrollment", "code": code},
-            },
+            "method": "devices.claim",
+            "params": {"code": code, "client": {"name": "pytest", "version": "0"}},
         }))
         result = await _read(connection)
-        return result["result"]["device"]["token"]
+        return result["result"]["token"]
 
 
 def _frame(value: dict) -> bytes:
@@ -187,7 +183,7 @@ async def test_websocket_transport_serves_the_same_method_table(tmp_path: Path) 
     ssl_ctx = _insecure_client_ssl()
     url = f"wss://127.0.0.1:{port}"
     task = asyncio.create_task(
-        serve_v3(
+        serve(
             socket_path=socket_path,
             data_dir=tmp_path / "data",
             workspace_roots=(tmp_path,),
@@ -214,18 +210,18 @@ async def test_websocket_transport_serves_the_same_method_table(tmp_path: Path) 
         # The Unix socket keeps serving while the WebSocket listener is up.
         reader, writer = await asyncio.open_unix_connection(str(socket_path))
         writer.write(_frame({"id": "1", "method": "system.handshake", "params": {
-            "protocol": {"min": "3.0.0", "max": "3.0.0"},
+            "protocol": {"min": "4.0.0", "max": "4.0.0"},
             "client": {"name": "pytest", "version": "0", "platform": "test"},
         }}))
         await writer.drain()
         size = struct.unpack("!I", await reader.readexactly(4))[0]
-        assert json.loads(await reader.readexactly(size))["result"]["protocol"] == "3.0.0"
+        assert json.loads(await reader.readexactly(size))["result"]["protocol"] == "4.0.0"
         writer.close()
         await writer.wait_closed()
     finally:
         reader, writer = await asyncio.open_unix_connection(str(socket_path))
         writer.write(_frame({"id": "1", "method": "system.handshake", "params": {
-            "protocol": {"min": "3.0.0", "max": "3.0.0"},
+            "protocol": {"min": "4.0.0", "max": "4.0.0"},
             "client": {"name": "pytest", "version": "0", "platform": "test"},
         }}))
         await writer.drain()

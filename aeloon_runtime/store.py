@@ -940,7 +940,7 @@ class AsyncRuntimeStore:
         # Composition roots that already own a RuntimeStore can attach the
         # serial worker without opening a second SQLite connection.  This is
         # important for the gateway: all production calls must pass through
-        # one ordered worker, while migration/tests may still use the
+        # one ordered worker, while recovery/tests may still use the
         # synchronous store directly.
         self._owns_store = not isinstance(path, RuntimeStore)
         self._store = path if isinstance(path, RuntimeStore) else RuntimeStore(path)
@@ -969,7 +969,7 @@ class AsyncRuntimeStore:
         # Submit a final barrier even when the synchronous store is owned by a
         # composition root.  This drains every queued operation before the
         # worker is stopped without closing a connection still exposed to the
-        # root's migration/test hooks.
+        # root's recovery/test hooks.
         await self._call(self._store.close if self._owns_store else (lambda: None))
         self._closed = True
         self._worker.shutdown(wait=True)

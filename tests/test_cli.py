@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+import subprocess
 import tomllib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -48,6 +51,106 @@ def _use_scripted_openai_provider(
         )
 
     monkeypatch.setattr(cli, "ProviderManager", create_manager)
+
+
+def test_reset_removes_every_data_entry_and_rebuilds_default_config(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    data_dir = tmp_path / "runtime-data"
+    data_dir.mkdir()
+    config_path = data_dir / "config.json"
+    config_path.write_text('{"legacy": true}\n', encoding="utf-8")
+    sqlite3.connect(data_dir / "runtime.sqlite").close()
+    (data_dir / "unknown-future-data").mkdir()
+    (data_dir / "unknown-future-data" / "payload").write_text("value", encoding="utf-8")
+    (data_dir / "tls.crt").write_text("old-certificate", encoding="utf-8")
+
+    assert cli.reset_command(
+        SimpleNamespace(force=True, data_dir=data_dir, config=config_path)
+    ) == 0
+
+    assert {item.name for item in data_dir.iterdir()} == {"config.json"}
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    assert payload["data_dir"] == str(data_dir)
+    assert json.loads(capsys.readouterr().out)["reset"] is True
+
+
+def test_reset_keeps_incomplete_marker_until_default_config_is_durable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "runtime-data"
+    data_dir.mkdir()
+    config_path = data_dir / "config.json"
+    config_path.write_text("{}\n", encoding="utf-8")
+    (data_dir / "stale").write_text("value", encoding="utf-8")
+
+    def fail_save(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(cli, "save_config", fail_save)
+
+    with pytest.raises(OSError, match="disk full"):
+        cli.reset_command(SimpleNamespace(force=True, data_dir=data_dir, config=config_path))
+
+    marker = data_dir / ".reset-incomplete"
+    assert marker.is_file()
+    assert marker.stat().st_mode & 0o777 == 0o600
+
+
+def test_reset_force_removes_dirty_managed_worktree_and_prunes_git_metadata(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project = tmp_path / "project"
+    workspace = tmp_path / "managed-worktree"
+    data_dir = tmp_path / "runtime-data"
+    project.mkdir()
+    data_dir.mkdir()
+    config_path = data_dir / "config.json"
+    config_path.write_text("{}\n", encoding="utf-8")
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(project), *args],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+
+    git("init")
+    git("config", "user.name", "Aeloon Test")
+    git("config", "user.email", "test@aeloon.invalid")
+    (project / "tracked.txt").write_text("base\n", encoding="utf-8")
+    git("add", "tracked.txt")
+    git("commit", "-m", "base")
+    git("worktree", "add", "-b", "managed", str(workspace))
+    (workspace / "dirty.txt").write_text("not committed\n", encoding="utf-8")
+
+    database = sqlite3.connect(data_dir / "runtime.sqlite")
+    try:
+        database.execute("CREATE TABLE projects (id TEXT PRIMARY KEY, path TEXT NOT NULL)")
+        database.execute(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, kind TEXT NOT NULL, workspace TEXT NOT NULL)"
+        )
+        database.execute("INSERT INTO projects VALUES (?, ?)", ("project-1", str(project)))
+        database.execute(
+            "INSERT INTO threads VALUES (?, ?, ?, ?)",
+            ("thread-1", "project-1", "worktree", str(workspace)),
+        )
+        database.commit()
+    finally:
+        database.close()
+
+    assert cli.reset_command(
+        SimpleNamespace(force=True, data_dir=data_dir, config=config_path)
+    ) == 0
+
+    assert not workspace.exists()
+    assert str(workspace) not in git("worktree", "list", "--porcelain")
+    assert {item.name for item in data_dir.iterdir()} == {"config.json"}
+    assert json.loads(capsys.readouterr().out)["reset"] is True
 
 
 @pytest.mark.asyncio
@@ -493,23 +596,10 @@ def test_removed_local_and_provider_login_commands_are_absent() -> None:
         parser.parse_args(["provider", "login"])
 
 
-def test_rpc_serve_has_no_browser_runtime_interface(tmp_path: Path) -> None:
+def test_removed_rpc_serve_command_is_absent(tmp_path: Path) -> None:
     parser = cli.build_parser()
-    args = parser.parse_args(["rpc", "serve", "--socket", str(tmp_path / "core.sock")])
-
-    assert args.rpc_command == "serve"
-    assert not hasattr(args, "browser_runtime_socket")
     with pytest.raises(SystemExit):
-        parser.parse_args(
-            [
-                "rpc",
-                "serve",
-                "--socket",
-                str(tmp_path / "core.sock"),
-                "--browser-runtime-socket",
-                str(tmp_path / "browser.sock"),
-            ]
-        )
+        parser.parse_args(["rpc", "serve", "--socket", str(tmp_path / "core.sock")])
 
 
 def test_runtime_serve_accepts_explicit_trace_directory(tmp_path: Path) -> None:

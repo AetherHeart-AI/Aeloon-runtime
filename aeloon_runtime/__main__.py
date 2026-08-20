@@ -4,14 +4,19 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import fcntl
 import getpass
 import json
 import os
+import shutil
+import sqlite3
+import subprocess
 import struct
 import sys
 import time
 from dataclasses import asdict, is_dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -35,9 +40,8 @@ from aeloon_runtime.core import (
     message_to_dict,
 )
 from aeloon_runtime.gateway_ws import parse_listen
-from aeloon_runtime.migration import migrate_workbench
+from aeloon_runtime.git_workspace import remove_worktree as git_remove_worktree
 from aeloon_runtime.rpc.protocol import RpcError
-from aeloon_runtime.rpc.server import run_rpc_server
 from aeloon_runtime.runtime import (
     JsonlSessionRepository,
     SessionError,
@@ -50,7 +54,7 @@ from aeloon_runtime.runtime.providers import (
     resolve_model_id,
 )
 from aeloon_runtime.runtime.skill_runtime import run_bundled_skill
-from aeloon_runtime.runtime_server_v3 import serve_v3
+from aeloon_runtime.runtime_server import serve
 from aeloon_runtime.version import __version__
 
 CONFIG_PATHS: dict[str, tuple[str, ...]] = {
@@ -96,9 +100,8 @@ _KNOWN_COMMANDS = {
     "config",
     "provider",
     "system",
-    "rpc",
     "serve",
-    "migrate",
+    "reset",
     "devices",
 }
 
@@ -226,24 +229,6 @@ def _add_provider_runtime_arguments(command: argparse.ArgumentParser) -> None:
     )
 
 
-def _add_rpc_commands(parent: argparse.ArgumentParser) -> None:
-    commands = parent.add_subparsers(dest="rpc_command", required=True, metavar="COMMAND")
-    serve = commands.add_parser("serve", help="Run the Electron-owned Core RPC process.")
-    serve.add_argument("--config", type=Path)
-    serve.add_argument("--data-dir", type=Path)
-    serve.add_argument("--socket", type=Path, required=True)
-    serve.add_argument(
-        "--listen",
-        help=(
-            "Also serve aeloon-rpc over WebSocket at HOST:PORT. Loopback is always "
-            "allowed; a routable address requires at least one paired device."
-        ),
-    )
-    serve.add_argument("--tls-cert", type=Path, help="TLS certificate for --listen.")
-    serve.add_argument("--tls-key", type=Path, help="TLS private key for --listen.")
-    serve.add_argument("--max-concurrent-operations", type=int, default=4)
-
-
 def _add_runtime_serve_command(commands: Any) -> None:
     serve = commands.add_parser("serve", help="Run the standalone aeloon Runtime.")
     serve.add_argument("--unix", type=Path, required=True, help="Unix socket path.")
@@ -267,19 +252,24 @@ def _add_runtime_serve_command(commands: Any) -> None:
             "allowed; a routable address requires at least one paired device."
         ),
     )
+    serve.add_argument(
+        "--advertise-url",
+        help="Pairing endpoint to advertise as a bare wss://host:port URL.",
+    )
+    serve.add_argument("--runtime-label", help="Human-readable Runtime label.")
     serve.add_argument("--tls-cert", type=Path, help="TLS certificate for --listen.")
     serve.add_argument("--tls-key", type=Path, help="TLS private key for --listen.")
     serve.add_argument("--max-concurrent-operations", type=int, default=4)
 
 
-def _add_runtime_migrate_command(commands: Any) -> None:
-    migrate = commands.add_parser(
-        "migrate", help="Migrate Workbench/Core data into Runtime storage."
+def _add_runtime_reset_command(commands: Any) -> None:
+    reset = commands.add_parser(
+        "reset",
+        help="Delete known Runtime data and initialize a fresh v4 state.",
     )
-    migrate.add_argument("--from-workbench", type=Path, required=True)
-    migrate.add_argument("--from-core", type=Path, required=True)
-    migrate.add_argument("--data-dir", type=Path, required=True)
-    migrate.add_argument("--roots-output", type=Path, required=True)
+    reset.add_argument("--data-dir", type=Path, required=True)
+    reset.add_argument("--config", type=Path, required=True)
+    reset.add_argument("--force", action="store_true")
 
 
 def _add_runtime_devices_command(commands: Any) -> None:
@@ -392,10 +382,8 @@ def build_parser() -> argparse.ArgumentParser:
     config_set.add_argument("value")
     config_set.add_argument("--config", type=Path)
 
-    rpc = commands.add_parser("rpc", help=argparse.SUPPRESS)
-    _add_rpc_commands(rpc)
     _add_runtime_serve_command(commands)
-    _add_runtime_migrate_command(commands)
+    _add_runtime_reset_command(commands)
     _add_runtime_devices_command(commands)
 
     system = commands.add_parser("system", help=argparse.SUPPRESS)
@@ -1215,16 +1203,6 @@ def config_command(args: argparse.Namespace) -> int:
     return 0
 
 
-async def rpc_command(args: argparse.Namespace) -> int:
-    runtime = create_runtime_service(
-        config_path=args.config,
-        data_dir=args.data_dir,
-        max_concurrent_operations=args.max_concurrent_operations,
-    )
-    await run_rpc_server(runtime, socket_path=args.socket)
-    return 0
-
-
 async def cloud_command(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {}
     if args.cloud_command == "login":
@@ -1445,7 +1423,7 @@ def _runtime_pid_socket(data_dir: Path) -> Path | None:
 
 
 async def _unix_rpc(socket_path: Path, method: str, params: dict[str, Any]) -> Any:
-    from aeloon_runtime.runtime_server_v3 import PROTOCOL_VERSION
+    from aeloon_runtime.runtime_server import PROTOCOL_VERSION
 
     reader, writer = await asyncio.open_unix_connection(str(socket_path))
 
@@ -1468,7 +1446,7 @@ async def _unix_rpc(socket_path: Path, method: str, params: dict[str, Any]) -> A
             "1",
             "system.handshake",
             {
-                "protocol": {"min": "3.0.0", "max": PROTOCOL_VERSION},
+                "protocol": {"min": PROTOCOL_VERSION, "max": PROTOCOL_VERSION},
                 "client": {
                     "name": "aeloon-runtime",
                     "version": cli_version(),
@@ -1578,6 +1556,109 @@ async def devices_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def reset_command(args: argparse.Namespace) -> int:
+    if not args.force:
+        raise ValueError("Runtime reset is destructive; pass --force explicitly")
+    data_dir = args.data_dir.expanduser()
+    config_path = args.config.expanduser()
+    if not data_dir.is_absolute() or not config_path.is_absolute():
+        raise ValueError("Runtime reset requires absolute --data-dir and --config paths")
+    if data_dir.is_symlink() or config_path.is_symlink():
+        raise ValueError("Runtime reset refuses symbolic-link paths")
+    data_dir = data_dir.resolve(strict=False)
+    config_path = config_path.resolve(strict=False)
+    forbidden = {Path("/"), Path.home().resolve(), Path.cwd().resolve()}
+    if data_dir in forbidden or config_path in forbidden:
+        raise ValueError("Runtime reset refuses root, home, or current working directory")
+    if config_path.parent != data_dir:
+        raise ValueError("--config must be a file directly inside --data-dir")
+    if not data_dir.exists() or not data_dir.is_dir():
+        raise ValueError("Runtime reset target must be an existing Runtime data directory")
+
+    lock_path = data_dir / ".runtime.lock"
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ValueError("Runtime is running; stop it before reset") from exc
+        marker = data_dir / ".reset-incomplete"
+        marker.write_text(
+            json.dumps({"version": 4, "started_at": datetime.now(UTC).isoformat()}) + "\n",
+            encoding="utf-8",
+        )
+        marker.chmod(0o600)
+        for worktree in _read_managed_worktrees(data_dir):
+            project_path, workspace = worktree
+            if not workspace.exists():
+                continue
+            if workspace.is_symlink() or project_path.is_symlink():
+                raise ValueError("Runtime reset refuses symbolic-link worktrees")
+            forbidden_worktree_paths = {Path("/"), Path.home().resolve(), Path.cwd().resolve()}
+            if workspace.resolve(strict=False) in forbidden_worktree_paths or project_path.resolve(strict=False) in forbidden_worktree_paths:
+                raise ValueError("Runtime reset refuses a root, home, or current working directory worktree")
+            git_remove_worktree(project_path, workspace, force=True)
+            subprocess.run(
+                ["git", "-C", str(project_path), "worktree", "prune"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        for target in tuple(data_dir.iterdir()):
+            if target in {lock_path, marker}:
+                continue
+            _remove_reset_entry(target)
+        save_config(Config(data_dir=data_dir), config_path, force=True)
+        marker.unlink(missing_ok=True)
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+        (data_dir / ".runtime.lock").unlink(missing_ok=True)
+    print(_json({"reset": True, "data_dir": str(data_dir), "config": str(config_path)}))
+    return 0
+
+
+def _read_managed_worktrees(data_dir: Path) -> list[tuple[Path, Path]]:
+    database = data_dir / "runtime.sqlite"
+    if not database.is_file() or database.is_symlink():
+        return []
+    try:
+        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+        try:
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            }
+            if not {"projects", "threads"}.issubset(tables):
+                return []
+            rows = connection.execute(
+                "SELECT projects.path, threads.workspace FROM projects "
+                "JOIN threads ON threads.project_id = projects.id WHERE threads.kind = 'worktree'"
+            ).fetchall()
+            result: list[tuple[Path, Path]] = []
+            for project_path, workspace in rows:
+                if not isinstance(project_path, str) or not isinstance(workspace, str):
+                    raise ValueError("Runtime reset found an invalid managed worktree record")
+                project = Path(project_path).expanduser()
+                worktree = Path(workspace).expanduser()
+                if not project.is_absolute() or not worktree.is_absolute():
+                    raise ValueError("Runtime reset found a relative managed worktree record")
+                result.append((project, worktree))
+            return result
+        finally:
+            connection.close()
+    except sqlite3.Error as exc:
+        raise ValueError(f"Runtime reset could not read managed worktrees: {exc}") from exc
+
+
+def _remove_reset_entry(target: Path) -> None:
+    if target.is_symlink() or target.is_file():
+        target.unlink(missing_ok=True)
+    elif target.is_dir():
+        shutil.rmtree(target)
+
+
 async def async_main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     normalized = _normalize_argv(raw)
@@ -1601,8 +1682,6 @@ async def async_main(argv: list[str] | None = None) -> int:
         return await doctor_command(args)
     if args.command == "completion":
         return completion_command(args)
-    if args.command == "rpc":
-        return await rpc_command(args)
     if args.command == "serve":
         if args.no_workspace_root and args.workspace_root:
             parser.error("--no-workspace-root cannot be combined with --workspace-root")
@@ -1612,7 +1691,7 @@ async def async_main(argv: list[str] | None = None) -> int:
             workspace_roots = tuple(args.workspace_root)
         else:
             workspace_roots = None
-        await serve_v3(
+        await serve(
             socket_path=args.unix,
             data_dir=args.data_dir,
             config_path=args.config,
@@ -1620,19 +1699,14 @@ async def async_main(argv: list[str] | None = None) -> int:
             max_concurrent_operations=args.max_concurrent_operations,
             record_trace=args.record_trace,
             listen=parse_listen(args.listen) if args.listen else None,
+            advertise_url=args.advertise_url,
+            runtime_label=args.runtime_label,
             tls_certificate=args.tls_cert,
             tls_key=args.tls_key,
         )
         return 0
-    if args.command == "migrate":
-        result = migrate_workbench(
-            from_workbench=args.from_workbench,
-            from_core=args.from_core,
-            data_dir=args.data_dir,
-            roots_output=args.roots_output,
-        )
-        print(_json(result))
-        return 0
+    if args.command == "reset":
+        return reset_command(args)
     if args.command == "devices":
         return await devices_command(args)
     if args.command == "system":

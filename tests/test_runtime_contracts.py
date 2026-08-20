@@ -9,26 +9,26 @@ from jsonschema import Draft202012Validator, ValidationError
 
 from aeloon_runtime.bootstrap import create_runtime_service
 from aeloon_runtime.rpc.protocol import RpcError
-from aeloon_runtime.runtime_server_v3 import (
+from aeloon_runtime.runtime_server import (
     FILE_BYTES,
     IMAGE_BYTES,
     MAX_FRAME_BYTES,
-    RuntimeV3Server,
-    _range_contains,
+    RuntimeServer,
+    _root_id,
     pack_frame,
 )
 
 
 def test_rpc_source_and_manifest_are_strict_and_complete() -> None:
-    source = json.loads(Path("docs/rpc-v3.json").read_text(encoding="utf-8"))
+    source = json.loads(Path("docs/rpc-v4.json").read_text(encoding="utf-8"))
     manifest = json.loads(
-        Path("aeloon_runtime/rpc/aeloon-rpc-v3.manifest.json").read_text(encoding="utf-8")
+        Path("aeloon_runtime/rpc/aeloon-rpc-v4.manifest.json").read_text(encoding="utf-8")
     )
     assert source["$schema"].endswith("draft/2020-12/schema")
     assert source["frame_max_bytes"] == MAX_FRAME_BYTES
     assert source["file_max_bytes"] == FILE_BYTES
     assert source["image_max_bytes"] == IMAGE_BYTES
-    assert len(manifest["methods"]) == 69
+    assert len(manifest["methods"]) == 72
     assert len(manifest["plugin_methods"]) == 9
     assert len(manifest["events"]) >= 30
     assert len(manifest["errors"]) >= 15
@@ -38,7 +38,7 @@ def test_rpc_source_and_manifest_are_strict_and_complete() -> None:
 
     defs = manifest["$defs"]
     thread_create = Draft202012Validator(
-        {"$defs": defs, "$ref": "#/$defs/Params_thread_create_v3"}
+        {"$defs": defs, "$ref": "#/$defs/Params_thread_create_v4"}
     )
     thread_create.validate({"project_id": "p", "kind": "standard"})
     thread_create.validate({"workspace": "/tmp/workspace", "kind": "worktree"})
@@ -49,14 +49,14 @@ def test_rpc_source_and_manifest_are_strict_and_complete() -> None:
             {"project_id": "p", "workspace": "/tmp/workspace", "kind": "standard"}
         )
 
-    fs_list = Draft202012Validator({"$defs": defs, "$ref": "#/$defs/Params_fs_list_v3"})
+    fs_list = Draft202012Validator({"$defs": defs, "$ref": "#/$defs/Params_fs_list_v4"})
     fs_list.validate({"thread_id": "t", "path": "src"})
     fs_list.validate({"root": "/tmp/workspace"})
     with pytest.raises(ValidationError):
         fs_list.validate({"thread_id": "t", "root": "/tmp/workspace"})
 
     settings_update = Draft202012Validator(
-        {"$defs": defs, "$ref": "#/$defs/Params_settings_update_v3"}
+        {"$defs": defs, "$ref": "#/$defs/Params_settings_update_v4"}
     )
     settings_update.validate(
         {
@@ -69,42 +69,23 @@ def test_rpc_source_and_manifest_are_strict_and_complete() -> None:
         }
     )
     provider_list = Draft202012Validator(
-        {"$defs": defs, "$ref": "#/$defs/Params_provider_list_v3"}
+        {"$defs": defs, "$ref": "#/$defs/Params_provider_list_v4"}
     )
     provider_list.validate({"workspace": "/tmp/workspace"})
     cloud_login = Draft202012Validator(
-        {"$defs": defs, "$ref": "#/$defs/Params_plugin_cloud_account_login_v3"}
+        {"$defs": defs, "$ref": "#/$defs/Params_plugin_cloud_account_login_v4"}
     )
     cloud_login.validate({"username": "user", "password": "pass", "workspace": "/tmp"})
 
 
-def test_handshake_negotiates_a_window_not_an_exact_version() -> None:
-    from aeloon_runtime.runtime_server_v3 import SUPPORTED_PROTOCOLS, _range_contains
+def test_handshake_accepts_only_the_exact_v4_version() -> None:
+    from aeloon_runtime.runtime_server import SUPPORTED_PROTOCOLS
 
-    # Newest first: a client that speaks both must be answered with the newer one.
-    assert SUPPORTED_PROTOCOLS[0] == "3.1.0"
-    assert "3.0.0" in SUPPORTED_PROTOCOLS
-
-    def negotiate(minimum: str, maximum: str) -> str | None:
-        return next(
-            (v for v in SUPPORTED_PROTOCOLS if _range_contains(minimum, maximum, v)),
-            None,
-        )
-
-    # A client pinned to the previous minor keeps working after the Runtime moves
-    # on; that is the whole point of versioning the two sides independently.
-    assert negotiate("3.0.0", "3.0.0") == "3.0.0"
-    assert negotiate("3.0.0", "3.1.0") == "3.1.0"
-    assert negotiate("3.1.0", "3.1.0") == "3.1.0"
-    assert negotiate("4.0.0", "4.0.0") is None
+    assert SUPPORTED_PROTOCOLS == ("4.0.0",)
+    assert SUPPORTED_PROTOCOLS != ("3.0.0",)
 
 
-def test_semver_endpoint_range_and_frame_limit() -> None:
-    assert _range_contains("3.0.0", "3.1.0", "3.0.0")
-    # A prerelease sorts below the release it precedes, so a client that only
-    # speaks the final 3.0.0 must not be matched by a 3.0.0-rc Runtime.
-    assert not _range_contains("3.0.0", "3.0.0", "3.0.0-rc.1")
-    assert _range_contains("3.0.0-rc.1", "3.0.0", "3.0.0-rc.1")
+def test_exact_v4_frame_limit() -> None:
     payload = {"data": "x" * (MAX_FRAME_BYTES - len(b'{"data":""}'))}
     assert len(pack_frame(payload)) > MAX_FRAME_BYTES
     with pytest.raises(RpcError, match="40 MiB"):
@@ -121,9 +102,11 @@ async def test_workspace_symlink_and_attachment_id_boundaries(tmp_path: Path) ->
     (workspace / "escape").symlink_to(outside, target_is_directory=True)
     data_dir = tmp_path / "data"
     runtime = create_runtime_service(config_path=data_dir / "config.json", data_dir=data_dir)
-    server = RuntimeV3Server(runtime, tmp_path / "runtime.sock", (workspace,), data_dir)
+    server = RuntimeServer(runtime, tmp_path / "runtime.sock", (workspace,), data_dir)
     try:
-        project = await server.dispatch("project.add", {"path": str(workspace)})
+        project = await server.dispatch(
+            "project.add", {"root_id": _root_id(workspace), "relative_path": "."}
+        )
         created = await server.dispatch(
             "thread.create", {"project_id": project["project"]["id"], "kind": "standard"}
         )
