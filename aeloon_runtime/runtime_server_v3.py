@@ -132,8 +132,15 @@ class RuntimeV3Server:
         data_dir: Path,
         trace_recorder: TraceRecorder | None = None,
         preacquired_lock_fd: int | None = None,
+        listen: tuple[str, int] | None = None,
+        tls_context: Any | None = None,
     ) -> None:
         self.runtime = runtime
+        # A WebSocket listener is additive: the Unix socket always exists, so a
+        # single Runtime can serve both and the two transports can be compared
+        # against identical state.
+        self.listen = listen
+        self.tls_context = tls_context
         self.socket_path = socket_path.expanduser().resolve(strict=False)
         # Empty means no authorized roots. The CLI default of cwd is applied
         # in ``serve_v3`` when the caller omits ``--workspace-root``; the
@@ -248,9 +255,23 @@ class RuntimeV3Server:
                 self._lock_fd = None
             await self._close_store()
             raise
+        websocket_server = None
+        if self.listen is not None:
+            from aeloon_runtime.gateway_ws import serve_websocket
+
+            host, port = self.listen
+            websocket_server = await serve_websocket(
+                self, host=host, port=port, tls=self.tls_context
+            )
+            if self.log is not None:
+                self.log.write("listening", host=host, port=port, tls=self.tls_context is not None)
         try:
             await self.stop_event.wait()
         finally:
+            if websocket_server is not None:
+                websocket_server.close()
+                with contextlib.suppress(Exception):
+                    await websocket_server.wait_closed()
             if self.log is not None:
                 self.log.write("stopped", server_instance_id=self.server_instance_id)
                 self.log.close()
@@ -1805,6 +1826,8 @@ async def serve_v3(
     workspace_roots: tuple[Path, ...] | None = None,
     max_concurrent_operations: int = 4,
     record_trace: Path | None = None,
+    listen: tuple[str, int] | None = None,
+    tls_context: Any | None = None,
 ) -> None:
     resolved_data = (
         (data_dir or Path("~/.aeloon-runtime").expanduser()).expanduser().resolve(strict=False)
@@ -1839,6 +1862,8 @@ async def serve_v3(
             resolved_data,
             trace_recorder=trace,
             preacquired_lock_fd=lock_fd,
+            listen=listen,
+            tls_context=tls_context,
         )
         lock_fd = None
         await server.run()

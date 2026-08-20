@@ -48,6 +48,7 @@ from aeloon_runtime.runtime.providers import (
     resolve_model_id,
 )
 from aeloon_runtime.runtime.skill_runtime import run_bundled_skill
+from aeloon_runtime.gateway_ws import build_tls_context, parse_listen
 from aeloon_runtime.runtime_server_v3 import serve_v3
 from aeloon_runtime.version import __version__
 
@@ -229,6 +230,15 @@ def _add_rpc_commands(parent: argparse.ArgumentParser) -> None:
     serve.add_argument("--config", type=Path)
     serve.add_argument("--data-dir", type=Path)
     serve.add_argument("--socket", type=Path, required=True)
+    serve.add_argument(
+        "--listen",
+        help=(
+            "Also serve aeloon-rpc over WebSocket at HOST:PORT. Loopback only "
+            "until device pairing lands; the Unix socket is always served."
+        ),
+    )
+    serve.add_argument("--tls-cert", type=Path, help="TLS certificate for --listen.")
+    serve.add_argument("--tls-key", type=Path, help="TLS private key for --listen.")
     serve.add_argument("--max-concurrent-operations", type=int, default=4)
 
 
@@ -248,6 +258,15 @@ def _add_runtime_serve_command(commands: Any) -> None:
         type=Path,
         help="Opt in to a redacted JSONL boundary trace under DIRECTORY.",
     )
+    serve.add_argument(
+        "--listen",
+        help=(
+            "Also serve aeloon-rpc over WebSocket at HOST:PORT. Loopback only "
+            "until device pairing lands; the Unix socket is always served."
+        ),
+    )
+    serve.add_argument("--tls-cert", type=Path, help="TLS certificate for --listen.")
+    serve.add_argument("--tls-key", type=Path, help="TLS private key for --listen.")
     serve.add_argument("--max-concurrent-operations", type=int, default=4)
 
 
@@ -1439,6 +1458,8 @@ async def async_main(argv: list[str] | None = None) -> int:
             workspace_roots=workspace_roots,
             max_concurrent_operations=args.max_concurrent_operations,
             record_trace=args.record_trace,
+            listen=parse_listen(args.listen) if args.listen else None,
+            tls_context=build_tls_context(args.tls_cert, args.tls_key),
         )
         return 0
     if args.command == "migrate":
