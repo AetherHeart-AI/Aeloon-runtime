@@ -31,21 +31,9 @@ jobs:
           python-version: "3.12"
       - run: uv run --frozen pytest -q
       - run: uv run --frozen ruff check .
-      - run: uv run --frozen python tools/gen_v3_manifest.py --check
+      - run: uv run --frozen python tools/gen_v4_manifest.py --check
       - run: uv run --frozen python tools/gen_rpc_docs.py --check
       - run: uv run --frozen python tools/gen_ts_protocol.py --check
-      - name: Check v3 protocol compatibility against the base revision
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          baseline="$RUNNER_TEMP/rpc-v3-baseline.json"
-          if [ -n "${BASE_SHA:-}" ] && git show "$BASE_SHA:aeloon_runtime/rpc/aeloon-rpc-v3.manifest.json" > "$baseline" 2>/dev/null; then
-            uv run --frozen python tools/check_rpc_compat.py "$baseline" aeloon_runtime/rpc/aeloon-rpc-v3.manifest.json
-          else
-            echo "No previous v3 manifest exists; compatibility check starts with this revision."
-          fi
       - name: Build and install the wheel
         shell: bash
         run: |

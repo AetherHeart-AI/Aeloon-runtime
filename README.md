@@ -180,7 +180,7 @@ session = await runtime.create_session(workspace="/path/to/repository")
 ```
 
 Runtime owns sessions, context construction, persistence, provider selection, workspace operations,
-and operation scheduling. The Electron desktop client connects through the `aeloon-rpc` v3 Unix
+and operation scheduling. The Electron desktop client connects through the `aeloon-rpc` v4 Unix
 socket gateway; the Runtime remains alive when the client exits.
 
 ## Security
@@ -196,7 +196,7 @@ the model is allowed to access the filesystem, credentials, and processes.
 uv sync
 uv run pytest -q
 uv run ruff check .
-uv run python tools/gen_v3_manifest.py --check
+uv run python tools/gen_v4_manifest.py --check
 uv run python tools/gen_rpc_docs.py
 uv build
 git diff --check
@@ -205,8 +205,8 @@ git diff --check
 The default test suite is offline and uses local fixtures. Optional live tests require credentials
 in an explicit test config and are not part of default CI.
 
-The checked-in `aeloon-rpc-v3.manifest.json` is generated from `docs/rpc-v3.json`; run
-`uv run python tools/gen_v3_manifest.py` and `uv run python tools/gen_rpc_docs.py` after changing a
+The checked-in `aeloon-rpc-v4.manifest.json` is generated from `docs/rpc-v4.json`; run
+`uv run python tools/gen_v4_manifest.py` and `uv run python tools/gen_rpc_docs.py` after changing a
 public method, result, or event payload. CI rejects stale generated output.
 
 ### Desktop distribution

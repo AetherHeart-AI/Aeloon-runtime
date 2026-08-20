@@ -1,67 +1,36 @@
-# Runtime v3 release gate
+# Runtime v4 release gate
 
-The base release is frozen only after these commands and platform jobs pass:
+The coordinated release is frozen only after these checks pass:
 
 ```bash
-uv run python tools/gen_v3_manifest.py --check
-uv run python tools/check_rpc_compat.py OLD.json aeloon_runtime/rpc/aeloon-rpc-v3.manifest.json
+uv run python tools/gen_v4_manifest.py --check
+uv run python tools/gen_rpc_docs.py --check
 uv run python tools/docker_smoke.py
 uv run pytest -q
 uv run ruff check aeloon_runtime tools tests
 ```
 
-The Docker smoke builds the image and starts it with mounted workspace, data,
-and Docker-managed `/run/aeloon` socket volumes. It performs v3 handshake,
-health, and controlled shutdown from inside the container; a Docker Desktop
-host bind mount is intentionally not used for the socket because virtiofs can
-reject `chmod(0600)` on socket inodes.
+The Runtime accepts only the exact `4.0.0` handshake. WSS pairing uses a
+one-shot `devices.claim` request followed by a `device_token` handshake;
+host-lifecycle methods remain Unix/CLI-only. Workspace authorization is
+root-based and `project.add` accepts only `{root_id, relative_path}`.
 
-Trace capture is opt-in and must be explicitly requested for a replay fixture:
-
-```bash
-uv run aeloon-runtime serve --unix /tmp/aeloon-runtime.sock \
-  --data-dir ~/.aeloon-runtime --record-trace ~/.aeloon-runtime/traces
-```
-
-The raw JSONL and `blobs/` directory are mode `0600`/`0700` local artifacts. Run the deterministic
-sanitizer and manually review the result before adding a trace to the repository:
-
-```bash
-uv run python tools/sanitize_trace.py RAW.jsonl REVIEWED.jsonl
-```
-
-Every Runtime data directory also keeps a bounded `runtime.log` plus one rotated
-`runtime.log.1`; both are private `0600` lifecycle diagnostics and are not replay
-fixtures.
-
-The protocol contract is 66 methods, 31 events, 16 error codes, a 40 MiB
-frame, 25 MiB ordinary-file and 10 MiB image limits. Migration jobs must cover
-empty data, WAL databases, malformed input, interrupted worktree moves, dirty
-and missing worktrees, idempotent reruns and rollback. Platform CI additionally
-builds the macOS ARM64 and Linux ARM64 Runtime archives, computes their SHA-256
-with `tools/build_runtime_bundle.py`, updates the UI lock through its
-`scripts/update-runtime-lock.ts` workflow, and runs the UI `bun run check` plus
-Playwright/Electron packaging checks.
+The protocol contract is 72 methods, 31 events, 17 error codes, a 40 MiB
+frame, 25 MiB ordinary-file and 10 MiB image limits. Runtime data is not
+migrated: old state blocks startup until the operator runs the explicit,
+force-confirmed v4 reset command.
 
 ## Handoff evidence
 
-The six base-release handoff gates map to these checked-in tests and commands:
-
-1. `tests/test_runtime_lifecycle.py` starts the real `aeloon-runtime serve`
-   command, closes and reconnects a client, verifies the PID and restored
-   projection, then performs an explicit shutdown.
-2. `bun run architecture:check` enforces the renderer/Electron boundary and
-   rejects the removed `src/server`, Workbench process, Bun sidecar and old
-   Core client paths.
-3. `tests/test_migration.py` covers empty data, WAL, attachments, worktrees,
-   dirty/missing inputs, interrupted journals, repeatability and rollback.
-4. `tests/replay-scenario.test.ts` and `scripts/replay-scenario.ts` provide
-   protocol-neutral legacy/v3 adapters plus file-tree, Git, turn and PTY
-   final-state oracles.
-5. `uv run python tools/docker_smoke.py`, the wheel build, and UI packaging
-   contract tests cover reproducible local packaging. Native ARM64 archives
-   and a non-zero Runtime lock digest remain release-CI gates until the
-   `runtime-v0.1.0` assets are published.
-6. `tools/check_rpc_compat.py` and the handshake range tests enforce additive
-   minor changes and major-version breaks; the generated protocol package is
-   checked against the single `docs/rpc-v3.json` source.
+1. `tests/test_runtime_lifecycle.py` starts the real Runtime, reconnects a
+   client, verifies persistence, and performs an explicit Unix shutdown.
+2. `tests/test_runtime_server.py` covers exact handshake identity/host
+   metadata, workspace roots, path boundaries, WSS lifecycle restrictions,
+   and Runtime-owned project/thread behavior.
+3. `tests/test_pairing.py` and `tests/test_pairing_gateway.py` cover strict
+   pairing URLs, one-shot claims, v4 device storage, and token revocation.
+4. UI `bun run check` covers protocol generation, architecture boundaries,
+   TypeScript, unit/Electron tests, Playwright, Unix replay, WSS replay
+   equivalence, and the production build.
+5. The wheel and bundle workflows verify the v4 manifest, generated docs,
+   Runtime package, and platform archives.

@@ -14,11 +14,10 @@ RUNTIME_VERSION = "0.1.0"
 
 
 def runtime_version() -> str:
-    """Return the standalone Runtime release identity when serving v3.
+    """Return the standalone Runtime release identity when serving v4.
 
-    The legacy command line and v2 RPC surface retain the Core 0.0.16
-    identity during the migration window.  A bundled/standalone Runtime must
-    report its independently versioned 0.1.0 line in v3 diagnostics.
+    The bundled/standalone Runtime reports its independently versioned 0.1.0
+    line in v4 diagnostics.
     """
 
     if os.environ.get("AELOON_RUNTIME_MODE") == "1" or Path(sys.argv[0]).name == "aeloon-runtime":

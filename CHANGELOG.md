@@ -85,7 +85,7 @@ release is cut, those entries should move to a versioned section with an ISO dat
 ### Added
 
 - Bundled local-first office execution skills for MarkItDown document extraction, PDF inspection,
-  PaddleOCR PP-StructureV3 parsing, editable PPTX generation, and Chinese DOCX formatting. The
+  PaddleOCR PP-StructureV4 parsing, editable PPTX generation, and Chinese DOCX formatting. The
   office router now delegates digital, scanned, presentation, and document-writing workflows to
   these skills.
 - Official packages now include the Python, Node.js, PptxGenJS, PDF, DOCX, PaddlePaddle, and

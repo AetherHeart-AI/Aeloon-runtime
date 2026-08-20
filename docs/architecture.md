@@ -5,7 +5,7 @@ not dependencies of this repository.
 
 ```mermaid
 flowchart LR
-    Desktop["Electron desktop"] --> RPC["aeloon-rpc v3 Unix gateway"]
+    Desktop["Electron desktop"] --> RPC["aeloon-rpc v4 Unix gateway"]
     RPC --> Runtime["Standalone Runtime"]
     Runtime --> Agent["stateless agent core"]
     Runtime --> Tools["runtime tool set"]
@@ -65,7 +65,7 @@ DeepSeek, Aeloon Cloud, and the testing-only `ScriptedProvider`.
 
 ## Local RPC and Cloud
 
-`aeloon-rpc` v3 is a length-prefixed JSON transport over a restricted Unix socket. The gateway owns
+`aeloon-rpc` v4 is a length-prefixed JSON transport over a restricted Unix socket. The gateway owns
 dispatch, cancellation, 40 MiB frame limits, event replay, workspace boundaries, and JSON DTOs. It
 uses draft SemVer range negotiation, has no TCP/TLS/token layer in the base release, and does not
 import UI or Electron code.

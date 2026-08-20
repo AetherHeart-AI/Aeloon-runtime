@@ -85,12 +85,12 @@ def request(identifier, method, params):
             return value
 
 handshake = request(1, "system.handshake", {
-    "protocol": {"min": "3.0.0", "max": "3.0.0"},
+    "protocol": {"min": "4.0.0", "max": "4.0.0"},
     "client": {"name": "docker-smoke", "version": "1", "platform": "linux-aarch64"},
 })
 health = request(2, "system.health", {})
 shutdown = request(3, "system.shutdown", {})
-assert handshake["result"]["protocol"] == "3.0.0", handshake
+assert handshake["result"]["protocol"] == "4.0.0", handshake
 assert health["result"]["ok"] is True, health
 assert shutdown["result"]["accepted"] is True, shutdown
 print(json.dumps({"handshake": handshake["result"]["protocol"], "health": True, "shutdown": True}))

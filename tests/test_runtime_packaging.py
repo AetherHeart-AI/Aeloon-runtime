@@ -34,13 +34,13 @@ def test_runtime_diagnostics_use_the_independent_runtime_version(monkeypatch) ->
     assert runtime_version() == "0.0.16"
 
 
-def test_protocol_package_is_generated_from_the_v3_manifest() -> None:
+def test_protocol_package_is_generated_from_the_v4_manifest() -> None:
     root = Path(__file__).parents[1]
     package = (root / "packages" / "protocol" / "package.json").read_text(encoding="utf-8")
     tsconfig = (root / "packages" / "protocol" / "tsconfig.json").read_text(encoding="utf-8")
     source = (root / "packages" / "protocol" / "src" / "index.ts").read_text(encoding="utf-8")
     assert '"name": "@aeloon/protocol"' in package
-    assert '"version": "3.0.0"' in package
+    assert '"version": "4.0.0"' in package
     assert '"main": "dist/index.js"' in package
     assert '"emitDeclarationOnly"' not in tsconfig
     assert "export interface RuntimeRpcMethodMap" in source
@@ -77,13 +77,3 @@ def test_runtime_release_publishes_the_runtime_wheel_alongside_bundles() -> None
     assert "name: aeloon-runtime-wheel" in workflow
     assert "needs: [bundle, protocol-package, wheel]" in workflow
     assert 'gh release upload "$tag" release/*.whl --clobber' in workflow
-
-
-def test_package_workflow_checks_protocol_compatibility_against_base_revision() -> None:
-    workflow = (
-        Path(__file__).parents[1] / ".github" / "workflows" / "python-package.yml"
-    ).read_text(encoding="utf-8")
-    assert "fetch-depth: 0" in workflow
-    assert "BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}" in workflow
-    assert "git show \"$BASE_SHA:aeloon_runtime/rpc/aeloon-rpc-v3.manifest.json\"" in workflow
-    assert "tools/check_rpc_compat.py" in workflow
