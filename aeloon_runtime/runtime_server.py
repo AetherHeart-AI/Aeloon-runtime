@@ -1,8 +1,7 @@
-"""Minimal aeloon-rpc v3 Unix gateway.
+"""Minimal aeloon-rpc v4 Runtime gateway.
 
-This is the first Runtime boundary. Store/workspace method groups are added by
-the migration work, while the server already provides the v3 framing,
-handshake, lifecycle and event replay guarantees needed by a desktop client.
+The Runtime owns the v4 framing, handshake, workspace authorization, lifecycle,
+and event replay guarantees needed by a desktop client.
 """
 
 from __future__ import annotations
@@ -17,9 +16,14 @@ import hashlib
 import json
 import mimetypes
 import os
+import platform
 import re
+import shutil
+import socket
 import stat
 import struct
+import sys
+import tempfile
 import time
 import uuid
 from collections import deque
@@ -65,15 +69,13 @@ AUTH_HANDSHAKE_TIMEOUT_S = 10.0
 EVENT_LIMIT = 10_000
 EVENT_QUEUE_LIMIT = 1_000
 _MANIFEST = json.loads(
-    (Path(__file__).with_name("rpc") / "aeloon-rpc-v3.manifest.json").read_text(encoding="utf-8")
+    (Path(__file__).with_name("rpc") / "aeloon-rpc-v4.manifest.json").read_text(encoding="utf-8")
 )
-PROTOCOL_VERSION = str(_MANIFEST["protocol_version"])
-# Newest first. One minor back stays supported so a client and a Runtime can be
-# upgraded independently; drop an entry only in a major bump.
-SUPPORTED_PROTOCOLS: tuple[str, ...] = (PROTOCOL_VERSION, "3.0.0")
+PROTOCOL_VERSION = "4.0.0"
+SUPPORTED_PROTOCOLS: tuple[str, ...] = (PROTOCOL_VERSION,)
 MAX_FRAME_BYTES = int(_MANIFEST["transport"]["max_frame_bytes"])
-FILE_BYTES = int(_MANIFEST["transport"]["file_bytes"])
-IMAGE_BYTES = int(_MANIFEST["transport"]["image_bytes"])
+FILE_BYTES = int(_MANIFEST["transport"].get("file_bytes", 25 * 1024 * 1024))
+IMAGE_BYTES = int(_MANIFEST["transport"].get("image_bytes", 10 * 1024 * 1024))
 _ALL_METHODS = {
     **_MANIFEST["methods"],
     **_MANIFEST.get("plugin_methods", {}),
@@ -130,7 +132,7 @@ async def read_frame(reader: asyncio.StreamReader) -> Any:
         raise RpcError("invalid_argument", "RPC frame contains invalid JSON") from None
 
 
-class RuntimeV3Server:
+class RuntimeServer:
     def __init__(
         self,
         runtime: RuntimeService,
@@ -143,6 +145,8 @@ class RuntimeV3Server:
         tls_context: Any | None = None,
         tls_certificate: Path | None = None,
         tls_key: Path | None = None,
+        runtime_label: str | None = None,
+        advertise_url: str | None = None,
     ) -> None:
         self.runtime = runtime
         # A WebSocket listener is additive: the Unix socket always exists, so a
@@ -152,26 +156,29 @@ class RuntimeV3Server:
         self.tls_context = tls_context
         self.tls_certificate = tls_certificate
         self.tls_key = tls_key
+        self.advertise_url = advertise_url
         self.socket_path = socket_path.expanduser().resolve(strict=False)
         # Empty means no authorized roots. The CLI default of cwd is applied
-        # in ``serve_v3`` when the caller omits ``--workspace-root``; the
+        # in ``serve`` when the caller omits ``--workspace-root``; the
         # desktop launcher must pass an explicit list (possibly empty) so a
         # packaged Electron cwd of ``/`` cannot become a sandbox.
         self.workspace_roots = tuple(
             root.expanduser().resolve(strict=False) for root in workspace_roots
         )
         self.data_dir = data_dir.expanduser().resolve(strict=False)
+        self.runtime_id = _load_runtime_identity(self.data_dir)
+        self.runtime_label = (runtime_label or socket.gethostname()).strip() or socket.gethostname()
         self.trace = trace_recorder
         self.server: asyncio.AbstractServer | None = None
-        self.connections: set[RuntimeV3Connection] = set()
-        self.pending_connections: set[RuntimeV3Connection] = set()
+        self.connections: set[RuntimeConnection] = set()
+        self.pending_connections: set[RuntimeConnection] = set()
         self.started_at = time.monotonic()
         self.server_instance_id = str(uuid.uuid4())
         self.current_seq = 0
         self.events: deque[dict[str, Any]] = deque(maxlen=EVENT_LIMIT)
         self.stop_event = asyncio.Event()
         self._remove_listener = runtime.add_event_listener(self._on_runtime_event)
-        # ``serve_v3`` acquires this before composing RuntimeService so a
+        # ``serve`` acquires this before composing RuntimeService so a
         # competing process cannot run repository/session cleanup while the
         # first owner is still being assembled. Direct unit composition keeps
         # the historical lazy acquisition in ``run``.
@@ -275,6 +282,10 @@ class RuntimeV3Server:
                 from aeloon_runtime.pairing import is_loopback_host
 
                 host, port = self.listen
+                if host in {"0.0.0.0", "::", "[::]"} and not self.advertise_url:
+                    raise ValueError(
+                        "Wildcard WebSocket listeners require --advertise-url wss://host:port"
+                    )
                 # Fail closed on a routable bind with zero paired devices *before*
                 # opening the listener. TLS alone is not enough: anyone on the
                 # network could otherwise walk enrollment.
@@ -285,6 +296,7 @@ class RuntimeV3Server:
                     port,
                     certificate=self.tls_certificate,
                     key=self.tls_key,
+                    advertise_url=self.advertise_url,
                 )
                 require_listen_host(
                     host,
@@ -355,14 +367,14 @@ class RuntimeV3Server:
             writer.close()
             await writer.wait_closed()
             return
-        connection = RuntimeV3Connection(self, reader, writer, requires_auth=False)
+        connection = RuntimeConnection(self, reader, writer, requires_auth=False)
         self.connections.add(connection)
         try:
             await connection.run()
         finally:
             self.connections.discard(connection)
 
-    def activate_connection(self, connection: RuntimeV3Connection) -> None:
+    def activate_connection(self, connection: RuntimeConnection) -> None:
         if len(self.connections) >= MAX_CLIENTS:
             raise RpcError("busy", "Runtime connection limit reached")
         self.pending_connections.discard(connection)
@@ -386,7 +398,7 @@ class RuntimeV3Server:
         }.get(raw.get("name"), raw.get("name"))
         if raw.get("name") == "log.entry":
             # The producer is shared with the frozen v2 surface, which has to go
-            # on emitting `core_*`. Rename on the way out so v3 never exposes
+            # on emitting `core_*`. Rename on the way out so v4 never exposes
             # the old identity.
             payload = raw.get("payload")
             if isinstance(payload, dict):
@@ -468,7 +480,7 @@ class RuntimeV3Server:
         self,
         method: str,
         params: Mapping[str, Any],
-        connection: RuntimeV3Connection | None = None,
+        connection: RuntimeConnection | None = None,
     ) -> Any:
         validator = _METHOD_SCHEMAS.get(method)
         if validator is not None:
@@ -532,6 +544,9 @@ class RuntimeV3Server:
             }
         if method == "system.snapshot":
             return await self._system_snapshot()
+        if method in {"system.shutdown", "system.uninstall_inspect", "system.uninstall_prepare"}:
+            if connection is not None and connection.requires_auth:
+                raise RpcError("forbidden", "Remote WSS connections cannot control Runtime lifecycle")
         if method == "system.uninstall_inspect":
             return await self._uninstall_inspect()
         if method == "system.uninstall_prepare":
@@ -541,9 +556,23 @@ class RuntimeV3Server:
             dirty = [item for item in inspection["worktrees"] if item.get("dirty")]
             if dirty:
                 raise RpcError("busy", "Commit or move changes from managed worktrees first")
-            removed: list[str] = []
+            removed = [
+                {
+                    "project_path": str(item["project_path"]),
+                    "workspace": str(item["workspace"]),
+                }
+                for item in inspection["worktrees"]
+            ]
+            response = {"prepared": True, "removed_worktrees": removed}
+            self.validate_result("system.uninstall_prepare", response)
+            deleted: list[dict[str, str]] = []
             for item in inspection["worktrees"]:
+                record = {
+                    "project_path": str(item["project_path"]),
+                    "workspace": str(item["workspace"]),
+                }
                 if not item.get("exists"):
+                    deleted.append(record)
                     continue
                 try:
                     await run_blocking(
@@ -551,10 +580,14 @@ class RuntimeV3Server:
                         Path(str(item["project_path"])),
                         Path(str(item["workspace"])),
                     )
-                    removed.append(str(item["workspace"]))
+                    deleted.append(record)
                 except (RuntimeError, OSError) as exc:
-                    raise RpcError("invalid_state", str(exc)) from None
-            return {"prepared": True, "removed_worktrees": removed}
+                    raise RpcError(
+                        "invalid_state",
+                        str(exc),
+                        {"removed_worktrees": deleted},
+                    ) from None
+            return response
         if method == "system.shutdown":
             if self.runtime.active_operation_count > 0:
                 raise RpcError("busy", "Runtime has active operations")
@@ -576,11 +609,11 @@ class RuntimeV3Server:
             return await self.runtime.account_logout(params)
         if method == "catalog.get":
             # The Runtime service keeps the complete resource catalog.  The
-            # v3 wire result deliberately names all of those collections so
+            # v4 wire result deliberately names all of those collections so
             # clients can render settings without a second legacy projection.
             catalog_params = dict(params)
             # Runtime internals still call the 1:1 session identity
-            # ``session_id``.  Keep that name out of the public v3 surface;
+            # ``session_id``.  Keep that name out of the public v4 surface;
             # the gateway is the sole translation point.
             if "thread_id" in catalog_params:
                 catalog_params["session_id"] = catalog_params.pop("thread_id")
@@ -628,10 +661,12 @@ class RuntimeV3Server:
             or method.startswith("plugin.knowledge.")
         ):
             raise RpcError("capability_unavailable", f"Capability is not enabled: {method}")
+        if method in {"workspace.roots", "workspace.list"}:
+            return await self._workspace_dispatch(method, params)
         if method.startswith("devices."):
             return await self._devices_dispatch(method, params, connection)
         if method.startswith("project."):
-            return await self._project_dispatch(method, params)
+            return await self._project_dispatch(method, params, connection)
         if method.startswith("thread."):
             return await self._thread_dispatch(method, params)
         if method.startswith("turn."):
@@ -649,7 +684,7 @@ class RuntimeV3Server:
                 return await self._git_dispatch(method, params)
             except ValueError as exc:
                 raise RpcError("invalid_argument", str(exc)) from None
-        raise RpcError("method_not_found", f"Unknown v3 method: {method}")
+        raise RpcError("method_not_found", f"Unknown v4 method: {method}")
 
     def validate_result(self, method: str, value: Any) -> None:
         validator = _RESULT_SCHEMAS.get(method)
@@ -671,12 +706,40 @@ class RuntimeV3Server:
             "default_workspace": str(self.workspace_roots[0]) if self.workspace_roots else "",
             "projects": projects,
             "threads": threads,
-            "runtime": {
-                "version": RUNTIME_VERSION,
-                "commit": RUNTIME_COMMIT,
-                "protocol": PROTOCOL_VERSION,
-            },
         }
+
+    async def _workspace_dispatch(
+        self, method: str, params: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        if method == "workspace.roots":
+            return {
+                "roots": [
+                    {
+                        "id": _root_id(root),
+                        "label": root.name or str(root),
+                        "path": str(root),
+                        "writable": os.access(root, os.W_OK),
+                    }
+                    for root in self.workspace_roots
+                ]
+            }
+        root_id = self._required_string(params, "root_id")
+        relative_path = params.get("relative_path")
+        if not isinstance(relative_path, str):
+            raise RpcError("invalid_argument", "relative_path is required")
+        root = next((item for item in self.workspace_roots if _root_id(item) == root_id), None)
+        if root is None:
+            raise RpcError("invalid_argument", "Unknown workspace root")
+        self._validate_relative(relative_path)
+        target = (root / relative_path).resolve(strict=False)
+        if not _is_within(target, root) or _contains_symlink(root / relative_path):
+            raise RpcError("forbidden", "Path resolves outside authorized workspace root")
+        if not target.exists() or not target.is_dir():
+            raise RpcError("invalid_argument", "Workspace directory does not exist")
+        entries = []
+        for item in sorted(target.iterdir(), key=lambda value: (not value.is_dir(), value.name.lower())):
+            entries.append({"name": item.name, "kind": "directory" if item.is_dir() else "file"})
+        return {"directory": relative_path or ".", "entries": entries}
 
     async def _uninstall_inspect(self) -> dict[str, Any]:
         estimated = 0
@@ -712,11 +775,24 @@ class RuntimeV3Server:
             "worktrees": worktrees,
         }
 
-    async def _project_dispatch(self, method: str, params: Mapping[str, Any]) -> dict[str, Any]:
+    async def _project_dispatch(
+        self,
+        method: str,
+        params: Mapping[str, Any],
+        connection: RuntimeConnection | None = None,
+    ) -> dict[str, Any]:
         if method == "project.list":
             return {"projects": await self._store_call("list_projects")}
         if method == "project.add":
-            path = self._allowed_path(params.get("path"), must_exist=True, directory=True)
+            root_id = self._required_string(params, "root_id")
+            relative_path = params.get("relative_path")
+            if not isinstance(relative_path, str):
+                raise RpcError("invalid_argument", "relative_path is required")
+            root = next((item for item in self.workspace_roots if _root_id(item) == root_id), None)
+            if root is None:
+                raise RpcError("invalid_argument", "Unknown workspace root")
+            self._validate_relative(relative_path)
+            path = self._allowed_path(str(root / relative_path), must_exist=True, directory=True)
             name = path.name or str(path)
             is_git = (path / ".git").exists()
             try:
@@ -1504,7 +1580,7 @@ class RuntimeV3Server:
     async def _handshake(
         self,
         params: Mapping[str, Any],
-        connection: RuntimeV3Connection | None = None,
+        connection: RuntimeConnection | None = None,
     ) -> dict[str, Any]:
         offered = params.get("protocol")
         if not isinstance(offered, Mapping):
@@ -1515,34 +1591,32 @@ class RuntimeV3Server:
             )
         minimum = str(offered.get("min") or "")
         maximum = str(offered.get("max") or "")
-        # A compatibility window, not an exact match: the Runtime answers with the
-        # newest protocol it speaks that the client also speaks. Requiring the
-        # client range to contain this Runtime's exact version would break every
-        # older client on each minor bump, which is the opposite of what
-        # independent versioning is for.
-        negotiated = next(
-            (
-                candidate
-                for candidate in SUPPORTED_PROTOCOLS
-                if _range_contains(minimum, maximum, candidate)
-            ),
-            None,
-        )
-        if negotiated is None:
-            supported = ", ".join(SUPPORTED_PROTOCOLS)
+        if minimum != PROTOCOL_VERSION or maximum != PROTOCOL_VERSION:
             raise RpcError(
                 "protocol_incompatible",
-                f"Runtime speaks {supported}; client offered {minimum}..{maximum}",
+                f"Runtime requires exactly {PROTOCOL_VERSION}; client offered {minimum}..{maximum}",
                 {
                     "client_min": minimum,
                     "client_max": maximum,
-                    "runtime_min": SUPPORTED_PROTOCOLS[0],
-                    "runtime_max": SUPPORTED_PROTOCOLS[-1],
+                    "runtime_min": PROTOCOL_VERSION,
+                    "runtime_max": PROTOCOL_VERSION,
                 },
             )
         result: dict[str, Any] = {
-            "protocol": negotiated,
-            "runtime": {"version": RUNTIME_VERSION, "commit": RUNTIME_COMMIT},
+            "protocol": PROTOCOL_VERSION,
+            "runtime": {
+                "id": self.runtime_id,
+                "label": self.runtime_label,
+                "version": RUNTIME_VERSION,
+                "commit": RUNTIME_COMMIT,
+            },
+            "host": {
+                "hostname": socket.gethostname(),
+                "platform": platform.system().lower() or sys.platform,
+                "architecture": platform.machine() or "unknown",
+                "shell": os.environ.get("SHELL") or "unknown",
+                "tools": {"git": bool(shutil.which("git")), "gh": bool(shutil.which("gh"))},
+            },
             "limits": {
                 "prompt_chars": 100_000,
                 "attachments": 8,
@@ -1551,7 +1625,6 @@ class RuntimeV3Server:
                 "request_bytes": MAX_FRAME_BYTES,
                 "retained_events": EVENT_LIMIT,
             },
-            "workspace_roots": [str(root) for root in self.workspace_roots],
         }
         if connection is not None:
             device = await self._authenticate_handshake(params, connection)
@@ -1562,7 +1635,7 @@ class RuntimeV3Server:
     async def _authenticate_handshake(
         self,
         params: Mapping[str, Any],
-        connection: RuntimeV3Connection,
+        connection: RuntimeConnection,
     ) -> dict[str, str] | None:
         requires_auth = connection.requires_auth and connection.device_id is None
         auth = params.get("auth")
@@ -1575,7 +1648,7 @@ class RuntimeV3Server:
     async def _authenticate_handshake_locked(
         self,
         params: Mapping[str, Any],
-        connection: RuntimeV3Connection,
+        connection: RuntimeConnection,
         source: str,
         auth: Any,
     ) -> dict[str, str] | None:
@@ -1586,12 +1659,10 @@ class RuntimeV3Server:
             await self._auth_failed(source, "missing")
             connection.close_after_response = True
             raise RpcError("unauthorized", "This connection requires device authentication")
-        scheme = auth.get("scheme")
+        scheme = auth.get("kind")
         try:
-            if scheme == "enrollment":
-                return self._enroll_device(params, connection, source)
-            if scheme == "bearer":
-                self._accept_bearer(auth, connection, source)
+            if scheme == "device_token":
+                self._accept_device_token(auth, connection, source)
                 return None
             raise RpcError("unauthorized", "Unsupported authentication scheme")
         except RpcError as exc:
@@ -1601,42 +1672,12 @@ class RuntimeV3Server:
                 connection.close_after_response = True
             raise
 
-    def _enroll_device(
-        self,
-        params: Mapping[str, Any],
-        connection: RuntimeV3Connection,
-        source: str,
-    ) -> dict[str, str]:
-        auth = params.get("auth")
-        code = auth.get("code") if isinstance(auth, Mapping) else None
-        if not isinstance(code, str) or not code.strip():
-            raise RpcError("unauthorized", "Enrollment requires a pairing code")
-        if not self.pairing.enrollment.consume(code):
-            raise RpcError("unauthorized", "Enrollment code is invalid or expired")
-        client = params.get("client") if isinstance(params.get("client"), Mapping) else {}
-        record, token = self.pairing.store.issue(
-            name=str(client.get("name") or "device"),
-            platform=str(client.get("platform") or "unknown"),
-        )
-        connection.device_id = str(record["id"])
-        try:
-            self._enforce_device_limit(connection.device_id)
-            self.activate_connection(connection)
-        except RpcError:
-            connection.device_id = None
-            self.pairing.store.revoke(str(record["id"]))
-            raise
-        self.pairing.limiter.record_success(source)
-        if self.log is not None:
-            self.log.write("paired", device_id=record["id"], name=record["name"])
-        return {"id": str(record["id"]), "token": token}
-
-    def _accept_bearer(
-        self, auth: Mapping[str, Any], connection: RuntimeV3Connection, source: str
+    def _accept_device_token(
+        self, auth: Mapping[str, Any], connection: RuntimeConnection, source: str
     ) -> None:
         token = auth.get("token")
         if not isinstance(token, str) or not token:
-            raise RpcError("unauthorized", "Bearer authentication requires a token")
+            raise RpcError("unauthorized", "Device token authentication requires a token")
         record = self.pairing.store.verify(token)
         if record is None:
             raise RpcError("unauthorized", "Device token is invalid")
@@ -1675,8 +1716,31 @@ class RuntimeV3Server:
         self,
         method: str,
         params: Mapping[str, Any],
-        connection: RuntimeV3Connection | None,
+        connection: RuntimeConnection | None,
     ) -> dict[str, Any]:
+        if method == "devices.claim":
+            if connection is None or not connection.requires_auth:
+                raise RpcError("forbidden", "devices.claim is only available on WSS enrollment connections")
+            code = self._required_string(params, "code")
+            client = params.get("client")
+            if not isinstance(client, Mapping):
+                raise RpcError("invalid_argument", "client is required")
+            if not isinstance(client.get("name"), str) or not str(client.get("name")).strip():
+                raise RpcError("invalid_argument", "client.name is required")
+            if not isinstance(client.get("version"), str) or not str(client.get("version")).strip():
+                raise RpcError("invalid_argument", "client.version is required")
+            if not self.pairing.enrollment.consume(code):
+                connection.close_after_response = True
+                raise RpcError("unauthorized", "Enrollment code is invalid or expired")
+            record, token = self.pairing.store.issue(
+                name=str(client["name"]),
+                platform="remote",
+            )
+            connection.close_after_response = True
+            self.pairing.limiter.record_success(connection.auth_source or "websocket")
+            if self.log is not None:
+                self.log.write("paired", device_id=record["id"], name=record["name"])
+            return {"device_id": str(record["id"]), "token": token}
         if method == "devices.list":
             return {
                 "devices": [self._device_public(item) for item in self.pairing.store.list_devices()]
@@ -1705,7 +1769,7 @@ class RuntimeV3Server:
             except RuntimeError as exc:
                 raise RpcError("invalid_state", str(exc)) from None
             return {"code": code, "expires_at": expires_at, "pairing_url": url}
-        raise RpcError("method_not_found", f"Unknown v3 method: {method}")
+        raise RpcError("method_not_found", f"Unknown v4 method: {method}")
 
     def _subscribe(self, params: Mapping[str, Any]) -> dict[str, Any]:
         after_seq = int(params.get("after_seq") or 0)
@@ -1740,10 +1804,10 @@ class RuntimeV3Server:
         }
 
 
-class RuntimeV3Connection:
+class RuntimeConnection:
     def __init__(
         self,
-        server: RuntimeV3Server,
+        server: RuntimeServer,
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
         *,
@@ -1845,7 +1909,7 @@ class RuntimeV3Connection:
             if not isinstance(params, Mapping):
                 raise RpcError("invalid_argument", "RPC params must be an object")
             method = str(request["method"])
-            if method != "system.handshake" and not self.handshaken:
+            if method != "system.handshake" and method != "devices.claim" and not self.handshaken:
                 raise RpcError(
                     "protocol_incompatible", "Complete system.handshake before other methods"
                 )
@@ -1864,11 +1928,13 @@ class RuntimeV3Connection:
             if self.close_after_response:
                 await self.close()
         except RpcError as exc:
-            if method == "system.handshake" and self.requires_auth:
+            if method in {"system.handshake", "devices.claim"} and self.requires_auth:
                 self.close_after_response = True
             if self.server.trace is not None:
                 self.server.trace.error(request_id, method, exc.code, str(exc))
             await self.send({"id": request_id, "error": exc.to_rpc()})
+            if self.close_after_response:
+                await self.close()
         except RuntimeFailure as exc:
             if self.server.trace is not None:
                 self.server.trace.error(request_id, method, exc.code, str(exc))
@@ -1982,36 +2048,37 @@ def _consume_future_exception(future: asyncio.Future[None]) -> None:
         future.exception()
 
 
-def _range_contains(minimum: str, maximum: str, version: str) -> bool:
-    def parse(
-        value: str,
-    ) -> tuple[tuple[int, int, int], tuple[tuple[int, int, object], ...]] | None:
-        value = value.removeprefix("v")
-        core, _, suffix = value.partition("-")
-        parts = core.split(".")
-        try:
-            if len(parts) != 3:
-                return None
-            numbers = tuple(int(part) for part in parts)
-        except (TypeError, ValueError):
-            return None
-        if not suffix:
-            return numbers, ((1, 0, ""),)
-        identifiers: list[tuple[int, int, object]] = []
-        for identifier in suffix.split("."):
-            if not identifier:
-                return None
-            if identifier.isdigit():
-                identifiers.append((0, 0, int(identifier)))
-            else:
-                identifiers.append((0, 1, identifier))
-        # A release is greater than every prerelease of the same core.
-        return numbers, ((0, 0, ""), *identifiers)
+def _load_runtime_identity(data_dir: Path) -> str:
+    """Load or atomically create the v4 Runtime identity."""
 
-    low = parse(minimum)
-    high = parse(maximum)
-    current = parse(version)
-    return low is not None and high is not None and current is not None and low <= current <= high
+    path = data_dir / "runtime-identity.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        value = payload.get("id") if isinstance(payload, Mapping) else None
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    except (OSError, json.JSONDecodeError, TypeError):
+        pass
+    value = str(uuid.uuid4())
+    data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, temporary = tempfile.mkstemp(prefix=".runtime-identity.", dir=data_dir)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({"schemaVersion": 1, "id": value}, handle, separators=(",", ":"))
+            handle.write("\n")
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary)
+    return value
+
+
+def _root_id(path: Path) -> str:
+    return hashlib.sha256(
+        str(path.expanduser().resolve(strict=False)).encode("utf-8")
+    ).hexdigest()
 
 
 def _open_runtime_lock(data_dir: Path) -> int:
@@ -2084,7 +2151,7 @@ def _snake_case_value(value: Any) -> Any:
     }
 
 
-async def serve_v3(
+async def serve(
     *,
     socket_path: Path,
     data_dir: Path | None = None,
@@ -2096,13 +2163,19 @@ async def serve_v3(
     tls_context: Any | None = None,
     tls_certificate: Path | None = None,
     tls_key: Path | None = None,
+    runtime_label: str | None = None,
+    advertise_url: str | None = None,
 ) -> None:
     resolved_data = (
         (data_dir or Path("~/.aeloon-runtime").expanduser()).expanduser().resolve(strict=False)
     )
-    if (resolved_data / ".incomplete").exists():
+    if (resolved_data / ".incomplete").exists() or (resolved_data / ".reset-incomplete").exists():
         raise RuntimeError(
-            "Runtime data migration is incomplete; resume or roll back before serving"
+            "Runtime reset state is incomplete; run the explicit v4 reset command before serving"
+        )
+    if (resolved_data / "devices.json").exists() or (resolved_data / "migration.complete").exists():
+        raise RuntimeError(
+            "Legacy Runtime data detected; run the explicit v4 reset command before serving"
         )
     # ``None`` is the standalone CLI default (launch directory). An explicit
     # empty tuple is the desktop "not yet authorized" state and must not
@@ -2110,12 +2183,12 @@ async def serve_v3(
     roots = (Path.cwd(),) if workspace_roots is None else workspace_roots
     # Hold the single-instance lock before composing RuntimeService. Its
     # constructor creates session/attachment projections and performs orphan
-    # cleanup, so locking only inside ``RuntimeV3Server.run`` leaves a startup
+    # cleanup, so locking only inside ``RuntimeServer.run`` leaves a startup
     # race between two standalone processes.
     lock_fd = _open_runtime_lock(resolved_data)
     runtime: RuntimeService | None = None
     trace: TraceRecorder | None = None
-    server: RuntimeV3Server | None = None
+    server: RuntimeServer | None = None
     try:
         runtime = create_runtime_service(
             config_path=config_path or resolved_data / "config.json",
@@ -2123,7 +2196,7 @@ async def serve_v3(
             max_concurrent_operations=max_concurrent_operations,
         )
         trace = TraceRecorder(record_trace) if record_trace is not None else None
-        server = RuntimeV3Server(
+        server = RuntimeServer(
             runtime,
             socket_path,
             roots,
@@ -2134,6 +2207,8 @@ async def serve_v3(
             tls_context=tls_context,
             tls_certificate=tls_certificate,
             tls_key=tls_key,
+            runtime_label=runtime_label,
+            advertise_url=advertise_url,
         )
         lock_fd = None
         await server.run()

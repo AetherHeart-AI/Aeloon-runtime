@@ -1,6 +1,6 @@
-# Aeloon RPC 3.0.0
+# Aeloon RPC 4.0.0
 
-This file is generated from `docs/rpc-v3.json`; do not edit by hand.
+This file is generated from `docs/rpc-v4.json`; do not edit by hand.
 
 - Protocol: `aeloon-rpc`
 - Frame: `40 MiB`
@@ -8,10 +8,10 @@ This file is generated from `docs/rpc-v3.json`; do not edit by hand.
 
 ## system
 
-- `system.handshake` — `{protocol:{min,max}, client:{name,version,platform}, auth?:{scheme:"bearer"|"mtls", token?}}` → `{protocol, runtime:{version,commit}, limits:{prompt_chars,attachments,image_bytes,file_bytes,request_bytes,retained_events}, workspace_roots[]}`
+- `system.handshake` — `{protocol:{min:"4.0.0",max:"4.0.0"}, client:{name,version,platform}, auth?:{kind:"device_token",token}}` → `{protocol:"4.0.0", runtime:{id,label,version,commit}, host:{hostname,platform,architecture,shell,tools}, limits}`
 - `system.health` — `{workspace?}` → `{ok, uptime_s, active_operations}`
 - `system.capabilities` — `{}` → `{capabilities:[{id,version,kind,enabled,settings_schema,methods[],events[],ui:{group,order}}]}`
-- `system.snapshot` — `{}` → `{default_workspace, projects[], threads[], runtime:{version,commit,protocol}}`
+- `system.snapshot` — `{}` → `{default_workspace, projects[], threads[]}`
 - `system.shutdown` — `{}` → `{accepted}`
 - `system.uninstall_inspect` — `{}` → `{data_paths[], estimated_bytes, active_operations, worktrees[]}`
 - `system.uninstall_prepare` — `{}` → `{prepared, removed_worktrees[]}`
@@ -23,7 +23,7 @@ This file is generated from `docs/rpc-v3.json`; do not edit by hand.
 ## project
 
 - `project.list` — `{}` → `{projects[]}`
-- `project.add` — `{path}` → `{project, projects[]}`
+- `project.add` — `{root_id,relative_path}` → `{project, projects[]}`
 - `project.remove` — `{project_id}` → `{removed}`
 - `project.refresh` — `{project_id}` → `{project, projects[]}`
 
@@ -58,12 +58,17 @@ This file is generated from `docs/rpc-v3.json`; do not edit by hand.
 - `fs.list` — `{thread_id|root, path?}` → `{entries:[{name,kind,size,mtime}]}`
 - `fs.read` — `{thread_id, path, max_bytes?}` → `{content, truncated, encoding}`
 
+## workspace
+
+- `workspace.roots` — `{}` → `{roots:[{id,label,path,writable}]}`
+- `workspace.list` — `{root_id,relative_path}` → `{directory,entries:[{name,kind}]}`
+
 ## git
 
 - `git.status` — `{thread_id}` → `{ok,branch,entries[],stderr}`
 - `git.github_status` — `{thread_id}` → `{github_origin,authenticated,remote,stderr}`
 - `git.diff` — `{thread_id, scope:"changes"|"staged", path?}` → `{ok,scope,path,patch,binary,truncated,stderr}`
-- `git.changes` — `{thread_id}` → `{branch,staged,changes}`
+- `git.changes` — `{thread_id}` → `{branch,staged:{files,additions,deletions},changes:{files,additions,deletions}}`
 - `git.stage` — `{thread_id, paths[]?}` → `{ok,stdout,stderr}`
 - `git.unstage` — `{thread_id, paths[]?}` → `{ok,stdout,stderr}`
 - `git.branches` — `{thread_id}` → `{ok,branches[],current,stderr}`
@@ -101,6 +106,13 @@ This file is generated from `docs/rpc-v3.json`; do not edit by hand.
 - `settings.get` — `{workspace?}` → `{settings, revision}`
 - `settings.update` — `{patch, revision, workspace?, secret_actions?}` → `{settings, revision}`
 - `tools.search_test` — `{query, provider?}` → `{results[], engine, error?}`
+
+## devices
+
+- `devices.list` — `{}` → `{devices:[{id,name,platform,paired_at,last_seen_at,connected}]}`
+- `devices.revoke` — `{device_id}` → `{revoked,devices[]}`
+- `devices.enroll` — `{}` → `{code,expires_at,pairing_url}`
+- `devices.claim` — `{code,client:{name,version}}` → `{device_id,token}`
 
 ## plugins
 

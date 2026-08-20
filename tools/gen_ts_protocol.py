@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the standalone TypeScript protocol package from the v3 manifest."""
+"""Generate the standalone TypeScript protocol package from the v4 manifest."""
 
 from __future__ import annotations
 
@@ -10,8 +10,8 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
-MANIFEST = ROOT / "aeloon_runtime" / "rpc" / "aeloon-rpc-v3.manifest.json"
-SOURCE = ROOT / "docs" / "rpc-v3.json"
+MANIFEST = ROOT / "aeloon_runtime" / "rpc" / "aeloon-rpc-v4.manifest.json"
+SOURCE = ROOT / "docs" / "rpc-v4.json"
 OUTPUT = ROOT / "packages" / "protocol" / "src" / "index.ts"
 
 
@@ -78,7 +78,7 @@ def render(manifest: dict[str, Any]) -> str:
     defs = manifest.get("$defs", {})
     lines = [
         "/* eslint-disable */",
-        "/** Generated from aeloon_runtime/rpc/aeloon-rpc-v3.manifest.json. DO NOT EDIT. */",
+        "/** Generated from aeloon_runtime/rpc/aeloon-rpc-v4.manifest.json. DO NOT EDIT. */",
         "",
     ]
     for name in sorted(defs):

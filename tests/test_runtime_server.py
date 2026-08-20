@@ -13,16 +13,24 @@ from typing import Any
 
 import pytest
 
-import aeloon_runtime.runtime_server_v3 as runtime_server_v3
+import aeloon_runtime.runtime_server as runtime_server
 from aeloon_runtime.bootstrap import create_runtime_service
 from aeloon_runtime.rpc.protocol import RpcError
 from aeloon_runtime.runtime.session import SessionError
-from aeloon_runtime.runtime_server_v3 import (
+from aeloon_runtime.runtime_server import (
     MAX_FRAME_BYTES,
-    RuntimeV3Connection,
-    RuntimeV3Server,
-    serve_v3,
+    RuntimeConnection,
+    RuntimeServer,
+    _root_id,
+    serve,
 )
+
+
+def _project_params(root: Path, target: Path | None = None) -> dict[str, str]:
+    root = root.resolve()
+    target = (target or root).resolve()
+    relative = target.relative_to(root).as_posix() or "."
+    return {"root_id": _root_id(root), "relative_path": relative}
 
 
 async def _request(
@@ -43,7 +51,7 @@ async def _handshake(reader: asyncio.StreamReader, writer: asyncio.StreamWriter)
             "id": "handshake",
             "method": "system.handshake",
             "params": {
-                "protocol": {"min": "3.0.0", "max": "3.0.0"},
+                "protocol": {"min": "4.0.0", "max": "4.0.0"},
                 "client": {"name": "pytest", "version": "0", "platform": "test"},
             },
         },
@@ -74,10 +82,10 @@ async def _read_response(reader: asyncio.StreamReader) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_v3_handshake_health_and_shutdown(tmp_path: Path) -> None:
-    socket_path = Path("/tmp") / f"aeloon-v3-{os.getpid()}.sock"
+async def test_v4_handshake_health_and_shutdown(tmp_path: Path) -> None:
+    socket_path = Path("/tmp") / f"aeloon-v4-{os.getpid()}.sock"
     task = asyncio.create_task(
-        serve_v3(socket_path=socket_path, data_dir=tmp_path / "data", workspace_roots=(tmp_path,))
+        serve(socket_path=socket_path, data_dir=tmp_path / "data", workspace_roots=(tmp_path,))
     )
     for _ in range(100):
         if socket_path.exists():
@@ -91,8 +99,8 @@ async def test_v3_handshake_health_and_shutdown(tmp_path: Path) -> None:
             "id": "0",
             "method": "system.handshake",
             "params": {
-                # A client that only speaks the next major cannot be served.
-                "protocol": {"min": "4.0.0", "max": "4.0.0"},
+                # A client that only speaks the removed major cannot be served.
+                "protocol": {"min": "3.0.0", "max": "3.0.0"},
                 "client": {"name": "pytest", "version": "0", "platform": "test"},
             },
         },
@@ -109,13 +117,14 @@ async def test_v3_handshake_health_and_shutdown(tmp_path: Path) -> None:
             "id": "1",
             "method": "system.handshake",
             "params": {
-                "protocol": {"min": "3.0.0", "max": "3.0.0"},
+                "protocol": {"min": "4.0.0", "max": "4.0.0"},
                 "client": {"name": "pytest", "version": "0", "platform": "test"},
             },
         },
     )
     assert handshake["result"]["limits"]["request_bytes"] == MAX_FRAME_BYTES
-    assert handshake["result"]["workspace_roots"] == [str(tmp_path)]
+    assert handshake["result"]["runtime"]["id"]
+    assert handshake["result"]["host"]["platform"]
     health = await _request(reader, writer, {"id": "2", "method": "system.health", "params": {}})
     assert health["result"]["ok"] is True
     capabilities = await _request(
@@ -158,13 +167,13 @@ async def test_v3_handshake_health_and_shutdown(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_v3_subscribe_returns_replay_in_result_without_duplicate_event_frames(
+async def test_v4_subscribe_returns_replay_in_result_without_duplicate_event_frames(
     tmp_path: Path,
 ) -> None:
     data_dir = tmp_path / "data"
-    socket_path = Path("/tmp") / f"aeloon-v3-replay-{os.getpid()}.sock"
+    socket_path = Path("/tmp") / f"aeloon-v4-replay-{os.getpid()}.sock"
     runtime = create_runtime_service(config_path=data_dir / "config.json", data_dir=data_dir)
-    server = RuntimeV3Server(runtime, socket_path, (tmp_path,), data_dir)
+    server = RuntimeServer(runtime, socket_path, (tmp_path,), data_dir)
     task = asyncio.create_task(server.run())
     for _ in range(100):
         if socket_path.exists():
@@ -208,12 +217,12 @@ async def test_v3_subscribe_returns_replay_in_result_without_duplicate_event_fra
 
 
 @pytest.mark.asyncio
-async def test_v3_control_requests_are_not_blocked_by_a_long_request(tmp_path: Path) -> None:
-    socket_path = Path("/tmp") / f"aeloon-v3-concurrent-{os.getpid()}.sock"
+async def test_v4_control_requests_are_not_blocked_by_a_long_request(tmp_path: Path) -> None:
+    socket_path = Path("/tmp") / f"aeloon-v4-concurrent-{os.getpid()}.sock"
     runtime = create_runtime_service(
         config_path=tmp_path / "data" / "config.json", data_dir=tmp_path / "data"
     )
-    server = RuntimeV3Server(runtime, socket_path, (tmp_path,), tmp_path / "data")
+    server = RuntimeServer(runtime, socket_path, (tmp_path,), tmp_path / "data")
     task = asyncio.create_task(server.run())
     for _ in range(100):
         if socket_path.exists():
@@ -257,11 +266,11 @@ async def test_v3_control_requests_are_not_blocked_by_a_long_request(tmp_path: P
 
 
 @pytest.mark.asyncio
-async def test_v3_trace_recording_is_explicit_and_captures_boundary(tmp_path: Path) -> None:
-    socket_path = Path("/tmp") / f"aeloon-v3-trace-{os.getpid()}.sock"
+async def test_v4_trace_recording_is_explicit_and_captures_boundary(tmp_path: Path) -> None:
+    socket_path = Path("/tmp") / f"aeloon-v4-trace-{os.getpid()}.sock"
     trace_directory = tmp_path / "traces"
     task = asyncio.create_task(
-        serve_v3(
+        serve(
             socket_path=socket_path,
             data_dir=tmp_path / "data",
             workspace_roots=(tmp_path,),
@@ -297,11 +306,11 @@ async def test_v3_trace_recording_is_explicit_and_captures_boundary(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_v3_does_not_unlink_a_non_socket_path(tmp_path: Path) -> None:
+async def test_v4_does_not_unlink_a_non_socket_path(tmp_path: Path) -> None:
     socket_path = tmp_path / "runtime.sock"
     socket_path.write_text("keep me", encoding="utf-8")
     with pytest.raises(RuntimeError, match="not a Unix socket"):
-        await serve_v3(
+        await serve(
             socket_path=socket_path,
             data_dir=tmp_path / "data",
             workspace_roots=(tmp_path,),
@@ -310,11 +319,11 @@ async def test_v3_does_not_unlink_a_non_socket_path(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_v3_data_lock_rejects_concurrent_runtime(tmp_path: Path) -> None:
-    socket_path = Path("/tmp") / f"aeloon-v3-lock-{os.getpid()}.sock"
+async def test_v4_data_lock_rejects_concurrent_runtime(tmp_path: Path) -> None:
+    socket_path = Path("/tmp") / f"aeloon-v4-lock-{os.getpid()}.sock"
     data_dir = tmp_path / "data"
     task = asyncio.create_task(
-        serve_v3(socket_path=socket_path, data_dir=data_dir, workspace_roots=(tmp_path,))
+        serve(socket_path=socket_path, data_dir=data_dir, workspace_roots=(tmp_path,))
     )
     for _ in range(100):
         if socket_path.exists():
@@ -324,9 +333,9 @@ async def test_v3_data_lock_rejects_concurrent_runtime(tmp_path: Path) -> None:
         config_path=data_dir / "config.json",
         data_dir=data_dir,
     )
-    second = RuntimeV3Server(
+    second = RuntimeServer(
         second_runtime,
-        Path("/tmp") / f"aeloon-v3-lock-second-{os.getpid()}.sock",
+        Path("/tmp") / f"aeloon-v4-lock-second-{os.getpid()}.sock",
         (tmp_path,),
         data_dir,
     )
@@ -342,13 +351,13 @@ async def test_v3_data_lock_rejects_concurrent_runtime(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_v3_composition_locks_data_before_runtime_factory(
+async def test_v4_composition_locks_data_before_runtime_factory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    socket_path = Path("/tmp") / f"aeloon-v3-compose-lock-{os.getpid()}.sock"
+    socket_path = Path("/tmp") / f"aeloon-v4-compose-lock-{os.getpid()}.sock"
     data_dir = tmp_path / "data"
     observed = False
-    original = runtime_server_v3.create_runtime_service
+    original = runtime_server.create_runtime_service
 
     def factory(*args: Any, **kwargs: Any) -> Any:
         nonlocal observed
@@ -364,9 +373,9 @@ async def test_v3_composition_locks_data_before_runtime_factory(
             os.close(fd)
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(runtime_server_v3, "create_runtime_service", factory)
+    monkeypatch.setattr(runtime_server, "create_runtime_service", factory)
     task = asyncio.create_task(
-        serve_v3(socket_path=socket_path, data_dir=data_dir, workspace_roots=(tmp_path,))
+        serve(socket_path=socket_path, data_dir=data_dir, workspace_roots=(tmp_path,))
     )
     for _ in range(100):
         if socket_path.exists():
@@ -382,10 +391,10 @@ async def test_v3_composition_locks_data_before_runtime_factory(
 
 
 @pytest.mark.asyncio
-async def test_v3_gateway_rejects_unknown_parameters(tmp_path: Path) -> None:
-    socket_path = Path("/tmp") / f"aeloon-v3-invalid-{os.getpid()}.sock"
+async def test_v4_gateway_rejects_unknown_parameters(tmp_path: Path) -> None:
+    socket_path = Path("/tmp") / f"aeloon-v4-invalid-{os.getpid()}.sock"
     task = asyncio.create_task(
-        serve_v3(socket_path=socket_path, data_dir=tmp_path / "data", workspace_roots=(tmp_path,))
+        serve(socket_path=socket_path, data_dir=tmp_path / "data", workspace_roots=(tmp_path,))
     )
     for _ in range(100):
         if socket_path.exists():
@@ -406,10 +415,10 @@ async def test_v3_gateway_rejects_unknown_parameters(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_v3_frame_limit_returns_error_before_closing_connection(tmp_path: Path) -> None:
-    socket_path = Path("/tmp") / f"aeloon-v3-frame-limit-{os.getpid()}.sock"
+async def test_v4_frame_limit_returns_error_before_closing_connection(tmp_path: Path) -> None:
+    socket_path = Path("/tmp") / f"aeloon-v4-frame-limit-{os.getpid()}.sock"
     task = asyncio.create_task(
-        serve_v3(socket_path=socket_path, data_dir=tmp_path / "data", workspace_roots=(tmp_path,))
+        serve(socket_path=socket_path, data_dir=tmp_path / "data", workspace_roots=(tmp_path,))
     )
     for _ in range(100):
         if socket_path.exists():
@@ -437,11 +446,11 @@ async def test_v3_frame_limit_returns_error_before_closing_connection(tmp_path: 
 
 
 @pytest.mark.asyncio
-async def test_v3_projects_threads_and_workspace_boundary(tmp_path: Path) -> None:
-    socket_path = Path("/tmp") / f"aeloon-v3-projects-{os.getpid()}.sock"
+async def test_v4_projects_threads_and_workspace_boundary(tmp_path: Path) -> None:
+    socket_path = Path("/tmp") / f"aeloon-v4-projects-{os.getpid()}.sock"
     (tmp_path / "note.txt").write_text("hello", encoding="utf-8")
     task = asyncio.create_task(
-        serve_v3(socket_path=socket_path, data_dir=tmp_path / "data", workspace_roots=(tmp_path,))
+        serve(socket_path=socket_path, data_dir=tmp_path / "data", workspace_roots=(tmp_path,))
     )
     for _ in range(100):
         if socket_path.exists():
@@ -452,7 +461,7 @@ async def test_v3_projects_threads_and_workspace_boundary(tmp_path: Path) -> Non
     added = await _request(
         reader,
         writer,
-        {"id": "1", "method": "project.add", "params": {"path": str(tmp_path)}},
+        {"id": "1", "method": "project.add", "params": _project_params(tmp_path)},
     )
     project = added["result"]["project"]
     created = await _request(
@@ -544,8 +553,8 @@ async def test_v3_projects_threads_and_workspace_boundary(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_v3_turn_created_precedes_operation_events(tmp_path: Path) -> None:
-    socket_path = Path("/tmp") / f"aeloon-v3-turn-{os.getpid()}.sock"
+async def test_v4_turn_created_precedes_operation_events(tmp_path: Path) -> None:
+    socket_path = Path("/tmp") / f"aeloon-v4-turn-{os.getpid()}.sock"
     data_dir = tmp_path / "data"
     runtime = create_runtime_service(config_path=data_dir / "config.json", data_dir=data_dir)
 
@@ -555,7 +564,7 @@ async def test_v3_turn_created_precedes_operation_events(tmp_path: Path) -> None
         operation.status = "completed"  # type: ignore[attr-defined]
 
     runtime._execute_turn = finish_without_provider  # type: ignore[method-assign]
-    server = RuntimeV3Server(runtime, socket_path, (tmp_path,), data_dir)
+    server = RuntimeServer(runtime, socket_path, (tmp_path,), data_dir)
     task = asyncio.create_task(server.run())
     for _ in range(100):
         if socket_path.exists():
@@ -566,7 +575,7 @@ async def test_v3_turn_created_precedes_operation_events(tmp_path: Path) -> None
     added = await _request(
         reader,
         writer,
-        {"id": "project", "method": "project.add", "params": {"path": str(tmp_path)}},
+        {"id": "project", "method": "project.add", "params": _project_params(tmp_path)},
     )
     project_id = added["result"]["project"]["id"]
     created = await _request(
@@ -621,12 +630,12 @@ async def test_v3_turn_created_precedes_operation_events(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
-async def test_v3_thread_create_rolls_back_workspace_only_project_on_session_failure(
+async def test_v4_thread_create_rolls_back_workspace_only_project_on_session_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     data_dir = tmp_path / "data"
     runtime = create_runtime_service(config_path=data_dir / "config.json", data_dir=data_dir)
-    server = RuntimeV3Server(runtime, tmp_path / "runtime.sock", (tmp_path,), data_dir)
+    server = RuntimeServer(runtime, tmp_path / "runtime.sock", (tmp_path,), data_dir)
 
     async def fail_create_session(**_: object) -> object:
         raise RuntimeError("session storage unavailable")
@@ -651,7 +660,7 @@ async def test_event_delivery_only_enqueues_and_does_not_wait_for_socket_drain()
         def is_closing(self) -> bool:
             return False
 
-    connection = RuntimeV3Connection.__new__(RuntimeV3Connection)
+    connection = RuntimeConnection.__new__(RuntimeConnection)
     connection.writer = Writer()
     connection.thread_ids = set()
     connection.subscribed = True
@@ -685,7 +694,7 @@ async def test_event_delivery_closes_a_slow_client_at_the_bound() -> None:
         async def wait_closed(self) -> None:
             return None
 
-    connection = RuntimeV3Connection.__new__(RuntimeV3Connection)
+    connection = RuntimeConnection.__new__(RuntimeConnection)
     connection.writer = Writer()
     connection.thread_ids = set()
     connection.subscribed = True
@@ -696,7 +705,7 @@ async def test_event_delivery_closes_a_slow_client_at_the_bound() -> None:
     connection._request_tasks = set()
     connection._writer_task = None
 
-    for index in range(runtime_server_v3.EVENT_QUEUE_LIMIT + 1):
+    for index in range(runtime_server.EVENT_QUEUE_LIMIT + 1):
         await connection.send_event({"name": "terminal.output", "thread_id": str(index)})
 
     assert connection._closed is True
@@ -705,17 +714,17 @@ async def test_event_delivery_closes_a_slow_client_at_the_bound() -> None:
 
 
 @pytest.mark.asyncio
-async def test_v3_worktree_create_rolls_back_implicit_project_on_git_failure(
+async def test_v4_worktree_create_rolls_back_implicit_project_on_git_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     data_dir = tmp_path / "data"
     runtime = create_runtime_service(config_path=data_dir / "config.json", data_dir=data_dir)
-    server = RuntimeV3Server(runtime, tmp_path / "runtime.sock", (tmp_path,), data_dir)
+    server = RuntimeServer(runtime, tmp_path / "runtime.sock", (tmp_path,), data_dir)
 
     def fail_worktree(*_: object, **__: object) -> object:
         raise RuntimeError("git worktree unavailable")
 
-    monkeypatch.setattr("aeloon_runtime.runtime_server_v3.git_create_worktree", fail_worktree)
+    monkeypatch.setattr("aeloon_runtime.runtime_server.git_create_worktree", fail_worktree)
     try:
         with pytest.raises(RpcError, match="git worktree unavailable"):
             await server.dispatch(
@@ -730,14 +739,14 @@ async def test_v3_worktree_create_rolls_back_implicit_project_on_git_failure(
 
 
 @pytest.mark.asyncio
-async def test_v3_project_remove_deletes_runtime_sessions_and_projection(
+async def test_v4_project_remove_deletes_runtime_sessions_and_projection(
     tmp_path: Path,
 ) -> None:
     data_dir = tmp_path / "data"
     runtime = create_runtime_service(config_path=data_dir / "config.json", data_dir=data_dir)
-    server = RuntimeV3Server(runtime, tmp_path / "runtime.sock", (tmp_path,), data_dir)
+    server = RuntimeServer(runtime, tmp_path / "runtime.sock", (tmp_path,), data_dir)
     try:
-        project = await server.dispatch("project.add", {"path": str(tmp_path)})
+        project = await server.dispatch("project.add", _project_params(tmp_path))
         project_id = project["project"]["id"]
         created = await server.dispatch(
             "thread.create", {"project_id": project_id, "kind": "standard"}
@@ -758,12 +767,12 @@ async def test_v3_project_remove_deletes_runtime_sessions_and_projection(
 
 
 @pytest.mark.asyncio
-async def test_v3_gateway_maps_internal_session_events_to_thread_events(tmp_path: Path) -> None:
+async def test_v4_gateway_maps_internal_session_events_to_thread_events(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     runtime = create_runtime_service(config_path=data_dir / "config.json", data_dir=data_dir)
-    server = RuntimeV3Server(runtime, tmp_path / "runtime.sock", (tmp_path,), data_dir)
+    server = RuntimeServer(runtime, tmp_path / "runtime.sock", (tmp_path,), data_dir)
     try:
-        project = await server.dispatch("project.add", {"path": str(tmp_path)})
+        project = await server.dispatch("project.add", _project_params(tmp_path))
         created = await server.dispatch(
             "thread.create", {"project_id": project["project"]["id"], "kind": "standard"}
         )
@@ -787,7 +796,7 @@ async def test_v3_gateway_maps_internal_session_events_to_thread_events(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_v3_worktree_lifecycle_is_runtime_owned(tmp_path: Path) -> None:
+async def test_v4_worktree_lifecycle_is_runtime_owned(tmp_path: Path) -> None:
     project_path = tmp_path / "project"
     project_path.mkdir()
     subprocess.run(["git", "-C", str(project_path), "init", "-q"], check=True)
@@ -808,9 +817,9 @@ async def test_v3_worktree_lifecycle_is_runtime_owned(tmp_path: Path) -> None:
         config_path=data_dir / "config.json",
         data_dir=data_dir,
     )
-    server = RuntimeV3Server(runtime, tmp_path / "runtime.sock", (tmp_path,), data_dir)
+    server = RuntimeServer(runtime, tmp_path / "runtime.sock", (tmp_path,), data_dir)
     try:
-        project = await server.dispatch("project.add", {"path": str(project_path)})
+        project = await server.dispatch("project.add", _project_params(tmp_path, project_path))
         created = await server.dispatch(
             "thread.create",
             {
@@ -844,32 +853,135 @@ async def test_v3_worktree_lifecycle_is_runtime_owned(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_v3_empty_workspace_roots_do_not_authorize_cwd(tmp_path: Path) -> None:
-    data_dir = tmp_path / "data"
-    secret = tmp_path / "secret"
-    secret.mkdir()
+async def test_v4_uninstall_prepare_validates_complete_response_before_first_side_effect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "runtime-data"
     runtime = create_runtime_service(config_path=data_dir / "config.json", data_dir=data_dir)
-    server = RuntimeV3Server(runtime, tmp_path / "runtime.sock", (), data_dir)
+    server = RuntimeServer(runtime, tmp_path / "runtime.sock", (tmp_path,), data_dir)
+    removed: list[Path] = []
+
+    async def inspection() -> dict[str, Any]:
+        return {
+            "active_operations": 0,
+            "worktrees": [{
+                "project_path": str(tmp_path / "project"),
+                "workspace": str(tmp_path / "workspace"),
+                "exists": True,
+                "dirty": False,
+            }],
+        }
+
+    def reject_result(_method: str, _value: Any) -> None:
+        raise RpcError("internal_error", "invalid uninstall response")
+
+    monkeypatch.setattr(server, "_uninstall_inspect", inspection)
+    monkeypatch.setattr(server, "validate_result", reject_result)
+    monkeypatch.setattr(
+        runtime_server,
+        "git_remove_worktree",
+        lambda _project, workspace: removed.append(workspace),
+    )
     try:
-        assert server.workspace_roots == ()
-        snapshot = await server.dispatch("system.snapshot", {})
-        assert snapshot["default_workspace"] == ""
-        with pytest.raises(RpcError, match="outside"):
-            await server.dispatch("project.add", {"path": str(secret)})
+        with pytest.raises(RpcError, match="invalid uninstall response"):
+            await server.dispatch("system.uninstall_prepare", {})
+        assert removed == []
     finally:
         await runtime.close()
         server.store.close()
 
 
 @pytest.mark.asyncio
-async def test_v3_project_refresh_persists_git_detection(tmp_path: Path) -> None:
+async def test_v4_uninstall_prepare_reports_partial_progress_and_retries_missing_worktrees(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "runtime-data"
+    runtime = create_runtime_service(config_path=data_dir / "config.json", data_dir=data_dir)
+    server = RuntimeServer(runtime, tmp_path / "runtime.sock", (tmp_path,), data_dir)
+    project = tmp_path / "project"
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    states = {first: True, second: True}
+    fail_second_once = True
+    calls: list[Path] = []
+
+    async def inspection() -> dict[str, Any]:
+        return {
+            "active_operations": 0,
+            "worktrees": [
+                {
+                    "project_path": str(project),
+                    "workspace": str(workspace),
+                    "exists": exists,
+                    "dirty": False,
+                }
+                for workspace, exists in states.items()
+            ],
+        }
+
+    def remove(_project: Path, workspace: Path) -> None:
+        nonlocal fail_second_once
+        calls.append(workspace)
+        if workspace == second and fail_second_once:
+            fail_second_once = False
+            raise RuntimeError("second worktree is busy")
+        states[workspace] = False
+
+    monkeypatch.setattr(server, "_uninstall_inspect", inspection)
+    monkeypatch.setattr(runtime_server, "git_remove_worktree", remove)
+    try:
+        with pytest.raises(RpcError, match="second worktree is busy") as raised:
+            await server.dispatch("system.uninstall_prepare", {})
+        assert raised.value.data == {
+            "removed_worktrees": [{"project_path": str(project), "workspace": str(first)}]
+        }
+        assert calls == [first, second]
+
+        retried = await server.dispatch("system.uninstall_prepare", {})
+        assert retried == {
+            "prepared": True,
+            "removed_worktrees": [
+                {"project_path": str(project), "workspace": str(first)},
+                {"project_path": str(project), "workspace": str(second)},
+            ],
+        }
+        # The missing first worktree is idempotent; only the failed second
+        # worktree needs another destructive call.
+        assert calls == [first, second, second]
+    finally:
+        await runtime.close()
+        server.store.close()
+
+
+@pytest.mark.asyncio
+async def test_v4_empty_workspace_roots_do_not_authorize_cwd(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    secret = tmp_path / "secret"
+    secret.mkdir()
+    runtime = create_runtime_service(config_path=data_dir / "config.json", data_dir=data_dir)
+    server = RuntimeServer(runtime, tmp_path / "runtime.sock", (), data_dir)
+    try:
+        assert server.workspace_roots == ()
+        snapshot = await server.dispatch("system.snapshot", {})
+        assert snapshot["default_workspace"] == ""
+        with pytest.raises(RpcError, match="Unknown workspace root"):
+            await server.dispatch("project.add", {"root_id": _root_id(secret), "relative_path": "."})
+    finally:
+        await runtime.close()
+        server.store.close()
+
+
+@pytest.mark.asyncio
+async def test_v4_project_refresh_persists_git_detection(tmp_path: Path) -> None:
     project_path = tmp_path / "project"
     project_path.mkdir()
     data_dir = tmp_path / "data"
     runtime = create_runtime_service(config_path=data_dir / "config.json", data_dir=data_dir)
-    server = RuntimeV3Server(runtime, tmp_path / "runtime.sock", (tmp_path,), data_dir)
+    server = RuntimeServer(runtime, tmp_path / "runtime.sock", (tmp_path,), data_dir)
     try:
-        added = await server.dispatch("project.add", {"path": str(project_path)})
+        added = await server.dispatch("project.add", _project_params(tmp_path, project_path))
         assert added["project"]["is_git"] is False
         subprocess.run(["git", "init", "-q", str(project_path)], check=True)
         refreshed = await server.dispatch(

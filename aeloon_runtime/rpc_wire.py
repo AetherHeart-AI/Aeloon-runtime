@@ -1,4 +1,4 @@
-"""Static wire shapes used to publish the aeloon-rpc-v2 contract.
+"""Static wire shapes used to publish the aeloon-rpc contract.
 
 These definitions are deliberately runtime-light.  Pydantic is only imported by
 the manifest exporter and contract tests; the RPC server uses these objects as
@@ -19,12 +19,23 @@ class EmptyParams(TypedDict):
 class ClientDescriptor(TypedDict):
     name: str
     version: str
+    platform: str
+
+
+class DeviceTokenAuth(TypedDict):
+    kind: Literal["device_token"]
+    token: str
+
+
+class ProtocolRange(TypedDict):
+    min: Literal["4.0.0"]
+    max: Literal["4.0.0"]
 
 
 class HandshakeParams(TypedDict):
-    protocol: Literal["aeloon-rpc-v2"]
-    client: NotRequired[ClientDescriptor]
-    attachment_roots: NotRequired[list[str]]
+    protocol: ProtocolRange
+    client: ClientDescriptor
+    auth: NotRequired[DeviceTokenAuth]
 
 
 class HandshakeLimits(TypedDict):
@@ -37,15 +48,9 @@ class HandshakeLimits(TypedDict):
 
 
 class HandshakeResult(TypedDict):
-    protocol: Literal["aeloon-rpc-v2"]
-    core_version: str
-    core_commit: str
-    server_instance_id: str
-    methods: list[str]
-    events: list[str]
-    attachment_roots: list[str]
-    config_path: str
-    data_dir: str
+    protocol: Literal["4.0.0"]
+    runtime: dict[str, Any]
+    host: dict[str, Any]
     limits: HandshakeLimits
 
 

@@ -8,11 +8,11 @@ import json
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-source = json.loads((ROOT / "docs" / "rpc-v3.json").read_text(encoding="utf-8"))
+source = json.loads((ROOT / "docs" / "rpc-v4.json").read_text(encoding="utf-8"))
 lines = [
     f"# Aeloon RPC {source['version']}",
     "",
-    "This file is generated from `docs/rpc-v3.json`; do not edit by hand.",
+    "This file is generated from `docs/rpc-v4.json`; do not edit by hand.",
     "",
     f"- Protocol: `{source['protocol']}`",
     f"- Frame: `{source['frame_max_bytes'] // (1024 * 1024)} MiB`",
@@ -55,63 +55,8 @@ for item in error_catalog.get("added", []):
 for item in error_catalog.get("renamed", []):
     lines.append(f"- `{item['from']}` → `{item['to']}` — renamed")
 
-report_lines = [
-    f"# Aeloon RPC {source['version']} compatibility report",
-    "",
-    "This file is generated from `docs/rpc-v3.json`; do not edit by hand.",
-    "",
-    "Minor-compatible changes are additive optional methods, events, fields, and error codes.",
-    (
-        "Removing an existing item, narrowing a shape, or changing existing semantics "
-        "requires a major version."
-    ),
-    "",
-    "## Method differences",
-    "",
-    "| Method | Change | Source | Note |",
-    "| --- | --- | --- | --- |",
-]
-for group in source["groups"]:
-    for method in group["methods"]:
-        note = str(method.get("note", "")).replace("|", "\\|").replace("\n", " ")
-        report_lines.append(
-            f"| `{method['name']}` | `{method.get('change', 'same')}` | "
-            f"`{method.get('src', '')}` | {note} |"
-        )
-if plugin_methods:
-    report_lines.extend(["", "## Plugin-contributed methods", ""])
-    for method in plugin_methods:
-        availability = (
-            "available as the hard-wired Cloud capability"
-            if method["name"].startswith("plugin.cloud.")
-            else "returns capability_unavailable in the base release"
-        )
-        report_lines.append(
-            f"- `{method['name']}` — contributed namespace; {availability}"
-        )
-removed = source.get("removed", [])
-if removed:
-    report_lines.extend(["", "## Removed or collapsed legacy surface", ""])
-    for item in removed:
-        report_lines.append(f"- `{item['name']}` — {item.get('why', '')}: {item.get('detail', '')}")
-report_lines.extend(["", "## Event differences", ""])
-for item in events.get("renamed_from_core", []):
-    report_lines.append(f"- `{item['from']}` → `{item['to']}`")
-for item in events.get("new", []):
-    report_lines.append(f"- `{item['name']}` — new")
-for item in events.get("removed", []):
-    report_lines.append(f"- `{item['name']}` — removed: {item.get('why', '')}")
-if events.get("envelope_change"):
-    report_lines.extend(["", f"Envelope: {events['envelope_change']}"])
-report_lines.extend(["", "## Error differences", ""])
-for item in error_catalog.get("added", []):
-    report_lines.append(f"- `{item['code']}` ({item['num']}) — {item.get('when', '')}")
-for item in error_catalog.get("renamed", []):
-    report_lines.append(f"- `{item['from']}` → `{item['to']}` — {item.get('note', '')}")
-
 outputs = {
-    ROOT / "docs" / "rpc-v3.md": "\n".join(lines) + "\n",
-    ROOT / "docs" / "rpc-v3-compatibility.md": "\n".join(report_lines) + "\n",
+    ROOT / "docs" / "rpc-v4.md": "\n".join(lines) + "\n",
 }
 parser = argparse.ArgumentParser()
 parser.add_argument("--check", action="store_true")

@@ -120,7 +120,7 @@ def test_core_contains_only_vendor_neutral_stateless_contracts() -> None:
 
 
 def test_rpc_adapter_depends_on_runtime_not_core() -> None:
-    adapter = (PACKAGE / "rpc" / "adapter.py").read_text(encoding="utf-8")
+    adapter = (PACKAGE / "runtime_adapter.py").read_text(encoding="utf-8")
     assert "aeloon_runtime.runtime" in adapter
     assert "aeloon_runtime.core" not in adapter
     assert "aeloon_runtime.cloud" not in adapter

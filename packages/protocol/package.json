@@ -1,7 +1,7 @@
 {
   "name": "@aeloon/protocol",
-  "version": "3.0.0",
-  "description": "Generated Aeloon Runtime RPC v3 protocol types.",
+  "version": "4.0.0",
+  "description": "Generated Aeloon Runtime RPC v4 protocol types.",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

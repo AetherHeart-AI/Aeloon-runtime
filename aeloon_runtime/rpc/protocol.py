@@ -1,15 +1,15 @@
-"""Strict aeloon-rpc-v2 protocol registry and public errors."""
+"""Strict RPC protocol registry and public errors."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
 
-from aeloon_runtime.rpc import models as wire
+from aeloon_runtime import rpc_wire as wire
 
-PROTOCOL_NAME = "aeloon-rpc-v2"
-PROTOCOL_VERSION = 2
-MAX_FRAME_BYTES = 12 * 1024 * 1024
+PROTOCOL_NAME = "aeloon-rpc"
+PROTOCOL_VERSION = "4.0.0"
+MAX_FRAME_BYTES = 40 * 1024 * 1024
 
 ParamsT = TypeVar("ParamsT")
 ResultT = TypeVar("ResultT")
@@ -32,6 +32,9 @@ class EventSpec(Generic[PayloadT]):
 
 METHOD_SPECS = (
     MethodSpec("system.handshake", "handshake", wire.HandshakeParams, wire.HandshakeResult),
+    MethodSpec("devices.claim", "devices_claim", wire.JsonObject, wire.JsonObject),
+    MethodSpec("workspace.roots", "workspace_roots", wire.EmptyParams, wire.JsonObject),
+    MethodSpec("workspace.list", "workspace_list", wire.JsonObject, wire.JsonObject),
     MethodSpec("system.health", "health", wire.EmptyParams, wire.HealthResult),
     MethodSpec("system.shutdown", "shutdown", wire.EmptyParams, wire.ShutdownResult),
     MethodSpec(

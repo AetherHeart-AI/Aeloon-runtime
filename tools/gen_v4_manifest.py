@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Generate the checked-in aeloon-rpc v3 JSON Schema manifest.
+"""Generate the checked-in aeloon-rpc v4 JSON Schema manifest.
 
-``docs/rpc-v3.json`` is the protocol source. Method entries contain a direct
+``docs/rpc-v4.json`` is the protocol source. Method entries contain a direct
 ``$ref`` for both parameters and results; the one-time ``--upgrade-source``
 helper converts the original compact signatures into those definitions while
 preserving the signatures as documentation fields.
@@ -18,13 +18,14 @@ from typing import Any
 from jsonschema import Draft202012Validator
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE = ROOT / "docs" / "rpc-v3.json"
-DEFAULT_OUTPUT = ROOT / "aeloon_runtime" / "rpc" / "aeloon-rpc-v3.manifest.json"
+SOURCE = ROOT / "docs" / "rpc-v4.json"
+DEFAULT_OUTPUT = ROOT / "aeloon_runtime" / "rpc" / "aeloon-rpc-v4.manifest.json"
 
 ERROR_CODES = {
     "protocol_incompatible": -32010,
     "invalid_argument": -32602,
     "thread_not_found": -32020,
+    "session_not_found": -32020,
     "operation_not_found": -32021,
     "busy": -32022,
     "invalid_state": -32023,
@@ -58,7 +59,7 @@ def _event_object(
 
 
 def _event_payload_schema(event: str) -> dict[str, Any] | None:
-    """Return the stable v3 payload shape for an event family.
+    """Return the stable v4 payload shape for an event family.
 
     Event envelopes carry the cursor/thread/operation metadata.  This table
     describes only ``payload`` so the gateway can validate producers without
@@ -423,7 +424,7 @@ def _split(value: str, separator: str) -> list[str]:
 
 def method_def_name(method: str, side: str) -> str:
     safe = re.sub(r"[^a-zA-Z0-9]+", "_", method).strip("_")
-    return f"{side}_{safe}_v3"
+    return f"{side}_{safe}_v4"
 
 
 def _method_schema(
@@ -488,10 +489,10 @@ def upgrade_source(source: dict[str, Any]) -> dict[str, Any]:
     ]
     for event in dict.fromkeys(event_names):
         safe = re.sub(r"[^a-zA-Z0-9]+", "_", event).strip("_")
-        name = f"Event_{safe}_v3"
+        name = f"Event_{safe}_v4"
         # Once the source has an explicit event definition, it is the single
-        # protocol authority.  The family table remains a compatibility
-        # fallback for older draft inputs that did not carry event `$defs`.
+        # protocol authority. The family table remains a fallback for draft
+        # inputs that did not carry event `$defs`.
         shape = definitions.get(name) or _event_payload_schema(event)
         if shape is not None:
             shape["title"] = name
@@ -578,21 +579,21 @@ def build(source: dict[str, Any]) -> dict[str, Any]:
             "$defs": dict(sorted(definitions.items())),
         }
     for event in source.get("events", {}).get("kept_from_core", []):
-        name = f"Event_{re.sub(r'[^a-zA-Z0-9]+', '_', event)}_v3"
+        name = f"Event_{re.sub(r'[^a-zA-Z0-9]+', '_', event)}_v4"
         definitions.setdefault(name, {"type": "object", "additionalProperties": True})
         events[event] = {"payload": {"$ref": f"#/$defs/{name}"}}
     for event in source.get("events", {}).get("kept_from_workbench", []):
-        name = f"Event_{re.sub(r'[^a-zA-Z0-9]+', '_', event)}_v3"
+        name = f"Event_{re.sub(r'[^a-zA-Z0-9]+', '_', event)}_v4"
         definitions.setdefault(name, {"type": "object", "additionalProperties": True})
         events[event] = {"payload": {"$ref": f"#/$defs/{name}"}}
     for item in source.get("events", {}).get("renamed_from_core", []):
         event = item["to"]
-        name = f"Event_{re.sub(r'[^a-zA-Z0-9]+', '_', event)}_v3"
+        name = f"Event_{re.sub(r'[^a-zA-Z0-9]+', '_', event)}_v4"
         definitions.setdefault(name, {"type": "object", "additionalProperties": True})
         events[event] = {"payload": {"$ref": f"#/$defs/{name}"}}
     for item in source.get("events", {}).get("new", []):
         event = item["name"]
-        name = f"Event_{re.sub(r'[^a-zA-Z0-9]+', '_', event)}_v3"
+        name = f"Event_{re.sub(r'[^a-zA-Z0-9]+', '_', event)}_v4"
         definitions.setdefault(name, {"type": "object", "additionalProperties": True})
         events[event] = {"payload": {"$ref": f"#/$defs/{name}"}}
     return {
@@ -631,7 +632,7 @@ def main() -> int:
     if errors:
         first = errors[0]
         location = ".".join(str(item) for item in first.path) or "$"
-        raise SystemExit(f"RPC v3 source is invalid at {location}: {first.message}")
+        raise SystemExit(f"RPC v4 source is invalid at {location}: {first.message}")
     if args.upgrade_source:
         upgraded = upgrade_source(source)
         SOURCE.write_text(
@@ -642,7 +643,7 @@ def main() -> int:
     rendered = json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     if args.check:
         if not args.output.is_file() or args.output.read_text(encoding="utf-8") != rendered:
-            raise SystemExit(f"Generated v3 manifest is stale: {args.output}")
+            raise SystemExit(f"Generated v4 manifest is stale: {args.output}")
     else:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(rendered, encoding="utf-8")

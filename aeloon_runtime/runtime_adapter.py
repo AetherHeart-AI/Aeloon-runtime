@@ -1,4 +1,4 @@
-"""aeloon-rpc-v2 adapter over the transport-free runtime service."""
+"""RPC adapter over the transport-free Runtime service."""
 
 from __future__ import annotations
 
@@ -124,7 +124,7 @@ class AeloonRpcAdapter:
         params: Mapping[str, Any],
     ) -> dict[str, Any]:
         if params.get("protocol") != PROTOCOL_NAME:
-            raise RpcError("protocol_incompatible", "Aeloon Runtime requires aeloon-rpc-v2")
+            raise RpcError("protocol_incompatible", "Aeloon Runtime requires aeloon-rpc")
         roots = params.get("attachment_roots") or []
         if not isinstance(roots, list) or any(not isinstance(root, str) for root in roots):
             raise RpcError("invalid_argument", "attachment_roots must be a list of paths")
