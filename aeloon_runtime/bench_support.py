@@ -20,6 +20,8 @@ import websockets
 
 from aeloon_runtime.runtime_server import pack_frame
 
+WS_SEND_CHUNK_BYTES = 64 * 1024
+
 USER_TURN_BYTES = 1024
 ASSISTANT_TURN_BYTES = 8192
 THREAD_GET_TURNS = 128
@@ -71,7 +73,14 @@ class BenchClient:
         self.events: list[dict[str, Any]] = []
 
     async def connect_wss(self, url: str, *, ssl_ctx: ssl.SSLContext) -> None:
-        self._ws = await websockets.connect(url, ssl=ssl_ctx, max_size=None, open_timeout=10)
+        self._ws = await websockets.connect(
+            url,
+            ssl=ssl_ctx,
+            max_size=None,
+            open_timeout=10,
+            ping_interval=15,
+            ping_timeout=15,
+        )
         self._pump_task = asyncio.create_task(self._pump())
 
     async def close(self) -> None:
@@ -116,13 +125,19 @@ class BenchClient:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[Any] = loop.create_future()
         self._pending[request_id] = future
-        await self._ws.send(
-            pack_frame({"id": request_id, "method": method, "params": params or {}})
-        )
+        await self._send_frame(pack_frame({"id": request_id, "method": method, "params": params or {}}))
         try:
-            return await asyncio.wait_for(future, timeout=60)
+            return await asyncio.wait_for(future, timeout=120)
         finally:
             self._pending.pop(request_id, None)
+
+    async def _send_frame(self, payload: bytes) -> None:
+        # Split one RPC frame across WebSocket messages so heartbeats can still
+        # run while a 25 MiB attachment is in flight over a slow tunnel.
+        offset = 0
+        while offset < len(payload):
+            await self._ws.send(payload[offset : offset + WS_SEND_CHUNK_BYTES])
+            offset += WS_SEND_CHUNK_BYTES
 
     async def handshake(self, token: str) -> Any:
         return await self.request(
@@ -223,6 +238,7 @@ __all__ = [
     "THREAD_GET_TURNS",
     "THROUGHPUT_RATES",
     "USER_TURN_BYTES",
+    "WS_SEND_CHUNK_BYTES",
     "measure_samples",
     "percentile",
     "seed_completed_turns",
