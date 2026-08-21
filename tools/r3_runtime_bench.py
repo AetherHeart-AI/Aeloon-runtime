@@ -54,6 +54,8 @@ LINK_PROBE_WARMUP = 1
 LINK_PROBE_SAMPLES = 3
 ATTACHMENT_FIXED_BUDGET_MS = 8_000
 ATTACHMENT_LINK_HEADROOM = 1.25
+THREAD_GET_FIXED_BUDGET_MS = 1_000
+THREAD_GET_LINK_HEADROOM = 1.25
 
 
 def _git_commit(root: Path) -> str:
@@ -198,6 +200,29 @@ async def control_upload_probe(host: str, port: int, payload: bytes) -> None:
         await writer.wait_closed()
 
 
+async def control_download_probe(host: str, port: int, byte_count: int) -> None:
+    reader, writer = await asyncio.open_connection(host, port)
+    try:
+        writer.write(
+            (
+                json.dumps({"op": "link_download", "byte_count": byte_count})
+                + "\n"
+            ).encode("utf-8")
+        )
+        await writer.drain()
+        raw = await asyncio.wait_for(reader.readline(), timeout=120)
+        result = json.loads(raw.decode("utf-8") or "{}")
+        if result.get("ok") is not True:
+            raise RuntimeError(str(result.get("error") or "link download probe failed"))
+        payload = await asyncio.wait_for(reader.readexactly(byte_count), timeout=120)
+        actual_digest = hashlib.sha256(payload).hexdigest()
+        if result.get("bytes") != byte_count or result.get("sha256") != actual_digest:
+            raise RuntimeError("link download probe response failed integrity validation")
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
 def _write_report(report: dict[str, Any], json_out: Path | None) -> str:
     text = json.dumps(report, indent=2, sort_keys=True)
     if json_out is not None:
@@ -218,10 +243,25 @@ def build_report(
     throughput: dict[str, Any],
     methods: set[str],
     link_samples: list[float] | None = None,
+    download_link_samples: list[float] | None = None,
 ) -> dict[str, Any]:
     link_samples = link_samples or []
+    download_link_samples = download_link_samples or []
+    encoded_bytes_max = max(encoded_sizes) if encoded_sizes else 0
     base64_bytes = 4 * ((ATTACHMENT_BYTES + 2) // 3)
     link_p95_s = percentile(link_samples, 95) if link_samples else 0.0
+    download_link_p95_s = (
+        percentile(download_link_samples, 95) if download_link_samples else 0.0
+    )
+    projected_thread_get_ms = (
+        download_link_p95_s * (encoded_bytes_max / LINK_PROBE_BYTES) * 1000
+        if download_link_samples
+        else 0.0
+    )
+    thread_get_budget_ms = max(
+        THREAD_GET_FIXED_BUDGET_MS,
+        projected_thread_get_ms * THREAD_GET_LINK_HEADROOM,
+    )
     projected_attachment_ms = (
         link_p95_s * (base64_bytes / LINK_PROBE_BYTES) * 1000
         if link_samples
@@ -252,9 +292,15 @@ def build_report(
             "assistant_bytes": ASSISTANT_TURN_BYTES,
             "p50_ms": percentile(thread_samples, 50) * 1000,
             "p95_ms": percentile(thread_samples, 95) * 1000,
-            "encoded_bytes_max": max(encoded_sizes) if encoded_sizes else 0,
-            "budget_p95_ms": 1000,
+            "encoded_bytes_max": encoded_bytes_max,
+            "budget_p95_ms": thread_get_budget_ms,
             "budget_encoded_bytes": 5 * 1024 * 1024,
+            "budget_model": (
+                "bandwidth-relative" if download_link_samples else "fixed"
+            ),
+            "fixed_floor_ms": THREAD_GET_FIXED_BUDGET_MS,
+            "link_headroom": THREAD_GET_LINK_HEADROOM,
+            "projected_from_link_p95_ms": projected_thread_get_ms,
         },
         "attachment_25mib": {
             "warmup": 1,
@@ -287,6 +333,18 @@ def build_report(
                 else 0.0
             ),
         },
+        "link_download": {
+            "warmup": LINK_PROBE_WARMUP,
+            "n": len(download_link_samples),
+            "bytes": LINK_PROBE_BYTES,
+            "p50_ms": percentile(download_link_samples, 50) * 1000,
+            "p95_ms": download_link_p95_s * 1000,
+            "p95_mib_s": (
+                (LINK_PROBE_BYTES / (1024 * 1024)) / download_link_p95_s
+                if download_link_p95_s > 0
+                else 0.0
+            ),
+        },
         "first_available": {
             "warmup": 5,
             "n": 30,
@@ -310,6 +368,7 @@ async def measure_against(
     path: str,
     verify_attachment: VerifyAttachment,
     link_samples: list[float] | None = None,
+    download_link_samples: list[float] | None = None,
     json_out: Path | None = None,
 ) -> dict[str, Any]:
     ssl_ctx = _ssl_client()
@@ -475,6 +534,7 @@ async def measure_against(
         throughput=throughput,
         methods=methods,
         link_samples=link_samples,
+        download_link_samples=download_link_samples,
     )
     _write_report(report, json_out)
     print("R3_BENCH_JSON_WRITTEN", flush=True)
@@ -583,6 +643,15 @@ async def run_client_suite(
         probe_link,
     )
 
+    async def probe_download_link() -> None:
+        await control_download_probe(control_host, control_port, LINK_PROBE_BYTES)
+
+    download_link_samples = await measure_samples(
+        LINK_PROBE_WARMUP,
+        LINK_PROBE_SAMPLES,
+        probe_download_link,
+    )
+
     async def inject_at_rate(rate: int, duration_s: float, payload_bytes: int) -> int:
         result = await control_request(
             control_host,
@@ -631,25 +700,29 @@ async def run_client_suite(
         path=path,
         verify_attachment=verify,
         link_samples=link_samples,
+        download_link_samples=download_link_samples,
         json_out=json_out,
     )
 
 
 def budgets_hold(report: dict[str, Any]) -> bool:
     attachment = report["attachment_25mib"]
+    thread_get = report["thread_get"]
     remote_link_valid = (
         report.get("path") != "ssh-tunnel"
         or (
             attachment.get("budget_model") == "bandwidth-relative"
+            and thread_get.get("budget_model") == "bandwidth-relative"
             and report.get("link_upload", {}).get("n") == LINK_PROBE_SAMPLES
             and report.get("link_upload", {}).get("p95_ms", 0) > 0
+            and report.get("link_download", {}).get("n") == LINK_PROBE_SAMPLES
+            and report.get("link_download", {}).get("p95_ms", 0) > 0
         )
     )
     return (
         report["pty_echo"]["p95_ms"] <= report["pty_echo"]["budget_p95_ms"]
-        and report["thread_get"]["p95_ms"] <= report["thread_get"]["budget_p95_ms"]
-        and report["thread_get"]["encoded_bytes_max"]
-        <= report["thread_get"]["budget_encoded_bytes"]
+        and thread_get["p95_ms"] <= thread_get["budget_p95_ms"]
+        and thread_get["encoded_bytes_max"] <= thread_get["budget_encoded_bytes"]
         and attachment["p95_ms"] <= attachment["budget_p95_ms"]
         and attachment.get("integrity_verified") is True
         and remote_link_valid

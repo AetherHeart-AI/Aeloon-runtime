@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import os
 import platform
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,7 @@ from aeloon_runtime.runtime_log import read_runtime_logs
 from aeloon_runtime.runtime_server import RuntimeServer
 
 MAX_LINK_PROBE_BYTES = 16 * 1024 * 1024
+LINK_DOWNLOAD_PAYLOAD = os.urandom(MAX_LINK_PROBE_BYTES)
 
 
 async def _handle_control(
@@ -38,6 +40,9 @@ async def _handle_control(
     try:
         raw = await reader.readline()
         request = json.loads(raw.decode("utf-8") or "{}")
+        if request.get("op") == "link_download":
+            await _send_link_download(writer, request)
+            return
         if request.get("op") == "link_upload":
             result = await _receive_link_upload(reader, request)
         else:
@@ -78,6 +83,29 @@ async def _receive_link_upload(
     if actual_digest != expected_digest:
         raise ValueError("link_upload payload digest did not match")
     return {"ok": True, "bytes": byte_count, "sha256": actual_digest}
+
+
+async def _send_link_download(
+    writer: asyncio.StreamWriter,
+    request: dict[str, Any],
+) -> None:
+    byte_count = request.get("byte_count")
+    if (
+        not isinstance(byte_count, int)
+        or isinstance(byte_count, bool)
+        or not 1 <= byte_count <= MAX_LINK_PROBE_BYTES
+    ):
+        raise ValueError("link_download byte_count is outside the test-only limit")
+    payload = LINK_DOWNLOAD_PAYLOAD[:byte_count]
+    digest = hashlib.sha256(payload).hexdigest()
+    writer.write(
+        (
+            json.dumps({"ok": True, "bytes": byte_count, "sha256": digest})
+            + "\n"
+        ).encode("utf-8")
+    )
+    writer.write(payload)
+    await writer.drain()
 
 
 async def _dispatch_control(server: RuntimeServer, request: dict[str, Any]) -> dict[str, Any]:

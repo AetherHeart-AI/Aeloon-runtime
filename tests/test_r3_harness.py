@@ -65,12 +65,13 @@ def test_remote_attachment_budget_tracks_independent_link_baseline() -> None:
         "path": "ssh-tunnel",
         "host_info": {},
         "pty_samples": [0.1],
-        "thread_samples": [0.2],
-        "encoded_sizes": [1024],
+        "thread_samples": [2.0],
+        "encoded_sizes": [2 * 1024 * 1024],
         "first_samples": [0.3],
         "throughput": {"required_1000_delivered": True},
         "methods": set(),
         "link_samples": [8.0, 8.0, 8.0],
+        "download_link_samples": [8.0, 8.0, 8.0],
     }
     passing = bench.build_report(attach_samples=[32.0], **common)
     assert passing["attachment_25mib"]["budget_model"] == "bandwidth-relative"
@@ -80,6 +81,9 @@ def test_remote_attachment_budget_tracks_independent_link_baseline() -> None:
     assert passing["attachment_25mib"]["budget_p95_ms"] == pytest.approx(
         41_666.66875, abs=0.01
     )
+    assert passing["thread_get"]["budget_model"] == "bandwidth-relative"
+    assert passing["thread_get"]["projected_from_link_p95_ms"] == 2_000
+    assert passing["thread_get"]["budget_p95_ms"] == 2_500
     assert bench.budgets_hold(passing)
 
     failing = bench.build_report(attach_samples=[45.0], **common)
@@ -105,6 +109,24 @@ async def test_link_upload_probe_validates_size_and_digest() -> None:
         "bytes": len(payload),
         "sha256": hashlib.sha256(payload).hexdigest(),
     }
+
+
+@pytest.mark.asyncio
+async def test_link_download_probe_validates_size_and_digest() -> None:
+    bench = _load_tool("r3_runtime_bench.py")
+    server_mod = _load_tool("r3_test_server.py")
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await server_mod._handle_control(None, reader, writer)
+
+    listener = await asyncio.start_server(handle, "127.0.0.1", 0)
+    try:
+        assert listener.sockets
+        port = int(listener.sockets[0].getsockname()[1])
+        await bench.control_download_probe("127.0.0.1", port, 64 * 1024)
+    finally:
+        listener.close()
+        await listener.wait_closed()
 
 
 @pytest.mark.asyncio
