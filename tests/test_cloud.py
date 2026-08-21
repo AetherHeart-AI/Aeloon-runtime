@@ -8,18 +8,18 @@ from typing import Any
 import httpx
 import pytest
 
-from aeloon_core.cloud import (
+from aeloon_runtime.cloud import (
     CloudAccountService,
     CloudConfig,
     CloudTokenBundle,
     InMemoryTokenVault,
 )
-from aeloon_core.config import Config, save_config
-from aeloon_core.core import InferenceContext, Model, StreamOptions, UserMessage
-from aeloon_core.core.inference_runtime import collect_assistant
-from aeloon_core.rpc import AeloonRpcAdapter
-from aeloon_core.runtime import RuntimeService
-from aeloon_core.runtime.providers import CloudProvider
+from aeloon_runtime.config import Config, save_config
+from aeloon_runtime.core import InferenceContext, Model, StreamOptions, UserMessage
+from aeloon_runtime.core.inference_runtime import collect_assistant
+from aeloon_runtime.rpc import AeloonRpcAdapter
+from aeloon_runtime.runtime import RuntimeService
+from aeloon_runtime.runtime.providers import CloudProvider
 
 
 class FakeCloudClient:
@@ -93,7 +93,7 @@ async def test_account_owns_refresh_token_and_raw_catalog(tmp_path: Path) -> Non
     models = await service.models()
     assert models[0]["model_key"] == "reasoner"
     assert models[0]["context_window"] == 200_000
-    assert client.login_calls[0]["device_name"] == "Aeloon Core"
+    assert client.login_calls[0]["device_name"] == "Aeloon Runtime"
 
     service._access_expires_at = datetime.now(UTC)
     assert await service.access_token() == "access-2"

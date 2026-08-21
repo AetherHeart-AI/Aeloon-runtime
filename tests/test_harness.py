@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator
 
 import pytest
 
-from aeloon_core.core import (
+from aeloon_runtime.core import (
     AssistantMessage,
     AssistantStreamEvent,
     RunController,
@@ -21,9 +21,9 @@ from aeloon_core.core import (
     UserMessage,
     run_agent,
 )
-from aeloon_core.runtime.providers import DEEPSEEK_V4_FLASH
-from aeloon_core.runtime.providers.testing import ScriptedProvider
-from aeloon_core.tool import BaseTool
+from aeloon_runtime.runtime.providers import DEEPSEEK_V4_FLASH
+from aeloon_runtime.runtime.providers.testing import ScriptedProvider
+from aeloon_runtime.tool import BaseTool
 
 
 class FunctionTool(BaseTool):

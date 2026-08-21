@@ -6,7 +6,7 @@ import json
 import httpx
 import pytest
 
-from aeloon_core.core import (
+from aeloon_runtime.core import (
     AssistantMessage,
     InferenceContext,
     InferenceError,
@@ -15,7 +15,7 @@ from aeloon_core.core import (
     ThinkingContent,
     UserMessage,
 )
-from aeloon_core.runtime.providers import CustomProvider
+from aeloon_runtime.runtime.providers import CustomProvider
 
 
 def _sse(*chunks: dict[str, object]) -> bytes:

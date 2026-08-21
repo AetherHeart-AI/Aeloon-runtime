@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from aeloon_core.core import (
+from aeloon_runtime.core import (
     AssistantMessage,
     RunController,
     TextContent,
@@ -16,13 +16,13 @@ from aeloon_core.core import (
     UserMessage,
     estimate_context_tokens,
 )
-from aeloon_core.core.events import RunEventDispatcher
-from aeloon_core.core.inference_runtime import (
+from aeloon_runtime.core.events import RunEventDispatcher
+from aeloon_runtime.core.inference_runtime import (
     normalize_inference_messages,
     project_inference_messages,
 )
-from aeloon_core.core.tool_runtime import ToolRuntime
-from aeloon_core.tool import BaseTool
+from aeloon_runtime.core.tool_runtime import ToolRuntime
+from aeloon_runtime.tool import BaseTool
 
 
 class FunctionTool(BaseTool):

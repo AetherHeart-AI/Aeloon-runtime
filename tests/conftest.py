@@ -8,7 +8,7 @@ import pytest
 
 # Keep file-based config tests deterministic regardless of the host shell.
 _CONFIG_ENV_OVERRIDES = (
-    "AELOON_CORE_CONFIG",
+    "AELOON_RUNTIME_CONFIG",
     "DEEPSEEK_API_KEY",
 )
 
@@ -22,4 +22,4 @@ def clear_config_environment_overrides(
 
     for name in _CONFIG_ENV_OVERRIDES:
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("AELOON_CORE_CONFIG", str(tmp_path / "isolated-config.json"))
+    monkeypatch.setenv("AELOON_RUNTIME_CONFIG", str(tmp_path / "isolated-config.json"))

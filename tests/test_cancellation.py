@@ -7,10 +7,26 @@ from pathlib import Path
 
 import pytest
 
-from aeloon_core.blocking import run_blocking
-from aeloon_core.runtime.coordinator import Operation
-from aeloon_core.runtime.service import RuntimeService
-from aeloon_core.tool import BashTool, ToolContext
+from aeloon_runtime.blocking import run_blocking
+from aeloon_runtime.runtime.coordinator import Operation
+from aeloon_runtime.runtime.service import RuntimeService
+from aeloon_runtime.tool import BashTool, ToolContext
+
+
+async def _assert_reaped(pid: int) -> None:
+    """Wait for the process group to actually go away.
+
+    Reaping is asynchronous, so a single fixed sleep only passes while the
+    machine is idle: under load these assertions fail for a reason that has
+    nothing to do with cancellation. Poll to a deadline instead.
+    """
+    for _ in range(200):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"process {pid} was still alive after 2s")
 
 
 @pytest.mark.asyncio
@@ -74,9 +90,7 @@ async def test_bash_cancel_stops_the_entire_process_group(tmp_path: Path) -> Non
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    await asyncio.sleep(0.05)
-    with pytest.raises(ProcessLookupError):
-        os.kill(child_pid, 0)
+    await _assert_reaped(child_pid)
 
 
 @pytest.mark.asyncio
@@ -99,9 +113,7 @@ async def test_bash_cancel_cleans_background_process_after_shell_exits(tmp_path:
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, timeout=2)
-    await asyncio.sleep(0.05)
-    with pytest.raises(ProcessLookupError):
-        os.kill(child_pid, 0)
+    await _assert_reaped(child_pid)
 
 
 @pytest.mark.asyncio
@@ -118,9 +130,7 @@ async def test_bash_timeout_stops_the_entire_process_group(tmp_path: Path) -> No
             None,
         )
     assert child_pid_file.exists()
-    await asyncio.sleep(0.05)
-    with pytest.raises(ProcessLookupError):
-        os.kill(int(child_pid_file.read_text(encoding="utf-8")), 0)
+    await _assert_reaped(int(child_pid_file.read_text(encoding="utf-8")))
 
 
 @pytest.mark.asyncio

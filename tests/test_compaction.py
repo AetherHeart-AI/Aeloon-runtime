@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from aeloon_core.config import Config
-from aeloon_core.core import (
+from aeloon_runtime.config import Config
+from aeloon_runtime.core import (
     AssistantMessage,
     AssistantStreamEvent,
     ContextPolicy,
@@ -20,22 +20,22 @@ from aeloon_core.core import (
     UserMessage,
     estimate_context_tokens,
 )
-from aeloon_core.core.compaction import (
+from aeloon_runtime.core.compaction import (
     effective_context_policy,
     is_context_overflow,
     should_compact,
 )
-from aeloon_core.runtime import JsonlSessionRepository
-from aeloon_core.runtime.agent import SessionAgent
-from aeloon_core.runtime.compaction import (
+from aeloon_runtime.runtime import JsonlSessionRepository
+from aeloon_runtime.runtime.agent import SessionAgent
+from aeloon_runtime.runtime.compaction import (
     CompactionPreparation,
     CompactionSettings,
     compact_preparation,
     prepare_compaction,
     serialize_conversation,
 )
-from aeloon_core.runtime.providers import DEEPSEEK_V4_FLASH
-from aeloon_core.runtime.providers.testing import ScriptedProvider
+from aeloon_runtime.runtime.providers import DEEPSEEK_V4_FLASH
+from aeloon_runtime.runtime.providers.testing import ScriptedProvider
 
 
 def _assistant(text: str, tokens: int = 0) -> AssistantMessage:

@@ -3,7 +3,7 @@
 This module is intentionally executed with the Python environment belonging to
 the LiveCodeBench checkout.  Keeping the adapter in a separate process avoids
 adding LiveCodeBench's heavyweight inference and evaluation dependencies to
-Aeloon Core itself.
+Aeloon Runtime itself.
 """
 
 from __future__ import annotations

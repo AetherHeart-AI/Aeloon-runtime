@@ -4,10 +4,10 @@ import ast
 from dataclasses import fields
 from pathlib import Path
 
-from aeloon_core.core import Model
+from aeloon_runtime.core import Model
 
 ROOT = Path(__file__).resolve().parents[1]
-PACKAGE = ROOT / "aeloon_core"
+PACKAGE = ROOT / "aeloon_runtime"
 
 
 def test_runtime_has_no_application_javascript_and_removed_subsystems_are_absent() -> None:
@@ -40,40 +40,40 @@ def test_package_imports_have_no_removed_runtime_edges() -> None:
                 imports.add(node.module)
             elif isinstance(node, ast.Import):
                 imports.update(alias.name for alias in node.names)
-    forbidden = ("mcp", "langgraph", "aeloon_core.web", "aeloon_core.orchestrator")
+    forbidden = ("mcp", "langgraph", "aeloon_runtime.web", "aeloon_runtime.orchestrator")
     assert not {name for name in imports if name.startswith(forbidden)}
 
 
 def test_architecture_dependencies_point_inward() -> None:
     forbidden_by_module = {
         "core": (
-            "aeloon_core.bootstrap",
-            "aeloon_core.rpc",
-            "aeloon_core.cloud",
-            "aeloon_core.config",
-            "aeloon_core.runtime",
-            "aeloon_core.tool",
+            "aeloon_runtime.bootstrap",
+            "aeloon_runtime.rpc",
+            "aeloon_runtime.cloud",
+            "aeloon_runtime.config",
+            "aeloon_runtime.runtime",
+            "aeloon_runtime.tool",
         ),
         "tool": (
-            "aeloon_core.bootstrap",
-            "aeloon_core.rpc",
-            "aeloon_core.cloud",
-            "aeloon_core.config",
-            "aeloon_core.runtime",
+            "aeloon_runtime.bootstrap",
+            "aeloon_runtime.rpc",
+            "aeloon_runtime.cloud",
+            "aeloon_runtime.config",
+            "aeloon_runtime.runtime",
         ),
-        "runtime": ("aeloon_core.rpc", "aeloon_core.cloud"),
+        "runtime": ("aeloon_runtime.rpc", "aeloon_runtime.cloud"),
         "rpc": (
-            "aeloon_core.bootstrap",
-            "aeloon_core.cloud",
-            "aeloon_core.core",
-            "aeloon_core.tool",
+            "aeloon_runtime.bootstrap",
+            "aeloon_runtime.cloud",
+            "aeloon_runtime.core",
+            "aeloon_runtime.tool",
         ),
         "cloud": (
-            "aeloon_core.rpc",
-            "aeloon_core.config",
-            "aeloon_core.core",
-            "aeloon_core.runtime",
-            "aeloon_core.tool",
+            "aeloon_runtime.rpc",
+            "aeloon_runtime.config",
+            "aeloon_runtime.core",
+            "aeloon_runtime.runtime",
+            "aeloon_runtime.tool",
         ),
     }
     for module, forbidden in forbidden_by_module.items():
@@ -120,10 +120,10 @@ def test_core_contains_only_vendor_neutral_stateless_contracts() -> None:
 
 
 def test_rpc_adapter_depends_on_runtime_not_core() -> None:
-    adapter = (PACKAGE / "rpc" / "adapter.py").read_text(encoding="utf-8")
-    assert "aeloon_core.runtime" in adapter
-    assert "aeloon_core.core" not in adapter
-    assert "aeloon_core.cloud" not in adapter
+    adapter = (PACKAGE / "runtime_adapter.py").read_text(encoding="utf-8")
+    assert "aeloon_runtime.runtime" in adapter
+    assert "aeloon_runtime.core" not in adapter
+    assert "aeloon_runtime.cloud" not in adapter
 
 
 def test_runtime_components_and_object_oriented_tool_layer_exist() -> None:
@@ -168,7 +168,7 @@ def test_artifact_delivery_is_runtime_owned() -> None:
 
 def test_shared_config_does_not_load_cloud_implementation() -> None:
     config = (PACKAGE / "config.py").read_text(encoding="utf-8")
-    assert "aeloon_core.cloud" not in config
+    assert "aeloon_runtime.cloud" not in config
 
 
 def test_dependency_manifest_has_no_removed_runtime_dependencies() -> None:

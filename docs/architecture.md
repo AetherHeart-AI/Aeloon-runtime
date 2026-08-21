@@ -1,12 +1,12 @@
-# Architecture
+# Runtime architecture
 
-Aeloon Core is one Python distribution with inward-only dependencies. Electron and UI code are
+Aeloon Runtime is one Python distribution with inward-only dependencies. Electron and UI code are
 not dependencies of this repository.
 
 ```mermaid
 flowchart LR
-    Workbench["Bun Workbench"] --> RPC["aeloon-rpc-v2 adapter"]
-    RPC --> Runtime["Core runtime"]
+    Desktop["Electron desktop"] --> RPC["aeloon-rpc v4 Unix gateway"]
+    RPC --> Runtime["Standalone Runtime"]
     Runtime --> Agent["stateless agent core"]
     Runtime --> Tools["runtime tool set"]
     Tools --> Agent
@@ -18,7 +18,7 @@ The fixed dependency directions are `rpc → runtime → core`, `runtime → too
 
 ## Core: one stateless inference run
 
-`aeloon_core.core.run_agent()` receives a complete `RunRequest` and returns a `RunResult`.
+`aeloon_runtime.core.run_agent()` receives a complete `RunRequest` and returns a `RunResult`.
 `RunRequest.inference` is an `InferencePort`; tools implement the neutral `Tool` protocol. Core
 owns only invocation-local engine, controller, queues, cancellation tasks, messages, and tool-loop
 state. Nothing is retained after the await completes.
@@ -30,7 +30,7 @@ discovery, or vendor compatibility logic.
 
 ## Tool: object-oriented built-ins
 
-`aeloon_core.tool` contains `BaseTool`, `ToolContext`, filesystem tools, `BashTool`, search tools,
+`aeloon_runtime.tool` contains `BaseTool`, `ToolContext`, filesystem tools, `BashTool`, search tools,
 and `BuiltinToolSet`. A ToolSet shares one context-scoped mutation-lock map; there is no process
 global write registry. Writes and edits replace their target atomically.
 
@@ -60,23 +60,27 @@ Bootstrap also gives each Manager a lazy Cloud account gateway bound to the same
 snapshot. Updating settings can therefore replace the service-level account client without
 mutating an operation that is already running.
 
-Concrete implementations live in `aeloon_core.runtime.providers`: Custom OpenAI-compatible APIs,
+Concrete implementations live in `aeloon_runtime.runtime.providers`: Custom OpenAI-compatible APIs,
 DeepSeek, Aeloon Cloud, and the testing-only `ScriptedProvider`.
 
 ## Local RPC and Cloud
 
-`aeloon-rpc-v2` is a small private transport adapter over Runtime. It uses length-prefixed JSON on
-a restricted Unix socket and owns dispatch, cancellation, frame limits, timeouts, event delivery,
-and JSON DTOs. It has no legacy negotiation, token, certificate, capability grant, or background
-discovery. The adapter does not import UI or Electron code.
+`aeloon-rpc` v4 is a length-prefixed JSON transport over a restricted Unix socket. The gateway owns
+dispatch, cancellation, 40 MiB frame limits, event replay, workspace boundaries, and JSON DTOs. It
+uses draft SemVer range negotiation, has no TCP/TLS/token layer in the base release, and does not
+import UI or Electron code.
 
 Its typed method/event registry is the protocol source of truth. A deterministic build-only
-exporter produces the checked-in JSON Schema manifest consumed by Desktop; the production adapter
-does not import the exporter or run schema validation on response and streaming-event hot paths.
+exporter produces the checked-in JSON Schema manifest consumed by Desktop; the production gateway
+loads that manifest and validates request parameters and method results at the RPC boundary.
 
 Cloud owns login, refresh tokens, the vault, and raw model-catalog access. It does not create Core
 models or inference implementations. Bootstrap adapts `CloudAccountService` to `AccountGateway`
 and injects it into Runtime's Provider manager factory.
 
-Sessions remain append-only JSONL. Socket paths and transport state are operation-local and are
-never serialized into Session data.
+Threads, turns and events are persisted in SQLite; boundary traces are opt-in JSONL recordings
+with secret redaction. Start the standalone gateway with
+`aeloon-runtime serve --unix PATH --record-trace DIRECTORY` when equivalence capture is explicitly
+needed. Raw traces and their mode-0600 content-addressed blobs remain local; sanitize and review
+them before committing corpus data. Socket paths and transport state are operation-local and are
+never serialized into thread data.

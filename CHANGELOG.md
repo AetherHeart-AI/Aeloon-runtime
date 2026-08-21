@@ -1,6 +1,6 @@
 # Changelog
 
-Significant changes to Aeloon Core are recorded here. New work is added under `Unreleased`; when a
+Significant changes to Aeloon Runtime are recorded here. New work is added under `Unreleased`; when a
 release is cut, those entries should move to a versioned section with an ISO date.
 
 ## Unreleased
@@ -85,7 +85,7 @@ release is cut, those entries should move to a versioned section with an ISO dat
 ### Added
 
 - Bundled local-first office execution skills for MarkItDown document extraction, PDF inspection,
-  PaddleOCR PP-StructureV3 parsing, editable PPTX generation, and Chinese DOCX formatting. The
+  PaddleOCR PP-StructureV4 parsing, editable PPTX generation, and Chinese DOCX formatting. The
   office router now delegates digital, scanned, presentation, and document-writing workflows to
   these skills.
 - Official packages now include the Python, Node.js, PptxGenJS, PDF, DOCX, PaddlePaddle, and
@@ -110,7 +110,7 @@ release is cut, those entries should move to a versioned section with an ISO dat
 
 - Made `core` a strictly stateless, vendor-neutral inference engine and renamed its contracts to
   `InferencePort`, `InferenceContext`, `InferenceError`, and `InferenceRuntime`.
-- Added the object-oriented `aeloon_core.tool` package and moved filesystem, shell, and search
+- Added the object-oriented `aeloon_runtime.tool` package and moved filesystem, shell, and search
   tools out of Core. Runtime explicitly composes them with `PresentFilesTool`.
 - Added `runtime.providers`, including OpenAI-compatible, DeepSeek, Ollama, Cloud, testing, and
   operation-scoped `ProviderManager` implementations.

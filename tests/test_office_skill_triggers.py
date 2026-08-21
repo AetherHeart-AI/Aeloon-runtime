@@ -7,7 +7,7 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
-SKILL = ROOT / "aeloon_core" / "resources" / "skills" / "aeloon-office-lite" / "SKILL.md"
+SKILL = ROOT / "aeloon_runtime" / "resources" / "skills" / "aeloon-office-lite" / "SKILL.md"
 CASES = ROOT / "tests" / "fixtures" / "office-skill-routing.json"
 
 POSITIVE = re.compile(

@@ -5,7 +5,7 @@ import json
 import pytest
 from pydantic import ValidationError
 
-from aeloon_core.config import (
+from aeloon_runtime.config import (
     Config,
     CustomProviderConfig,
     DeepSeekProviderConfig,
@@ -151,3 +151,19 @@ def test_public_config_redacts_every_provider_secret_and_sensitive_header() -> N
         "Cookie": "***",
         "X-Trace": "trace-id",
     }
+
+
+def test_plugin_settings_namespace_round_trips_and_redacts_secrets(tmp_path) -> None:
+    path = tmp_path / "config.json"
+    config = Config(
+        plugins={
+            "memory": {"enabled": True, "endpoint": "http://127.0.0.1:9000", "api_key": "secret"}
+        }
+    )
+    save_config(config, path)
+    loaded = load_config(path)
+    assert loaded.plugins["memory"]["enabled"] is True
+    assert loaded.plugins["memory"]["api_key"] == "secret"
+    public = public_config(loaded)
+    assert public["plugins"]["memory"]["api_key"] == "***"
+    assert public["plugins"]["memory"]["endpoint"] == "http://127.0.0.1:9000"

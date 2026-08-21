@@ -1,0 +1,286 @@
+name: Runtime release
+
+on:
+  push:
+    tags: ["runtime-v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: runtime-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RUNTIME_VERSION: "0.1.0"
+  PROTOCOL_RANGE: ">=4.0.0 <5.0.0"
+  PYTHON_STANDALONE_RELEASE: "20260728"
+  PYTHON_VERSION: "3.12.13"
+  UV_VERSION: "0.12.0"
+  RIPGREP_VERSION: "15.1.0"
+
+jobs:
+  version-gate:
+    # RUNTIME_VERSION, pyproject and the tag are three places that can disagree.
+    # A release built from a mismatch ships archives and a manifest labelled with
+    # a version nobody asked for, so fail before anything is produced.
+    name: Verify the tag, pyproject and RUNTIME_VERSION agree
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Compare the three version sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          project="$(grep -m1 '^version = ' pyproject.toml | cut -d '"' -f2)"
+          test "$project" = "$RUNTIME_VERSION" \
+            || { echo "pyproject $project != RUNTIME_VERSION $RUNTIME_VERSION"; exit 1; }
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            tagged="${GITHUB_REF_NAME#runtime-v}"
+            test "$tagged" = "$RUNTIME_VERSION" \
+              || { echo "tag $GITHUB_REF_NAME != RUNTIME_VERSION $RUNTIME_VERSION"; exit 1; }
+          fi
+          echo "version $RUNTIME_VERSION agrees across pyproject, tag and workflow"
+
+  wheel:
+    name: Build aeloon-runtime wheel
+    needs: version-gate
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - name: Build and smoke-test the wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run --frozen pytest -q
+          uv build --wheel --out-dir "$RUNNER_TEMP/runtime-wheel"
+          wheel="$(find "$RUNNER_TEMP/runtime-wheel" -maxdepth 1 -name '*.whl' -print -quit)"
+          test -n "$wheel"
+          uv venv --python 3.12 "$RUNNER_TEMP/wheel-smoke"
+          uv pip install --python "$RUNNER_TEMP/wheel-smoke/bin/python" "$wheel"
+          test "$(AELOON_RUNTIME_MODE=1 "$RUNNER_TEMP/wheel-smoke/bin/python" -m aeloon_runtime --version)" = "aeloon-runtime ${RUNTIME_VERSION}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aeloon-runtime-wheel
+          path: ${{ runner.temp }}/runtime-wheel/*.whl
+          if-no-files-found: error
+
+  protocol-package:
+    needs: version-gate
+    name: Build @aeloon/protocol package
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: https://registry.npmjs.org
+      - name: Verify generated protocol and build package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/gen_ts_protocol.py --check
+          npm install --no-save --ignore-scripts --no-package-lock typescript@5.7.2
+          npx --no-install tsc -p packages/protocol/tsconfig.json
+          test -f packages/protocol/dist/index.js
+          test -f packages/protocol/dist/index.d.ts
+          mkdir -p "$RUNNER_TEMP/protocol"
+          npm pack ./packages/protocol --pack-destination "$RUNNER_TEMP/protocol"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aeloon-protocol
+          path: ${{ runner.temp }}/protocol/*.tgz
+          if-no-files-found: error
+
+  bundle:
+    name: Build ${{ matrix.platform }} Runtime archive
+    needs: version-gate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin-aarch64
+            runner: macos-15
+            python_asset: cpython-3.12.13+20260728-aarch64-apple-darwin-install_only_stripped.tar.gz
+            uv_asset: uv-aarch64-apple-darwin.tar.gz
+            ripgrep_asset: ripgrep-15.1.0-aarch64-apple-darwin.tar.gz
+          - platform: linux-aarch64
+            runner: ubuntu-22.04-arm
+            python_asset: cpython-3.12.13+20260728-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz
+            uv_asset: uv-aarch64-unknown-linux-gnu.tar.gz
+            ripgrep_asset: ripgrep-15.1.0-aarch64-unknown-linux-gnu.tar.gz
+          # Most LAN and cloud hosts are x86_64, so a Runtime that only ships
+          # aarch64 cannot actually be deployed to the machines it targets.
+          - platform: linux-x86_64
+            runner: ubuntu-22.04
+            python_asset: cpython-3.12.13+20260728-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz
+            uv_asset: uv-x86_64-unknown-linux-gnu.tar.gz
+            ripgrep_asset: ripgrep-15.1.0-x86_64-unknown-linux-musl.tar.gz
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - name: Verify Runtime source
+        run: |
+          uv run --frozen pytest -q
+          uv run --frozen ruff check aeloon_runtime tools tests
+          uv run --frozen python tools/gen_v4_manifest.py --check
+          uv run --frozen python tools/gen_rpc_docs.py --check
+          uv run --frozen python tools/docker_smoke.py --check-only
+      - name: Download pinned native Runtime components
+        shell: bash
+        env:
+          PYTHON_ASSET: ${{ matrix.python_asset }}
+          UV_ASSET: ${{ matrix.uv_asset }}
+          RIPGREP_ASSET: ${{ matrix.ripgrep_asset }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/runtime-components"
+          curl --fail --location --retry 3 \
+            "https://github.com/astral-sh/python-build-standalone/releases/download/${PYTHON_STANDALONE_RELEASE}/${PYTHON_ASSET}" \
+            --output "$RUNNER_TEMP/runtime-components/python.tar.gz"
+          curl --fail --location --retry 3 \
+            "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/${UV_ASSET}" \
+            --output "$RUNNER_TEMP/runtime-components/uv.tar.gz"
+          curl --fail --location --retry 3 \
+            "https://github.com/BurntSushi/ripgrep/releases/download/${RIPGREP_VERSION}/${RIPGREP_ASSET}" \
+            --output "$RUNNER_TEMP/runtime-components/ripgrep.tar.gz"
+          mkdir -p "$RUNNER_TEMP/runtime-components/python" "$RUNNER_TEMP/runtime-components/uv" "$RUNNER_TEMP/runtime-components/ripgrep"
+          tar -xzf "$RUNNER_TEMP/runtime-components/python.tar.gz" -C "$RUNNER_TEMP/runtime-components/python" --strip-components=1
+          tar -xzf "$RUNNER_TEMP/runtime-components/uv.tar.gz" -C "$RUNNER_TEMP/runtime-components/uv" --strip-components=1
+          tar -xzf "$RUNNER_TEMP/runtime-components/ripgrep.tar.gz" -C "$RUNNER_TEMP/runtime-components/ripgrep" --strip-components=1
+      - name: Assemble and smoke-test the Runtime tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/aeloon-runtime"
+          mkdir -p "$root/bin" "$root/components" "$root/runtime-site"
+          cp -R "$RUNNER_TEMP/runtime-components/python" "$root/components/python"
+          mkdir -p "$root/components/uv" "$root/components/ripgrep"
+          uv_path="$(find "$RUNNER_TEMP/runtime-components/uv" -type f -name uv -perm -111 -print -quit)"
+          rg_path="$(find "$RUNNER_TEMP/runtime-components/ripgrep" -type f -name rg -perm -111 -print -quit)"
+          test -n "$uv_path" && test -n "$rg_path"
+          cp "$uv_path" "$root/components/uv/uv"
+          cp "$rg_path" "$root/components/ripgrep/rg"
+          uv build --wheel --out-dir "$RUNNER_TEMP/wheel"
+          uv export --frozen --no-dev --no-emit-project --format requirements-txt \
+            --output-file "$RUNNER_TEMP/runtime-requirements.txt"
+          cat > "$root/bin/aeloon-runtime" <<'SH'
+          #!/bin/sh
+          set -eu
+          root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+          export PYTHONPATH="$root/runtime-site${PYTHONPATH:+:$PYTHONPATH}"
+          export AELOON_RUNTIME_MODE=1
+          export AELOON_RUNTIME_COMMIT="__RUNTIME_COMMIT__"
+          exec "$root/components/python/bin/python3" -m aeloon_runtime "$@"
+          SH
+          # The release commit is embedded at build time. Leaving a
+          # ``${GITHUB_SHA}`` expansion in the shipped launcher would make a
+          # standalone user invocation fail with ``set -u`` outside Actions.
+          sed -i.bak "s/__RUNTIME_COMMIT__/${GITHUB_SHA}/" "$root/bin/aeloon-runtime"
+          rm -f "$root/bin/aeloon-runtime.bak"
+          chmod 0755 "$root/bin/aeloon-runtime" "$root/components/uv/uv" "$root/components/ripgrep/rg"
+          runtime_python="$root/components/python/bin/python3"
+          UV_PYTHON="$runtime_python" UV_PYTHON_DOWNLOADS=never \
+            "$root/components/uv/uv" pip install \
+              --target "$root/runtime-site" \
+              --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+              --requirement "$RUNNER_TEMP/runtime-requirements.txt"
+          UV_PYTHON="$runtime_python" UV_PYTHON_DOWNLOADS=never \
+            "$root/components/uv/uv" pip install \
+              --target "$root/runtime-site" \
+              --no-deps \
+              "$(find "$RUNNER_TEMP/wheel" -name '*.whl' -print -quit)"
+          PYTHON_VERSION="$PYTHON_VERSION" UV_VERSION="$UV_VERSION" RIPGREP_VERSION="$RIPGREP_VERSION" \
+            python tools/write_runtime_manifest.py \
+              --root "$root" \
+              --platform "${{ matrix.platform }}" \
+              --bundle-version "$RUNTIME_VERSION" \
+              --runtime-version "$RUNTIME_VERSION" \
+              --runtime-commit "$GITHUB_SHA"
+          AELOON_RUNTIME_MODE=1 "$root/bin/aeloon-runtime" --version
+          python tools/build_runtime_bundle.py \
+            --runtime-root "$root" \
+            --platform "${{ matrix.platform }}" \
+            --runtime-version "$RUNTIME_VERSION" \
+            --protocol-range "$PROTOCOL_RANGE" \
+            --output "$RUNNER_TEMP/aeloon-runtime-${{ matrix.platform }}.tar.zst" \
+            > "$RUNNER_TEMP/runtime-lock-entry.json"
+          cat "$RUNNER_TEMP/runtime-lock-entry.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aeloon-runtime-${{ matrix.platform }}
+          path: ${{ runner.temp }}/aeloon-runtime-${{ matrix.platform }}.tar.zst
+          if-no-files-found: error
+
+  publish:
+    name: Publish Runtime archives
+    needs: [bundle, protocol-package, wheel]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: aeloon-runtime-*
+          path: release
+          merge-multiple: true
+      - uses: actions/download-artifact@v5
+        with:
+          name: aeloon-protocol
+          path: release
+      - uses: actions/download-artifact@v5
+        with:
+          name: aeloon-runtime-wheel
+          path: release
+      - name: Publish the Runtime release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME:-runtime-v${RUNTIME_VERSION}}"
+          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --title "Aeloon Runtime $RUNTIME_VERSION" --generate-notes
+          gh release upload "$tag" release/*.tar.zst --clobber
+          gh release upload "$tag" release/*.tgz --clobber
+          gh release upload "$tag" release/*.whl --clobber
+
+      - name: Notify the UI repository when configured
+        env:
+          GH_TOKEN: ${{ secrets.AELOON_UI_REPOSITORY_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A separate step so a missing or expired token cannot fail a release
+          # whose assets are already published. Unconfigured means the UI lock is
+          # pinned by hand; adding the secret turns the hop on with no edit here.
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "AELOON_UI_REPOSITORY_TOKEN is not configured."
+            echo "Pin the UI lock by hand with scripts/update-runtime-lock.ts."
+            exit 0
+          fi
+          tag="${GITHUB_REF_NAME:-runtime-v${RUNTIME_VERSION}}"
+          gh api --method POST repos/AetherHeart-AI/Aeloon-ui/dispatches --input - <<JSON
+          {"event_type":"runtime-release","client_payload":{"runtime_version":"${RUNTIME_VERSION}","release_tag":"${tag}","runtime_commit":"${GITHUB_SHA}"}}
+          JSON
+
+      - name: Publish @aeloon/protocol to npm when configured
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${NPM_TOKEN:-}" ]; then
+            echo "NPM_TOKEN is not configured; package is available as a release asset."
+            exit 0
+          fi
+          echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > "$RUNNER_TEMP/.npmrc"
+          NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/.npmrc" npm publish release/*.tgz --access public

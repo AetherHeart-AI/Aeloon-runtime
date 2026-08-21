@@ -31,7 +31,7 @@ def test_benchmark_manifest_records_source_and_harness_versions(
     harnesses = [
         SimpleNamespace(
             name="aeloon",
-            version="aeloon-core@abc",
+            version="aeloon-runtime@abc",
             model="deepseek-v4-flash",
         ),
         SimpleNamespace(
@@ -54,7 +54,7 @@ def test_benchmark_manifest_records_source_and_harness_versions(
     assert manifest["harnesses"] == [
         {
             "id": "aeloon",
-            "version": "aeloon-core@abc",
+            "version": "aeloon-runtime@abc",
             "model": "deepseek-v4-flash",
         },
         {

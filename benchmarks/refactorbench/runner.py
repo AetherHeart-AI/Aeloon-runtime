@@ -371,7 +371,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "model": args.model,
         "harnesses": harness_metadata,
         "cases": [case.instance_id for case in cases],
-        "aeloon_core_commit": _git_revision(PROJECT_ROOT),
+        "aeloon_runtime_commit": _git_revision(PROJECT_ROOT),
     }
     _write_json(archive_root / "manifest.json", manifest)
 
@@ -536,7 +536,7 @@ def _run_case(
         "test_path": str(case.test_path),
         "workspace": str(workspace),
         "baseline_commit": baseline,
-        "aeloon_core_commit": _git_revision(PROJECT_ROOT),
+        "aeloon_runtime_commit": _git_revision(PROJECT_ROOT),
         "config_path": (
             str(config_path.expanduser().resolve())
             if harness == "aeloon" and config_path is not None
@@ -683,7 +683,7 @@ def _resolve_harness_executable(harness: str) -> str:
 def _harness_version(harness: str, executable: str) -> str | None:
     if harness == "aeloon":
         revision = _git_revision(PROJECT_ROOT)
-        return f"aeloon-core@{revision}" if revision else "aeloon-core"
+        return f"aeloon-runtime@{revision}" if revision else "aeloon-runtime"
     outcome = _run_process(
         [executable, "--version"],
         cwd=PROJECT_ROOT,
@@ -709,7 +709,7 @@ def _build_harness_invocation(
         command = [
             executable,
             "-m",
-            "aeloon_core",
+            "aeloon_runtime",
             "run",
             "--workspace",
             str(workspace),
@@ -1387,7 +1387,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--config",
         type=Path,
         default=None,
-        help="Aeloon Core config JSON path.",
+        help="Aeloon Runtime config JSON path.",
     )
     parser.add_argument(
         "--cache-dir",

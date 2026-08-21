@@ -7,9 +7,9 @@ __pycache__/
 /.test/
 /build/
 /dist/
+node_modules/
+packages/protocol/dist/
 
-aeloon_core/web/node_modules/
-aeloon_core/pi_runtime/node_modules/
 .benchmark-workspaces/
 benchmarks/results/
 
@@ -18,3 +18,9 @@ benchmarks/results/
 .env.*
 .worktrees
 *.old
+
+# Explicitly recorded Runtime traces and local state are never repository data.
+traces/
+blobs/
+.aeloon-runtime/
+runtime.sqlite*

@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from aeloon_core.runtime import ResourceLoader, build_system_prompt
-from aeloon_core.tool import BuiltinToolSet
+from aeloon_runtime.runtime import ResourceLoader, build_system_prompt
+from aeloon_runtime.tool import BuiltinToolSet
 
 
 def create_all_tools(cwd: Path):
@@ -54,7 +54,7 @@ Current working directory: {tmp_path}"""
 def test_system_override_and_append_context_skills_order(tmp_path: Path) -> None:
     global_dir = tmp_path / "global"
     workspace = tmp_path / "repo" / "nested"
-    project = workspace / ".aeloon-core"
+    project = workspace / ".aeloon-runtime"
     (global_dir / "skills" / "global-skill").mkdir(parents=True)
     (global_dir / "skills" / "global-skill" / "SKILL.md").write_text(
         "---\nname: same\ndescription: global\n---\nglobal body\n",
@@ -98,7 +98,7 @@ def test_system_override_and_append_context_skills_order(tmp_path: Path) -> None
 
 def test_prompt_templates_use_project_override(tmp_path: Path) -> None:
     global_dir = tmp_path / "global"
-    project_dir = tmp_path / ".aeloon-core"
+    project_dir = tmp_path / ".aeloon-runtime"
     (global_dir / "prompts").mkdir(parents=True)
     (project_dir / "prompts").mkdir(parents=True)
     (global_dir / "prompts" / "review.md").write_text("global $1", encoding="utf-8")

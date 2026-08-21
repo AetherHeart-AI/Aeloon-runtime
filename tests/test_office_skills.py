@@ -6,11 +6,11 @@ from pathlib import Path
 import pytest
 import yaml
 
-from aeloon_core import __main__ as cli
-from aeloon_core.runtime import skill_runtime
-from aeloon_core.runtime.builtin_skills import BUILTIN_SKILL_IDS
+from aeloon_runtime import __main__ as cli
+from aeloon_runtime.runtime import skill_runtime
+from aeloon_runtime.runtime.builtin_skills import BUILTIN_SKILL_IDS
 
-RESOURCE_ROOT = Path(__file__).parents[1] / "aeloon_core" / "resources" / "skills"
+RESOURCE_ROOT = Path(__file__).parents[1] / "aeloon_runtime" / "resources" / "skills"
 OFFICE_SKILL_IDS = ("aeloon-office-lite",)
 
 
@@ -24,7 +24,7 @@ def test_only_office_lite_is_bundled_and_valid() -> None:
     assert set(metadata) == {"name", "description"}
     assert metadata["name"] == "aeloon-office-lite"
     assert "present_files" in body
-    assert "aeloon-core system skill" in body
+    assert "aeloon-runtime system skill" in body
     assert "aeloon system skill" not in body
     assert "https://pypi.tuna.tsinghua.edu.cn/simple" in body
     interface = yaml.safe_load((skill_dir / "agents" / "openai.yaml").read_text(encoding="utf-8"))[
@@ -103,7 +103,7 @@ def test_wheel_packaging_uses_only_lite_python_office_dependencies() -> None:
     ):
         assert removed not in manifest.lower()
     assert "https://pypi.tuna.tsinghua.edu.cn/simple" in manifest
-    assert '[project.scripts]\naeloon-core = "aeloon_core.__main__:main"' in manifest
+    assert '[project.scripts]\naeloon-runtime = "aeloon_runtime.__main__:main"' in manifest
     assert '\naeloon = "' not in manifest
     assert not list(RESOURCE_ROOT.rglob("package.json"))
     assert not list(RESOURCE_ROOT.rglob("*.js"))

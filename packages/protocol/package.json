@@ -1,0 +1,13 @@
+{
+  "name": "@aeloon/protocol",
+  "version": "4.0.0",
+  "description": "Generated Aeloon Runtime RPC v4 protocol types.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "license": "MIT",
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  }
+}

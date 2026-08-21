@@ -364,7 +364,7 @@ def _invoke_agent(
     command = [
         sys.executable,
         "-m",
-        "aeloon_core",
+        "aeloon_runtime",
         "run",
         "--stdin",
         "--output",
@@ -774,7 +774,7 @@ def _record_header(
         "release_version": release_version,
         "scenario": scenario,
         **_case_metadata(case),
-        "aeloon_core_commit": _git_revision(PROJECT_ROOT),
+        "aeloon_runtime_commit": _git_revision(PROJECT_ROOT),
         "config_path": (
             str(config_path.expanduser().resolve()) if config_path is not None else None
         ),
@@ -1021,7 +1021,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Run LiveCodeBench v6 code-generation and self-repair tests through "
-            "Aeloon Core."
+            "Aeloon Runtime."
         )
     )
     parser.add_argument(
@@ -1076,7 +1076,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--config",
         type=Path,
         default=None,
-        help="Aeloon Core config JSON path.",
+        help="Aeloon Runtime config JSON path.",
     )
     parser.add_argument(
         "--workspace-dir",

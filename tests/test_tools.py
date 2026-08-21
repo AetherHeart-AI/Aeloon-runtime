@@ -10,9 +10,9 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
-from aeloon_core.core import ImageContent
-from aeloon_core.tool import BuiltinToolSet
-from aeloon_core.tool.shell import prune_bash_logs
+from aeloon_runtime.core import ImageContent
+from aeloon_runtime.tool import BuiltinToolSet
+from aeloon_runtime.tool.shell import prune_bash_logs
 
 DEFAULT_ACTIVE_TOOLS = BuiltinToolSet.default_active_names
 

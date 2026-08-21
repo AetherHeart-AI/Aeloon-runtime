@@ -7,18 +7,18 @@ from pathlib import Path
 
 import pytest
 
-from aeloon_core.config import Config
-from aeloon_core.core import (
+from aeloon_runtime.config import Config
+from aeloon_runtime.core import (
     AssistantMessage,
     TextContent,
     ToolResultMessage,
     Usage,
     UserMessage,
 )
-from aeloon_core.runtime import JsonlSessionRepository
-from aeloon_core.runtime.agent import SessionAgent
-from aeloon_core.runtime.providers import DEEPSEEK_V4_FLASH
-from aeloon_core.runtime.providers.testing import ScriptedProvider
+from aeloon_runtime.runtime import JsonlSessionRepository
+from aeloon_runtime.runtime.agent import SessionAgent
+from aeloon_runtime.runtime.providers import DEEPSEEK_V4_FLASH
+from aeloon_runtime.runtime.providers.testing import ScriptedProvider
 
 
 def _assistant(text: str) -> AssistantMessage:
@@ -152,7 +152,7 @@ async def test_incremental_stats_match_full_recomputation(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_jsonl_v3_is_message_durable_and_recovers_truncated_tail(tmp_path: Path) -> None:
+async def test_jsonl_v4_is_message_durable_and_recovers_truncated_tail(tmp_path: Path) -> None:
     repository = JsonlSessionRepository(tmp_path)
     session = await repository.create(cwd=tmp_path, session_id="durable")
     await session.append_message(UserMessage("hello"))
@@ -182,7 +182,7 @@ async def test_jsonl_appends_coalesce_syncs_and_terminal_entries_force_flush(
         nonlocal syncs
         syncs += 1
 
-    monkeypatch.setattr("aeloon_core.runtime.session._fsync_path", record_sync)
+    monkeypatch.setattr("aeloon_runtime.runtime.session._fsync_path", record_sync)
     for index in range(100):
         await session.append_message(UserMessage(str(index)))
     await asyncio.sleep(0.05)

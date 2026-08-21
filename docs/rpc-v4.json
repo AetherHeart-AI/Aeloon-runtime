@@ -1,0 +1,5891 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aeloon.dev/schemas/rpc-v4.json",
+  "title": "Aeloon Runtime RPC v4 protocol source",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "protocol": {
+      "const": "aeloon-rpc"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?$"
+    },
+    "schema_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "frame_max_bytes": {
+      "type": "integer",
+      "const": 41943040
+    },
+    "file_max_bytes": {
+      "type": "integer",
+      "const": 26214400
+    },
+    "image_max_bytes": {
+      "type": "integer",
+      "const": 10485760
+    },
+    "groups": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/method_group"
+      }
+    },
+    "events": {
+      "$ref": "#/$defs/event_catalog"
+    },
+    "event_schemas": {
+      "$ref": "#/$defs/event_schema_map"
+    },
+    "json_schema_draft": {
+      "type": "string",
+      "format": "uri-reference"
+    },
+    "transport": {
+      "$ref": "#/$defs/transport"
+    },
+    "naming": {
+      "type": "string"
+    },
+    "plugin_contributed": {
+      "$ref": "#/$defs/plugin_contributed"
+    },
+    "removed": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/removed_item"
+      }
+    },
+    "errors": {
+      "$ref": "#/$defs/errors"
+    },
+    "tenancy": {
+      "type": "string"
+    },
+    "limits_note": {
+      "type": "string"
+    },
+    "resolved": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/resolved_decision"
+      }
+    },
+    "$schema": {
+      "type": "string",
+      "format": "uri-reference"
+    },
+    "$id": {
+      "type": "string",
+      "format": "uri-reference"
+    },
+    "title": {
+      "type": "string"
+    },
+    "$defs": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "additionalProperties": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "object",
+          "additionalProperties": true
+        }
+      ]
+    },
+    "properties": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "required": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "type": {
+      "const": "object"
+    }
+  },
+  "required": [
+    "protocol",
+    "version",
+    "schema_version",
+    "groups",
+    "event_schemas"
+  ],
+  "$defs": {
+    "transport": {
+      "type": "object",
+      "required": [
+        "encoding",
+        "framing",
+        "max_frame_bytes",
+        "file_bytes",
+        "image_bytes"
+      ],
+      "properties": {
+        "encoding": {
+          "type": "string"
+        },
+        "framing": {
+          "type": "string"
+        },
+        "max_frame_bytes": {
+          "type": "integer"
+        },
+        "file_bytes": {
+          "type": "integer"
+        },
+        "image_bytes": {
+          "type": "integer"
+        }
+      },
+      "additionalProperties": false
+    },
+    "plugin_contributed": {
+      "type": "object",
+      "required": [
+        "namespace",
+        "methods"
+      ],
+      "properties": {
+        "namespace": {
+          "type": "string"
+        },
+        "note": {
+          "type": "string"
+        },
+        "methods": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/plugin_method"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "plugin_method": {
+      "type": "object",
+      "required": [
+        "name",
+        "from",
+        "params",
+        "result"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^plugin\\.[a-z][a-z0-9_]*\\.[a-z][a-z0-9_]*$"
+        },
+        "from": {
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/$defs/schema_ref"
+        },
+        "result": {
+          "$ref": "#/$defs/schema_ref"
+        }
+      },
+      "additionalProperties": false
+    },
+    "errors": {
+      "type": "object",
+      "required": [
+        "kept",
+        "added",
+        "renamed"
+      ],
+      "properties": {
+        "kept": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "added": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/error_added"
+          }
+        },
+        "renamed": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/error_renamed"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "method_group": {
+      "type": "object",
+      "required": [
+        "id",
+        "methods"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "methods": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/method"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "method": {
+      "type": "object",
+      "required": [
+        "name",
+        "params",
+        "result"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9]*(?:\\.[a-z][a-z0-9_]*)+$"
+        },
+        "params": {
+          "$ref": "#/$defs/schema_ref"
+        },
+        "result": {
+          "$ref": "#/$defs/schema_ref"
+        },
+        "params_signature": {
+          "$ref": "#/$defs/signature"
+        },
+        "result_signature": {
+          "$ref": "#/$defs/signature"
+        },
+        "src": {
+          "type": "string"
+        },
+        "change": {
+          "type": "string"
+        },
+        "note": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "signature": {
+      "type": "string",
+      "minLength": 2,
+      "description": "Compact human-readable shape expanded into generated JSON Schema definitions."
+    },
+    "schema_ref": {
+      "type": "object",
+      "required": [
+        "$ref"
+      ],
+      "properties": {
+        "$ref": {
+          "type": "string",
+          "pattern": "^#/\\$defs/[A-Za-z0-9_.-]+$"
+        },
+        "description": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "removed_item": {
+      "type": "object",
+      "required": [
+        "name",
+        "why",
+        "detail"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "why": {
+          "type": "string",
+          "minLength": 1
+        },
+        "detail": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "resolved_decision": {
+      "type": "object",
+      "required": [
+        "id",
+        "decision",
+        "detail"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "decision": {
+          "type": "string",
+          "minLength": 1
+        },
+        "detail": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "event_schema_map": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/schema_ref"
+      }
+    },
+    "event_catalog": {
+      "type": "object",
+      "properties": {
+        "kept_from_core": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/event_name"
+          }
+        },
+        "kept_from_workbench": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/event_name"
+          }
+        },
+        "renamed_from_core": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/renamed_event"
+          }
+        },
+        "new": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/new_event"
+          }
+        },
+        "removed": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/removed_event"
+          }
+        },
+        "envelope_change": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "event_name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "renamed_event": {
+      "type": "object",
+      "required": [
+        "from",
+        "to"
+      ],
+      "properties": {
+        "from": {
+          "$ref": "#/$defs/event_name"
+        },
+        "to": {
+          "$ref": "#/$defs/event_name"
+        }
+      },
+      "additionalProperties": false
+    },
+    "new_event": {
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/event_name"
+        },
+        "why": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "removed_event": {
+      "type": "object",
+      "required": [
+        "name",
+        "why"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/event_name"
+        },
+        "why": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "error_added": {
+      "type": "object",
+      "required": [
+        "code",
+        "num",
+        "when"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "minLength": 1
+        },
+        "num": {
+          "type": "integer"
+        },
+        "when": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "error_renamed": {
+      "type": "object",
+      "required": [
+        "from",
+        "to",
+        "note"
+      ],
+      "properties": {
+        "from": {
+          "type": "string",
+          "minLength": 1
+        },
+        "to": {
+          "type": "string",
+          "minLength": 1
+        },
+        "note": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "Params_system_handshake_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "min": {
+              "type": "string"
+            },
+            "max": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "min",
+            "max"
+          ]
+        },
+        "client": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "version": {
+              "type": "string"
+            },
+            "platform": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "version",
+            "platform"
+          ]
+        },
+        "auth": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "device_token",
+              "type": "string"
+            },
+            "token": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "token"
+          ]
+        }
+      },
+      "required": [
+        "protocol",
+        "client"
+      ],
+      "title": "Params_system_handshake_v4"
+    },
+    "Result_system_handshake_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "const": "4.0.0",
+          "type": "string"
+        },
+        "runtime": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "label": {
+              "type": "string"
+            },
+            "version": {
+              "type": "string"
+            },
+            "commit": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "label",
+            "version",
+            "commit"
+          ]
+        },
+        "host": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "hostname": {"type": "string"},
+            "platform": {"type": "string"},
+            "architecture": {"type": "string"},
+            "shell": {"type": "string"},
+            "tools": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "git": {"type": "boolean"},
+                "gh": {"type": "boolean"}
+              },
+              "required": ["git", "gh"]
+            }
+          },
+          "required": ["hostname", "platform", "architecture", "shell", "tools"]
+        },
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "prompt_chars": {
+              "type": "integer"
+            },
+            "attachments": {
+              "type": "integer"
+            },
+            "image_bytes": {
+              "type": "integer"
+            },
+            "file_bytes": {
+              "type": "integer"
+            },
+            "request_bytes": {
+              "type": "integer"
+            },
+            "retained_events": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "prompt_chars",
+            "attachments",
+            "image_bytes",
+            "file_bytes",
+            "request_bytes",
+            "retained_events"
+          ]
+        }
+      },
+      "required": [
+        "protocol",
+        "runtime",
+        "host",
+        "limits"
+      ],
+      "title": "Result_system_handshake_v4"
+    },
+    "Params_system_health_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "workspace": {
+          "type": "string"
+        }
+      },
+      "title": "Params_system_health_v4"
+    },
+    "Result_system_health_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "uptime_s": {
+          "type": "integer"
+        },
+        "active_operations": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "ok",
+        "uptime_s",
+        "active_operations"
+      ],
+      "title": "Result_system_health_v4"
+    },
+    "Params_system_capabilities_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {},
+      "title": "Params_system_capabilities_v4"
+    },
+    "Result_system_capabilities_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "capabilities": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "version": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string"
+              },
+              "enabled": {
+                "type": "boolean"
+              },
+              "settings_schema": {
+                "type": [
+                  "object",
+                  "null"
+                ],
+                "additionalProperties": true
+              },
+              "methods": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "events": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "ui": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "group": {
+                    "type": "string"
+                  },
+                  "order": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "group",
+                  "order"
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "version",
+              "kind",
+              "enabled",
+              "settings_schema",
+              "methods",
+              "events",
+              "ui"
+            ]
+          }
+        }
+      },
+      "required": [
+        "capabilities"
+      ],
+      "title": "Result_system_capabilities_v4"
+    },
+    "Params_system_snapshot_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {},
+      "title": "Params_system_snapshot_v4"
+    },
+    "Result_system_snapshot_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "default_workspace": {
+          "type": "string"
+        },
+        "projects": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "threads": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
+      },
+      "required": [
+        "default_workspace",
+        "projects",
+        "threads"
+      ],
+      "title": "Result_system_snapshot_v4"
+    },
+    "Params_system_shutdown_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {},
+      "title": "Params_system_shutdown_v4"
+    },
+    "Result_system_shutdown_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "accepted": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "accepted"
+      ],
+      "title": "Result_system_shutdown_v4"
+    },
+    "Params_system_uninstall_inspect_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {},
+      "title": "Params_system_uninstall_inspect_v4"
+    },
+    "Result_system_uninstall_inspect_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "data_paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "estimated_bytes": {
+          "type": "integer"
+        },
+        "active_operations": {
+          "type": "integer"
+        },
+        "worktrees": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
+      },
+      "required": [
+        "data_paths",
+        "estimated_bytes",
+        "active_operations",
+        "worktrees"
+      ],
+      "title": "Result_system_uninstall_inspect_v4"
+    },
+    "Params_system_uninstall_prepare_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {},
+      "title": "Params_system_uninstall_prepare_v4"
+    },
+    "Result_system_uninstall_prepare_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "prepared": {
+          "type": "boolean"
+        },
+        "removed_worktrees": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["project_path", "workspace"],
+            "properties": {
+              "project_path": {"type": "string"},
+              "workspace": {"type": "string"}
+            }
+          }
+        }
+      },
+      "required": [
+        "prepared",
+        "removed_worktrees"
+      ],
+      "title": "Result_system_uninstall_prepare_v4"
+    },
+    "Params_events_subscribe_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "after_seq": {
+          "type": "integer"
+        },
+        "server_instance_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "thread_ids"
+      ],
+      "title": "Params_events_subscribe_v4"
+    },
+    "Result_events_subscribe_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "server_instance_id": {
+          "type": "string"
+        },
+        "current_seq": {
+          "type": "integer"
+        },
+        "replay_complete": {
+          "type": "boolean"
+        },
+        "events": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "cursor": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "server_instance_id": {
+              "type": "string"
+            },
+            "seq": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "server_instance_id",
+            "seq"
+          ]
+        }
+      },
+      "required": [
+        "server_instance_id",
+        "current_seq",
+        "replay_complete",
+        "events",
+        "cursor"
+      ],
+      "title": "Result_events_subscribe_v4"
+    },
+    "Params_diagnostics_logs_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500
+        }
+      },
+      "title": "Params_diagnostics_logs_v4"
+    },
+    "Result_diagnostics_logs_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "entries": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "at": {
+                "type": "string"
+              },
+              "event": {
+                "type": "string"
+              },
+              "fields": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": [
+                    "string",
+                    "integer",
+                    "number",
+                    "boolean",
+                    "null"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "at",
+              "event",
+              "fields"
+            ]
+          }
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "entries",
+        "truncated"
+      ],
+      "title": "Result_diagnostics_logs_v4"
+    },
+    "Params_project_list_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {},
+      "title": "Params_project_list_v4"
+    },
+    "Result_project_list_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "projects": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
+      },
+      "required": [
+        "projects"
+      ],
+      "title": "Result_project_list_v4"
+    },
+    "Params_project_add_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "root_id": {"type": "string"},
+        "relative_path": {"type": "string"}
+      },
+      "required": [
+        "root_id",
+        "relative_path"
+      ],
+      "title": "Params_project_add_v4"
+    },
+    "Result_project_add_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "project": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "projects": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
+      },
+      "required": [
+        "project",
+        "projects"
+      ],
+      "title": "Result_project_add_v4"
+    },
+    "Params_project_remove_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "project_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id"
+      ],
+      "title": "Params_project_remove_v4"
+    },
+    "Result_project_remove_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "removed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "removed"
+      ],
+      "title": "Result_project_remove_v4"
+    },
+    "Params_project_refresh_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "project_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id"
+      ],
+      "title": "Params_project_refresh_v4"
+    },
+    "Result_project_refresh_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "project": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "projects": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
+      },
+      "required": [
+        "project",
+        "projects"
+      ],
+      "title": "Result_project_refresh_v4"
+    },
+    "Params_thread_create_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "project_id": {
+          "type": "string"
+        },
+        "workspace": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "kind": {
+          "anyOf": [
+            {
+              "const": "standard"
+            },
+            {
+              "const": "worktree"
+            }
+          ]
+        },
+        "branch": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "project_id": {
+              "type": "string"
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "title": {
+              "type": "string"
+            },
+            "kind": {
+              "anyOf": [
+                {
+                  "const": "standard"
+                },
+                {
+                  "const": "worktree"
+                }
+              ]
+            },
+            "branch": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "model_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "project_id"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "project_id": {
+              "type": "string"
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "title": {
+              "type": "string"
+            },
+            "kind": {
+              "anyOf": [
+                {
+                  "const": "standard"
+                },
+                {
+                  "const": "worktree"
+                }
+              ]
+            },
+            "branch": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "model_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "workspace"
+          ]
+        }
+      ],
+      "title": "Params_thread_create_v4"
+    },
+    "Result_thread_create_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "threads": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
+      },
+      "required": [
+        "thread",
+        "threads"
+      ],
+      "title": "Result_thread_create_v4"
+    },
+    "Params_thread_list_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "project_id": {
+          "type": "string"
+        },
+        "filter": {
+          "anyOf": [
+            {
+              "const": "active"
+            },
+            {
+              "const": "archived"
+            },
+            {
+              "const": "all"
+            }
+          ]
+        }
+      },
+      "required": [
+        "filter"
+      ],
+      "title": "Params_thread_list_v4"
+    },
+    "Result_thread_list_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "threads": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
+      },
+      "required": [
+        "threads"
+      ],
+      "title": "Result_thread_list_v4"
+    },
+    "Params_thread_get_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        },
+        "refresh": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "thread_id"
+      ],
+      "title": "Params_thread_get_v4"
+    },
+    "Result_thread_get_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "stats": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "history": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "turns": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "events": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
+      },
+      "required": [
+        "thread",
+        "stats",
+        "history",
+        "turns",
+        "events"
+      ],
+      "title": "Result_thread_get_v4"
+    },
+    "Params_thread_delete_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "thread_id"
+      ],
+      "title": "Params_thread_delete_v4"
+    },
+    "Result_thread_delete_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "deleted": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "deleted"
+      ],
+      "title": "Result_thread_delete_v4"
+    },
+    "Params_thread_rename_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "thread_id",
+        "title"
+      ],
+      "title": "Params_thread_rename_v4"
+    },
+    "Result_thread_rename_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "thread"
+      ],
+      "title": "Result_thread_rename_v4"
+    },
+    "Params_thread_configure_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        },
+        "model_id": {
+          "type": "string"
+        },
+        "thinking_level": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "thread_id"
+      ],
+      "title": "Params_thread_configure_v4"
+    },
+    "Result_thread_configure_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "thread"
+      ],
+      "title": "Result_thread_configure_v4"
+    },
+    "Params_thread_reorder_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "project_id": {
+          "type": "string"
+        },
+        "thread_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "project_id",
+        "thread_ids"
+      ],
+      "title": "Params_thread_reorder_v4"
+    },
+    "Result_thread_reorder_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "threads": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
+      },
+      "required": [
+        "threads"
+      ],
+      "title": "Result_thread_reorder_v4"
+    },
+    "Params_thread_set_pinned_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        },
+        "pinned": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "thread_id",
+        "pinned"
+      ],
+      "title": "Params_thread_set_pinned_v4"
+    },
+    "Result_thread_set_pinned_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "thread"
+      ],
+      "title": "Result_thread_set_pinned_v4"
+    },
+    "Params_thread_set_archived_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        },
+        "archived": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "thread_id",
+        "archived"
+      ],
+      "title": "Params_thread_set_archived_v4"
+    },
+    "Result_thread_set_archived_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "thread"
+      ],
+      "title": "Result_thread_set_archived_v4"
+    },
+    "Params_thread_set_read_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        },
+        "read": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "thread_id",
+        "read"
+      ],
+      "title": "Params_thread_set_read_v4"
+    },
+    "Result_thread_set_read_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "updated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "updated"
+      ],
+      "title": "Result_thread_set_read_v4"
+    },
+    "Params_thread_context_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "thread_id"
+      ],
+      "title": "Params_thread_context_v4"
+    },
+    "Result_thread_context_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "used": {
+          "type": "integer"
+        },
+        "maximum": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "ratio": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "used",
+        "maximum",
+        "ratio"
+      ],
+      "title": "Result_thread_context_v4"
+    },
+    "Params_thread_tree_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "thread_id"
+      ],
+      "title": "Params_thread_tree_v4"
+    },
+    "Result_thread_tree_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "nodes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "current": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "nodes",
+        "current"
+      ],
+      "title": "Result_thread_tree_v4"
+    },
+    "Params_thread_navigate_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        },
+        "node_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "thread_id",
+        "node_id"
+      ],
+      "title": "Params_thread_navigate_v4"
+    },
+    "Result_thread_navigate_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "current": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stats": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "current",
+        "stats"
+      ],
+      "title": "Result_thread_navigate_v4"
+    },
+    "Params_thread_compact_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        },
+        "mode": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "thread_id"
+      ],
+      "title": "Params_thread_compact_v4"
+    },
+    "Result_thread_compact_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "compacted": {
+          "type": "boolean"
+        },
+        "stats": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "compacted",
+        "stats"
+      ],
+      "title": "Result_thread_compact_v4"
+    },
+    "Params_thread_next_turn_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "thread_id"
+      ],
+      "title": "Params_thread_next_turn_v4"
+    },
+    "Result_thread_next_turn_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "turn_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "turn_id"
+      ],
+      "title": "Result_thread_next_turn_v4"
+    },
+    "Params_turn_start_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "attachment_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "thread_id",
+        "text",
+        "attachment_ids"
+      ],
+      "title": "Params_turn_start_v4"
+    },
+    "Result_turn_start_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "operation_id": {
+          "type": "string"
+        },
+        "turn_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "operation_id",
+        "turn_id"
+      ],
+      "title": "Result_turn_start_v4"
+    },
+    "Params_turn_cancel_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "operation_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "operation_id"
+      ],
+      "title": "Params_turn_cancel_v4"
+    },
+    "Result_turn_cancel_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cancelling": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "cancelling"
+      ],
+      "title": "Result_turn_cancel_v4"
+    },
+    "Params_turn_steer_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "operation_id": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "operation_id",
+        "text"
+      ],
+      "title": "Params_turn_steer_v4"
+    },
+    "Result_turn_steer_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "accepted": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "accepted"
+      ],
+      "title": "Result_turn_steer_v4"
+    },
+    "Params_turn_follow_up_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "thread_id",
+        "text"
+      ],
+      "title": "Params_turn_follow_up_v4"
+    },
+    "Result_turn_follow_up_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "accepted": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "accepted"
+      ],
+      "title": "Result_turn_follow_up_v4"
+    },
+    "Params_fs_roots_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {},
+      "title": "Params_fs_roots_v4"
+    },
+    "Result_fs_roots_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "roots": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "label": {
+                "type": "string"
+              },
+              "writable": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "path",
+              "label",
+              "writable"
+            ]
+          }
+        }
+      },
+      "required": [
+        "roots"
+      ],
+      "title": "Result_fs_roots_v4"
+    },
+    "Params_fs_list_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        },
+        "root": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "thread_id": {
+              "type": "string"
+            },
+            "root": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "thread_id"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "thread_id": {
+              "type": "string"
+            },
+            "root": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "root"
+          ]
+        }
+      ],
+      "title": "Params_fs_list_v4"
+    },
+    "Result_fs_list_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "entries": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string"
+              },
+              "size": {
+                "type": "integer"
+              },
+              "mtime": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "name",
+              "kind",
+              "size",
+              "mtime"
+            ]
+          }
+        }
+      },
+      "required": [
+        "entries"
+      ],
+      "title": "Result_fs_list_v4"
+    },
+    "Params_fs_read_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "max_bytes": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "thread_id",
+        "path"
+      ],
+      "title": "Params_fs_read_v4"
+    },
+    "Result_fs_read_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "encoding": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "content",
+        "truncated",
+        "encoding"
+      ],
+      "title": "Result_fs_read_v4"
+    },
+    "Params_git_status_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "thread_id"
+      ],
+      "title": "Params_git_status_v4"
+    },
+    "Result_git_status_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "branch": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "entries": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "stderr": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "ok",
+        "branch",
+        "entries",
+        "stderr"
+      ],
+      "title": "Result_git_status_v4"
+    },
+    "Params_git_github_status_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "thread_id"
+      ],
+      "title": "Params_git_github_status_v4"
+    },
+    "Result_git_github_status_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "github_origin": {
+          "type": "string"
+        },
+        "authenticated": {
+          "type": "boolean"
+        },
+        "remote": {
+          "type": "string"
+        },
+        "stderr": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "github_origin",
+        "authenticated",
+        "remote",
+        "stderr"
+      ],
+      "title": "Result_git_github_status_v4"
+    },
+    "Params_git_diff_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        },
+        "scope": {
+          "anyOf": [
+            {
+              "const": "changes"
+            },
+            {
+              "const": "staged"
+            }
+          ]
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "thread_id",
+        "scope"
+      ],
+      "title": "Params_git_diff_v4"
+    },
+    "Result_git_diff_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "scope": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "patch": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "binary": {
+          "type": "boolean"
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "stderr": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "ok",
+        "scope",
+        "path",
+        "patch",
+        "binary",
+        "truncated",
+        "stderr"
+      ],
+      "title": "Result_git_diff_v4"
+    },
+    "Params_git_changes_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "thread_id"
+      ],
+      "title": "Params_git_changes_v4"
+    },
+    "Result_git_changes_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "branch": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "staged": {
+          "$ref": "#/$defs/GitChangeGroup_v4"
+        },
+        "changes": {
+          "$ref": "#/$defs/GitChangeGroup_v4"
+        }
+      },
+      "required": [
+        "branch",
+        "staged",
+        "changes"
+      ],
+      "title": "Result_git_changes_v4"
+    },
+    "Git_change_entry_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "additions": {
+          "type": "integer"
+        },
+        "deletions": {
+          "type": "integer"
+        },
+        "binary": {
+          "type": "boolean"
+        },
+        "renamed_from": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "status",
+        "additions",
+        "deletions",
+        "binary"
+      ],
+      "title": "Git_change_entry_v4"
+    },
+    "Params_git_stage_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        },
+        "paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "thread_id"
+      ],
+      "title": "Params_git_stage_v4"
+    },
+    "Result_git_stage_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "stdout": {
+          "type": "string"
+        },
+        "stderr": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "ok",
+        "stdout",
+        "stderr"
+      ],
+      "title": "Result_git_stage_v4"
+    },
+    "Params_git_unstage_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        },
+        "paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "thread_id"
+      ],
+      "title": "Params_git_unstage_v4"
+    },
+    "Result_git_unstage_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "stdout": {
+          "type": "string"
+        },
+        "stderr": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "ok",
+        "stdout",
+        "stderr"
+      ],
+      "title": "Result_git_unstage_v4"
+    },
+    "Params_git_branches_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "thread_id"
+      ],
+      "title": "Params_git_branches_v4"
+    },
+    "Result_git_branches_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "branches": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "current": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stderr": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "ok",
+        "branches",
+        "current",
+        "stderr"
+      ],
+      "title": "Result_git_branches_v4"
+    },
+    "Params_git_branch_create_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        },
+        "branch": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "thread_id",
+        "branch"
+      ],
+      "title": "Params_git_branch_create_v4"
+    },
+    "Result_git_branch_create_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "branch": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stdout": {
+          "type": "string"
+        },
+        "stderr": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "ok",
+        "branch",
+        "stdout",
+        "stderr"
+      ],
+      "title": "Result_git_branch_create_v4"
+    },
+    "Params_git_commit_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "thread_id",
+        "message"
+      ],
+      "title": "Params_git_commit_v4"
+    },
+    "Result_git_commit_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "commit": {
+          "type": "string"
+        },
+        "stdout": {
+          "type": "string"
+        },
+        "stderr": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "ok",
+        "commit",
+        "stdout",
+        "stderr"
+      ],
+      "title": "Result_git_commit_v4"
+    },
+    "Params_git_push_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "thread_id"
+      ],
+      "title": "Params_git_push_v4"
+    },
+    "Result_git_push_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "pushed": {
+          "type": "boolean"
+        },
+        "remote": {
+          "type": "string"
+        },
+        "stdout": {
+          "type": "string"
+        },
+        "stderr": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "ok",
+        "pushed",
+        "remote",
+        "stdout",
+        "stderr"
+      ],
+      "title": "Result_git_push_v4"
+    },
+    "Params_git_pr_create_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "body": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "thread_id",
+        "title"
+      ],
+      "title": "Params_git_pr_create_v4"
+    },
+    "Result_git_pr_create_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "url": {
+          "type": "string"
+        },
+        "stdout": {
+          "type": "string"
+        },
+        "stderr": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "ok",
+        "url",
+        "stdout",
+        "stderr"
+      ],
+      "title": "Result_git_pr_create_v4"
+    },
+    "Params_terminal_open_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "thread_id"
+      ],
+      "title": "Params_terminal_open_v4"
+    },
+    "Result_terminal_open_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "opened": {
+          "type": "boolean"
+        },
+        "terminal_id": {
+          "type": "string"
+        },
+        "columns": {
+          "type": "integer"
+        },
+        "rows": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "opened",
+        "terminal_id",
+        "columns",
+        "rows"
+      ],
+      "title": "Result_terminal_open_v4"
+    },
+    "Params_terminal_input_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        },
+        "data": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "thread_id",
+        "data"
+      ],
+      "title": "Params_terminal_input_v4"
+    },
+    "Result_terminal_input_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "accepted": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "accepted"
+      ],
+      "title": "Result_terminal_input_v4"
+    },
+    "Params_terminal_resize_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        },
+        "columns": {
+          "type": "integer"
+        },
+        "rows": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "thread_id",
+        "columns",
+        "rows"
+      ],
+      "title": "Params_terminal_resize_v4"
+    },
+    "Result_terminal_resize_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "accepted": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "accepted"
+      ],
+      "title": "Result_terminal_resize_v4"
+    },
+    "Params_terminal_close_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "thread_id"
+      ],
+      "title": "Params_terminal_close_v4"
+    },
+    "Result_terminal_close_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "closed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "closed"
+      ],
+      "title": "Result_terminal_close_v4"
+    },
+    "Params_attachment_upload_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "mime_type": {
+          "type": "string"
+        },
+        "data_base64": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "data_base64"
+      ],
+      "title": "Params_attachment_upload_v4"
+    },
+    "Result_attachment_upload_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "attachment_id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "mime_type": {
+          "type": "string"
+        },
+        "size": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "attachment_id",
+        "name",
+        "mime_type",
+        "size"
+      ],
+      "title": "Result_attachment_upload_v4"
+    },
+    "Params_attachment_delete_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "attachment_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "attachment_id"
+      ],
+      "title": "Params_attachment_delete_v4"
+    },
+    "Result_attachment_delete_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "deleted": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "deleted"
+      ],
+      "title": "Result_attachment_delete_v4"
+    },
+    "Params_attachment_preview_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "attachment_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "attachment_id"
+      ],
+      "title": "Params_attachment_preview_v4"
+    },
+    "Result_attachment_preview_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "preview": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "preview"
+      ],
+      "title": "Result_attachment_preview_v4"
+    },
+    "Params_attachment_download_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "attachment_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "attachment_id"
+      ],
+      "title": "Params_attachment_download_v4"
+    },
+    "Result_attachment_download_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "data_base64": {
+          "type": "string"
+        },
+        "mime_type": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "data_base64",
+        "mime_type",
+        "name"
+      ],
+      "title": "Result_attachment_download_v4"
+    },
+    "Params_artifact_resolve_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        },
+        "paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "thread_id",
+        "paths"
+      ],
+      "title": "Params_artifact_resolve_v4"
+    },
+    "Result_artifact_resolve_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "artifacts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string"
+              },
+              "exists": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "path",
+              "kind",
+              "exists"
+            ]
+          }
+        }
+      },
+      "required": [
+        "artifacts"
+      ],
+      "title": "Result_artifact_resolve_v4"
+    },
+    "Params_artifact_download_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "thread_id",
+        "path"
+      ],
+      "title": "Params_artifact_download_v4"
+    },
+    "Result_artifact_download_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "data_base64": {
+          "type": "string"
+        },
+        "mime_type": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "data_base64",
+        "mime_type"
+      ],
+      "title": "Result_artifact_download_v4"
+    },
+    "Params_catalog_get_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        },
+        "workspace": {
+          "type": "string"
+        }
+      },
+      "title": "Params_catalog_get_v4"
+    },
+    "Result_catalog_get_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "models": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "skills": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "tools": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "providers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "prompt_templates": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "default_model_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "models",
+        "skills",
+        "tools",
+        "providers",
+        "prompt_templates",
+        "default_model_id"
+      ],
+      "title": "Result_catalog_get_v4"
+    },
+    "Params_provider_list_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "workspace": {
+          "type": "string"
+        }
+      },
+      "title": "Params_provider_list_v4"
+    },
+    "Result_provider_list_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "providers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
+      },
+      "required": [
+        "providers"
+      ],
+      "title": "Result_provider_list_v4"
+    },
+    "Params_provider_refresh_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "provider_id": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "provider_id"
+      ],
+      "title": "Params_provider_refresh_v4"
+    },
+    "Result_provider_refresh_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "provider": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "provider"
+      ],
+      "title": "Result_provider_refresh_v4"
+    },
+    "Params_provider_add_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "provider_id": {
+          "type": "string"
+        },
+        "config": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "revision": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "provider_id",
+        "config"
+      ],
+      "title": "Params_provider_add_v4"
+    },
+    "Result_provider_add_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "provider": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "provider"
+      ],
+      "title": "Result_provider_add_v4"
+    },
+    "Params_provider_remove_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "provider_id": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "provider_id"
+      ],
+      "title": "Params_provider_remove_v4"
+    },
+    "Result_provider_remove_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "removed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "removed"
+      ],
+      "title": "Result_provider_remove_v4"
+    },
+    "Params_settings_get_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "workspace": {
+          "type": "string"
+        }
+      },
+      "title": "Params_settings_get_v4"
+    },
+    "Result_settings_get_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "settings": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "revision": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "settings",
+        "revision"
+      ],
+      "title": "Result_settings_get_v4"
+    },
+    "Params_settings_update_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "patch": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "revision": {
+          "type": "integer"
+        },
+        "workspace": {
+          "type": "string"
+        },
+        "secret_actions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
+      },
+      "required": [
+        "patch",
+        "revision"
+      ],
+      "title": "Params_settings_update_v4"
+    },
+    "Result_settings_update_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "settings": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "revision": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "settings",
+        "revision"
+      ],
+      "title": "Result_settings_update_v4"
+    },
+    "Params_tools_search_test_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "query": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "title": "Params_tools_search_test_v4"
+    },
+    "Result_tools_search_test_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "results": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "engine": {
+          "type": "string"
+        },
+        "error": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "results",
+        "engine"
+      ],
+      "title": "Result_tools_search_test_v4"
+    },
+    "Params_plugins_list_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {},
+      "title": "Params_plugins_list_v4"
+    },
+    "Result_plugins_list_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "plugins": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "version": {
+                "type": "string"
+              },
+              "enabled": {
+                "type": "boolean"
+              },
+              "state": {
+                "type": "string"
+              },
+              "ports": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "error": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "version",
+              "enabled",
+              "state",
+              "ports"
+            ]
+          }
+        }
+      },
+      "required": [
+        "plugins"
+      ],
+      "title": "Result_plugins_list_v4"
+    },
+    "Params_plugins_set_enabled_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "plugin_id": {
+          "type": "string"
+        },
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "plugin_id",
+        "enabled"
+      ],
+      "title": "Params_plugins_set_enabled_v4"
+    },
+    "Result_plugins_set_enabled_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "plugin": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "plugin"
+      ],
+      "title": "Result_plugins_set_enabled_v4"
+    },
+    "Params_plugins_configure_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "plugin_id": {
+          "type": "string"
+        },
+        "settings": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "revision": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "plugin_id",
+        "settings",
+        "revision"
+      ],
+      "title": "Params_plugins_configure_v4"
+    },
+    "Result_plugins_configure_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "plugin": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "plugin",
+        "revision"
+      ],
+      "title": "Result_plugins_configure_v4"
+    },
+    "Event_operation_queued_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "queue_position": {
+          "type": "integer"
+        },
+        "skill_id": {
+          "type": "string"
+        },
+        "attachment_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "duration_ms": {
+          "type": "integer"
+        },
+        "error": {
+          "type": "string"
+        },
+        "code": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "Event_operation_queued_v4"
+    },
+    "Event_operation_started_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "queue_position": {
+          "type": "integer"
+        },
+        "skill_id": {
+          "type": "string"
+        },
+        "attachment_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "duration_ms": {
+          "type": "integer"
+        },
+        "error": {
+          "type": "string"
+        },
+        "code": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "Event_operation_started_v4"
+    },
+    "Event_operation_cancelling_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "queue_position": {
+          "type": "integer"
+        },
+        "skill_id": {
+          "type": "string"
+        },
+        "attachment_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "duration_ms": {
+          "type": "integer"
+        },
+        "error": {
+          "type": "string"
+        },
+        "code": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "Event_operation_cancelling_v4"
+    },
+    "Event_operation_completed_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "queue_position": {
+          "type": "integer"
+        },
+        "skill_id": {
+          "type": "string"
+        },
+        "attachment_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "duration_ms": {
+          "type": "integer"
+        },
+        "error": {
+          "type": "string"
+        },
+        "code": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "Event_operation_completed_v4"
+    },
+    "Event_operation_failed_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "queue_position": {
+          "type": "integer"
+        },
+        "skill_id": {
+          "type": "string"
+        },
+        "attachment_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "duration_ms": {
+          "type": "integer"
+        },
+        "error": {
+          "type": "string"
+        },
+        "code": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "Event_operation_failed_v4"
+    },
+    "Event_operation_cancelled_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "queue_position": {
+          "type": "integer"
+        },
+        "skill_id": {
+          "type": "string"
+        },
+        "attachment_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "duration_ms": {
+          "type": "integer"
+        },
+        "error": {
+          "type": "string"
+        },
+        "code": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "Event_operation_cancelled_v4"
+    },
+    "Event_content_started_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "block": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "block"
+      ],
+      "title": "Event_content_started_v4"
+    },
+    "Event_content_delta_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "block_id": {
+          "type": "string"
+        },
+        "delta": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "block_id",
+        "delta"
+      ],
+      "title": "Event_content_delta_v4"
+    },
+    "Event_content_updated_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "block_id": {
+          "type": "string"
+        },
+        "patch": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "block_id",
+        "patch"
+      ],
+      "title": "Event_content_updated_v4"
+    },
+    "Event_content_completed_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "block_id": {
+          "type": "string"
+        },
+        "patch": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "block_id",
+        "patch"
+      ],
+      "title": "Event_content_completed_v4"
+    },
+    "Event_tool_started_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "block": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "block"
+      ],
+      "title": "Event_tool_started_v4"
+    },
+    "Event_tool_updated_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "block_id": {
+          "type": "string"
+        },
+        "patch": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "block_id",
+        "patch"
+      ],
+      "title": "Event_tool_updated_v4"
+    },
+    "Event_tool_completed_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "block_id": {
+          "type": "string"
+        },
+        "patch": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "block_id",
+        "patch"
+      ],
+      "title": "Event_tool_completed_v4"
+    },
+    "Event_usage_updated_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "usage": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "stats": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "title": "Event_usage_updated_v4"
+    },
+    "Event_queue_updated_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "queued_operation_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "active_operation_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "title": "Event_queue_updated_v4"
+    },
+    "Event_retry_started_v4": {
+      "title": "Event_retry_started_v4",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "Event_retry_completed_v4": {
+      "title": "Event_retry_completed_v4",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "Event_settings_updated_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "revision": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "revision"
+      ],
+      "title": "Event_settings_updated_v4"
+    },
+    "Event_provider_updated_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "provider_id": {
+          "type": "string"
+        },
+        "action": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider_id",
+        "action"
+      ],
+      "title": "Event_provider_updated_v4"
+    },
+    "Event_log_entry_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "category": {
+          "type": "string"
+        },
+        "action": {
+          "type": "string"
+        },
+        "attachment_id": {
+          "type": "string"
+        },
+        "canonical_path": {
+          "type": "string"
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "pages": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "dpi": {
+          "type": "integer"
+        },
+        "level": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "data": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "runtime_version": {
+          "type": "string"
+        },
+        "runtime_commit": {
+          "type": "string"
+        }
+      },
+      "title": "Event_log_entry_v4"
+    },
+    "Event_system_shutdown_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "intentional": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "intentional",
+        "reason"
+      ],
+      "title": "Event_system_shutdown_v4"
+    },
+    "Event_terminal_opened_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "columns": {
+          "type": "integer"
+        },
+        "rows": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "columns",
+        "rows"
+      ],
+      "title": "Event_terminal_opened_v4"
+    },
+    "Event_terminal_output_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "data": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "data"
+      ],
+      "title": "Event_terminal_output_v4"
+    },
+    "Event_terminal_exit_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "type": "string"
+        },
+        "exit_code": {
+          "type": "integer"
+        },
+        "signal": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "title": "Event_terminal_exit_v4"
+    },
+    "Event_turn_created_v4": {
+      "title": "Event_turn_created_v4",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "Event_thread_compacted_v4": {
+      "title": "Event_thread_compacted_v4",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "Event_thread_navigated_v4": {
+      "title": "Event_thread_navigated_v4",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "Event_thread_renamed_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "title"
+      ],
+      "title": "Event_thread_renamed_v4"
+    },
+    "Event_plugin_cloud_account_updated_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "authenticated": {
+          "type": "boolean"
+        },
+        "user": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true
+        },
+        "base_url": {
+          "type": "string"
+        },
+        "vault_kind": {
+          "type": "string"
+        },
+        "ok": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "enabled",
+        "authenticated",
+        "user",
+        "base_url",
+        "vault_kind"
+      ],
+      "title": "Event_plugin_cloud_account_updated_v4"
+    },
+    "Event_capabilities_updated_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "capabilities": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
+      },
+      "required": [
+        "capabilities"
+      ],
+      "title": "Event_capabilities_updated_v4"
+    },
+    "Event_plugin_id_v4": {
+      "title": "Event_plugin_id_v4",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "Params_plugin_cloud_account_status_v4": {
+      "title": "Params_plugin_cloud_account_status_v4",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "workspace": {
+          "type": "string"
+        }
+      }
+    },
+    "Params_plugin_cloud_account_login_v4": {
+      "title": "Params_plugin_cloud_account_login_v4",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "username": {
+          "type": "string"
+        },
+        "password": {
+          "type": "string"
+        },
+        "workspace": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "username",
+        "password"
+      ]
+    },
+    "Params_plugin_cloud_account_logout_v4": {
+      "title": "Params_plugin_cloud_account_logout_v4",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "workspace": {
+          "type": "string"
+        }
+      }
+    },
+    "Result_plugin_cloud_account_status_v4": {
+      "title": "Result_plugin_cloud_account_status_v4",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "authenticated": {
+          "type": "boolean"
+        },
+        "user": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true
+        },
+        "base_url": {
+          "type": "string"
+        },
+        "vault_kind": {
+          "type": "string"
+        },
+        "ok": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "enabled",
+        "authenticated",
+        "user",
+        "base_url",
+        "vault_kind"
+      ]
+    },
+    "Params_plugin_memory_remember_v4": {
+      "title": "Params_plugin_memory_remember_v4",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "Result_plugin_memory_remember_v4": {
+      "title": "Result_plugin_memory_remember_v4",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "Params_plugin_memory_recall_v4": {
+      "title": "Params_plugin_memory_recall_v4",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "Result_plugin_memory_recall_v4": {
+      "title": "Result_plugin_memory_recall_v4",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "Params_plugin_memory_forget_v4": {
+      "title": "Params_plugin_memory_forget_v4",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "Result_plugin_memory_forget_v4": {
+      "title": "Result_plugin_memory_forget_v4",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "Params_plugin_knowledge_index_v4": {
+      "title": "Params_plugin_knowledge_index_v4",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "Result_plugin_knowledge_index_v4": {
+      "title": "Result_plugin_knowledge_index_v4",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "Params_plugin_knowledge_search_v4": {
+      "title": "Params_plugin_knowledge_search_v4",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "Result_plugin_knowledge_search_v4": {
+      "title": "Result_plugin_knowledge_search_v4",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "Params_plugin_knowledge_stat_v4": {
+      "title": "Params_plugin_knowledge_stat_v4",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "Result_plugin_knowledge_stat_v4": {
+      "title": "Result_plugin_knowledge_stat_v4",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "GitChangeFile_v4": {
+      "title": "GitChangeFile_v4",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "status",
+        "additions",
+        "deletions",
+        "binary"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "additions": {
+          "type": "integer"
+        },
+        "deletions": {
+          "type": "integer"
+        },
+        "binary": {
+          "type": "boolean"
+        },
+        "renamed_from": {
+          "type": "string"
+        }
+      }
+    },
+    "GitChangeGroup_v4": {
+      "title": "GitChangeGroup_v4",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "files",
+        "additions",
+        "deletions"
+      ],
+      "properties": {
+        "files": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/GitChangeFile_v4"
+          }
+        },
+        "additions": {
+          "type": "integer"
+        },
+        "deletions": {
+          "type": "integer"
+        }
+      }
+    },
+    "Device_v4": {
+      "title": "Device_v4",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name",
+        "platform",
+        "paired_at"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "platform": {
+          "type": "string"
+        },
+        "paired_at": {
+          "type": "string"
+        },
+        "last_seen_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "connected": {
+          "type": "boolean"
+        }
+      }
+    },
+    "Params_devices_list_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {},
+      "title": "Params_devices_list_v4"
+    },
+    "Result_devices_list_v4": {
+      "title": "Result_devices_list_v4",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "devices"
+      ],
+      "properties": {
+        "devices": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Device_v4"
+          }
+        }
+      }
+    },
+    "Params_devices_revoke_v4": {
+      "title": "Params_devices_revoke_v4",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "device_id"
+      ],
+      "properties": {
+        "device_id": {
+          "type": "string"
+        }
+      }
+    },
+    "Result_devices_revoke_v4": {
+      "title": "Result_devices_revoke_v4",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "revoked",
+        "devices"
+      ],
+      "properties": {
+        "revoked": {
+          "type": "boolean"
+        },
+        "devices": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Device_v4"
+          }
+        }
+      }
+    },
+    "Params_devices_enroll_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {},
+      "title": "Params_devices_enroll_v4"
+    },
+    "Result_devices_enroll_v4": {
+      "title": "Result_devices_enroll_v4",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "expires_at",
+        "pairing_url"
+      ],
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "expires_at": {
+          "type": "string"
+        },
+        "pairing_url": {
+          "type": "string"
+        }
+      }
+    },
+    "Params_devices_claim_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "client"],
+      "properties": {
+        "code": {"type": "string"},
+        "client": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "version"],
+          "properties": {
+            "name": {"type": "string"},
+            "version": {"type": "string"}
+          }
+        }
+      },
+      "title": "Params_devices_claim_v4"
+    },
+    "Result_devices_claim_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["device_id", "token"],
+      "properties": {
+        "device_id": {"type": "string"},
+        "token": {"type": "string"}
+      },
+      "title": "Result_devices_claim_v4"
+    },
+    "Params_workspace_roots_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {},
+      "title": "Params_workspace_roots_v4"
+    },
+    "Result_workspace_roots_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["roots"],
+      "properties": {
+        "roots": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "label", "path", "writable"],
+            "properties": {
+              "id": {"type": "string"},
+              "label": {"type": "string"},
+              "path": {"type": "string"},
+              "writable": {"type": "boolean"}
+            }
+          }
+        }
+      },
+      "title": "Result_workspace_roots_v4"
+    },
+    "Params_workspace_list_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["root_id", "relative_path"],
+      "properties": {
+        "root_id": {"type": "string"},
+        "relative_path": {"type": "string"}
+      },
+      "title": "Params_workspace_list_v4"
+    },
+    "Result_workspace_list_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["directory", "entries"],
+      "properties": {
+        "directory": {"type": "string"},
+        "entries": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "kind"],
+            "properties": {
+              "name": {"type": "string"},
+              "kind": {"enum": ["file", "directory"]}
+            }
+          }
+        }
+      },
+      "title": "Result_workspace_list_v4"
+    }
+  },
+  "protocol": "aeloon-rpc",
+  "version": "4.0.0",
+  "schema_version": 1,
+  "json_schema_draft": "https://json-schema.org/draft/2020-12/schema",
+  "frame_max_bytes": 41943040,
+  "file_max_bytes": 26214400,
+  "image_max_bytes": 10485760,
+  "transport": {
+    "encoding": "utf-8-json",
+    "framing": "uint32-be-length-prefix",
+    "max_frame_bytes": 41943040,
+    "file_bytes": 26214400,
+    "image_bytes": 10485760
+  },
+  "naming": "snake_case params; two-segment method names; thread is the public identity, session is its runtime projection",
+  "groups": [
+    {
+      "id": "system",
+      "title": "system · 握手 / 健康 / 能力",
+      "methods": [
+        {
+          "name": "system.handshake",
+          "params": {
+            "$ref": "#/$defs/Params_system_handshake_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_system_handshake_v4"
+          },
+          "src": "core",
+          "change": "changed",
+          "note": "协议固定为 4.0.0；WSS 正常握手只接受 device_token，握手结果携带 Runtime 身份与 Runtime 主机能力",
+          "params_signature": "{protocol:{min:\"4.0.0\",max:\"4.0.0\"}, client:{name,version,platform}, auth?:{kind:\"device_token\",token}}",
+          "result_signature": "{protocol:\"4.0.0\", runtime:{id,label,version,commit}, host:{hostname,platform,architecture,shell,tools}, limits}"
+        },
+        {
+          "name": "system.health",
+          "params": {
+            "$ref": "#/$defs/Params_system_health_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_system_health_v4"
+          },
+          "src": "core",
+          "change": "same",
+          "note": "原样保留",
+          "params_signature": "{workspace?}",
+          "result_signature": "{ok, uptime_s, active_operations}"
+        },
+        {
+          "name": "system.capabilities",
+          "params": {
+            "$ref": "#/$defs/Params_system_capabilities_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_system_capabilities_v4"
+          },
+          "src": "new",
+          "change": "new",
+          "note": "UI 显示什么面板的唯一来源。插件启停后发 capabilities.updated",
+          "params_signature": "{}",
+          "result_signature": "{capabilities:[{id,version,kind,enabled,settings_schema,methods[],events[],ui:{group,order}}]}"
+        },
+        {
+          "name": "system.snapshot",
+          "params": {
+            "$ref": "#/$defs/Params_system_snapshot_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_system_snapshot_v4"
+          },
+          "src": "workbench",
+          "change": "changed",
+          "note": "原 app.snapshot。Runtime 与 host 身份只来自 handshake",
+          "params_signature": "{}",
+          "result_signature": "{default_workspace, projects[], threads[]}"
+        },
+        {
+          "name": "system.shutdown",
+          "params": {
+            "$ref": "#/$defs/Params_system_shutdown_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_system_shutdown_v4"
+          },
+          "src": "core",
+          "change": "changed",
+          "note": "单租户下无权限位——通过鉴权即所有者。不做共享会话，因此不需要区分「关掉自己的」和「关掉别人的」",
+          "params_signature": "{}",
+          "result_signature": "{accepted}"
+        },
+        {
+          "name": "system.uninstall_inspect",
+          "params": {
+            "$ref": "#/$defs/Params_system_uninstall_inspect_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_system_uninstall_inspect_v4"
+          },
+          "src": "workbench",
+          "change": "changed",
+          "note": "只报告 Runtime 侧数据；客户端本地 app 数据由客户端自己算",
+          "params_signature": "{}",
+          "result_signature": "{data_paths[], estimated_bytes, active_operations, worktrees[]}"
+        },
+        {
+          "name": "system.uninstall_prepare",
+          "params": {
+            "$ref": "#/$defs/Params_system_uninstall_prepare_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_system_uninstall_prepare_v4"
+          },
+          "src": "workbench",
+          "change": "same",
+          "note": "活动 operation 或脏 worktree 时拒绝",
+          "params_signature": "{}",
+          "result_signature": "{prepared, removed_worktrees[]}"
+        }
+      ]
+    },
+    {
+      "id": "events",
+      "title": "events · 订阅",
+      "methods": [
+        {
+          "name": "events.subscribe",
+          "params": {
+            "$ref": "#/$defs/Params_events_subscribe_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_events_subscribe_v4"
+          },
+          "src": "core",
+          "change": "changed",
+          "note": "只改 session_ids → thread_ids。断线续传机制**今天已经有**：adapter 用 maxlen 有界 deque 保留事件，after_seq 增量重放，replay_complete 告诉客户端缓冲区是否已经滚过去（滚过去就必须走 thread.get 全量重取），server_instance_id 用于识别 Runtime 重启。v4 原样保留，不要重新发明",
+          "params_signature": "{thread_ids[], after_seq?, server_instance_id?}",
+          "result_signature": "{server_instance_id, current_seq, replay_complete, events[], cursor:{server_instance_id,seq}}"
+        }
+      ]
+    },
+    {
+      "id": "diagnostics",
+      "title": "diagnostics · 过滤后的 Runtime 生命周期日志",
+      "methods": [
+        {
+          "name": "diagnostics.logs",
+          "params": {
+            "$ref": "#/$defs/Params_diagnostics_logs_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_diagnostics_logs_v4"
+          },
+          "src": "new",
+          "change": "new",
+          "note": "单租户下任何已鉴权设备都可读。只读 runtime.log.1 与 runtime.log；跳过损坏或未写完的行；fields 仅含白名单标量。limit 默认 200，范围 1..500，最新记录在前",
+          "params_signature": "{limit?}",
+          "result_signature": "{entries:[{at,event,fields}], truncated}"
+        }
+      ]
+    },
+    {
+      "id": "project",
+      "title": "project · 项目",
+      "methods": [
+        {
+          "name": "project.list",
+          "params": {
+            "$ref": "#/$defs/Params_project_list_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_project_list_v4"
+          },
+          "src": "new",
+          "change": "new",
+          "note": "从 app.snapshot 里拆出来，让项目列表可以单独刷新",
+          "params_signature": "{}",
+          "result_signature": "{projects[]}"
+        },
+        {
+          "name": "project.add",
+          "params": {
+            "$ref": "#/$defs/Params_project_add_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_project_add_v4"
+          },
+          "src": "workbench",
+          "change": "changed",
+          "note": "通过 root_id 与相对路径选择 Runtime 主机上的项目，拒绝越界与符号链接",
+          "params_signature": "{root_id,relative_path}",
+          "result_signature": "{project, projects[]}"
+        },
+        {
+          "name": "project.remove",
+          "params": {
+            "$ref": "#/$defs/Params_project_remove_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_project_remove_v4"
+          },
+          "src": "workbench",
+          "change": "same",
+          "note": "级联关闭该项目下所有线程的 PTY",
+          "params_signature": "{project_id}",
+          "result_signature": "{removed}"
+        },
+        {
+          "name": "project.refresh",
+          "params": {
+            "$ref": "#/$defs/Params_project_refresh_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_project_refresh_v4"
+          },
+          "src": "workbench",
+          "change": "same",
+          "note": "重新探测名称与是否 git 仓",
+          "params_signature": "{project_id}",
+          "result_signature": "{project, projects[]}"
+        }
+      ]
+    },
+    {
+      "id": "thread",
+      "title": "thread · 线程（吸收全部 session.*）",
+      "methods": [
+        {
+          "name": "thread.create",
+          "params": {
+            "$ref": "#/$defs/Params_thread_create_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_thread_create_v4"
+          },
+          "src": "both",
+          "change": "changed",
+          "note": "今天要 4 次跨进程调用（session.create + settings.get + session.configure + 写库），合并后是一个事务",
+          "params_signature": "{project_id|workspace, title?, kind:\"standard\"|\"worktree\", branch?, model_id?}",
+          "result_signature": "{thread, threads[]}"
+        },
+        {
+          "name": "thread.list",
+          "params": {
+            "$ref": "#/$defs/Params_thread_list_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_thread_list_v4"
+          },
+          "src": "workbench",
+          "change": "changed",
+          "note": "吸收 thread.archived.list",
+          "params_signature": "{project_id?, filter:\"active\"|\"archived\"|\"all\"}",
+          "result_signature": "{threads[]}"
+        },
+        {
+          "name": "thread.get",
+          "params": {
+            "$ref": "#/$defs/Params_thread_get_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_thread_get_v4"
+          },
+          "src": "workbench",
+          "change": "changed",
+          "note": "原 thread.snapshot。合并后不再需要 flushEvents 与 refreshSessionSnapshot 的双路径",
+          "params_signature": "{thread_id, refresh?}",
+          "result_signature": "{thread, stats, history[], turns[], events[]}"
+        },
+        {
+          "name": "thread.delete",
+          "params": {
+            "$ref": "#/$defs/Params_thread_delete_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_thread_delete_v4"
+          },
+          "src": "both",
+          "change": "changed",
+          "note": "运行中拒绝；连带删附件、关 PTY、删 session",
+          "params_signature": "{thread_id}",
+          "result_signature": "{deleted}"
+        },
+        {
+          "name": "thread.rename",
+          "params": {
+            "$ref": "#/$defs/Params_thread_rename_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_thread_rename_v4"
+          },
+          "src": "both",
+          "change": "changed",
+          "note": "今天要同时写 core session 和本地库，合并后一次",
+          "params_signature": "{thread_id, title}",
+          "result_signature": "{thread}"
+        },
+        {
+          "name": "thread.configure",
+          "params": {
+            "$ref": "#/$defs/Params_thread_configure_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_thread_configure_v4"
+          },
+          "src": "both",
+          "change": "changed",
+          "note": "同上",
+          "params_signature": "{thread_id, model_id?, thinking_level?}",
+          "result_signature": "{thread}"
+        },
+        {
+          "name": "thread.reorder",
+          "params": {
+            "$ref": "#/$defs/Params_thread_reorder_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_thread_reorder_v4"
+          },
+          "src": "workbench",
+          "change": "same",
+          "note": "拖拽排序持久化",
+          "params_signature": "{project_id, thread_ids[]}",
+          "result_signature": "{threads[]}"
+        },
+        {
+          "name": "thread.set_pinned",
+          "params": {
+            "$ref": "#/$defs/Params_thread_set_pinned_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_thread_set_pinned_v4"
+          },
+          "src": "workbench",
+          "change": "changed",
+          "note": "原 thread.pin，改为显式布尔",
+          "params_signature": "{thread_id, pinned}",
+          "result_signature": "{thread}"
+        },
+        {
+          "name": "thread.set_archived",
+          "params": {
+            "$ref": "#/$defs/Params_thread_set_archived_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_thread_set_archived_v4"
+          },
+          "src": "workbench",
+          "change": "changed",
+          "note": "合并 thread.archive 与 thread.unarchive",
+          "params_signature": "{thread_id, archived}",
+          "result_signature": "{thread}"
+        },
+        {
+          "name": "thread.set_read",
+          "params": {
+            "$ref": "#/$defs/Params_thread_set_read_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_thread_set_read_v4"
+          },
+          "src": "workbench",
+          "change": "changed",
+          "note": "合并 thread.read 与 thread.unread",
+          "params_signature": "{thread_id, read}",
+          "result_signature": "{updated}"
+        },
+        {
+          "name": "thread.context",
+          "params": {
+            "$ref": "#/$defs/Params_thread_context_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_thread_context_v4"
+          },
+          "src": "workbench",
+          "change": "changed",
+          "note": "今天要 catalog.get + session.get 两次调用，合并后一次",
+          "params_signature": "{thread_id}",
+          "result_signature": "{used, maximum, ratio}"
+        },
+        {
+          "name": "thread.tree",
+          "params": {
+            "$ref": "#/$defs/Params_thread_tree_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_thread_tree_v4"
+          },
+          "src": "core",
+          "change": "changed",
+          "note": "原 session.tree。thread 与 session 定为 1:1，分支是 session 内部概念，方法签名不带 session_id",
+          "params_signature": "{thread_id}",
+          "result_signature": "{nodes[], current}"
+        },
+        {
+          "name": "thread.navigate",
+          "params": {
+            "$ref": "#/$defs/Params_thread_navigate_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_thread_navigate_v4"
+          },
+          "src": "core",
+          "change": "changed",
+          "note": "原 session.navigate",
+          "params_signature": "{thread_id, node_id}",
+          "result_signature": "{current, stats}"
+        },
+        {
+          "name": "thread.compact",
+          "params": {
+            "$ref": "#/$defs/Params_thread_compact_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_thread_compact_v4"
+          },
+          "src": "core",
+          "change": "changed",
+          "note": "原 session.compact。注意与 Memory 插件区分：这是会话内压缩，不是跨会话记忆",
+          "params_signature": "{thread_id, mode?}",
+          "result_signature": "{compacted, stats}"
+        },
+        {
+          "name": "thread.next_turn",
+          "params": {
+            "$ref": "#/$defs/Params_thread_next_turn_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_thread_next_turn_v4"
+          },
+          "src": "core",
+          "change": "changed",
+          "note": "原 session.next_turn",
+          "params_signature": "{thread_id}",
+          "result_signature": "{turn_id}"
+        }
+      ]
+    },
+    {
+      "id": "turn",
+      "title": "turn · 回合",
+      "methods": [
+        {
+          "name": "turn.start",
+          "params": {
+            "$ref": "#/$defs/Params_turn_start_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_turn_start_v4"
+          },
+          "src": "both",
+          "change": "changed",
+          "note": "attachments 从内联对象改为 attachment_ids，配合 attachment.upload",
+          "params_signature": "{thread_id, text, attachment_ids[]}",
+          "result_signature": "{operation_id, turn_id}"
+        },
+        {
+          "name": "turn.cancel",
+          "params": {
+            "$ref": "#/$defs/Params_turn_cancel_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_turn_cancel_v4"
+          },
+          "src": "both",
+          "change": "changed",
+          "note": "今天 workbench 叫 turnId、core 叫 operation_id，统一为 operation_id",
+          "params_signature": "{operation_id}",
+          "result_signature": "{cancelling}"
+        },
+        {
+          "name": "turn.steer",
+          "params": {
+            "$ref": "#/$defs/Params_turn_steer_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_turn_steer_v4"
+          },
+          "src": "core",
+          "change": "same",
+          "note": "workbench 今天没暴露，v4 直接给 UI",
+          "params_signature": "{operation_id, text}",
+          "result_signature": "{accepted}"
+        },
+        {
+          "name": "turn.follow_up",
+          "params": {
+            "$ref": "#/$defs/Params_turn_follow_up_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_turn_follow_up_v4"
+          },
+          "src": "core",
+          "change": "same",
+          "note": "同上",
+          "params_signature": "{thread_id, text}",
+          "result_signature": "{accepted}"
+        }
+      ]
+    },
+    {
+      "id": "fs",
+      "title": "fs · 远程文件（原 file.*）",
+      "methods": [
+        {
+          "name": "fs.roots",
+          "params": {
+            "$ref": "#/$defs/Params_fs_roots_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_fs_roots_v4"
+          },
+          "src": "new",
+          "change": "new",
+          "note": "替代 workspace.choose。根由 Runtime 启动参数 --workspace-root 声明，默认为启动目录 ./，不暴露 $HOME。桌面启动器必须显式传参",
+          "params_signature": "{}",
+          "result_signature": "{roots:[{path,label,writable}]}"
+        },
+        {
+          "name": "fs.list",
+          "params": {
+            "$ref": "#/$defs/Params_fs_list_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_fs_list_v4"
+          },
+          "src": "workbench",
+          "change": "changed",
+          "note": "原 file.list。必须做 workspace 越界检查",
+          "params_signature": "{thread_id|root, path?}",
+          "result_signature": "{entries:[{name,kind,size,mtime}]}"
+        },
+        {
+          "name": "fs.read",
+          "params": {
+            "$ref": "#/$defs/Params_fs_read_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_fs_read_v4"
+          },
+          "src": "workbench",
+          "change": "same",
+          "note": "原 file.read，仍是预览用途",
+          "params_signature": "{thread_id, path, max_bytes?}",
+          "result_signature": "{content, truncated, encoding}"
+        }
+      ]
+    },
+    {
+      "id": "workspace",
+      "title": "workspace · Runtime 授权根目录",
+      "methods": [
+        {
+          "name": "workspace.roots",
+          "params": {"$ref": "#/$defs/Params_workspace_roots_v4"},
+          "result": {"$ref": "#/$defs/Result_workspace_roots_v4"},
+          "src": "new",
+          "change": "new",
+          "note": "返回启动参数授权的根目录；不暴露客户端本机路径",
+          "params_signature": "{}",
+          "result_signature": "{roots:[{id,label,path,writable}]}"
+        },
+        {
+          "name": "workspace.list",
+          "params": {"$ref": "#/$defs/Params_workspace_list_v4"},
+          "result": {"$ref": "#/$defs/Result_workspace_list_v4"},
+          "src": "new",
+          "change": "new",
+          "note": "按 root_id 与相对路径列目录，拒绝越界与符号链接",
+          "params_signature": "{root_id,relative_path}",
+          "result_signature": "{directory,entries:[{name,kind}]}"
+        }
+      ]
+    },
+    {
+      "id": "git",
+      "title": "git · 全部在 Runtime 主机上执行",
+      "methods": [
+        {
+          "name": "git.status",
+          "params": {
+            "$ref": "#/$defs/Params_git_status_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_git_status_v4"
+          },
+          "src": "workbench",
+          "change": "same",
+          "note": "",
+          "params_signature": "{thread_id}",
+          "result_signature": "{ok,branch,entries[],stderr}"
+        },
+        {
+          "name": "git.github_status",
+          "params": {
+            "$ref": "#/$defs/Params_git_github_status_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_git_github_status_v4"
+          },
+          "src": "workbench",
+          "change": "changed",
+          "note": "原 git.github.status（三段命名）。authenticated 语义从「笔记本已登录」变成「Runtime 主机已登录」",
+          "params_signature": "{thread_id}",
+          "result_signature": "{github_origin,authenticated,remote,stderr}"
+        },
+        {
+          "name": "git.diff",
+          "params": {
+            "$ref": "#/$defs/Params_git_diff_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_git_diff_v4"
+          },
+          "src": "workbench",
+          "change": "same",
+          "note": "带 path 时返回单文件 diff",
+          "params_signature": "{thread_id, scope:\"changes\"|\"staged\", path?}",
+          "result_signature": "{ok,scope,path,patch,binary,truncated,stderr}"
+        },
+        {
+          "name": "git.changes",
+          "params": {
+            "$ref": "#/$defs/Params_git_changes_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_git_changes_v4"
+          },
+          "src": "workbench",
+          "change": "same",
+          "note": "",
+          "params_signature": "{thread_id}",
+          "result_signature": "{branch,staged:{files,additions,deletions},changes:{files,additions,deletions}}"
+        },
+        {
+          "name": "git.stage",
+          "params": {
+            "$ref": "#/$defs/Params_git_stage_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_git_stage_v4"
+          },
+          "src": "workbench",
+          "change": "same",
+          "note": "paths 省略则全部",
+          "params_signature": "{thread_id, paths[]?}",
+          "result_signature": "{ok,stdout,stderr}"
+        },
+        {
+          "name": "git.unstage",
+          "params": {
+            "$ref": "#/$defs/Params_git_unstage_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_git_unstage_v4"
+          },
+          "src": "workbench",
+          "change": "same",
+          "note": "",
+          "params_signature": "{thread_id, paths[]?}",
+          "result_signature": "{ok,stdout,stderr}"
+        },
+        {
+          "name": "git.branches",
+          "params": {
+            "$ref": "#/$defs/Params_git_branches_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_git_branches_v4"
+          },
+          "src": "workbench",
+          "change": "same",
+          "note": "",
+          "params_signature": "{thread_id}",
+          "result_signature": "{ok,branches[],current,stderr}"
+        },
+        {
+          "name": "git.branch_create",
+          "params": {
+            "$ref": "#/$defs/Params_git_branch_create_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_git_branch_create_v4"
+          },
+          "src": "workbench",
+          "change": "changed",
+          "note": "原 git.branch.create",
+          "params_signature": "{thread_id, branch}",
+          "result_signature": "{ok,branch,stdout,stderr}"
+        },
+        {
+          "name": "git.commit",
+          "params": {
+            "$ref": "#/$defs/Params_git_commit_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_git_commit_v4"
+          },
+          "src": "workbench",
+          "change": "same",
+          "note": "",
+          "params_signature": "{thread_id, message}",
+          "result_signature": "{ok,commit,stdout,stderr}"
+        },
+        {
+          "name": "git.push",
+          "params": {
+            "$ref": "#/$defs/Params_git_push_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_git_push_v4"
+          },
+          "src": "workbench",
+          "change": "same",
+          "note": "凭据在 Runtime 主机上",
+          "params_signature": "{thread_id}",
+          "result_signature": "{ok,pushed,remote,stdout,stderr}"
+        },
+        {
+          "name": "git.pr_create",
+          "params": {
+            "$ref": "#/$defs/Params_git_pr_create_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_git_pr_create_v4"
+          },
+          "src": "workbench",
+          "change": "changed",
+          "note": "原 git.pr.create。需要 Runtime 主机上 gh 已登录",
+          "params_signature": "{thread_id, title, body?}",
+          "result_signature": "{ok,url,stdout,stderr}"
+        }
+      ]
+    },
+    {
+      "id": "terminal",
+      "title": "terminal · Runtime 侧 PTY",
+      "methods": [
+        {
+          "name": "terminal.open",
+          "params": {
+            "$ref": "#/$defs/Params_terminal_open_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_terminal_open_v4"
+          },
+          "src": "workbench",
+          "change": "same",
+          "note": "PTY 跑在 Runtime 主机上",
+          "params_signature": "{thread_id}",
+          "result_signature": "{opened, terminal_id, columns, rows}"
+        },
+        {
+          "name": "terminal.input",
+          "params": {
+            "$ref": "#/$defs/Params_terminal_input_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_terminal_input_v4"
+          },
+          "src": "workbench",
+          "change": "same",
+          "note": "高频小包，远程时是背压主要来源",
+          "params_signature": "{thread_id, data}",
+          "result_signature": "{accepted}"
+        },
+        {
+          "name": "terminal.resize",
+          "params": {
+            "$ref": "#/$defs/Params_terminal_resize_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_terminal_resize_v4"
+          },
+          "src": "workbench",
+          "change": "same",
+          "note": "",
+          "params_signature": "{thread_id, columns, rows}",
+          "result_signature": "{accepted}"
+        },
+        {
+          "name": "terminal.close",
+          "params": {
+            "$ref": "#/$defs/Params_terminal_close_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_terminal_close_v4"
+          },
+          "src": "workbench",
+          "change": "same",
+          "note": "",
+          "params_signature": "{thread_id}",
+          "result_signature": "{closed}"
+        }
+      ]
+    },
+    {
+      "id": "attachment",
+      "title": "attachment · 附件",
+      "methods": [
+        {
+          "name": "attachment.upload",
+          "params": {
+            "$ref": "#/$defs/Params_attachment_upload_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_attachment_upload_v4"
+          },
+          "src": "workbench",
+          "change": "changed",
+          "note": "原 attachment.save。今天 UI 已经在传 base64，所以远程化不需要新造上传通道——只需要让 Runtime 返回 id 而不是路径。单次传完，上限见握手 limits.file_bytes",
+          "params_signature": "{name, mime_type?, data_base64}",
+          "result_signature": "{attachment_id, name, mime_type, size}"
+        },
+        {
+          "name": "attachment.delete",
+          "params": {
+            "$ref": "#/$defs/Params_attachment_delete_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_attachment_delete_v4"
+          },
+          "src": "workbench",
+          "change": "changed",
+          "note": "参数从 {id, path} 变成只要 id",
+          "params_signature": "{attachment_id}",
+          "result_signature": "{deleted}"
+        },
+        {
+          "name": "attachment.preview",
+          "params": {
+            "$ref": "#/$defs/Params_attachment_preview_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_attachment_preview_v4"
+          },
+          "src": "workbench",
+          "change": "changed",
+          "note": "同上",
+          "params_signature": "{attachment_id}",
+          "result_signature": "{kind, preview}"
+        },
+        {
+          "name": "attachment.download",
+          "params": {
+            "$ref": "#/$defs/Params_attachment_download_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_attachment_download_v4"
+          },
+          "src": "new",
+          "change": "new",
+          "note": "替代 attachment.open / attachment.reveal。Runtime 给字节，客户端在本机打开或另存",
+          "params_signature": "{attachment_id}",
+          "result_signature": "{data_base64, mime_type, name}"
+        }
+      ]
+    },
+    {
+      "id": "artifact",
+      "title": "artifact · 会话产物",
+      "methods": [
+        {
+          "name": "artifact.resolve",
+          "params": {
+            "$ref": "#/$defs/Params_artifact_resolve_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_artifact_resolve_v4"
+          },
+          "src": "workbench",
+          "change": "same",
+          "note": "",
+          "params_signature": "{thread_id, paths[]}",
+          "result_signature": "{artifacts:[{path,kind,exists}]}"
+        },
+        {
+          "name": "artifact.download",
+          "params": {
+            "$ref": "#/$defs/Params_artifact_download_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_artifact_download_v4"
+          },
+          "src": "new",
+          "change": "new",
+          "note": "替代 artifact.open / artifact.reveal",
+          "params_signature": "{thread_id, path}",
+          "result_signature": "{data_base64, mime_type}"
+        }
+      ]
+    },
+    {
+      "id": "catalog",
+      "title": "catalog / provider / settings / tools",
+      "methods": [
+        {
+          "name": "catalog.get",
+          "params": {
+            "$ref": "#/$defs/Params_catalog_get_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_catalog_get_v4"
+          },
+          "src": "both",
+          "change": "same",
+          "note": "workbench 今天是纯代理，合并后直连",
+          "params_signature": "{thread_id?, workspace?}",
+          "result_signature": "{models[], skills[], tools[], providers[], prompt_templates[], default_model_id}"
+        },
+        {
+          "name": "provider.list",
+          "params": {
+            "$ref": "#/$defs/Params_provider_list_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_provider_list_v4"
+          },
+          "src": "both",
+          "change": "same",
+          "note": "纯代理，合并后直连",
+          "params_signature": "{workspace?}",
+          "result_signature": "{providers[]}"
+        },
+        {
+          "name": "provider.refresh",
+          "params": {
+            "$ref": "#/$defs/Params_provider_refresh_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_provider_refresh_v4"
+          },
+          "src": "both",
+          "change": "same",
+          "note": "同上",
+          "params_signature": "{provider_id, revision?}",
+          "result_signature": "{provider}"
+        },
+        {
+          "name": "provider.add",
+          "params": {
+            "$ref": "#/$defs/Params_provider_add_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_provider_add_v4"
+          },
+          "src": "both",
+          "change": "same",
+          "note": "同上",
+          "params_signature": "{provider_id, config, revision?}",
+          "result_signature": "{provider}"
+        },
+        {
+          "name": "provider.remove",
+          "params": {
+            "$ref": "#/$defs/Params_provider_remove_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_provider_remove_v4"
+          },
+          "src": "both",
+          "change": "same",
+          "note": "同上",
+          "params_signature": "{provider_id, revision?}",
+          "result_signature": "{removed}"
+        },
+        {
+          "name": "settings.get",
+          "params": {
+            "$ref": "#/$defs/Params_settings_get_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_settings_get_v4"
+          },
+          "src": "both",
+          "change": "same",
+          "note": "纯代理，合并后直连。必须一并返回 plugins 段——与 plugins.configure 共用同一份 Config 与同一个 revision",
+          "params_signature": "{workspace?}",
+          "result_signature": "{settings, revision}"
+        },
+        {
+          "name": "settings.update",
+          "params": {
+            "$ref": "#/$defs/Params_settings_update_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_settings_update_v4"
+          },
+          "src": "both",
+          "change": "same",
+          "note": "乐观并发，冲突返回 revision_conflict。与 plugins.configure 是同一个写路径的两个入口",
+          "params_signature": "{patch, revision, workspace?, secret_actions?}",
+          "result_signature": "{settings, revision}"
+        },
+        {
+          "name": "tools.search_test",
+          "params": {
+            "$ref": "#/$defs/Params_tools_search_test_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_tools_search_test_v4"
+          },
+          "src": "both",
+          "change": "changed",
+          "note": "原 tools.search.test（三段命名）",
+          "params_signature": "{query, provider?}",
+          "result_signature": "{results[], engine, error?}"
+        }
+      ]
+    },
+    {
+      "id": "devices",
+      "title": "devices · 设备配对与令牌（4.0.0 新增）",
+      "methods": [
+        {
+          "name": "devices.list",
+          "params": {
+            "$ref": "#/$defs/Params_devices_list_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_devices_list_v4"
+          },
+          "src": "new",
+          "change": "new",
+          "note": "单租户：这里列的是同一个所有者的多台设备，不是多个用户",
+          "params_signature": "{}",
+          "result_signature": "{devices:[{id,name,platform,paired_at,last_seen_at,connected}]}"
+        },
+        {
+          "name": "devices.revoke",
+          "params": {
+            "$ref": "#/$defs/Params_devices_revoke_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_devices_revoke_v4"
+          },
+          "src": "new",
+          "change": "new",
+          "note": "吊销后立即断开该设备的活动连接，而不是等它下次握手",
+          "params_signature": "{device_id}",
+          "result_signature": "{revoked,devices[]}"
+        },
+        {
+          "name": "devices.enroll",
+          "params": {
+            "$ref": "#/$defs/Params_devices_enroll_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_devices_enroll_v4"
+          },
+          "src": "new",
+          "change": "new",
+          "note": "从已配对设备生成新注册码，配第二台机器时不必回到服务器终端。短时效、一次性",
+          "params_signature": "{}",
+          "result_signature": "{code,expires_at,pairing_url}"
+        },
+        {
+          "name": "devices.claim",
+          "params": {
+            "$ref": "#/$defs/Params_devices_claim_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_devices_claim_v4"
+          },
+          "src": "new",
+          "change": "new",
+          "note": "WSS 配对连接上的一次性注册码兑换；成功后连接立即关闭，令牌只通过该响应返回",
+          "params_signature": "{code,client:{name,version}}",
+          "result_signature": "{device_id,token}"
+        }
+      ]
+    },
+    {
+      "id": "plugins",
+      "title": "plugins · 插件管理（新）",
+      "methods": [
+        {
+          "name": "plugins.list",
+          "params": {
+            "$ref": "#/$defs/Params_plugins_list_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_plugins_list_v4"
+          },
+          "src": "new",
+          "change": "new",
+          "note": "比 system.capabilities 更细：含未启用、加载失败的插件与失败原因",
+          "params_signature": "{}",
+          "result_signature": "{plugins:[{id,version,enabled,state,ports[],error?}]}"
+        },
+        {
+          "name": "plugins.set_enabled",
+          "params": {
+            "$ref": "#/$defs/Params_plugins_set_enabled_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_plugins_set_enabled_v4"
+          },
+          "src": "new",
+          "change": "new",
+          "note": "L1 热插拔。disable 时把 Port 换成 Null 实现，不重启 Runtime",
+          "params_signature": "{plugin_id, enabled}",
+          "result_signature": "{plugin}"
+        },
+        {
+          "name": "plugins.configure",
+          "params": {
+            "$ref": "#/$defs/Params_plugins_configure_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_plugins_configure_v4"
+          },
+          "src": "new",
+          "change": "new",
+          "note": "settings 由插件自己的 pydantic model 校验；失败只禁用该插件并上报。与 settings.update 写同一份 Config、共用 revision；单独成方法是因为它还要触发插件生命周期（重新装配 Provider）",
+          "params_signature": "{plugin_id, settings, revision}",
+          "result_signature": "{plugin, revision}"
+        }
+      ]
+    }
+  ],
+  "plugin_contributed": {
+    "namespace": "plugin.<plugin_id>.<method>",
+    "note": "插件贡献的方法一律带 plugin.<id>. 前缀，避免与一等方法撞名，也让 UI 能从 capabilities 推断哪些可调",
+    "methods": [
+      {
+        "name": "plugin.cloud.account_status",
+        "from": "cloud.account.status",
+        "params": {
+          "$ref": "#/$defs/Params_plugin_cloud_account_status_v4"
+        },
+        "result": {
+          "$ref": "#/$defs/Result_plugin_cloud_account_status_v4"
+        }
+      },
+      {
+        "name": "plugin.cloud.account_login",
+        "from": "cloud.account.login",
+        "params": {
+          "$ref": "#/$defs/Params_plugin_cloud_account_login_v4"
+        },
+        "result": {
+          "$ref": "#/$defs/Result_plugin_cloud_account_status_v4"
+        }
+      },
+      {
+        "name": "plugin.cloud.account_logout",
+        "from": "cloud.account.logout",
+        "params": {
+          "$ref": "#/$defs/Params_plugin_cloud_account_logout_v4"
+        },
+        "result": {
+          "$ref": "#/$defs/Result_plugin_cloud_account_status_v4"
+        }
+      },
+      {
+        "name": "plugin.memory.remember",
+        "from": "新增",
+        "params": {
+          "$ref": "#/$defs/Params_plugin_memory_remember_v4"
+        },
+        "result": {
+          "$ref": "#/$defs/Result_plugin_memory_remember_v4"
+        }
+      },
+      {
+        "name": "plugin.memory.recall",
+        "from": "新增",
+        "params": {
+          "$ref": "#/$defs/Params_plugin_memory_recall_v4"
+        },
+        "result": {
+          "$ref": "#/$defs/Result_plugin_memory_recall_v4"
+        }
+      },
+      {
+        "name": "plugin.memory.forget",
+        "from": "新增",
+        "params": {
+          "$ref": "#/$defs/Params_plugin_memory_forget_v4"
+        },
+        "result": {
+          "$ref": "#/$defs/Result_plugin_memory_forget_v4"
+        }
+      },
+      {
+        "name": "plugin.knowledge.index",
+        "from": "新增",
+        "params": {
+          "$ref": "#/$defs/Params_plugin_knowledge_index_v4"
+        },
+        "result": {
+          "$ref": "#/$defs/Result_plugin_knowledge_index_v4"
+        }
+      },
+      {
+        "name": "plugin.knowledge.search",
+        "from": "新增",
+        "params": {
+          "$ref": "#/$defs/Params_plugin_knowledge_search_v4"
+        },
+        "result": {
+          "$ref": "#/$defs/Result_plugin_knowledge_search_v4"
+        }
+      },
+      {
+        "name": "plugin.knowledge.stat",
+        "from": "新增",
+        "params": {
+          "$ref": "#/$defs/Params_plugin_knowledge_stat_v4"
+        },
+        "result": {
+          "$ref": "#/$defs/Result_plugin_knowledge_stat_v4"
+        }
+      }
+    ]
+  },
+  "removed": [
+    {
+      "name": "workspace.choose",
+      "why": "客户端本地",
+      "detail": "调 Electron 原生目录对话框。远程 Runtime 上无意义。改用 fs.roots + fs.list 做远程浏览器"
+    },
+    {
+      "name": "attachment.open",
+      "why": "客户端本地",
+      "detail": "在 Runtime 主机的桌面上打开文件是错的。改用 attachment.download 后由客户端本地打开"
+    },
+    {
+      "name": "attachment.reveal",
+      "why": "客户端本地",
+      "detail": "同上，「在访达中显示」在远程语境下没有意义"
+    },
+    {
+      "name": "artifact.open",
+      "why": "客户端本地",
+      "detail": "同上"
+    },
+    {
+      "name": "artifact.reveal",
+      "why": "客户端本地",
+      "detail": "同上"
+    },
+    {
+      "name": "core.mark_interrupted",
+      "why": "合并后消失",
+      "detail": "跨进程重连后把活动 turn 标记为中断的对账动作，进程内不需要"
+    },
+    {
+      "name": "thread.archive / thread.unarchive",
+      "why": "合并",
+      "detail": "→ thread.set_archived"
+    },
+    {
+      "name": "thread.read / thread.unread",
+      "why": "合并",
+      "detail": "→ thread.set_read"
+    },
+    {
+      "name": "thread.pin",
+      "why": "合并",
+      "detail": "→ thread.set_pinned（显式布尔）"
+    },
+    {
+      "name": "thread.archived.list",
+      "why": "合并",
+      "detail": "→ thread.list(filter=\"archived\")"
+    },
+    {
+      "name": "session.* 全部 10 个",
+      "why": "改名",
+      "detail": "session.create/list/get/delete/rename/configure/tree/navigate/compact/next_turn → thread.*。thread 是持久身份，session 降为内部投影"
+    },
+    {
+      "name": "13 个代理方法",
+      "why": "塌缩",
+      "detail": "turn.start/cancel、catalog.get、provider.*4、settings.*2、tools.search.test、cloud.account.*3 今天在 workbench 和 core 各有一份，合并后只剩一份"
+    }
+  ],
+  "events": {
+    "kept_from_core": [
+      "operation.queued",
+      "operation.started",
+      "operation.cancelling",
+      "operation.completed",
+      "operation.failed",
+      "operation.cancelled",
+      "content.started",
+      "content.delta",
+      "content.updated",
+      "content.completed",
+      "tool.started",
+      "tool.updated",
+      "tool.completed",
+      "usage.updated",
+      "queue.updated",
+      "retry.started",
+      "retry.completed",
+      "settings.updated",
+      "provider.updated",
+      "log.entry",
+      "system.shutdown"
+    ],
+    "renamed_from_core": [
+      {
+        "from": "session.compacted",
+        "to": "thread.compacted"
+      },
+      {
+        "from": "session.navigated",
+        "to": "thread.navigated"
+      },
+      {
+        "from": "session.renamed",
+        "to": "thread.renamed"
+      },
+      {
+        "from": "cloud.account.updated",
+        "to": "plugin.cloud.account_updated"
+      }
+    ],
+    "kept_from_workbench": [
+      "terminal.opened",
+      "terminal.output",
+      "terminal.exit",
+      "turn.created"
+    ],
+    "new": [
+      {
+        "name": "capabilities.updated",
+        "why": "插件启停后 UI 重新拉 catalog"
+      },
+      {
+        "name": "plugin.<id>.*",
+        "why": "插件事件命名空间，由 plugin host 统一写入 session log"
+      }
+    ],
+    "removed": [
+      {
+        "name": "core.ready / core.disconnected / core.unresponsive",
+        "why": "没有跨进程 core 连接了"
+      },
+      {
+        "name": "core.events",
+        "why": "批量封套消失，事件直接投递"
+      },
+      {
+        "name": "server.ready",
+        "why": "workbench 进程不存在了"
+      },
+      {
+        "name": "thread.reconciled",
+        "why": "进程内无需对账"
+      }
+    ],
+    "envelope_change": "所有事件的 session_id 字段改为 thread_id；需要时附带 session_id 作为内部投影引用"
+  },
+  "errors": {
+    "kept": [
+      "protocol_incompatible",
+      "invalid_argument",
+      "thread_not_found",
+      "operation_not_found",
+      "busy",
+      "invalid_state",
+      "invalid_attachment",
+      "attachment_processing_failed",
+      "revision_conflict",
+      "authentication_failed",
+      "internal_error",
+      "method_not_found"
+    ],
+    "added": [
+      {
+        "code": "unauthorized",
+        "num": -32011,
+        "when": "握手未通过鉴权，或方法需要更高权限位"
+      },
+      {
+        "code": "forbidden",
+        "num": -32012,
+        "when": "路径越出 workspace_roots；远程连接调用受限方法如 system.shutdown"
+      },
+      {
+        "code": "capability_unavailable",
+        "num": -32013,
+        "when": "调了未启用插件贡献的方法"
+      },
+      {
+        "code": "payload_too_large",
+        "num": -32014,
+        "when": "超出握手声明的 limits"
+      }
+    ],
+    "renamed": [
+      {
+        "from": "session_not_found",
+        "to": "thread_not_found",
+        "note": "语义跟随身份改名"
+      }
+    ]
+  },
+  "tenancy": "single-tenant: 一个 Runtime 属于一个所有者；auth token 是所有者凭据而非用户身份。多租户是独立的后续决定，不在 v4 范围内",
+  "limits_note": "单帧上限固定为 40 MiB；普通文件握手声明 25 MiB、图片 10 MiB。base64 使用单帧传输，不做分片",
+  "resolved": [
+    {
+      "id": "帧上限",
+      "decision": "40 MiB（41943040 字节）",
+      "detail": "不做分片上传。握手 limits 里 file_bytes 声明 25 MiB、image_bytes 声明 10 MiB。超出则 payload_too_large，由客户端在发之前拦截"
+    },
+    {
+      "id": "thread 与 session",
+      "decision": "1:1，不开一对多",
+      "detail": "thread_id 即 session id，维持今天的形状。分支与 fork 仍是 session 内部概念（SessionManager 已有 fork）。公开方法不出现 session_id 参数，也不预留可选参数——需要时再开是 major 版本的事"
+    },
+    {
+      "id": "配置与 revision",
+      "decision": "同一份 Config，同一个 revision",
+      "detail": "plugins.configure 与 settings.update 写同一份配置、共用一个 revision 计数，杜绝两个互不知情的写者。settings.get 必须一并返回 plugins 段，UI 一次读完"
+    },
+    {
+      "id": "共享与权限",
+      "decision": "单租户，会话默认 private，shutdown 无权限位",
+      "detail": "不做共享会话。任何通过鉴权的客户端就是所有者，system.shutdown 不需要额外权限位。MAX_CLIENTS 的含义变成「同一个人的多个设备」，不是多用户配额"
+    },
+    {
+      "id": "workspace 根",
+      "decision": "由 --workspace-root 决定，默认 ./",
+      "detail": "默认是 Runtime 启动时的当前目录，与 Config.workspace 今天的 Path.cwd() 默认一致，不暴露 $HOME。桌面启动器必须显式传参——Electron 的 CWD 对用户没有意义"
+    },
+    {
+      "id": "事件信封",
+      "decision": "thread_id 映射放 gateway 层",
+      "detail": "事件在离开 gateway 之前完成 session_id → thread_id 映射，runtime 内层不引入 thread 概念。1:1 之后这层映射是一张平凡的对照表"
+    }
+  ],
+  "event_schemas": {
+    "operation.queued": {
+      "$ref": "#/$defs/Event_operation_queued_v4"
+    },
+    "operation.started": {
+      "$ref": "#/$defs/Event_operation_started_v4"
+    },
+    "operation.cancelling": {
+      "$ref": "#/$defs/Event_operation_cancelling_v4"
+    },
+    "operation.completed": {
+      "$ref": "#/$defs/Event_operation_completed_v4"
+    },
+    "operation.failed": {
+      "$ref": "#/$defs/Event_operation_failed_v4"
+    },
+    "operation.cancelled": {
+      "$ref": "#/$defs/Event_operation_cancelled_v4"
+    },
+    "content.started": {
+      "$ref": "#/$defs/Event_content_started_v4"
+    },
+    "content.delta": {
+      "$ref": "#/$defs/Event_content_delta_v4"
+    },
+    "content.updated": {
+      "$ref": "#/$defs/Event_content_updated_v4"
+    },
+    "content.completed": {
+      "$ref": "#/$defs/Event_content_completed_v4"
+    },
+    "tool.started": {
+      "$ref": "#/$defs/Event_tool_started_v4"
+    },
+    "tool.updated": {
+      "$ref": "#/$defs/Event_tool_updated_v4"
+    },
+    "tool.completed": {
+      "$ref": "#/$defs/Event_tool_completed_v4"
+    },
+    "usage.updated": {
+      "$ref": "#/$defs/Event_usage_updated_v4"
+    },
+    "queue.updated": {
+      "$ref": "#/$defs/Event_queue_updated_v4"
+    },
+    "retry.started": {
+      "$ref": "#/$defs/Event_retry_started_v4"
+    },
+    "retry.completed": {
+      "$ref": "#/$defs/Event_retry_completed_v4"
+    },
+    "settings.updated": {
+      "$ref": "#/$defs/Event_settings_updated_v4"
+    },
+    "provider.updated": {
+      "$ref": "#/$defs/Event_provider_updated_v4"
+    },
+    "log.entry": {
+      "$ref": "#/$defs/Event_log_entry_v4"
+    },
+    "system.shutdown": {
+      "$ref": "#/$defs/Event_system_shutdown_v4"
+    },
+    "terminal.opened": {
+      "$ref": "#/$defs/Event_terminal_opened_v4"
+    },
+    "terminal.output": {
+      "$ref": "#/$defs/Event_terminal_output_v4"
+    },
+    "terminal.exit": {
+      "$ref": "#/$defs/Event_terminal_exit_v4"
+    },
+    "turn.created": {
+      "$ref": "#/$defs/Event_turn_created_v4"
+    },
+    "thread.compacted": {
+      "$ref": "#/$defs/Event_thread_compacted_v4"
+    },
+    "thread.navigated": {
+      "$ref": "#/$defs/Event_thread_navigated_v4"
+    },
+    "thread.renamed": {
+      "$ref": "#/$defs/Event_thread_renamed_v4"
+    },
+    "plugin.cloud.account_updated": {
+      "$ref": "#/$defs/Event_plugin_cloud_account_updated_v4"
+    },
+    "capabilities.updated": {
+      "$ref": "#/$defs/Event_capabilities_updated_v4"
+    },
+    "plugin.<id>.*": {
+      "$ref": "#/$defs/Event_plugin_id_v4"
+    }
+  }
+}
