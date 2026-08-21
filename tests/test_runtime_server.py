@@ -977,7 +977,9 @@ async def test_v4_empty_workspace_roots_do_not_authorize_cwd(tmp_path: Path) -> 
         snapshot = await server.dispatch("system.snapshot", {})
         assert snapshot["default_workspace"] == ""
         with pytest.raises(RpcError, match="Unknown workspace root"):
-            await server.dispatch("project.add", {"root_id": _root_id(secret), "relative_path": "."})
+            await server.dispatch(
+                "project.add", {"root_id": _root_id(secret), "relative_path": "."}
+            )
     finally:
         await runtime.close()
         server.store.close()

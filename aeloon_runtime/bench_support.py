@@ -128,7 +128,9 @@ class BenchClient:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[Any] = loop.create_future()
         self._pending[request_id] = future
-        await self._send_frame(pack_frame({"id": request_id, "method": method, "params": params or {}}))
+        await self._send_frame(
+            pack_frame({"id": request_id, "method": method, "params": params or {}})
+        )
         try:
             return await asyncio.wait_for(future, timeout=120)
         finally:

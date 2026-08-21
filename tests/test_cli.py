@@ -132,7 +132,8 @@ def test_reset_force_removes_dirty_managed_worktree_and_prunes_git_metadata(
     try:
         database.execute("CREATE TABLE projects (id TEXT PRIMARY KEY, path TEXT NOT NULL)")
         database.execute(
-            "CREATE TABLE threads (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, kind TEXT NOT NULL, workspace TEXT NOT NULL)"
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, project_id TEXT NOT NULL,"
+            " kind TEXT NOT NULL, workspace TEXT NOT NULL)"
         )
         database.execute("INSERT INTO projects VALUES (?, ?)", ("project-1", str(project)))
         database.execute(

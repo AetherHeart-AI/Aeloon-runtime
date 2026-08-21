@@ -7,7 +7,6 @@ from jsonschema import Draft202012Validator
 
 from aeloon_runtime.rpc.protocol import PROTOCOL_NAME, PROTOCOL_VERSION, RPC_CODES
 
-
 ROOT = Path(__file__).resolve().parents[1]
 
 

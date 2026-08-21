@@ -11,8 +11,8 @@ import json
 import os
 import shutil
 import sqlite3
-import subprocess
 import struct
+import subprocess
 import sys
 import time
 from dataclasses import asdict, is_dataclass
@@ -948,7 +948,10 @@ async def models_command(args: argparse.Namespace) -> int:
         print(_json(payload))
         return 0
     if not payload:
-        print("No models are connected. Run `aeloon-runtime provider add ...` or `aeloon-runtime login`.")
+        print(
+            "No models are connected."
+            " Run `aeloon-runtime provider add ...` or `aeloon-runtime login`."
+        )
         return 0
     _print_table(
         ("", "MODEL", "PROVIDER", "CONTEXT"),
@@ -1099,7 +1102,12 @@ async def doctor_command(args: argparse.Namespace) -> int:
             try:
                 model = await manager.model(config.agent.model)
             except (KeyError, RuntimeError, PermissionError) as exc:
-                add("model", "error", str(exc), "Run `aeloon-runtime models` to choose another model.")
+                add(
+                    "model",
+                    "error",
+                    str(exc),
+                    "Run `aeloon-runtime models` to choose another model.",
+                )
             else:
                 add("model", "ok", f"{model.id} ({model.name})")
                 if model.provider == "deepseek" and not getattr(
@@ -1166,7 +1174,9 @@ def completion_command(args: argparse.Namespace) -> int:
             "}\n"
             "complete -F _aeloon_runtime_complete aeloon-runtime"
         ),
-        "zsh": (f"#compdef aeloon-runtime\n_arguments '1:command:({commands})' '*::argument:->args'"),
+        "zsh": (
+            f"#compdef aeloon-runtime\n_arguments '1:command:({commands})' '*::argument:->args'"
+        ),
         "fish": "\n".join(
             f"complete -c aeloon-runtime -f -n '__fish_use_subcommand' -a {command}"
             for command in commands.split()
@@ -1595,8 +1605,13 @@ def reset_command(args: argparse.Namespace) -> int:
             if workspace.is_symlink() or project_path.is_symlink():
                 raise ValueError("Runtime reset refuses symbolic-link worktrees")
             forbidden_worktree_paths = {Path("/"), Path.home().resolve(), Path.cwd().resolve()}
-            if workspace.resolve(strict=False) in forbidden_worktree_paths or project_path.resolve(strict=False) in forbidden_worktree_paths:
-                raise ValueError("Runtime reset refuses a root, home, or current working directory worktree")
+            if (
+                workspace.resolve(strict=False) in forbidden_worktree_paths
+                or project_path.resolve(strict=False) in forbidden_worktree_paths
+            ):
+                raise ValueError(
+                    "Runtime reset refuses a root, home, or current working directory worktree"
+                )
             git_remove_worktree(project_path, workspace, force=True)
             subprocess.run(
                 ["git", "-C", str(project_path), "worktree", "prune"],
@@ -1759,10 +1774,12 @@ def _print_cli_error(code: str, message: str, *, as_json: bool) -> None:
     print(f"Error: {message}", file=sys.stderr)
     suggestions = {
         "auth": (
-            "Run `aeloon-runtime provider add ...` or `aeloon-runtime login` to configure a model source."
+            "Run `aeloon-runtime provider add ...` or `aeloon-runtime login`"
+            " to configure a model source."
         ),
         "model_not_configured": (
-            "Add an API with `aeloon-runtime provider add ...` or sign in with `aeloon-runtime login`, "
+            "Add an API with `aeloon-runtime provider add ...`"
+            " or sign in with `aeloon-runtime login`, "
             "then Aeloon will use the first available model automatically."
         ),
         "model_not_found": "Run `aeloon-runtime models` to see available models.",

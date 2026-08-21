@@ -577,7 +577,9 @@ class RuntimeServer:
             return await self._system_snapshot()
         if method in {"system.shutdown", "system.uninstall_inspect", "system.uninstall_prepare"}:
             if connection is not None and connection.requires_auth:
-                raise RpcError("forbidden", "Remote WSS connections cannot control Runtime lifecycle")
+                raise RpcError(
+                    "forbidden", "Remote WSS connections cannot control Runtime lifecycle"
+                )
         if method == "system.uninstall_inspect":
             return await self._uninstall_inspect()
         if method == "system.uninstall_prepare":
@@ -770,7 +772,9 @@ class RuntimeServer:
         if not target.exists() or not target.is_dir():
             raise RpcError("invalid_argument", "Workspace directory does not exist")
         entries = []
-        for item in sorted(target.iterdir(), key=lambda value: (not value.is_dir(), value.name.lower())):
+        for item in sorted(
+            target.iterdir(), key=lambda value: (not value.is_dir(), value.name.lower())
+        ):
             entries.append({"name": item.name, "kind": "directory" if item.is_dir() else "file"})
         return {"directory": relative_path or ".", "entries": entries}
 
@@ -1762,7 +1766,9 @@ class RuntimeServer:
     ) -> dict[str, Any]:
         if method == "devices.claim":
             if connection is None or not connection.requires_auth:
-                raise RpcError("forbidden", "devices.claim is only available on WSS enrollment connections")
+                raise RpcError(
+                    "forbidden", "devices.claim is only available on WSS enrollment connections"
+                )
             code = self._required_string(params, "code")
             client = params.get("client")
             if not isinstance(client, Mapping):
