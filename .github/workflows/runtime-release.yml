@@ -22,8 +22,31 @@ env:
   RIPGREP_VERSION: "15.1.0"
 
 jobs:
+  version-gate:
+    # RUNTIME_VERSION, pyproject and the tag are three places that can disagree.
+    # A release built from a mismatch ships archives and a manifest labelled with
+    # a version nobody asked for, so fail before anything is produced.
+    name: Verify the tag, pyproject and RUNTIME_VERSION agree
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Compare the three version sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          project="$(grep -m1 '^version = ' pyproject.toml | cut -d '"' -f2)"
+          test "$project" = "$RUNTIME_VERSION" \
+            || { echo "pyproject $project != RUNTIME_VERSION $RUNTIME_VERSION"; exit 1; }
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            tagged="${GITHUB_REF_NAME#runtime-v}"
+            test "$tagged" = "$RUNTIME_VERSION" \
+              || { echo "tag $GITHUB_REF_NAME != RUNTIME_VERSION $RUNTIME_VERSION"; exit 1; }
+          fi
+          echo "version $RUNTIME_VERSION agrees across pyproject, tag and workflow"
+
   wheel:
     name: Build aeloon-runtime wheel
+    needs: version-gate
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5
@@ -49,6 +72,7 @@ jobs:
           if-no-files-found: error
 
   protocol-package:
+    needs: version-gate
     name: Build @aeloon/protocol package
     runs-on: ubuntu-22.04
     steps:
@@ -76,6 +100,7 @@ jobs:
 
   bundle:
     name: Build ${{ matrix.platform }} Runtime archive
+    needs: version-gate
     strategy:
       fail-fast: false
       matrix:
@@ -90,6 +115,13 @@ jobs:
             python_asset: cpython-3.12.13+20260728-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz
             uv_asset: uv-aarch64-unknown-linux-gnu.tar.gz
             ripgrep_asset: ripgrep-15.1.0-aarch64-unknown-linux-gnu.tar.gz
+          # Most LAN and cloud hosts are x86_64, so a Runtime that only ships
+          # aarch64 cannot actually be deployed to the machines it targets.
+          - platform: linux-x86_64
+            runner: ubuntu-22.04
+            python_asset: cpython-3.12.13+20260728-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz
+            uv_asset: uv-x86_64-unknown-linux-gnu.tar.gz
+            ripgrep_asset: ripgrep-15.1.0-x86_64-unknown-linux-musl.tar.gz
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
@@ -212,7 +244,6 @@ jobs:
       - name: Publish the Runtime release assets
         env:
           GH_TOKEN: ${{ github.token }}
-          UI_TOKEN: ${{ secrets.AELOON_UI_REPOSITORY_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
@@ -221,10 +252,23 @@ jobs:
           gh release upload "$tag" release/*.tar.zst --clobber
           gh release upload "$tag" release/*.tgz --clobber
           gh release upload "$tag" release/*.whl --clobber
-          test -n "$UI_TOKEN"
-          gh api --method POST repos/AetherHeart-AI/Aeloon-ui/dispatches \
-            --input - \
-            -H "Authorization: Bearer ${UI_TOKEN}" <<JSON
+
+      - name: Notify the UI repository when configured
+        env:
+          GH_TOKEN: ${{ secrets.AELOON_UI_REPOSITORY_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A separate step so a missing or expired token cannot fail a release
+          # whose assets are already published. Unconfigured means the UI lock is
+          # pinned by hand; adding the secret turns the hop on with no edit here.
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "AELOON_UI_REPOSITORY_TOKEN is not configured."
+            echo "Pin the UI lock by hand with scripts/update-runtime-lock.ts."
+            exit 0
+          fi
+          tag="${GITHUB_REF_NAME:-runtime-v${RUNTIME_VERSION}}"
+          gh api --method POST repos/AetherHeart-AI/Aeloon-ui/dispatches --input - <<JSON
           {"event_type":"runtime-release","client_payload":{"runtime_version":"${RUNTIME_VERSION}","release_tag":"${tag}","runtime_commit":"${GITHUB_SHA}"}}
           JSON
 

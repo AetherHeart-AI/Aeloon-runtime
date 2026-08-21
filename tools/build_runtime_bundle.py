@@ -23,7 +23,11 @@ from pathlib import Path
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--runtime-root", type=Path, required=True)
-    parser.add_argument("--platform", choices=("darwin-aarch64", "linux-aarch64"), required=True)
+    parser.add_argument(
+        "--platform",
+        choices=("darwin-aarch64", "linux-aarch64", "linux-x86_64"),
+        required=True,
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--runtime-version", default="0.1.0")
     parser.add_argument("--protocol-range", default=">=4.0.0 <5.0.0")
