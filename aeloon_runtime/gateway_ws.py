@@ -164,6 +164,7 @@ def build_tls_context(certificate: Path | None, key: Path | None) -> ssl.SSLCont
 
 WS_PING_INTERVAL_S = 15
 WS_PING_TIMEOUT_S = 15
+WS_WRITE_LIMIT_BYTES = 4 * 1024 * 1024
 
 
 async def serve_websocket(
@@ -213,6 +214,11 @@ async def serve_websocket(
         max_size=MAX_FRAME_BYTES + 4,
         ping_interval=WS_PING_INTERVAL_S,
         ping_timeout=WS_PING_TIMEOUT_S,
+        # Permessage-deflate and the 32 KiB write buffer turn 25 MiB uploads
+        # over SSH into CPU- and RTT-bound transfers. Keep the socket raw and
+        # give the tunnel a window that can fill a long-fat pipe.
+        compression=None,
+        write_limit=WS_WRITE_LIMIT_BYTES,
     )
 
 

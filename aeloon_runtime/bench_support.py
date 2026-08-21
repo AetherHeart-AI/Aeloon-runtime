@@ -21,6 +21,7 @@ import websockets
 from aeloon_runtime.runtime_server import pack_frame
 
 WS_SEND_CHUNK_BYTES = 1024 * 1024
+WS_WRITE_LIMIT_BYTES = 4 * 1024 * 1024
 
 USER_TURN_BYTES = 1024
 ASSISTANT_TURN_BYTES = 8192
@@ -80,6 +81,8 @@ class BenchClient:
             open_timeout=10,
             ping_interval=15,
             ping_timeout=15,
+            compression=None,
+            write_limit=WS_WRITE_LIMIT_BYTES,
         )
         self._pump_task = asyncio.create_task(self._pump())
 

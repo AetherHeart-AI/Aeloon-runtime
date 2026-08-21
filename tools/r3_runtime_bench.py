@@ -116,7 +116,13 @@ async def _claim_token(url: str, code: str) -> str:
     import websockets
 
     ssl_ctx = _ssl_client()
-    async with websockets.connect(url, ssl=ssl_ctx, max_size=None) as connection:
+    async with websockets.connect(
+        url,
+        ssl=ssl_ctx,
+        max_size=None,
+        compression=None,
+        write_limit=4 * 1024 * 1024,
+    ) as connection:
         await connection.send(
             pack_frame(
                 {
