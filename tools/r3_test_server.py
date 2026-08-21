@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import json
 import platform
 from pathlib import Path
@@ -26,6 +27,8 @@ from aeloon_runtime.bootstrap import create_runtime_service
 from aeloon_runtime.runtime_log import read_runtime_logs
 from aeloon_runtime.runtime_server import RuntimeServer
 
+MAX_LINK_PROBE_BYTES = 16 * 1024 * 1024
+
 
 async def _handle_control(
     server: RuntimeServer,
@@ -35,7 +38,10 @@ async def _handle_control(
     try:
         raw = await reader.readline()
         request = json.loads(raw.decode("utf-8") or "{}")
-        result = await _dispatch_control(server, request)
+        if request.get("op") == "link_upload":
+            result = await _receive_link_upload(reader, request)
+        else:
+            result = await _dispatch_control(server, request)
         writer.write((json.dumps(result) + "\n").encode("utf-8"))
         await writer.drain()
     except Exception as exc:
@@ -46,6 +52,32 @@ async def _handle_control(
         writer.close()
         with contextlib.suppress(Exception):
             await writer.wait_closed()
+
+
+async def _receive_link_upload(
+    reader: asyncio.StreamReader,
+    request: dict[str, Any],
+) -> dict[str, Any]:
+    byte_count = request.get("byte_count")
+    expected_digest = request.get("sha256")
+    if (
+        not isinstance(byte_count, int)
+        or isinstance(byte_count, bool)
+        or not 1 <= byte_count <= MAX_LINK_PROBE_BYTES
+    ):
+        raise ValueError("link_upload byte_count is outside the test-only limit")
+    if not isinstance(expected_digest, str) or len(expected_digest) != 64:
+        raise ValueError("link_upload sha256 is required")
+    digest = hashlib.sha256()
+    remaining = byte_count
+    while remaining:
+        chunk = await reader.readexactly(min(256 * 1024, remaining))
+        digest.update(chunk)
+        remaining -= len(chunk)
+    actual_digest = digest.hexdigest()
+    if actual_digest != expected_digest:
+        raise ValueError("link_upload payload digest did not match")
+    return {"ok": True, "bytes": byte_count, "sha256": actual_digest}
 
 
 async def _dispatch_control(server: RuntimeServer, request: dict[str, Any]) -> dict[str, Any]:
@@ -94,6 +126,28 @@ async def _dispatch_control(server: RuntimeServer, request: dict[str, Any]) -> d
         except Exception:
             pass
         return {"ok": True, "root_id": root_id}
+    if op == "verify_attachment":
+        attachment_id = str(request.get("attachment_id") or "")
+        expected_size = int(request.get("size") or -1)
+        expected_digest = str(request.get("sha256") or "")
+        value = server.store.get_attachment(attachment_id)
+        if value is None:
+            raise ValueError("attachment does not exist")
+        path = server._attachment_storage_path(value)
+
+        def inspect() -> tuple[int, str]:
+            digest = hashlib.sha256()
+            size = 0
+            with path.open("rb") as handle:
+                while chunk := handle.read(256 * 1024):
+                    size += len(chunk)
+                    digest.update(chunk)
+            return size, digest.hexdigest()
+
+        actual_size, actual_digest = await asyncio.to_thread(inspect)
+        if actual_size != expected_size or actual_digest != expected_digest:
+            raise ValueError("stored attachment failed the benchmark integrity check")
+        return {"ok": True, "size": actual_size, "sha256": actual_digest}
     if op == "logs":
         payload = read_runtime_logs(
             server.data_dir, limit=int(request.get("limit") or 200)

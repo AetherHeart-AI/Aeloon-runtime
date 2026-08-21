@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import importlib.util
 from pathlib import Path
 
@@ -57,6 +59,54 @@ def test_unique_attachment_blobs_and_pairing_code() -> None:
     )
 
 
+def test_remote_attachment_budget_tracks_independent_link_baseline() -> None:
+    bench = _load_tool("r3_runtime_bench.py")
+    common = {
+        "path": "ssh-tunnel",
+        "host_info": {},
+        "pty_samples": [0.1],
+        "thread_samples": [0.2],
+        "encoded_sizes": [1024],
+        "first_samples": [0.3],
+        "throughput": {"required_1000_delivered": True},
+        "methods": set(),
+        "link_samples": [8.0, 8.0, 8.0],
+    }
+    passing = bench.build_report(attach_samples=[32.0], **common)
+    assert passing["attachment_25mib"]["budget_model"] == "bandwidth-relative"
+    assert passing["attachment_25mib"]["projected_from_link_p95_ms"] == pytest.approx(
+        33_333.335, abs=0.01
+    )
+    assert passing["attachment_25mib"]["budget_p95_ms"] == pytest.approx(
+        41_666.66875, abs=0.01
+    )
+    assert bench.budgets_hold(passing)
+
+    failing = bench.build_report(attach_samples=[45.0], **common)
+    assert not bench.budgets_hold(failing)
+
+
+@pytest.mark.asyncio
+async def test_link_upload_probe_validates_size_and_digest() -> None:
+    server_mod = _load_tool("r3_test_server.py")
+    payload = b"raw-link-probe" * 1024
+    reader = asyncio.StreamReader()
+    reader.feed_data(payload)
+    reader.feed_eof()
+    result = await server_mod._receive_link_upload(
+        reader,
+        {
+            "byte_count": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        },
+    )
+    assert result == {
+        "ok": True,
+        "bytes": len(payload),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }
+
+
 @pytest.mark.asyncio
 async def test_control_dispatch_seeds_turns_and_exposes_status(tmp_path: Path) -> None:
     server_mod = _load_tool("r3_test_server.py")
@@ -98,6 +148,22 @@ async def test_control_dispatch_seeds_turns_and_exposes_status(tmp_path: Path) -
         logs = await server_mod._dispatch_control(server, {"op": "logs", "limit": 20})
         assert logs["ok"] is True
         assert "entries" in logs
+        attachment = server.store.add_attachment(
+            name="verified.bin",
+            mime_type="application/octet-stream",
+            data=b"verified attachment",
+            root=data_dir / "attachments",
+        )
+        verified = await server_mod._dispatch_control(
+            server,
+            {
+                "op": "verify_attachment",
+                "attachment_id": attachment["id"],
+                "size": len(b"verified attachment"),
+                "sha256": hashlib.sha256(b"verified attachment").hexdigest(),
+            },
+        )
+        assert verified["ok"] is True
     finally:
         await runtime.close()
         server.store.close()

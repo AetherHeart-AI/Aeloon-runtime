@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import platform
@@ -46,6 +47,13 @@ from aeloon_runtime.runtime_server import RuntimeServer, pack_frame
 
 InjectAtRate = Callable[[int, float, int], Awaitable[int]]
 SeedTurns = Callable[[str], Awaitable[None]]
+VerifyAttachment = Callable[[str, int, str], Awaitable[None]]
+
+LINK_PROBE_BYTES = 8 * 1024 * 1024
+LINK_PROBE_WARMUP = 1
+LINK_PROBE_SAMPLES = 3
+ATTACHMENT_FIXED_BUDGET_MS = 8_000
+ATTACHMENT_LINK_HEADROOM = 1.25
 
 
 def _git_commit(root: Path) -> str:
@@ -161,6 +169,35 @@ async def control_request(
         await writer.wait_closed()
 
 
+async def control_upload_probe(host: str, port: int, payload: bytes) -> None:
+    reader, writer = await asyncio.open_connection(host, port)
+    expected_digest = hashlib.sha256(payload).hexdigest()
+    try:
+        writer.write(
+            (
+                json.dumps(
+                    {
+                        "op": "link_upload",
+                        "byte_count": len(payload),
+                        "sha256": expected_digest,
+                    }
+                )
+                + "\n"
+            ).encode("utf-8")
+        )
+        writer.write(payload)
+        await writer.drain()
+        raw = await asyncio.wait_for(reader.readline(), timeout=120)
+        result = json.loads(raw.decode("utf-8") or "{}")
+        if result.get("ok") is not True:
+            raise RuntimeError(str(result.get("error") or "link upload probe failed"))
+        if result.get("bytes") != len(payload) or result.get("sha256") != expected_digest:
+            raise RuntimeError("link upload probe response failed integrity validation")
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
 def _write_report(report: dict[str, Any], json_out: Path | None) -> str:
     text = json.dumps(report, indent=2, sort_keys=True)
     if json_out is not None:
@@ -180,7 +217,21 @@ def build_report(
     first_samples: list[float],
     throughput: dict[str, Any],
     methods: set[str],
+    link_samples: list[float] | None = None,
 ) -> dict[str, Any]:
+    link_samples = link_samples or []
+    base64_bytes = 4 * ((ATTACHMENT_BYTES + 2) // 3)
+    link_p95_s = percentile(link_samples, 95) if link_samples else 0.0
+    projected_attachment_ms = (
+        link_p95_s * (base64_bytes / LINK_PROBE_BYTES) * 1000
+        if link_samples
+        else 0.0
+    )
+    attachment_budget_ms = max(
+        ATTACHMENT_FIXED_BUDGET_MS,
+        projected_attachment_ms * ATTACHMENT_LINK_HEADROOM,
+    )
+    attachment_p95_ms = percentile(attach_samples, 95) * 1000
     return {
         "protocol": PROTOCOL_VERSION,
         "path": path,
@@ -209,10 +260,32 @@ def build_report(
             "warmup": 1,
             "n": 10,
             "p50_ms": percentile(attach_samples, 50) * 1000,
-            "p95_ms": percentile(attach_samples, 95) * 1000,
-            "budget_p95_ms": 8000,
+            "p95_ms": attachment_p95_ms,
+            "budget_p95_ms": attachment_budget_ms,
+            "budget_model": "bandwidth-relative" if link_samples else "fixed",
+            "fixed_floor_ms": ATTACHMENT_FIXED_BUDGET_MS,
+            "link_headroom": ATTACHMENT_LINK_HEADROOM,
+            "projected_from_link_p95_ms": projected_attachment_ms,
+            "overhead_ratio": (
+                attachment_p95_ms / projected_attachment_ms
+                if projected_attachment_ms > 0
+                else None
+            ),
             "includes_base64": True,
             "unique_payloads": True,
+            "integrity_verified": True,
+        },
+        "link_upload": {
+            "warmup": LINK_PROBE_WARMUP,
+            "n": len(link_samples),
+            "bytes": LINK_PROBE_BYTES,
+            "p50_ms": percentile(link_samples, 50) * 1000,
+            "p95_ms": link_p95_s * 1000,
+            "p95_mib_s": (
+                (LINK_PROBE_BYTES / (1024 * 1024)) / link_p95_s
+                if link_p95_s > 0
+                else 0.0
+            ),
         },
         "first_available": {
             "warmup": 5,
@@ -235,6 +308,8 @@ async def measure_against(
     methods: set[str],
     host_info: dict[str, Any],
     path: str,
+    verify_attachment: VerifyAttachment,
+    link_samples: list[float] | None = None,
     json_out: Path | None = None,
 ) -> dict[str, Any]:
     ssl_ctx = _ssl_client()
@@ -314,12 +389,13 @@ async def measure_against(
 
     blobs = unique_attachment_blobs(11)
     blob_index = 0
+    uploaded: list[tuple[str, int, str]] = []
 
     async def upload() -> None:
         nonlocal blob_index
         payload = base64.b64encode(blobs[blob_index]).decode("ascii")
         blob_index += 1
-        await client.request(
+        result = await client.request(
             "attachment.upload",
             {
                 "name": f"r3-{blob_index}.bin",
@@ -327,8 +403,19 @@ async def measure_against(
                 "data_base64": payload,
             },
         )
+        if not isinstance(result, dict) or not isinstance(result.get("attachment_id"), str):
+            raise RuntimeError("attachment.upload omitted attachment_id")
+        uploaded.append(
+            (
+                result["attachment_id"],
+                len(blobs[blob_index - 1]),
+                hashlib.sha256(blobs[blob_index - 1]).hexdigest(),
+            )
+        )
 
     attach_samples = await measure_samples(1, 10, upload)
+    for attachment_id, size, digest in uploaded:
+        await verify_attachment(attachment_id, size, digest)
 
     throughput: dict[str, Any] = {"rates": {}}
     stable = 0
@@ -387,6 +474,7 @@ async def measure_against(
         first_samples=first_samples,
         throughput=throughput,
         methods=methods,
+        link_samples=link_samples,
     )
     _write_report(report, json_out)
     print("R3_BENCH_JSON_WRITTEN", flush=True)
@@ -432,6 +520,15 @@ async def run_suite(
         async def seed(thread_id: str) -> None:
             seed_completed_turns(server.store, thread_id)
 
+        async def verify(attachment_id: str, size: int, digest: str) -> None:
+            value = server.store.get_attachment(attachment_id)
+            if value is None:
+                raise RuntimeError("attachment does not exist")
+            path_value = server._attachment_storage_path(value)
+            data = await asyncio.to_thread(path_value.read_bytes)
+            if len(data) != size or hashlib.sha256(data).hexdigest() != digest:
+                raise RuntimeError("stored attachment failed integrity validation")
+
         capabilities = await _unix_rpc(socket_path, "system.capabilities", {})
         methods = {
             name
@@ -451,6 +548,7 @@ async def run_suite(
                 "client_hostname": platform.node(),
             },
             path=path,
+            verify_attachment=verify,
             json_out=json_out,
         )
     finally:
@@ -474,6 +572,16 @@ async def run_client_suite(
     token = await _claim_token(endpoint, pairing_code(pairing))
     status = await control_request(control_host, control_port, {"op": "status"})
     methods = set(status.get("methods") or [])
+    link_payload = os.urandom(LINK_PROBE_BYTES)
+
+    async def probe_link() -> None:
+        await control_upload_probe(control_host, control_port, link_payload)
+
+    link_samples = await measure_samples(
+        LINK_PROBE_WARMUP,
+        LINK_PROBE_SAMPLES,
+        probe_link,
+    )
 
     async def inject_at_rate(rate: int, duration_s: float, payload_bytes: int) -> int:
         result = await control_request(
@@ -496,6 +604,18 @@ async def run_client_suite(
             {"op": "seed_turns", "thread_id": thread_id},
         )
 
+    async def verify(attachment_id: str, size: int, digest: str) -> None:
+        await control_request(
+            control_host,
+            control_port,
+            {
+                "op": "verify_attachment",
+                "attachment_id": attachment_id,
+                "size": size,
+                "sha256": digest,
+            },
+        )
+
     return await measure_against(
         url=endpoint,
         token=token,
@@ -509,17 +629,30 @@ async def run_client_suite(
             "client_hostname": platform.node(),
         },
         path=path,
+        verify_attachment=verify,
+        link_samples=link_samples,
         json_out=json_out,
     )
 
 
 def budgets_hold(report: dict[str, Any]) -> bool:
+    attachment = report["attachment_25mib"]
+    remote_link_valid = (
+        report.get("path") != "ssh-tunnel"
+        or (
+            attachment.get("budget_model") == "bandwidth-relative"
+            and report.get("link_upload", {}).get("n") == LINK_PROBE_SAMPLES
+            and report.get("link_upload", {}).get("p95_ms", 0) > 0
+        )
+    )
     return (
         report["pty_echo"]["p95_ms"] <= report["pty_echo"]["budget_p95_ms"]
         and report["thread_get"]["p95_ms"] <= report["thread_get"]["budget_p95_ms"]
         and report["thread_get"]["encoded_bytes_max"]
         <= report["thread_get"]["budget_encoded_bytes"]
-        and report["attachment_25mib"]["p95_ms"] <= report["attachment_25mib"]["budget_p95_ms"]
+        and attachment["p95_ms"] <= attachment["budget_p95_ms"]
+        and attachment.get("integrity_verified") is True
+        and remote_link_valid
         and report["first_available"]["p95_ms"] <= report["first_available"]["budget_p95_ms"]
         and report["event_throughput"]["required_1000_delivered"] is True
         and report["private_methods_leaked"] is False
