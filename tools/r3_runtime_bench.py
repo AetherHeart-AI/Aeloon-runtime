@@ -121,7 +121,7 @@ async def _claim_token(url: str, code: str) -> str:
         ssl=ssl_ctx,
         max_size=None,
         compression=None,
-        write_limit=4 * 1024 * 1024,
+        write_limit=512 * 1024,
     ) as connection:
         await connection.send(
             pack_frame(

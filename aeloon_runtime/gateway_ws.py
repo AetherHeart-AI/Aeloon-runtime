@@ -164,7 +164,7 @@ def build_tls_context(certificate: Path | None, key: Path | None) -> ssl.SSLCont
 
 WS_PING_INTERVAL_S = 15
 WS_PING_TIMEOUT_S = 15
-WS_WRITE_LIMIT_BYTES = 4 * 1024 * 1024
+WS_WRITE_LIMIT_BYTES = 512 * 1024
 
 
 async def serve_websocket(
