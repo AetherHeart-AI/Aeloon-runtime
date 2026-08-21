@@ -20,7 +20,7 @@ import websockets
 
 from aeloon_runtime.runtime_server import pack_frame
 
-WS_SEND_CHUNK_BYTES = 64 * 1024
+WS_SEND_CHUNK_BYTES = 1024 * 1024
 
 USER_TURN_BYTES = 1024
 ASSISTANT_TURN_BYTES = 8192
