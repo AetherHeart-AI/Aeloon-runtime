@@ -21,9 +21,27 @@ migrated: old state blocks startup until the operator runs the explicit,
 force-confirmed v4 reset command.
 
 <!-- r3-acceptance:start -->
-R3 remote numbers are written by `bun run test:r3:remote` after a clean-tree
-benchmark whose WSS client runs on the operator machine through an SSH tunnel,
-plus the four fault-proxy resilience scenarios against that same forwarded Runtime.
+## R3 remote acceptance
+
+Date: 2026-08-21
+Runtime commit: 5f6d9afb0901faf25556699292c8f67dc1f995a7
+UI commit: 8bf5fa7e9d346db3ce27bc4405657c6d65c3ae97
+Path: ssh-tunnel (WSS client on the operator machine through SSH local-forward)
+Runtime host: autodl-container-e5354dbac4-b13fcaaf / linux / x86_64
+Client host: zhangxins-MacBook-Air.local
+Protocol: 4.0.0
+Gate: failed
+
+| Probe | warmup / n | p50 | p95 | budget | extra |
+| --- | --- | --- | --- | --- | --- |
+| PTY echo | 5 / 50 | 45.5 ms | 103.6 ms | ≤ 250 ms | pass |
+| thread.get | 3 / 30 | 708.9 ms | 904.3 ms | ≤ 1000 ms | encoded 1228360 B / 5 MiB; pass |
+| 25 MiB attachment | 1 / 10 | 30892.4 ms | 32026.9 ms | ≤ 8000 ms | base64 + unique payloads; FAIL |
+| First available | 5 / 30 | 360.0 ms | 405.7 ms | ≤ 2000 ms | TLS + handshake + subscribe + capabilities + snapshot; pass |
+
+Event throughput 1 KiB: 1000 events/s delivered=true, receive p50=987.9 / p95=988.4, highest stable=2000 events/s.
+
+Budgets are hard gates measured over the SSH-tunneled WSS path and were not relaxed. This run is recorded even though at least one budget missed. Private benchmark methods stay off the RPC manifest.
 <!-- r3-acceptance:end -->
 
 ## Handoff evidence
