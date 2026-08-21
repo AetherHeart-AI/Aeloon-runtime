@@ -134,6 +134,7 @@ async def test_v4_handshake_health_and_shutdown(tmp_path: Path) -> None:
         item for item in capabilities["result"]["capabilities"] if item["id"] == "core"
     )
     assert "system.snapshot" in core_capability["methods"]
+    assert "diagnostics.logs" in core_capability["methods"]
     assert "plugins.configure" not in core_capability["methods"]
     cloud_capability = next(
         item for item in capabilities["result"]["capabilities"] if item["id"] == "cloud"
@@ -667,6 +668,9 @@ async def test_event_delivery_only_enqueues_and_does_not_wait_for_socket_drain()
     connection._closed = False
     connection._write_sequence = 0
     connection._pending_event_frames = 0
+    connection._pending_event_bytes = 0
+    connection._event_queue_limit = runtime_server.EVENT_QUEUE_LIMIT
+    connection._event_queue_bytes = runtime_server.EVENT_QUEUE_BYTES
     connection._writes = asyncio.PriorityQueue()
 
     await connection.send_event({"name": "operation.started", "thread_id": "thread-1"})
@@ -677,6 +681,7 @@ async def test_event_delivery_only_enqueues_and_does_not_wait_for_socket_drain()
     future.set_result(None)
     await asyncio.sleep(0)
     assert connection._pending_event_frames == 0
+    assert connection._pending_event_bytes == 0
 
 
 @pytest.mark.asyncio
@@ -701,9 +706,14 @@ async def test_event_delivery_closes_a_slow_client_at_the_bound() -> None:
     connection._closed = False
     connection._write_sequence = 0
     connection._pending_event_frames = 0
+    connection._pending_event_bytes = 0
+    connection._event_queue_limit = runtime_server.EVENT_QUEUE_LIMIT
+    connection._event_queue_bytes = runtime_server.EVENT_QUEUE_BYTES
     connection._writes = asyncio.PriorityQueue()
     connection._request_tasks = set()
     connection._writer_task = None
+    connection.handshaken = False
+    connection.server = None
 
     for index in range(runtime_server.EVENT_QUEUE_LIMIT + 1):
         await connection.send_event({"name": "terminal.output", "thread_id": str(index)})
@@ -994,3 +1004,233 @@ async def test_v4_project_refresh_persists_git_detection(tmp_path: Path) -> None
     finally:
         await runtime.close()
         server.store.close()
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_logs_returns_newest_filtered_records(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    runtime = create_runtime_service(config_path=data_dir / "config.json", data_dir=data_dir)
+    server = RuntimeServer(runtime, tmp_path / "runtime.sock", (tmp_path,), data_dir)
+    try:
+        from aeloon_runtime.runtime_log import RuntimeLog
+
+        server.log = RuntimeLog(data_dir)
+        server.log.write(
+            "connected", transport="unix", device_id="dev-1", source="unix", token="secret"
+        )
+        server.log.write(
+            "resync_served",
+            after_seq=1,
+            current_seq=4,
+            replay_complete=True,
+            replayed_events=3,
+        )
+        (data_dir / "runtime.log").write_bytes(
+            (data_dir / "runtime.log").read_bytes() + b"{not json\n"
+        )
+        logs = await server.dispatch("diagnostics.logs", {"limit": 10})
+        assert logs["truncated"] is False
+        assert [item["event"] for item in logs["entries"]] == ["resync_served", "connected"]
+        assert "token" not in logs["entries"][1]["fields"]
+        assert logs["entries"][1]["fields"]["transport"] == "unix"
+        with pytest.raises(RpcError, match="limit"):
+            await server.dispatch("diagnostics.logs", {"limit": 0})
+        with pytest.raises(RpcError, match="Invalid parameters"):
+            await server.dispatch("diagnostics.logs", {"path": "/etc/passwd"})
+    finally:
+        if server.log is not None:
+            server.log.close()
+        await runtime.close()
+        server.store.close()
+
+
+@pytest.mark.asyncio
+async def test_event_delivery_closes_when_pending_bytes_exceed_the_bound() -> None:
+    class Writer:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def is_closing(self) -> bool:
+            return self.closed
+
+        def close(self) -> None:
+            self.closed = True
+
+        async def wait_closed(self) -> None:
+            return None
+
+    connection = RuntimeConnection.__new__(RuntimeConnection)
+    connection.writer = Writer()
+    connection.thread_ids = set()
+    connection.subscribed = True
+    connection._closed = False
+    connection._write_sequence = 0
+    connection._pending_event_frames = 0
+    connection._pending_event_bytes = 0
+    connection._event_queue_limit = runtime_server.EVENT_QUEUE_LIMIT
+    connection._event_queue_bytes = 64
+    connection._writes = asyncio.PriorityQueue()
+    connection._request_tasks = set()
+    connection._writer_task = None
+    connection.handshaken = False
+    connection.server = None
+    await connection.send_event(
+        {"name": "terminal.output", "thread_id": "thread-1", "payload": {"data": "x" * 200}}
+    )
+    assert connection._closed is True
+
+
+@pytest.mark.asyncio
+async def test_overflow_close_cancels_a_stuck_writer() -> None:
+    class StuckWriter:
+        def __init__(self) -> None:
+            self.closed = False
+            self.aborted = False
+
+        def is_closing(self) -> bool:
+            return self.closed
+
+        def write(self, _data: bytes) -> None:
+            return None
+
+        async def drain(self) -> None:
+            await asyncio.sleep(60)
+
+        def close(self) -> None:
+            self.closed = True
+
+        async def wait_closed(self) -> None:
+            return None
+
+        @property
+        def transport(self) -> object:
+            writer = self
+
+            class Transport:
+                def abort(self) -> None:
+                    writer.aborted = True
+
+            return Transport()
+
+    connection = RuntimeConnection.__new__(RuntimeConnection)
+    connection.writer = StuckWriter()
+    connection.thread_ids = set()
+    connection.subscribed = True
+    connection._closed = False
+    connection._close_reason = "peer"
+    connection._write_sequence = 0
+    connection._pending_event_frames = 0
+    connection._pending_event_bytes = 0
+    connection._event_queue_limit = 2
+    connection._event_queue_bytes = 1024 * 1024
+    connection._writes = asyncio.PriorityQueue()
+    connection._request_tasks = set()
+    connection.write_lock = asyncio.Lock()
+    connection.handshaken = True
+    connection.connected_at = 0.0
+    connection.server = None
+    connection.device_id = None
+    connection.requires_auth = False
+    connection._disconnected_logged = False
+    connection._writer_task = asyncio.create_task(connection._writer_loop())
+    await connection.send_event({"name": "log.entry", "payload": {"category": "r3", "action": "a"}})
+    await connection.send_event({"name": "log.entry", "payload": {"category": "r3", "action": "b"}})
+    await asyncio.wait_for(
+        connection.send_event({"name": "log.entry", "payload": {"category": "r3", "action": "c"}}),
+        timeout=2,
+    )
+    assert connection._closed is True
+    assert connection.writer.aborted is True
+
+
+@pytest.mark.asyncio
+async def test_unix_seventeenth_connection_receives_busy(tmp_path: Path) -> None:
+    socket_path = Path("/tmp") / f"aeloon-v4-limit-{os.getpid()}.sock"
+    socket_path.unlink(missing_ok=True)
+    task = asyncio.create_task(
+        serve(socket_path=socket_path, data_dir=tmp_path / "data", workspace_roots=(tmp_path,))
+    )
+    try:
+        for _ in range(200):
+            if socket_path.exists():
+                break
+            await asyncio.sleep(0.01)
+        handshake = {
+            "protocol": {"min": "4.0.0", "max": "4.0.0"},
+            "client": {"name": "pytest", "version": "0", "platform": "test"},
+        }
+        held: list[tuple[asyncio.StreamReader, asyncio.StreamWriter]] = []
+        for index in range(16):
+            reader, writer = await asyncio.open_unix_connection(str(socket_path))
+            response = await _request(
+                reader,
+                writer,
+                {"id": f"hs-{index}", "method": "system.handshake", "params": handshake},
+            )
+            assert "result" in response
+            held.append((reader, writer))
+        extra_reader, extra_writer = await asyncio.open_unix_connection(str(socket_path))
+        busy = await _request(
+            extra_reader,
+            extra_writer,
+            {"id": "busy", "method": "system.handshake", "params": handshake},
+        )
+        assert busy["error"]["data"]["code"] == "busy"
+        extra_writer.close()
+        await extra_writer.wait_closed()
+        for _reader, writer in held:
+            writer.close()
+            await writer.wait_closed()
+        logs = await _connect_and_read_logs(socket_path)
+        events = {item["event"] for item in logs["entries"]}
+        assert "connected" in events
+        assert "disconnected" in events
+        assert "resync_served" in events
+        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        await _request(
+            reader,
+            writer,
+            {
+                "id": "down-hs",
+                "method": "system.handshake",
+                "params": handshake,
+            },
+        )
+        await _request(reader, writer, {"id": "down", "method": "system.shutdown", "params": {}})
+        writer.close()
+        await writer.wait_closed()
+        await asyncio.wait_for(task, timeout=5)
+    finally:
+        if not task.done():
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        socket_path.unlink(missing_ok=True)
+
+
+async def _connect_and_read_logs(socket_path: Path) -> dict[str, Any]:
+    reader, writer = await asyncio.open_unix_connection(str(socket_path))
+    await _request(
+        reader,
+        writer,
+        {
+            "id": "log-hs",
+            "method": "system.handshake",
+            "params": {
+                "protocol": {"min": "4.0.0", "max": "4.0.0"},
+                "client": {"name": "pytest", "version": "0", "platform": "test"},
+            },
+        },
+    )
+    await _request(
+        reader,
+        writer,
+        {"id": "sub", "method": "events.subscribe", "params": {"thread_ids": []}},
+    )
+    response = await _request(
+        reader, writer, {"id": "logs", "method": "diagnostics.logs", "params": {"limit": 200}}
+    )
+    writer.close()
+    await writer.wait_closed()
+    return response["result"]
+

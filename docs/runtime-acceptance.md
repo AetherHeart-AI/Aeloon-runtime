@@ -15,10 +15,16 @@ one-shot `devices.claim` request followed by a `device_token` handshake;
 host-lifecycle methods remain Unix/CLI-only. Workspace authorization is
 root-based and `project.add` accepts only `{root_id, relative_path}`.
 
-The protocol contract is 72 methods, 31 events, 17 error codes, a 40 MiB
+The protocol contract is 73 methods, 31 events, 17 error codes, a 40 MiB
 frame, 25 MiB ordinary-file and 10 MiB image limits. Runtime data is not
 migrated: old state blocks startup until the operator runs the explicit,
 force-confirmed v4 reset command.
+
+<!-- r3-acceptance:start -->
+R3 remote numbers are written by `bun run test:r3:remote` after a clean-tree
+benchmark whose WSS client runs on the operator machine through an SSH tunnel,
+plus the four fault-proxy resilience scenarios against that same forwarded Runtime.
+<!-- r3-acceptance:end -->
 
 ## Handoff evidence
 

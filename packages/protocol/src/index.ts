@@ -262,6 +262,10 @@ export interface Params_devices_revoke_v4 {
   device_id: string;
 }
 
+export interface Params_diagnostics_logs_v4 {
+  limit?: number;
+}
+
 export interface Params_events_subscribe_v4 {
   after_seq?: number;
   server_instance_id?: string;
@@ -634,6 +638,11 @@ export interface Result_devices_revoke_v4 {
   revoked: boolean;
 }
 
+export interface Result_diagnostics_logs_v4 {
+  entries: ({ [k: string]: unknown })[];
+  truncated: boolean;
+}
+
 export interface Result_events_subscribe_v4 {
   current_seq: number;
   cursor: { [k: string]: unknown };
@@ -998,6 +1007,7 @@ export interface RuntimeRpcMethodMap {
   "devices.enroll": { params: Params_devices_enroll_v4; result: Result_devices_enroll_v4 };
   "devices.list": { params: Params_devices_list_v4; result: Result_devices_list_v4 };
   "devices.revoke": { params: Params_devices_revoke_v4; result: Result_devices_revoke_v4 };
+  "diagnostics.logs": { params: Params_diagnostics_logs_v4; result: Result_diagnostics_logs_v4 };
   "events.subscribe": { params: Params_events_subscribe_v4; result: Result_events_subscribe_v4 };
   "fs.list": { params: Params_fs_list_v4; result: Result_fs_list_v4 };
   "fs.read": { params: Params_fs_read_v4; result: Result_fs_read_v4 };

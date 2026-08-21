@@ -28,7 +28,7 @@ def test_rpc_source_and_manifest_are_strict_and_complete() -> None:
     assert source["frame_max_bytes"] == MAX_FRAME_BYTES
     assert source["file_max_bytes"] == FILE_BYTES
     assert source["image_max_bytes"] == IMAGE_BYTES
-    assert len(manifest["methods"]) == 72
+    assert len(manifest["methods"]) == 73
     assert len(manifest["plugin_methods"]) == 9
     assert len(manifest["events"]) >= 30
     assert len(manifest["errors"]) >= 15

@@ -236,7 +236,7 @@ async def test_listen_prints_pairing_url_and_issues_a_token(
             )
             second = await _read(connection)
             assert "device" not in second["result"]
-            assert second["result"]["protocol"] in {"4.0.0", "4.0.0"}
+            assert second["result"]["protocol"] in {"4.0.0"}
         async with websockets.connect(
             f"wss://127.0.0.1:{port}", ssl=ssl_ctx, max_size=None
         ) as connection:
@@ -354,7 +354,7 @@ async def test_revoke_disconnects_the_active_connection(tmp_path: Path) -> None:
                     }
                 )
             )
-            first = await _read(connection)
+            await _read(connection)
             device_id = claimed["device_id"]
             reader, writer = await asyncio.open_unix_connection(str(socket_path))
             await _unix_request(
@@ -386,7 +386,7 @@ async def test_unix_socket_still_works_without_auth(tmp_path: Path) -> None:
             writer,
             {"id": "1", "method": "system.handshake", "params": _handshake_params()},
         )
-        assert handshake["result"]["protocol"] in {"4.0.0", "4.0.0"}
+        assert handshake["result"]["protocol"] in {"4.0.0"}
         assert "device" not in handshake["result"]
         health = await _unix_request(
             reader, writer, {"id": "2", "method": "system.health", "params": {}}
@@ -395,4 +395,53 @@ async def test_unix_socket_still_works_without_auth(tmp_path: Path) -> None:
         writer.close()
         await writer.wait_closed()
     finally:
+        await _stop_runtime(task, socket_path, port)
+
+
+@pytest.mark.asyncio
+async def test_seventeenth_wss_connection_receives_busy_after_unix_clients_fill_the_limit(
+    tmp_path: Path,
+) -> None:
+    port = 47_410
+    task, socket_path = await _start_runtime(tmp_path, port)
+    held: list[tuple[asyncio.StreamReader, asyncio.StreamWriter]] = []
+    try:
+        enrollment = await _enroll_over_unix(socket_path)
+        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_NONE
+        claimed = await _claim_over_websocket(
+            f"wss://127.0.0.1:{port}", enrollment["code"], ssl_ctx
+        )
+        handshake = _handshake_params()
+        for index in range(16):
+            reader, writer = await asyncio.open_unix_connection(str(socket_path))
+            response = await _unix_request(
+                reader,
+                writer,
+                {"id": f"hs-{index}", "method": "system.handshake", "params": handshake},
+            )
+            assert "result" in response
+            held.append((reader, writer))
+        async with websockets.connect(
+            f"wss://127.0.0.1:{port}", ssl=ssl_ctx, max_size=None
+        ) as connection:
+            await connection.send(
+                _frame(
+                    {
+                        "id": "busy",
+                        "method": "system.handshake",
+                        "params": _handshake_params(
+                            kind="device_token", token=claimed["token"]
+                        ),
+                    }
+                )
+            )
+            response = await _read(connection)
+            assert response["error"]["data"]["code"] == "busy"
+            await asyncio.wait_for(connection.wait_closed(), timeout=2)
+    finally:
+        for _reader, writer in held:
+            writer.close()
+            await writer.wait_closed()
         await _stop_runtime(task, socket_path, port)

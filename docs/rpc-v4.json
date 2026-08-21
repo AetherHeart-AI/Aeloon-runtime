@@ -956,6 +956,64 @@
       ],
       "title": "Result_events_subscribe_v4"
     },
+    "Params_diagnostics_logs_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500
+        }
+      },
+      "title": "Params_diagnostics_logs_v4"
+    },
+    "Result_diagnostics_logs_v4": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "entries": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "at": {
+                "type": "string"
+              },
+              "event": {
+                "type": "string"
+              },
+              "fields": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": [
+                    "string",
+                    "integer",
+                    "number",
+                    "boolean",
+                    "null"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "at",
+              "event",
+              "fields"
+            ]
+          }
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "entries",
+        "truncated"
+      ],
+      "title": "Result_diagnostics_logs_v4"
+    },
     "Params_project_list_v4": {
       "type": "object",
       "additionalProperties": false,
@@ -4436,6 +4494,26 @@
           "note": "只改 session_ids → thread_ids。断线续传机制**今天已经有**：adapter 用 maxlen 有界 deque 保留事件，after_seq 增量重放，replay_complete 告诉客户端缓冲区是否已经滚过去（滚过去就必须走 thread.get 全量重取），server_instance_id 用于识别 Runtime 重启。v4 原样保留，不要重新发明",
           "params_signature": "{thread_ids[], after_seq?, server_instance_id?}",
           "result_signature": "{server_instance_id, current_seq, replay_complete, events[], cursor:{server_instance_id,seq}}"
+        }
+      ]
+    },
+    {
+      "id": "diagnostics",
+      "title": "diagnostics · 过滤后的 Runtime 生命周期日志",
+      "methods": [
+        {
+          "name": "diagnostics.logs",
+          "params": {
+            "$ref": "#/$defs/Params_diagnostics_logs_v4"
+          },
+          "result": {
+            "$ref": "#/$defs/Result_diagnostics_logs_v4"
+          },
+          "src": "new",
+          "change": "new",
+          "note": "单租户下任何已鉴权设备都可读。只读 runtime.log.1 与 runtime.log；跳过损坏或未写完的行；fields 仅含白名单标量。limit 默认 200，范围 1..500，最新记录在前",
+          "params_signature": "{limit?}",
+          "result_signature": "{entries:[{at,event,fields}], truncated}"
         }
       ]
     },

@@ -162,6 +162,10 @@ def build_tls_context(certificate: Path | None, key: Path | None) -> ssl.SSLCont
     return context
 
 
+WS_PING_INTERVAL_S = 15
+WS_PING_TIMEOUT_S = 15
+
+
 async def serve_websocket(
     server: RuntimeServer,
     *,
@@ -171,17 +175,13 @@ async def serve_websocket(
 ) -> Any:
     """Start the WebSocket listener and return it, already serving."""
     from aeloon_runtime.runtime_server import (
-        MAX_CLIENTS,
         MAX_FRAME_BYTES,
         MAX_PENDING_AUTH,
         RuntimeConnection,
     )
 
     async def handler(connection: ServerConnection) -> None:
-        if (
-            len(server.connections) >= MAX_CLIENTS
-            or len(server.pending_connections) >= MAX_PENDING_AUTH
-        ):
+        if len(server.pending_connections) >= MAX_PENDING_AUTH:
             await connection.close(code=1013, reason="Runtime connection limit reached")
             return
         stream = WebSocketByteStream(connection)
@@ -211,12 +211,14 @@ async def serve_websocket(
         # Frames are already bounded by the gateway's own limit; letting the
         # library enforce a smaller one would truncate legitimate attachments.
         max_size=MAX_FRAME_BYTES + 4,
-        ping_interval=20,
-        ping_timeout=20,
+        ping_interval=WS_PING_INTERVAL_S,
+        ping_timeout=WS_PING_TIMEOUT_S,
     )
 
 
 __all__ = [
+    "WS_PING_INTERVAL_S",
+    "WS_PING_TIMEOUT_S",
     "WebSocketByteStream",
     "build_tls_context",
     "parse_listen",

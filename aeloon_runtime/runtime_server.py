@@ -55,7 +55,7 @@ from aeloon_runtime.pty_manager import PTYManager
 from aeloon_runtime.rpc.protocol import RpcError
 from aeloon_runtime.runtime.service import RuntimeService
 from aeloon_runtime.runtime.types import RuntimeFailure
-from aeloon_runtime.runtime_log import RuntimeLog
+from aeloon_runtime.runtime_log import RuntimeLog, read_runtime_logs
 from aeloon_runtime.store import AsyncRuntimeStore, RuntimeStore
 from aeloon_runtime.trace import TraceRecorder
 from aeloon_runtime.version import RUNTIME_VERSION, runtime_commit
@@ -68,6 +68,17 @@ MAX_PENDING_AUTH = 16
 AUTH_HANDSHAKE_TIMEOUT_S = 10.0
 EVENT_LIMIT = 10_000
 EVENT_QUEUE_LIMIT = 1_000
+EVENT_QUEUE_BYTES = 64 * 1024 * 1024
+
+
+def _env_int(name: str) -> int | None:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
 _MANIFEST = json.loads(
     (Path(__file__).with_name("rpc") / "aeloon-rpc-v4.manifest.json").read_text(encoding="utf-8")
 )
@@ -147,6 +158,9 @@ class RuntimeServer:
         tls_key: Path | None = None,
         runtime_label: str | None = None,
         advertise_url: str | None = None,
+        event_limit: int | None = None,
+        event_queue_limit: int | None = None,
+        event_queue_bytes: int | None = None,
     ) -> None:
         self.runtime = runtime
         # A WebSocket listener is additive: the Unix socket always exists, so a
@@ -175,7 +189,20 @@ class RuntimeServer:
         self.started_at = time.monotonic()
         self.server_instance_id = str(uuid.uuid4())
         self.current_seq = 0
-        self.events: deque[dict[str, Any]] = deque(maxlen=EVENT_LIMIT)
+        if event_limit is None:
+            event_limit = _env_int("AELOON_RUNTIME_EVENT_LIMIT")
+        if event_queue_limit is None:
+            event_queue_limit = _env_int("AELOON_RUNTIME_EVENT_QUEUE_LIMIT")
+        if event_queue_bytes is None:
+            event_queue_bytes = _env_int("AELOON_RUNTIME_EVENT_QUEUE_BYTES")
+        self.event_limit = EVENT_LIMIT if event_limit is None else event_limit
+        self.event_queue_limit = (
+            EVENT_QUEUE_LIMIT if event_queue_limit is None else event_queue_limit
+        )
+        self.event_queue_bytes = (
+            EVENT_QUEUE_BYTES if event_queue_bytes is None else event_queue_bytes
+        )
+        self.events: deque[dict[str, Any]] = deque(maxlen=self.event_limit)
         self.stop_event = asyncio.Event()
         self._remove_listener = runtime.add_event_listener(self._on_runtime_event)
         # ``serve`` acquires this before composing RuntimeService so a
@@ -329,7 +356,8 @@ class RuntimeServer:
                 self.log = None
             self.server.close()
             await self.server.wait_closed()
-            for connection in tuple(self.connections):
+            for connection in tuple(self.connections) + tuple(self.pending_connections):
+                connection._close_reason = "shutdown"
                 await connection.close()
             await self.pty.close_all()
             with contextlib.suppress(FileNotFoundError):
@@ -363,12 +391,12 @@ class RuntimeServer:
         self._lock_fd = _open_runtime_lock(self.data_dir)
 
     async def _accept(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        if len(self.connections) >= MAX_CLIENTS:
-            writer.close()
-            await writer.wait_closed()
-            return
-        connection = RuntimeConnection(self, reader, writer, requires_auth=False)
-        self.connections.add(connection)
+        at_limit = len(self.connections) >= MAX_CLIENTS
+        connection = RuntimeConnection(
+            self, reader, writer, requires_auth=False, reject_busy=at_limit
+        )
+        if not at_limit:
+            self.connections.add(connection)
         try:
             await connection.run()
         finally:
@@ -482,6 +510,9 @@ class RuntimeServer:
         params: Mapping[str, Any],
         connection: RuntimeConnection | None = None,
     ) -> Any:
+        if connection is not None and connection.reject_busy:
+            connection.close_after_response = True
+            raise RpcError("busy", "Runtime connection limit reached")
         validator = _METHOD_SCHEMAS.get(method)
         if validator is not None:
             try:
@@ -601,6 +632,8 @@ class RuntimeServer:
             return {"accepted": True}
         if method == "events.subscribe":
             return self._subscribe(params)
+        if method == "diagnostics.logs":
+            return self._diagnostics_logs(params)
         if method == "plugin.cloud.account_status":
             return await self.runtime.account_status(params)
         if method == "plugin.cloud.account_login":
@@ -1623,13 +1656,22 @@ class RuntimeServer:
                 "image_bytes": IMAGE_BYTES,
                 "file_bytes": FILE_BYTES,
                 "request_bytes": MAX_FRAME_BYTES,
-                "retained_events": EVENT_LIMIT,
+                "retained_events": self.event_limit,
             },
         }
         if connection is not None:
             device = await self._authenticate_handshake(params, connection)
             if device is not None:
                 result["device"] = device
+            connection.connected_at = time.monotonic()
+            if self.log is not None:
+                self.log.write(
+                    "connected",
+                    transport="wss" if connection.requires_auth else "unix",
+                    device_id=connection.device_id or "",
+                    source=connection.auth_source
+                    or ("websocket" if connection.requires_auth else "unix"),
+                )
         return result
 
     async def _authenticate_handshake(
@@ -1795,12 +1837,73 @@ class RuntimeServer:
             if replay_complete
             else []
         )
-        return {
+        result = {
             "server_instance_id": self.server_instance_id,
             "current_seq": self.current_seq,
             "replay_complete": replay_complete,
             "events": events,
             "cursor": {"server_instance_id": self.server_instance_id, "seq": self.current_seq},
+        }
+        if self.log is not None:
+            self.log.write(
+                "resync_served",
+                after_seq=after_seq,
+                current_seq=self.current_seq,
+                replay_complete=replay_complete,
+                replayed_events=len(events),
+            )
+        return result
+
+    def _diagnostics_logs(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        limit = params.get("limit", 200)
+        if not isinstance(limit, int) or isinstance(limit, bool):
+            raise RpcError("invalid_argument", "limit must be an integer")
+        try:
+            return read_runtime_logs(self.data_dir, limit=limit)
+        except ValueError as exc:
+            raise RpcError("invalid_argument", str(exc)) from None
+
+    async def inject_benchmark_events(self, count: int, *, payload_bytes: int = 1024) -> None:
+        """Private event generator for the R3 harness. Not part of the RPC surface."""
+
+        if count < 0 or payload_bytes < 1:
+            raise ValueError("benchmark event count and payload size must be positive")
+        padding = "x" * max(0, payload_bytes - 80)
+        for index in range(count):
+            await self._on_runtime_event(self._benchmark_event(index, padding))
+
+    async def inject_benchmark_events_at_rate(
+        self,
+        rate: int,
+        duration_s: float,
+        *,
+        payload_bytes: int = 1024,
+    ) -> int:
+        """Emit ``rate`` events/s for ``duration_s``. Returns the number injected."""
+
+        if rate < 1 or duration_s <= 0 or payload_bytes < 1:
+            raise ValueError("rate, duration and payload size must be positive")
+        expected = int(rate * duration_s)
+        interval = 1.0 / rate
+        padding = "x" * max(0, payload_bytes - 80)
+        started = time.perf_counter()
+        for index in range(expected):
+            await self._on_runtime_event(self._benchmark_event(index, padding))
+            delay = started + (index + 1) * interval - time.perf_counter()
+            if delay > 0:
+                await asyncio.sleep(delay)
+        return expected
+
+    @staticmethod
+    def _benchmark_event(index: int, padding: str) -> dict[str, Any]:
+        return {
+            "name": "log.entry",
+            "payload": {
+                "category": "benchmark",
+                "action": "inject",
+                "message": padding,
+                "data": {"n": index},
+            },
         }
 
 
@@ -1813,17 +1916,21 @@ class RuntimeConnection:
         *,
         requires_auth: bool = False,
         auth_source: str = "",
+        reject_busy: bool = False,
     ) -> None:
         self.server = server
         self.reader = reader
         self.writer = writer
         self.requires_auth = requires_auth
         self.auth_source = auth_source
+        self.reject_busy = reject_busy
         self.device_id: str | None = None
         self.close_after_response = False
         self.thread_ids: set[str] = set()
         self.subscribed = False
         self.handshaken = False
+        self.connected_at = time.monotonic()
+        self._close_reason = "peer"
         self.write_lock = asyncio.Lock()
         self._writes: asyncio.PriorityQueue[
             tuple[int, int, dict[str, Any], asyncio.Future[None]]
@@ -1833,10 +1940,14 @@ class RuntimeConnection:
         # avoids an unbounded mixed priority queue when a client stops reading
         # but Runtime producers continue to publish output.
         self._pending_event_frames = 0
+        self._pending_event_bytes = 0
+        self._event_queue_limit = server.event_queue_limit
+        self._event_queue_bytes = server.event_queue_bytes
         self._write_sequence = 0
         self._writer_task: asyncio.Task[None] | None = None
         self._request_tasks: set[asyncio.Task[None]] = set()
         self._closed = False
+        self._disconnected_logged = False
 
     async def run(self) -> None:
         self._writer_task = asyncio.create_task(self._writer_loop())
@@ -1970,23 +2081,46 @@ class RuntimeConnection:
         thread_id = event.get("thread_id")
         if self.thread_ids and thread_id is not None and thread_id not in self.thread_ids:
             return
-        if self._pending_event_frames >= EVENT_QUEUE_LIMIT:
+        payload = {"method": "event", "params": event}
+        try:
+            size = len(pack_frame(payload))
+        except RpcError:
+            await self.close()
+            return
+        queue_limit = getattr(self, "_event_queue_limit", EVENT_QUEUE_LIMIT)
+        queue_bytes = getattr(self, "_event_queue_bytes", EVENT_QUEUE_BYTES)
+        pending_frames = self._pending_event_frames
+        pending_bytes = getattr(self, "_pending_event_bytes", 0)
+        if pending_frames >= queue_limit or pending_bytes + size > queue_bytes:
+            self._close_reason = "event_overflow"
+            log = getattr(getattr(self, "server", None), "log", None)
+            if log is not None:
+                overflow_thread = thread_id if isinstance(thread_id, str) else ""
+                log.write(
+                    "event_overflow_closed",
+                    thread_id=overflow_thread,
+                    pending_frames=pending_frames,
+                    pending_bytes=pending_bytes,
+                )
             await self.close()
             return
         self._pending_event_frames += 1
+        self._pending_event_bytes = pending_bytes + size
         try:
-            future = await self._enqueue({"method": "event", "params": event}, event=True)
+            future = await self._enqueue(payload, event=True)
         except Exception:
             self._pending_event_frames = max(0, self._pending_event_frames - 1)
+            self._pending_event_bytes = max(0, self._pending_event_bytes - size)
             raise
         # Event delivery is deliberately fire-and-forget.  The bounded queue
         # and overflow close protect the Runtime from a client that stops
         # reading, while this callback consumes a late writer exception so it
         # cannot become an unhandled Future warning.
-        future.add_done_callback(self._event_frame_done)
+        future.add_done_callback(lambda done, nbytes=size: self._event_frame_done(done, nbytes))
 
-    def _event_frame_done(self, future: asyncio.Future[None]) -> None:
+    def _event_frame_done(self, future: asyncio.Future[None], size: int = 0) -> None:
         self._pending_event_frames = max(0, self._pending_event_frames - 1)
+        self._pending_event_bytes = max(0, getattr(self, "_pending_event_bytes", 0) - size)
         _consume_future_exception(future)
 
     async def send(self, value: dict[str, Any], *, event: bool = False) -> None:
@@ -2014,6 +2148,7 @@ class RuntimeConnection:
             except Exception as exc:
                 if not future.done():
                     future.set_exception(exc)
+                self._close_reason = "error"
                 await self.close()
                 return
             if not future.done():
@@ -2023,12 +2158,19 @@ class RuntimeConnection:
         if self._closed:
             return
         self._closed = True
+        self._log_disconnected()
         current = asyncio.current_task()
         tasks = tuple(task for task in self._request_tasks if task is not current)
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        writer_task = self._writer_task
+        if writer_task is not None and writer_task is not current:
+            writer_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await writer_task
+            self._writer_task = None
         while True:
             try:
                 _priority, _sequence, _value, future = self._writes.get_nowait()
@@ -2036,9 +2178,32 @@ class RuntimeConnection:
                 break
             if not future.done():
                 future.set_exception(ConnectionError("Runtime connection is closed"))
+        transport = getattr(self.writer, "transport", None)
+        if transport is not None:
+            abort = getattr(transport, "abort", None)
+            if callable(abort):
+                with contextlib.suppress(Exception):
+                    abort()
         self.writer.close()
         with contextlib.suppress(Exception):
-            await self.writer.wait_closed()
+            await asyncio.wait_for(self.writer.wait_closed(), timeout=1.0)
+
+    def _log_disconnected(self) -> None:
+        if getattr(self, "_disconnected_logged", False) or not getattr(self, "handshaken", False):
+            return
+        self._disconnected_logged = True
+        log = getattr(getattr(self, "server", None), "log", None)
+        if log is None:
+            return
+        started = getattr(self, "connected_at", time.monotonic())
+        duration_ms = max(0, int((time.monotonic() - started) * 1000))
+        log.write(
+            "disconnected",
+            transport="wss" if getattr(self, "requires_auth", False) else "unix",
+            device_id=getattr(self, "device_id", None) or "",
+            duration_ms=duration_ms,
+            reason=getattr(self, "_close_reason", "peer"),
+        )
 
 
 def _consume_future_exception(future: asyncio.Future[None]) -> None:

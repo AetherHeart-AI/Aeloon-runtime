@@ -10,8 +10,20 @@ from pathlib import Path
 import pytest
 import websockets
 
-from aeloon_runtime.gateway_ws import WebSocketByteStream, build_tls_context, parse_listen
+from aeloon_runtime.gateway_ws import (
+    WS_PING_INTERVAL_S,
+    WS_PING_TIMEOUT_S,
+    WebSocketByteStream,
+    build_tls_context,
+    parse_listen,
+)
 from aeloon_runtime.runtime_server import serve
+
+
+def test_websocket_heartbeat_detects_half_open_connections_in_about_thirty_seconds() -> None:
+    assert WS_PING_INTERVAL_S == 15
+    assert WS_PING_TIMEOUT_S == 15
+    assert WS_PING_INTERVAL_S + WS_PING_TIMEOUT_S == 30
 
 
 def test_parse_listen_accepts_loopback_forms() -> None:

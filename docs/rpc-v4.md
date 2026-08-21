@@ -20,6 +20,10 @@ This file is generated from `docs/rpc-v4.json`; do not edit by hand.
 
 - `events.subscribe` — `{thread_ids[], after_seq?, server_instance_id?}` → `{server_instance_id, current_seq, replay_complete, events[], cursor:{server_instance_id,seq}}`
 
+## diagnostics
+
+- `diagnostics.logs` — `{limit?}` → `{entries:[{at,event,fields}], truncated}`
+
 ## project
 
 - `project.list` — `{}` → `{projects[]}`

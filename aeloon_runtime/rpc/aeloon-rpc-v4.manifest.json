@@ -855,6 +855,18 @@
       "title": "Params_devices_revoke_v4",
       "type": "object"
     },
+    "Params_diagnostics_logs_v4": {
+      "additionalProperties": false,
+      "properties": {
+        "limit": {
+          "maximum": 500,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "title": "Params_diagnostics_logs_v4",
+      "type": "object"
+    },
     "Params_events_subscribe_v4": {
       "additionalProperties": false,
       "properties": {
@@ -2292,6 +2304,52 @@
         "devices"
       ],
       "title": "Result_devices_revoke_v4",
+      "type": "object"
+    },
+    "Result_diagnostics_logs_v4": {
+      "additionalProperties": false,
+      "properties": {
+        "entries": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "at": {
+                "type": "string"
+              },
+              "event": {
+                "type": "string"
+              },
+              "fields": {
+                "additionalProperties": {
+                  "type": [
+                    "string",
+                    "integer",
+                    "number",
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "type": "object"
+              }
+            },
+            "required": [
+              "at",
+              "event",
+              "fields"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "entries",
+        "truncated"
+      ],
+      "title": "Result_diagnostics_logs_v4",
       "type": "object"
     },
     "Result_events_subscribe_v4": {
@@ -4125,6 +4183,14 @@
       },
       "result": {
         "$ref": "#/$defs/Result_devices_revoke_v4"
+      }
+    },
+    "diagnostics.logs": {
+      "params": {
+        "$ref": "#/$defs/Params_diagnostics_logs_v4"
+      },
+      "result": {
+        "$ref": "#/$defs/Result_diagnostics_logs_v4"
       }
     },
     "events.subscribe": {
