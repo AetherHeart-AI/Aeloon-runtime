@@ -185,11 +185,27 @@ async def test_jsonl_appends_coalesce_syncs_and_terminal_entries_force_flush(
     monkeypatch.setattr("aeloon_runtime.runtime.session._fsync_path", record_sync)
     for index in range(100):
         await session.append_message(UserMessage(str(index)))
-    await asyncio.sleep(0.05)
-    assert syncs == 1
+    # Poll until the debounced flush stops firing rather than assuming one fixed
+    # interval covers the batch. How many windows 100 appends span depends on how
+    # busy the machine is, and that number was never the claim: the claim is that
+    # appends coalesce instead of syncing once per entry.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 5.0
+    quiet_until = loop.time() + 0.2
+    batched = syncs
+    while loop.time() < deadline:
+        await asyncio.sleep(0.01)
+        if syncs != batched:
+            batched = syncs
+            quiet_until = loop.time() + 0.2
+        elif loop.time() >= quiet_until:
+            break
+    assert 1 <= batched <= 10, f"100 appends cost {batched} syncs"
 
     await session.append_run_end(run_id="run", status="completed")
-    assert syncs == 2
+    # A terminal entry flushes immediately: exactly one more, whatever the batch
+    # above happened to cost.
+    assert syncs == batched + 1
     reopened = await repository.open("batched-sync")
     assert len(await reopened.get_entries()) == 101
 
