@@ -248,10 +248,18 @@ jobs:
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME:-runtime-v${RUNTIME_VERSION}}"
-          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --title "Aeloon Runtime $RUNTIME_VERSION" --generate-notes
-          gh release upload "$tag" release/*.tar.zst --clobber
-          gh release upload "$tag" release/*.tgz --clobber
-          gh release upload "$tag" release/*.whl --clobber
+          # This job only downloads artifacts, so there is no checkout for gh to
+          # infer the repository from. Naming it beats checking out a tree that
+          # nothing here reads.
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
+                 --title "Aeloon Runtime $RUNTIME_VERSION" --generate-notes
+          # The globs expand to filenames here, so an unmatched one stays
+          # literal and fails the upload — which is what a missing artifact
+          # should do.
+          for asset in release/*.tar.zst release/*.tgz release/*.whl; do
+            gh release upload "$tag" "$asset" --repo "$GITHUB_REPOSITORY" --clobber
+          done
 
       - name: Notify the UI repository when configured
         env:

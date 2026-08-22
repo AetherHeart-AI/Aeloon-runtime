@@ -5,6 +5,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import yaml
+
 from aeloon_runtime.version import runtime_version
 
 
@@ -76,4 +78,11 @@ def test_runtime_release_publishes_the_runtime_wheel_alongside_bundles() -> None
     assert "name: Build aeloon-runtime wheel" in workflow
     assert "name: aeloon-runtime-wheel" in workflow
     assert "needs: [bundle, protocol-package, wheel]" in workflow
-    assert 'gh release upload "$tag" release/*.whl --clobber' in workflow
+    # Asserted against the parsed publish job rather than the exact command
+    # text: pinning the spelling made a rewrite of the upload loop fail a test
+    # while publishing exactly the same files.
+    publish = yaml.safe_load(workflow)["jobs"]["publish"]
+    script = "\n".join(str(step.get("run", "")) for step in publish["steps"])
+    assert "gh release upload" in script
+    for pattern in ("release/*.whl", "release/*.tar.zst", "release/*.tgz"):
+        assert pattern in script, f"the release publishes no {pattern}"
