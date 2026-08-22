@@ -807,7 +807,7 @@ async def resume_command(args: argparse.Namespace) -> int:
                 "not_found",
                 f"No saved task was found for {config.workspace}",
             )
-        args.session = max(sessions, key=_session_mtime).id
+        args.session = max(sessions, key=_session_last_activity).id
     return await run_command(args)
 
 
@@ -840,7 +840,7 @@ async def history_command(args: argparse.Namespace) -> int:
 
     workspace = None if args.all else (args.workspace or config.workspace)
     sessions = await repository.list(cwd=workspace)
-    sessions.sort(key=_session_mtime, reverse=True)
+    sessions.sort(key=_session_last_activity, reverse=True)
     payload: list[dict[str, Any]] = []
     for metadata in sessions:
         session = await repository.open(metadata.id)
@@ -849,9 +849,7 @@ async def history_command(args: argparse.Namespace) -> int:
             {
                 "id": metadata.id,
                 "created_at": metadata.created_at,
-                "updated_at": datetime.fromtimestamp(_session_mtime(metadata))
-                .astimezone()
-                .isoformat(),
+                "updated_at": _session_last_activity(metadata).astimezone().isoformat(),
                 "workspace": metadata.cwd,
                 "summary": await session.get_name()
                 or _session_summary(context.messages)
@@ -894,11 +892,51 @@ def _format_history_time(value: str) -> str:
     return value[:16].replace("T", " ") if len(value) >= 16 else value
 
 
-def _session_mtime(metadata: Any) -> float:
+def _last_entry_timestamp(path: Path) -> str | None:
+    """The timestamp of the last complete entry, read from the tail of the file."""
+
     try:
-        return metadata.path.stat().st_mtime
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            window = min(size, 64 * 1024)
+            handle.seek(size - window)
+            tail = handle.read(window)
     except OSError:
-        return 0.0
+        return None
+    # Reversed, so a line truncated by the window edge is only ever reached
+    # after every whole line behind it has been tried.
+    for line in reversed(tail.splitlines()):
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        timestamp = entry.get("timestamp")
+        if isinstance(timestamp, str):
+            return timestamp
+    return None
+
+
+def _session_last_activity(metadata: Any) -> datetime:
+    """When this session was last written to.
+
+    File mtime is the obvious signal and it is the wrong one: its resolution is
+    the filesystem's, so two sessions touched inside a single tick compare
+    equal. `max` keeps the first of equal elements and `list` returns sessions
+    newest-created first, which means a tie resumes the session that was just
+    created rather than the one actually being worked in. Every entry carries
+    its own timestamp, so let the file say when it last changed.
+    """
+
+    for value in (_last_entry_timestamp(metadata.path), getattr(metadata, "created_at", None)):
+        if isinstance(value, str):
+            try:
+                return datetime.fromisoformat(value)
+            except ValueError:
+                continue
+    return datetime.fromtimestamp(0, UTC)
 
 
 def _session_summary(messages: Any) -> str:

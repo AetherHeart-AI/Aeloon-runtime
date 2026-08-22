@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
 import tomllib
@@ -756,6 +757,52 @@ async def test_resume_uses_latest_session_in_workspace(tmp_path: Path, monkeypat
 
     assert resumed["session_id"] == first["session_id"]
     assert resumed["final_content"] == "continued"
+
+
+@pytest.mark.asyncio
+async def test_resume_prefers_recent_activity_over_file_timestamps(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Resume must not depend on how finely the filesystem records mtime.
+
+    Sessions written inside one mtime tick used to compare equal, and because
+    the listing is newest-created first the tie resumed the wrong session. This
+    forces every session file to share an mtime so that ambiguity is present on
+    every filesystem rather than only on the coarse ones.
+    """
+
+    data_dir = tmp_path / "data"
+    monkeypatch.setattr(cli, "DeepSeekProvider", lambda **_kwargs: _provider("saved"))
+    common = [
+        "-C",
+        str(tmp_path),
+        "--data-dir",
+        str(data_dir),
+        "--model",
+        "deepseek/deepseek-v4-flash",
+        "--json",
+    ]
+    await cli.async_main(["first task", *common])
+    first = json.loads(capsys.readouterr().out)
+    await cli.async_main(["newer task", *common])
+    second = json.loads(capsys.readouterr().out)
+    assert second["session_id"] != first["session_id"]
+
+    repository = cli.JsonlSessionRepository(data_dir)
+    first_session = await repository.open(first["session_id"])
+    await first_session.append_custom_message(custom_type="note", content="recent activity")
+
+    frozen = 1_700_000_000
+    for path in data_dir.rglob("*.jsonl"):
+        os.utime(path, (frozen, frozen))
+
+    monkeypatch.setattr(cli, "DeepSeekProvider", lambda **_kwargs: _provider("continued"))
+    await cli.async_main(
+        ["resume", "continue", "-C", str(tmp_path), "--data-dir", str(data_dir), "--json"]
+    )
+    resumed = json.loads(capsys.readouterr().out)
+
+    assert resumed["session_id"] == first["session_id"]
 
 
 @pytest.mark.asyncio
