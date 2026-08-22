@@ -60,3 +60,78 @@ Latency budgets are hard floors over SSH-tunneled WSS. Bulk response and attachm
    equivalence, and the production build.
 5. The wheel and bundle workflows verify the v4 manifest, generated docs,
    Runtime package, and platform archives.
+
+## R4 release acceptance
+
+Date: 2026-08-22
+Runtime commit: 64699536a7d248ff0811705a38eaee2fb4dbda72
+Tag: runtime-v0.1.0
+UI commit: 04f2e680712ed4ee004a7d166dd9dbcd0c6c00b6
+Gate: **partial — see "Not verified" below**
+
+R4 set out to turn work that had only ever run on one developer machine into a
+release that CI has checked and that something can actually install. The release
+pipeline fixes were the means; being consumable was the goal.
+
+### Published
+
+`runtime-v0.1.0` carries five assets:
+
+| Asset | Size |
+| --- | --- |
+| aeloon-runtime-darwin-aarch64.tar.zst | 73,225,848 |
+| aeloon-runtime-linux-aarch64.tar.zst | 85,583,747 |
+| aeloon-runtime-linux-x86_64.tar.zst | 97,135,508 |
+| aeloon_runtime-0.1.0-py3-none-any.whl | 250,244 |
+| aeloon-protocol-4.0.0.tgz | 4,891 |
+
+`linux-x86_64` is new in this release. Only aarch64 archives existed before,
+which a Runtime meant for LAN and cloud hosts cannot be deployed from.
+
+### Verified
+
+- Both repositories' CI passes and the work is merged to `main`. Neither had
+  ever run CI before this phase.
+- The release workflow completes in one run: the tag, `pyproject` and
+  `RUNTIME_VERSION` are checked against each other before anything is built,
+  all three platform archives are produced, and every asset uploads.
+- With no `AELOON_UI_REPOSITORY_TOKEN` configured, the UI notification step
+  reports success rather than failing a release whose assets are already
+  published.
+- The published `linux-x86_64` archive hashes to what
+  `runtime-bundle.lock.json` pins, byte for byte, and the pin was computed from
+  the downloaded bytes rather than a build log.
+- That archive contains genuine x86-64 ELF binaries for Python, uv and ripgrep;
+  its manifest declares `linux-x86_64`, names this commit, and its recorded
+  component digests match the files beside them.
+- A clean clone of the client with no local state installs, builds, validates
+  the lock under `--release`, typechecks and passes its unit tests.
+- The client suite runs against a real Runtime in CI, including the replay
+  corpus over both transports with byte-identical transcripts. Before this
+  phase that equivalence had only ever been demonstrated on one machine.
+
+### Not verified
+
+Two exit criteria are open. Nothing below has been demonstrated, and the
+release should not be described as consumable until they are.
+
+1. **The published x86_64 archive has never been executed.** Its integrity and
+   contents are checked, but no process has been started from it. That needs an
+   x86_64 Linux host; the machine used for R3 stopped accepting SSH
+   (`kex_exchange_identification`, before key exchange) and was not replaced.
+2. **No client has connected to a Runtime started from a release artifact.** The
+   clean-clone client was built but never pointed at one, because (1) is open.
+
+Everything to date shows the release can be built and pinned. Whether it can be
+installed and used is the question these two answer, and it is the one that
+matters — a pipeline that produces artifacts nobody has started is the ordinary
+way this goes wrong.
+
+### Known gap
+
+The remote-pairing e2e specs skip in CI. Electron reports
+`isEncryptionAvailable=false backend=basic_text` on a stock runner, and the
+client refuses remote profiles rather than keep a device token in plaintext, so
+those specs would be asserting against a flow the product declines to offer.
+Two attempts to give the runner a working keyring did not change the reported
+backend. They still run on a developer machine with a real keychain.
